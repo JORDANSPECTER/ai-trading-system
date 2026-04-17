@@ -319,6 +319,10 @@ def build_trade_plan(structure: dict, levels: dict, vwap: float) -> dict:
     return plan
 
 
+# ======================
+# REPLACE YOUR CURRENT grade_trade() WITH THIS
+# ======================
+
 def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) -> tuple[str, bool]:
     score = 0
     chase = False
@@ -358,7 +362,7 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     elif setup in bearish_setups and below_vwap:
         score += 3
     else:
-        score += 1  # partial credit instead of auto-killing the grade
+        score += 1
 
     # ======================
     # VOLUME
@@ -406,6 +410,22 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     else:
         return "C", False
 
+
+# ======================
+# THEN INSIDE build_premium_message()
+# FIND THIS LINE:
+# grade, chase = grade_trade(structure, vwap, rsi, qqq)
+#
+# AND CHANGE THAT PART TO THIS:
+# ======================
+
+grade, chase = grade_trade(structure, vwap, rsi, qqq)
+reasons.append(
+    f"Grade Engine Input -> setup={structure['setup']}, "
+    f"volume={structure['volume_signal']}, "
+    f"above_vwap={qqq > vwap}, "
+    f"below_vwap={qqq < vwap}"
+)
 
 # ======================
 # MESSAGE BUILDERS
