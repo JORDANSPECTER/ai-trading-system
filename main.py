@@ -350,7 +350,6 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     bullish_setups = ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
     bearish_setups = ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
 
-    # setup quality
     if setup == "BREAK AND HOLD":
         score += 4
     elif setup == "RETEST HOLD":
@@ -366,7 +365,6 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     elif setup == "NO CLEAN STRUCTURE":
         score += 0
 
-    # VWAP logic (more flexible)
     if setup in bullish_setups:
         if above_vwap:
             score += 3
@@ -380,13 +378,11 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     else:
         score += 1
 
-    # volume
     if volume_signal == "STRONG":
         score += 2
     else:
         score += 1
 
-    # RSI quality
     if setup in bullish_setups:
         if 45 <= rsi <= 72:
             score += 3
@@ -418,6 +414,7 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
         return "B", False
     else:
         return "C", False
+
 
 # ======================
 # MESSAGE BUILDERS
@@ -489,7 +486,6 @@ def build_premium_context(
             bias = "BEARISH"
             action = "PUT IDEA"
             reasons.append("High-quality bearish alignment.")
-
     elif grade == "B":
         if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
             bias = "BULLISH"
@@ -503,7 +499,6 @@ def build_premium_context(
             bias = "MIXED"
             action = "WAIT FOR CONFIRMATION"
             reasons.append("Setup is only partially aligned.")
-
     elif grade == "AVOID":
         if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
             bias = "BULLISH"
@@ -514,7 +509,6 @@ def build_premium_context(
 
         action = "🚨 YOU ARE CHASING — WAIT"
         reasons.append("Setup is extended. Wait for retest or reset.")
-
     else:
         if structure["setup"] == "NO CLEAN STRUCTURE":
             bias = "NEUTRAL"
@@ -673,7 +667,7 @@ def main() -> None:
         send_discord(DISCORD_WEBHOOK_FREE, free_message, "FREE")
         send_telegram(premium_message)
 
-        if grade in ["A+", "A"]:
+        if grade in ["A+", "A", "B"]:
             send_discord(DISCORD_WEBHOOK_PREMIUM, premium_message, "PREMIUM")
             log(f"Premium Discord alert sent for grade {grade}")
         else:
