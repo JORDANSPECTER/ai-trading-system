@@ -784,19 +784,21 @@ def main() -> None:
         structure = detect_structure(context, bars)
         decision = make_decision(context, structure)
 
-        log(f"Decision: {decision.grade} | {decision.bias} | {decision.action}")
-        log(f"Score: {decision.score}")
-        log(f"Context snapshot: {json.dumps({
-            'symbol': context.symbol,
-            'price': context.current_price,
-            'vwap': context.vwap,
-            'rsi': context.rsi,
-            'oil_price': context.oil_price,
-            'oil_change_dollars': context.oil_day_change_dollars,
-            'macro_bias': context.macro_bias,
-            'oil_trend': context.oil_trend
-        }, default=str)}")
+       log(f"Decision: {decision.grade} | {decision.bias} | {decision.action}")
+log(f"Score: {decision.score}")
 
+context_snapshot = {
+    "symbol": context.symbol,
+    "price": context.current_price,
+    "vwap": context.vwap,
+    "rsi": context.rsi,
+    "oil_price": context.oil_price,
+    "oil_change_dollars": context.oil_day_change_dollars,
+    "macro_bias": context.macro_bias,
+    "oil_trend": context.oil_trend,
+}
+
+log("Context snapshot: " + json.dumps(context_snapshot, default=str))
         send_to_discord(decision.premium_message)
         send_to_telegram(decision.premium_message)
 
