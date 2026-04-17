@@ -35,6 +35,10 @@ def to_float(value, default=0.0) -> float:
         return default
 
 
+# ======================
+# DATA FETCH
+# ======================
+
 def get_quote(symbol: str) -> dict:
     url = "https://api.twelvedata.com/quote"
     params = {"symbol": symbol, "apikey": TWELVE_DATA_API_KEY}
@@ -68,6 +72,14 @@ def get_time_series(symbol: str, interval: str = "5min", outputsize: int = 40) -
     return values
 
 
+# ======================
+# CANDLE HELPERS
+# ======================
+
+def candle_open(bar: dict) -> float:
+    return to_float(bar.get("open"))
+
+
 def candle_close(bar: dict) -> float:
     return to_float(bar.get("close"))
 
@@ -84,6 +96,10 @@ def candle_volume(bar: dict) -> float:
     return to_float(bar.get("volume"))
 
 
+# ======================
+# ALERT SENDERS
+# ======================
+
 def send_discord(webhook_url: str, msg: str, label: str) -> None:
     if not webhook_url:
         log(f"{label}: Missing Discord webhook, skipping.")
@@ -91,6 +107,7 @@ def send_discord(webhook_url: str, msg: str, label: str) -> None:
 
     payload = {"content": msg[:1900]}
     r = requests.post(webhook_url, json=payload, timeout=20)
+
     log(f"{label}: Discord status {r.status_code}")
     log(f"{label}: Discord response {r.text[:200]}")
 
@@ -106,6 +123,7 @@ def send_telegram(msg: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]}
     r = requests.post(url, data=payload, timeout=20)
+
     log(f"Telegram status: {r.status_code}")
 
     if not (200 <= r.status_code < 300):
@@ -319,14 +337,6 @@ def build_trade_plan(structure: dict, levels: dict, vwap: float) -> dict:
     return plan
 
 
-# ======================
-# REPLACE YOUR CURRENT grade_trade() WITH THIS
-# ======================
-
-# ======================
-# REPLACE YOUR CURRENT grade_trade() WITH THIS
-# ======================
-
 def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) -> tuple[str, bool]:
     score = 0
     chase = False
@@ -340,7 +350,6 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     bullish_setups = ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
     bearish_setups = ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
 
-    # setup quality
     if setup == "BREAK AND HOLD":
         score += 4
     elif setup == "RETEST HOLD":
@@ -356,7 +365,6 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     elif setup == "NO CLEAN STRUCTURE":
         score += 0
 
-    # VWAP alignment
     if setup in bullish_setups and above_vwap:
         score += 3
     elif setup in bearish_setups and below_vwap:
@@ -364,13 +372,11 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     else:
         score += 1
 
-    # volume
     if volume_signal == "STRONG":
         score += 2
     else:
         score += 1
 
-    # RSI quality
     if setup in bullish_setups:
         if 45 <= rsi <= 72:
             score += 3
@@ -405,10 +411,10 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
 
 
 # ======================
-# REPLACE YOUR CURRENT build_premium_message() WITH THIS
+# MESSAGE BUILDERS
 # ======================
 
-def build_premium_message(
+def build_premium_context(
     qqq_data: dict,
     spy_data: dict,
     oil_data: dict,
@@ -416,7 +422,7 @@ def build_premium_message(
     vwap: float,
     rsi: float,
     levels: dict,
-) -> tuple[str, str]:
+) -> dict:
     qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
     spy = to_float(spy_data.get("close") or spy_data.get("price"))
     oil = to_float(oil_data.get("close") or oil_data.get("price"))
@@ -500,129 +506,6 @@ def build_premium_message(
         action = "🚨 YOU ARE CHASING — WAIT"
         reasons.append("Setup is extended. Wait for retest or reset.")
 
-    else:
-        if structure["setup"] == "NO CLEAN STRUCTURE":
-            bias = "NEUTRAL"
-            action = "WAIT"
-            reasons.append("No clean setup yet.")
-        else:
-            bias = "MIXED"
-            action = "WAIT FOR CONFIRMATION"
-            reasons.append("Conditions are not fully aligned.")
-
-    plan = build_trade_plan(structure, levels, vwap)
-    reason_text = "\n".join([f"• {r}" for r in reasons])
-
-    message = (
-        f"💎 UnBiased Trades Premium Alert\n\n"
-        f"{SYMBOL}: {qqq:.2f} ({qqq_change:+.2f})\n"
-        f"{SECONDARY_SYMBOL}: {spy:.2f} ({spy_change:+.2f})\n"
-        f"{OIL_SYMBOL}: {oil:.2f} ({oil_change:+.2f})\n\n"
-        f"Bias: {bias}\n"
-        f"Action: {action}\n"
-        f"Grade: {grade}\n"
-        f"Setup: {structure['setup']}\n"
-        f"Volume: {structure['volume_signal']}\n"
-        f"VWAP: {vwap:.2f}\n"
-        f"RSI: {rsi:.1f}\n"
-        f"Day High: {levels['day_high']:.2f}\n"
-        f"Day Low: {levels['day_low']:.2f}\n"
-        f"Prev Close: {levels['prev_close']:.2f}\n\n"
-        f"Entry: {plan['entry']}\n"
-        f"Invalidation: {plan['stop']}\n"
-        f"Target: {plan['target']}\n\n"
-        f"Reasons:\n{reason_text}\n\n"
-        f"Where information becomes execution."
-    )
-
-    return message, grade
-
-# ======================
-# MESSAGE BUILDERS
-# ======================
-
-def build_premium_context(
-    qqq_data: dict,
-    spy_data: dict,
-    oil_data: dict,
-    structure: dict,
-    vwap: float,
-    rsi: float,
-    levels: dict,
-) -> dict:
-    qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
-    spy = to_float(spy_data.get("close") or spy_data.get("price"))
-    oil = to_float(oil_data.get("close") or oil_data.get("price"))
-
-    qqq_prev = to_float(qqq_data.get("previous_close"))
-    spy_prev = to_float(spy_data.get("previous_close"))
-    oil_prev = to_float(oil_data.get("previous_close"))
-
-    qqq_change = qqq - qqq_prev
-    spy_change = spy - spy_prev
-    oil_change = oil - oil_prev
-
-    reasons = []
-    bias = "NEUTRAL"
-    action = "WAIT"
-
-    above_vwap = qqq > vwap
-    below_vwap = qqq < vwap
-
-    if qqq_change > 0 and spy_change > 0:
-        reasons.append("QQQ and SPY are both green on the day.")
-    if qqq_change < 0 and spy_change < 0:
-        reasons.append("QQQ and SPY are both red on the day.")
-    if oil_change > 0:
-        reasons.append("Oil is pushing higher.")
-    if oil_change < 0:
-        reasons.append("Oil is easing lower.")
-
-    if above_vwap:
-        reasons.append("Price is above VWAP.")
-    if below_vwap:
-        reasons.append("Price is below VWAP.")
-
-    reasons.append(f"Setup: {structure['setup']}")
-    reasons.append(f"Volume Signal: {structure['volume_signal']}")
-    reasons.append(f"Nearest Support: {structure['nearest_support']:.2f}")
-    reasons.append(f"Nearest Resistance: {structure['nearest_resistance']:.2f}")
-    reasons.append(f"RSI: {rsi:.1f}")
-
-    grade, chase = grade_trade(structure, vwap, rsi, qqq)
-
-    if grade in ["A+", "A"]:
-        if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
-            bias = "BULLISH"
-            action = "CALL IDEA"
-            reasons.append("High-quality bullish alignment.")
-        elif structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
-            bias = "BEARISH"
-            action = "PUT IDEA"
-            reasons.append("High-quality bearish alignment.")
-    elif grade == "B":
-        if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
-            bias = "BULLISH"
-            action = "CALL IDEA (LOWER QUALITY)"
-            reasons.append("Usable bullish setup, but not ideal.")
-        elif structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
-            bias = "BEARISH"
-            action = "PUT IDEA (LOWER QUALITY)"
-            reasons.append("Usable bearish setup, but not ideal.")
-        else:
-            bias = "MIXED"
-            action = "WAIT FOR CONFIRMATION"
-            reasons.append("Setup is only partially aligned.")
-    elif grade == "AVOID":
-        if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
-            bias = "BULLISH"
-        elif structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
-            bias = "BEARISH"
-        else:
-            bias = "MIXED"
-
-        action = "🚨 YOU ARE CHASING — WAIT"
-        reasons.append("Setup is extended. Wait for retest or reset.")
     else:
         if structure["setup"] == "NO CLEAN STRUCTURE":
             bias = "NEUTRAL"
