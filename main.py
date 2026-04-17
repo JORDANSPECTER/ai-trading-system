@@ -1249,24 +1249,19 @@ def main() -> None:
     if ENABLE_HEARTBEAT:
         send_heartbeat(force=True)
 
-    while True:
-        try:
-            process_telegram_commands()
+    try:
+    process_telegram_commands()
 
-            if ENABLE_HEARTBEAT:
-                send_heartbeat()
+    if ENABLE_HEARTBEAT:
+        send_heartbeat()
 
-            run_analysis_cycle()
-            time.sleep(POLL_INTERVAL)
+    run_analysis_cycle()
 
-        except KeyboardInterrupt:
-            log("Keyboard interrupt received. Exiting.")
-            break
-        except Exception as e:
-            log(f"Fatal loop error: {e}")
-            log(traceback.format_exc())
-            time.sleep(15)
-
+except KeyboardInterrupt:
+    log("Keyboard interrupt received. Exiting.")
+except Exception as e:
+    log(f"Fatal loop error: {e}")
+    log(traceback.format_exc())
 
 # =========================================================
 # ENTRY
@@ -3359,4 +3354,25 @@ def run() -> None:
 # ============================================================
 
 if __name__ == "__main__":
-    run()
+  if __name__ == "__main__":
+    log("🚀 SYSTEM STARTING")
+    validate_env()
+
+    context = build_market_context()
+
+    if context:
+        bars = twelve_time_series(SYMBOL, interval="5min", outputsize=30)
+        st = detect_structure(context, bars)
+        decision = make_decision(context, st)
+
+        log(f"Decision: {decision.grade} | {decision.bias} | {decision.action}")
+
+        send_to_discord(decision.premium_message)
+        send_to_telegram(decision.premium_message)
+    else:
+        log("❌ Failed to build market context")
+
+    log("✅ Run complete. Exiting.")
+
+if __name__ == "__main__":
+    main()
