@@ -1,4 +1,149 @@
 # =========================================================
+# AI TRADING SYSTEM — CLEAN MASTER BUILD
+# TOP SECTION (CORRECTED)
+# =========================================================
+
+import os
+import time
+import json
+import traceback
+import requests
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Dict, Tuple
+
+
+# =========================================================
+# ENV VARIABLES
+# These must be set in GitHub Secrets / Variables
+# =========================================================
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
+SYMBOL = os.getenv("SYMBOL", "QQQ").strip().upper()
+SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").strip().upper()
+OIL_SYMBOL = os.getenv("OIL_SYMBOL", "USO").strip().upper()
+
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "900"))
+
+ENABLE_DISCORD_ALERTS = os.getenv("ENABLE_DISCORD_ALERTS", "true").lower() == "true"
+ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "true").lower() == "true"
+ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
+
+MAX_CHASE_DISTANCE_PCT = float(os.getenv("MAX_CHASE_DISTANCE_PCT", "0.35"))
+MIN_SCORE_FOR_ALERT = int(os.getenv("MIN_SCORE_FOR_ALERT", "55"))
+
+
+# =========================================================
+# RUNTIME STATE
+# =========================================================
+
+BOT_ACTIVE = True
+LAST_HEARTBEAT_TS = 0.0
+LAST_ALERT_SIGNATURE = ""
+LAST_TELEGRAM_UPDATE_ID = 0
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+# =========================================================
+# STARTUP / ENV CHECKS
+# =========================================================
+
+def validate_env() -> None:
+    log("Checking environment variables...")
+
+    log(f"DISCORD_WEBHOOK_URL: {'OK' if DISCORD_WEBHOOK_URL else 'MISSING'}")
+    log(f"TELEGRAM_BOT_TOKEN: {'OK' if TELEGRAM_BOT_TOKEN else 'MISSING'}")
+    log(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'MISSING'}")
+    log(f"TWELVE_DATA_API_KEY: {'OK' if TWELVE_DATA_API_KEY else 'MISSING'}")
+
+    log(f"SYMBOL: {SYMBOL}")
+    log(f"SECONDARY_SYMBOL: {SECONDARY_SYMBOL}")
+    log(f"OIL_SYMBOL: {OIL_SYMBOL}")
+    log(f"POLL_INTERVAL: {POLL_INTERVAL}")
+    log(f"HEARTBEAT_INTERVAL: {HEARTBEAT_INTERVAL}")
+
+
+# =========================================================
+# TEST HELPERS
+# =========================================================
+
+def test_twelve_data(symbol: str = None) -> None:
+    symbol = symbol or SYMBOL
+
+    if not TWELVE_DATA_API_KEY:
+        log("Twelve Data test skipped: missing API key")
+        return
+
+    try:
+        url = "https://api.twelvedata.com/quote"
+        params = {
+            "symbol": symbol,
+            "apikey": TWELVE_DATA_API_KEY
+        }
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        log(f"Twelve Data test for {symbol}:")
+        log(json.dumps(data, indent=2)[:1000])
+
+    except Exception as e:
+        log(f"Twelve Data test failed: {e}")
+
+
+def send_discord_test() -> None:
+    if not DISCORD_WEBHOOK_URL:
+        log("Discord test skipped: missing webhook")
+        return
+
+    try:
+        payload = {"content": "🧪 Discord test working from main.py"}
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        log(f"Discord status: {r.status_code}")
+        log(r.text[:300])
+    except Exception as e:
+        log(f"Discord test failed: {e}")
+
+
+def send_telegram_test() -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram test skipped: missing token or chat id")
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": "🧪 Telegram test working from main.py"
+        }
+        r = requests.post(url, data=payload, timeout=15)
+        log(f"Telegram status: {r.status_code}")
+        log(r.text[:300])
+    except Exception as e:
+        log(f"Telegram test failed: {e}")
+
+# =========================================================
 # ENV VARIABLES
 # =========================================================
 
