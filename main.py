@@ -11,6 +11,7 @@ import requests
 
 DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE", "").strip()
 DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM", "").strip()
+DISCORD_WEBHOOK_PREMIUM_LEVELS = os.getenv("DISCORD_WEBHOOK_PREMIUM_LEVELS", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
@@ -582,6 +583,52 @@ def build_premium_message(
     return message, ctx["grade"]
 
 
+def build_levels_message(
+    qqq_data: dict,
+    spy_data: dict,
+    oil_data: dict,
+    structure: dict,
+    vwap: float,
+    rsi: float,
+    levels: dict,
+    grade: str,
+) -> str:
+    qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
+    spy = to_float(spy_data.get("close") or spy_data.get("price"))
+    oil = to_float(oil_data.get("close") or oil_data.get("price"))
+
+    qqq_prev = to_float(qqq_data.get("previous_close"))
+    spy_prev = to_float(spy_data.get("previous_close"))
+    oil_prev = to_float(oil_data.get("previous_close"))
+
+    qqq_change = qqq - qqq_prev
+    spy_change = spy - spy_prev
+    oil_change = oil - oil_prev
+
+    plan = build_trade_plan(structure, levels, vwap)
+
+    return (
+        f"📍 Premium Daily Levels\n\n"
+        f"{SYMBOL}: {qqq:.2f} ({qqq_change:+.2f})\n"
+        f"{SECONDARY_SYMBOL}: {spy:.2f} ({spy_change:+.2f})\n"
+        f"{OIL_SYMBOL}: {oil:.2f} ({oil_change:+.2f})\n\n"
+        f"Grade: {grade}\n"
+        f"Setup: {structure['setup']}\n"
+        f"Volume: {structure['volume_signal']}\n"
+        f"VWAP: {vwap:.2f}\n"
+        f"RSI: {rsi:.1f}\n\n"
+        f"Day High: {levels['day_high']:.2f}\n"
+        f"Day Low: {levels['day_low']:.2f}\n"
+        f"Prev Close: {levels['prev_close']:.2f}\n"
+        f"Recent High: {levels['recent_high']:.2f}\n"
+        f"Recent Low: {levels['recent_low']:.2f}\n\n"
+        f"Potential Entry Map: {plan['entry']}\n"
+        f"Invalidation Map: {plan['stop']}\n"
+        f"Target Map: {plan['target']}\n\n"
+        f"This is a levels / map alert, not a top-grade trigger."
+    )
+
+
 def build_free_message(
     qqq_data: dict,
     spy_data: dict,
@@ -661,7 +708,18 @@ def main() -> None:
             levels=levels,
         )
 
-        log("Built free + premium messages")
+        levels_message = build_levels_message(
+            qqq_data=qqq_data,
+            spy_data=spy_data,
+            oil_data=oil_data,
+            structure=structure,
+            vwap=vwap,
+            rsi=rsi,
+            levels=levels,
+            grade=grade,
+        )
+
+        log("Built free + premium + levels messages")
         log(f"Premium grade detected: {grade}")
 
         send_discord(DISCORD_WEBHOOK_FREE, free_message, "FREE")
@@ -671,7 +729,8 @@ def main() -> None:
             send_discord(DISCORD_WEBHOOK_PREMIUM, premium_message, "PREMIUM")
             log(f"Premium Discord alert sent for grade {grade}")
         else:
-            log(f"Premium Discord alert blocked because grade was {grade}")
+            send_discord(DISCORD_WEBHOOK_PREMIUM_LEVELS, levels_message, "PREMIUM_LEVELS")
+            log(f"Premium Daily Levels alert sent because grade was {grade}")
 
         log("Alerts processed successfully")
 
