@@ -1,3 +1,48 @@
+# =========================
+# LIVE DATA ENGINE
+# =========================
+
+TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+
+def fetch_price(symbol):
+    try:
+        url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVE_API_KEY}"
+        r = requests.get(url).json()
+        return float(r["price"])
+    except Exception as e:
+        print(f"Error fetching {symbol}: {e}")
+        return None
+
+
+def fetch_vwap(symbol):
+    try:
+        url = f"https://api.twelvedata.com/vwap?symbol={symbol}&interval=1min&apikey={TWELVE_API_KEY}"
+        r = requests.get(url).json()
+        return float(r["values"][0]["vwap"])
+    except Exception as e:
+        print(f"VWAP error {symbol}: {e}")
+        return None
+
+
+def fetch_rsi(symbol):
+    try:
+        url = f"https://api.twelvedata.com/rsi?symbol={symbol}&interval=5min&apikey={TWELVE_API_KEY}"
+        r = requests.get(url).json()
+        return float(r["values"][0]["rsi"])
+    except Exception as e:
+        print(f"RSI error {symbol}: {e}")
+        return 50
+
+
+def fetch_oil_price():
+    try:
+        url = f"https://api.twelvedata.com/price?symbol=CL=F&apikey={TWELVE_API_KEY}"
+        r = requests.get(url).json()
+        return float(r["price"])
+    except:
+        return None
+
 # ============================================================
 # AI TRADING SYSTEM — CLEAN FOUNDATION BUILD
 # VERSION: V2
