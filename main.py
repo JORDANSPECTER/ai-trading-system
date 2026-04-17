@@ -47,7 +47,7 @@ def get_quote(symbol: str) -> dict:
     return data
 
 
-def get_time_series(symbol: str, interval: str = "5min", outputsize: int = 30) -> list:
+def get_time_series(symbol: str, interval: str = "5min", outputsize: int = 40) -> list:
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -67,6 +67,10 @@ def get_time_series(symbol: str, interval: str = "5min", outputsize: int = 30) -
     return values
 
 
+def candle_open(bar: dict) -> float:
+    return to_float(bar.get("open"))
+
+
 def candle_close(bar: dict) -> float:
     return to_float(bar.get("close"))
 
@@ -82,6 +86,23 @@ def candle_low(bar: dict) -> float:
 def candle_volume(bar: dict) -> float:
     return to_float(bar.get("volume"))
 
+
+def send_discord(msg: str) -> None:
+    payload = {"content": msg[:1900]}
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+    log(f"Discord status: {r.status_code}")
+
+
+def send_telegram(msg: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]}
+    r = requests.post(url, data=payload, timeout=20)
+    log(f"Telegram status: {r.status_code}")
+
+
+# ======================
+# INDICATORS
+# ======================
 
 def calc_vwap(bars: list) -> float:
     total_pv = 0.0
@@ -129,56 +150,112 @@ def calc_rsi(closes: list, period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-def send_discord(msg: str) -> None:
-    payload = {"content": msg[:1900]}
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-    log(f"Discord status: {r.status_code}")
+# ======================
+# LEVELS
+# ======================
+
+def round_level(price: float) -> float:
+    return round(price, 2)
 
 
-def send_telegram(msg: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]}
-    r = requests.post(url, data=payload, timeout=20)
-    log(f"Telegram status: {r.status_code}")
+def nearest_level(price: float, levels: list) -> float:
+    if not levels:
+        return 0.0
+    return min(levels, key=lambda x: abs(x - price))
+
+
+def distance_pct(price: float, level: float) -> float:
+    if level == 0:
+        return 999.0
+    return abs(price - level) / level * 100.0
+
+
+def build_key_levels(quote: dict, bars: list) -> dict:
+    day_high = round_level(to_float(quote.get("high")))
+    day_low = round_level(to_float(quote.get("low")))
+    prev_close = round_level(to_float(quote.get("previous_close")))
+    open_price = round_level(to_float(quote.get("open")))
+
+    highs = [candle_high(b) for b in bars[-12:]] if bars else []
+    lows = [candle_low(b) for b in bars[-12:]] if bars else []
+
+    recent_high = round_level(max(highs)) if highs else day_high
+    recent_low = round_level(min(lows)) if lows else day_low
+
+    supports = sorted(list(set([day_low, prev_close, recent_low])))
+    resistances = sorted(list(set([day_high, open_price, recent_high])))
+
+    return {
+        "day_high": day_high,
+        "day_low": day_low,
+        "prev_close": prev_close,
+        "open_price": open_price,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "supports": supports,
+        "resistances": resistances,
+    }
 
 
 # ======================
-# STRUCTURE LOGIC
+# STRUCTURE / SETUPS
 # ======================
 
-def detect_structure(bars: list) -> dict:
-    if len(bars) < 3:
+def detect_structure(bars: list, current_price: float, vwap: float, levels: dict) -> dict:
+    if len(bars) < 4:
         return {
             "trend": "UNKNOWN",
             "setup": "NOT ENOUGH DATA",
             "volume_signal": "UNKNOWN",
+            "near_support": False,
+            "near_resistance": False,
         }
 
-    b1, b2, b3 = bars[-3], bars[-2], bars[-1]
+    b1, b2, b3, b4 = bars[-4], bars[-3], bars[-2], bars[-1]
 
-    c1, c2, c3 = candle_close(b1), candle_close(b2), candle_close(b3)
-    h1, h2, h3 = candle_high(b1), candle_high(b2), candle_high(b3)
-    l1, l2, l3 = candle_low(b1), candle_low(b2), candle_low(b3)
-    v1, v2, v3 = candle_volume(b1), candle_volume(b2), candle_volume(b3)
+    h2, h3, h4 = candle_high(b2), candle_high(b3), candle_high(b4)
+    l2, l3, l4 = candle_low(b2), candle_low(b3), candle_low(b4)
+    c3, c4 = candle_close(b3), candle_close(b4)
+    v2, v3, v4 = candle_volume(b2), candle_volume(b3), candle_volume(b4)
 
-    higher_lows = l3 > l2 >= l1
-    lower_highs = h3 < h2 <= h1
-    breakout = c3 > h2
-    breakdown = c3 < l2
-    strong_volume = v3 > max(v1, v2)
+    higher_lows = l4 > l3 >= l2
+    lower_highs = h4 < h3 <= h2
 
-    if higher_lows and breakout:
+    breakout = c4 > h3
+    breakdown = c4 < l3
+
+    strong_volume = v4 > max(v2, v3)
+
+    supports = levels["supports"] + [vwap]
+    resistances = levels["resistances"] + [vwap]
+
+    nearest_support = nearest_level(current_price, supports)
+    nearest_resistance = nearest_level(current_price, resistances)
+
+    near_support = distance_pct(current_price, nearest_support) <= 0.20
+    near_resistance = distance_pct(current_price, nearest_resistance) <= 0.20
+
+    above_vwap = current_price > vwap
+    below_vwap = current_price < vwap
+
+    if higher_lows and breakout and above_vwap:
         trend = "BULLISH"
-        setup = "BULLISH CONTINUATION"
-    elif lower_highs and breakdown:
+        setup = "BREAK AND HOLD"
+    elif higher_lows and near_support and above_vwap:
+        trend = "BULLISH"
+        setup = "RETEST HOLD"
+    elif lower_highs and breakdown and below_vwap:
         trend = "BEARISH"
-        setup = "BEARISH CONTINUATION"
-    elif higher_lows:
+        setup = "BREAKDOWN AND HOLD"
+    elif lower_highs and near_resistance and below_vwap:
+        trend = "BEARISH"
+        setup = "REJECTION"
+    elif lower_highs and below_vwap:
+        trend = "BEARISH LEAN"
+        setup = "FAILED BOUNCE"
+    elif higher_lows and above_vwap:
         trend = "BULLISH LEAN"
         setup = "WAIT FOR BREAK CONFIRMATION"
-    elif lower_highs:
-        trend = "BEARISH LEAN"
-        setup = "WAIT FOR BREAKDOWN CONFIRMATION"
     else:
         trend = "CHOPPY"
         setup = "NO CLEAN STRUCTURE"
@@ -189,6 +266,10 @@ def detect_structure(bars: list) -> dict:
         "trend": trend,
         "setup": setup,
         "volume_signal": volume_signal,
+        "near_support": near_support,
+        "near_resistance": near_resistance,
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
     }
 
 
@@ -196,7 +277,15 @@ def detect_structure(bars: list) -> dict:
 # SIGNAL LOGIC
 # ======================
 
-def build_signal_message(qqq_data: dict, spy_data: dict, oil_data: dict, structure: dict, vwap: float, rsi: float) -> str:
+def build_signal_message(
+    qqq_data: dict,
+    spy_data: dict,
+    oil_data: dict,
+    structure: dict,
+    vwap: float,
+    rsi: float,
+    levels: dict,
+) -> str:
     qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
     spy = to_float(spy_data.get("close") or spy_data.get("price"))
     oil = to_float(oil_data.get("close") or oil_data.get("price"))
@@ -212,7 +301,7 @@ def build_signal_message(qqq_data: dict, spy_data: dict, oil_data: dict, structu
     reasons = []
     bias = "NEUTRAL"
     action = "WAIT"
-    grade = "B"
+    grade = "C"
 
     above_vwap = qqq > vwap
     below_vwap = qqq < vwap
@@ -231,59 +320,56 @@ def build_signal_message(qqq_data: dict, spy_data: dict, oil_data: dict, structu
     if below_vwap:
         reasons.append("Price is below VWAP.")
 
-    reasons.append(f"5m Structure: {structure['setup']}")
-    reasons.append(f"5m Volume Signal: {structure['volume_signal']}")
+    reasons.append(f"Setup: {structure['setup']}")
+    reasons.append(f"Volume Signal: {structure['volume_signal']}")
+    reasons.append(f"Nearest Support: {structure['nearest_support']:.2f}")
+    reasons.append(f"Nearest Resistance: {structure['nearest_resistance']:.2f}")
     reasons.append(f"RSI: {rsi:.1f}")
-
-    if rsi >= 75:
-        reasons.append("Market is stretched to the upside.")
-    elif rsi <= 25:
-        reasons.append("Market is stretched to the downside.")
 
     if (
         qqq_change > 0
         and spy_change > 0
         and oil_change <= 0
-        and structure["trend"] in ["BULLISH", "BULLISH LEAN"]
+        and structure["setup"] in ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
         and above_vwap
     ):
         bias = "BULLISH"
         action = "CALL IDEA"
-        grade = "A" if structure["volume_signal"] == "STRONG" else "B+"
-        reasons.append("Market direction, VWAP, and structure are aligned for upside.")
+        grade = "A" if structure["setup"] in ["BREAK AND HOLD", "RETEST HOLD"] and structure["volume_signal"] == "STRONG" else "B+"
+        reasons.append("Bullish alignment across market direction, VWAP, and structure.")
 
         if rsi >= 75:
             action = "AVOID CHASING"
             grade = "C"
-            reasons.append("Bullish setup is extended. Wait for retest instead.")
+            reasons.append("Upside is stretched. Wait for a pullback or retest.")
 
     elif (
         qqq_change < 0
         and spy_change < 0
         and oil_change > 0
-        and structure["trend"] in ["BEARISH", "BEARISH LEAN"]
+        and structure["setup"] in ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
         and below_vwap
     ):
         bias = "BEARISH"
         action = "PUT IDEA"
-        grade = "A" if structure["volume_signal"] == "STRONG" else "B+"
-        reasons.append("Market direction, VWAP, and structure are aligned for downside.")
+        grade = "A" if structure["setup"] in ["BREAKDOWN AND HOLD", "REJECTION"] and structure["volume_signal"] == "STRONG" else "B+"
+        reasons.append("Bearish alignment across market direction, VWAP, and structure.")
 
         if rsi <= 25:
             action = "AVOID CHASING"
             grade = "C"
-            reasons.append("Bearish setup is extended. Wait for bounce/reject instead.")
+            reasons.append("Downside is stretched. Wait for bounce then reject.")
 
-    elif structure["trend"] == "CHOPPY":
+    elif structure["setup"] == "NO CLEAN STRUCTURE":
         bias = "NEUTRAL"
         action = "WAIT"
         grade = "C"
-        reasons.append("No clean 5m structure yet.")
+        reasons.append("No clean setup yet.")
     else:
         bias = "MIXED"
         action = "WAIT FOR CONFIRMATION"
         grade = "C"
-        reasons.append("Market conditions are not fully aligned yet.")
+        reasons.append("Conditions are not fully aligned.")
 
     reason_text = "\n".join([f"• {r}" for r in reasons])
 
@@ -295,10 +381,13 @@ def build_signal_message(qqq_data: dict, spy_data: dict, oil_data: dict, structu
         f"Bias: {bias}\n"
         f"Action: {action}\n"
         f"Grade: {grade}\n"
-        f"Structure: {structure['setup']}\n"
+        f"Setup: {structure['setup']}\n"
         f"Volume: {structure['volume_signal']}\n"
         f"VWAP: {vwap:.2f}\n"
-        f"RSI: {rsi:.1f}\n\n"
+        f"RSI: {rsi:.1f}\n"
+        f"Day High: {levels['day_high']:.2f}\n"
+        f"Day Low: {levels['day_low']:.2f}\n"
+        f"Prev Close: {levels['prev_close']:.2f}\n\n"
         f"Reasons:\n{reason_text}\n\n"
         f"Where information becomes execution."
     )
@@ -316,14 +405,24 @@ def main() -> None:
         spy_data = get_quote(SECONDARY_SYMBOL)
         oil_data = get_quote(OIL_SYMBOL)
 
-        bars = get_time_series(SYMBOL, interval="5min", outputsize=30)
-        structure = detect_structure(bars)
+        bars = get_time_series(SYMBOL, interval="5min", outputsize=40)
 
         closes = [candle_close(bar) for bar in bars]
+        current_price = to_float(qqq_data.get("close") or qqq_data.get("price"))
         vwap = calc_vwap(bars)
         rsi = calc_rsi(closes)
+        levels = build_key_levels(qqq_data, bars)
+        structure = detect_structure(bars, current_price, vwap, levels)
 
-        message = build_signal_message(qqq_data, spy_data, oil_data, structure, vwap, rsi)
+        message = build_signal_message(
+            qqq_data=qqq_data,
+            spy_data=spy_data,
+            oil_data=oil_data,
+            structure=structure,
+            vwap=vwap,
+            rsi=rsi,
+            levels=levels,
+        )
 
         log("Built signal message")
         log(message)
