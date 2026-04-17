@@ -1,5 +1,4 @@
 import os
-import json
 import traceback
 from datetime import datetime
 
@@ -28,65 +27,96 @@ def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
-def get_price(symbol: str) -> float:
-    url = "https://api.twelvedata.com/price"
+def get_quote(symbol: str) -> dict:
+    url = "https://api.twelvedata.com/quote"
     params = {"symbol": symbol, "apikey": TWELVE_DATA_API_KEY}
 
     r = requests.get(url, params=params, timeout=20)
     data = r.json()
 
-    log(f"TwelveData raw for {symbol}: {json.dumps(data)[:300]}")
-
-    if "price" not in data:
+    if "close" not in data and "price" not in data:
         raise Exception(f"Bad API response for {symbol}: {data}")
 
-    return float(data["price"])
+    return data
+
+
+def to_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
 def send_discord(msg: str) -> None:
-    if not DISCORD_WEBHOOK_URL:
-        raise Exception("DISCORD_WEBHOOK_URL missing")
-
     payload = {"content": msg[:1900]}
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-
     log(f"Discord status: {r.status_code}")
-    log(f"Discord response: {r.text[:500]}")
-
-    if not (200 <= r.status_code < 300):
-        raise Exception(f"Discord failed: {r.status_code} | {r.text}")
 
 
 def send_telegram(msg: str) -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        raise Exception("TELEGRAM_BOT_TOKEN missing")
-
-    if not TELEGRAM_CHAT_ID:
-        raise Exception("TELEGRAM_CHAT_ID missing")
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg[:4000],
-    }
-
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]}
     r = requests.post(url, data=payload, timeout=20)
-
     log(f"Telegram status: {r.status_code}")
-    log(f"Telegram response: {r.text[:500]}")
-
-    if not (200 <= r.status_code < 300):
-        raise Exception(f"Telegram failed: {r.status_code} | {r.text}")
 
 
-def validate_env() -> None:
-    log(f"DISCORD_WEBHOOK_URL loaded: {bool(DISCORD_WEBHOOK_URL)}")
-    log(f"TELEGRAM_BOT_TOKEN loaded: {bool(TELEGRAM_BOT_TOKEN)}")
-    log(f"TELEGRAM_CHAT_ID loaded: {bool(TELEGRAM_CHAT_ID)}")
-    log(f"TWELVE_DATA_API_KEY loaded: {bool(TWELVE_DATA_API_KEY)}")
-    log(f"SYMBOL={SYMBOL}")
-    log(f"SECONDARY_SYMBOL={SECONDARY_SYMBOL}")
-    log(f"OIL_SYMBOL={OIL_SYMBOL}")
+# ======================
+# BIAS LOGIC
+# ======================
+
+def build_signal_message(qqq_data: dict, spy_data: dict, oil_data: dict) -> str:
+    qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
+    spy = to_float(spy_data.get("close") or spy_data.get("price"))
+    oil = to_float(oil_data.get("close") or oil_data.get("price"))
+
+    qqq_prev = to_float(qqq_data.get("previous_close"))
+    spy_prev = to_float(spy_data.get("previous_close"))
+    oil_prev = to_float(oil_data.get("previous_close"))
+
+    qqq_change = qqq - qqq_prev
+    spy_change = spy - spy_prev
+    oil_change = oil - oil_prev
+
+    reasons = []
+    bias = "NEUTRAL"
+    action = "WAIT"
+
+    if qqq_change > 0 and spy_change > 0:
+        reasons.append("QQQ and SPY are both green on the day.")
+    if qqq_change < 0 and spy_change < 0:
+        reasons.append("QQQ and SPY are both red on the day.")
+    if oil_change > 0:
+        reasons.append("Oil is pushing higher.")
+    if oil_change < 0:
+        reasons.append("Oil is easing lower.")
+
+    if qqq_change > 0 and spy_change > 0 and oil_change <= 0:
+        bias = "BULLISH"
+        action = "CALL IDEA"
+        reasons.append("Index strength is aligned while oil pressure is not rising.")
+    elif qqq_change < 0 and spy_change < 0 and oil_change > 0:
+        bias = "BEARISH"
+        action = "PUT IDEA"
+        reasons.append("Index weakness is aligned with rising oil pressure.")
+    elif qqq_change > 0 and spy_change > 0:
+        bias = "SLIGHTLY BULLISH"
+        action = "WAIT FOR CONFIRMATION"
+    elif qqq_change < 0 and spy_change < 0:
+        bias = "SLIGHTLY BEARISH"
+        action = "WAIT FOR CONFIRMATION"
+
+    reason_text = "\n".join([f"• {r}" for r in reasons]) if reasons else "• No strong alignment yet."
+
+    return (
+        f"📡 UnBiased Trades Bot\n\n"
+        f"{SYMBOL}: {qqq:.2f} ({qqq_change:+.2f})\n"
+        f"{SECONDARY_SYMBOL}: {spy:.2f} ({spy_change:+.2f})\n"
+        f"{OIL_SYMBOL}: {oil:.2f} ({oil_change:+.2f})\n\n"
+        f"Bias: {bias}\n"
+        f"Action: {action}\n\n"
+        f"Reasons:\n{reason_text}\n\n"
+        f"Where information becomes execution."
+    )
 
 
 # ======================
@@ -94,28 +124,22 @@ def validate_env() -> None:
 # ======================
 
 def main() -> None:
-    log("Starting bot")
-    validate_env()
+    log("Starting signal bot")
 
     try:
-        qqq = get_price(SYMBOL)
-        spy = get_price(SECONDARY_SYMBOL)
-        oil = get_price(OIL_SYMBOL)
+        qqq_data = get_quote(SYMBOL)
+        spy_data = get_quote(SECONDARY_SYMBOL)
+        oil_data = get_quote(OIL_SYMBOL)
 
-        message = (
-            f"📊 Market Snapshot\n"
-            f"{SYMBOL}: {qqq}\n"
-            f"{SECONDARY_SYMBOL}: {spy}\n"
-            f"{OIL_SYMBOL}: {oil}"
-        )
+        message = build_signal_message(qqq_data, spy_data, oil_data)
 
-        log("Final message:")
+        log("Built signal message")
         log(message)
 
         send_discord(message)
         send_telegram(message)
 
-        log("Both send calls completed")
+        log("Alerts sent successfully")
 
     except Exception as e:
         log(f"ERROR: {e}")
