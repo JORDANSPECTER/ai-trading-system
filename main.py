@@ -350,6 +350,7 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     bullish_setups = ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
     bearish_setups = ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
 
+    # setup quality
     if setup == "BREAK AND HOLD":
         score += 4
     elif setup == "RETEST HOLD":
@@ -365,27 +366,27 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     elif setup == "NO CLEAN STRUCTURE":
         score += 0
 
-   # VWAP logic (more flexible like your trading)
-if setup in bullish_setups:
-    if above_vwap:
-        score += 3
+    # VWAP logic (more flexible)
+    if setup in bullish_setups:
+        if above_vwap:
+            score += 3
+        else:
+            score += 2
+    elif setup in bearish_setups:
+        if below_vwap:
+            score += 3
+        else:
+            score += 2
     else:
-        score += 2  # still give credit if slightly below VWAP
+        score += 1
 
-elif setup in bearish_setups:
-    if below_vwap:
-        score += 3
-    else:
-        score += 2  # still give credit if slightly above VWAP
-
-else:
-    score += 1
-
+    # volume
     if volume_signal == "STRONG":
         score += 2
     else:
         score += 1
 
+    # RSI quality
     if setup in bullish_setups:
         if 45 <= rsi <= 72:
             score += 3
@@ -417,7 +418,6 @@ else:
         return "B", False
     else:
         return "C", False
-
 
 # ======================
 # MESSAGE BUILDERS
