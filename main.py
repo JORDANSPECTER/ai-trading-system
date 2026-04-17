@@ -10,10 +10,10 @@ import requests
 # ENV
 # ======================
 
-DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1494042156069949533/sxnwJnv036sXgcMy4vWnz1lFuK_hmi4p7OJk1Mbuaa83azTq9WugFPAPMMpWf1at21Wu", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("8636128819:AAFT9ibrwatP7O6wsTQi7wJVeQcuNqMLv4I", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("8661143355", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("b8760b201df4466b8082bc17c1ab1e9b", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 SYMBOL = os.getenv("SYMBOL", "QQQ").strip().upper()
 SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").strip().upper()
