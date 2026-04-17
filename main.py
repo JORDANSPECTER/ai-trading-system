@@ -68,10 +68,6 @@ def get_time_series(symbol: str, interval: str = "5min", outputsize: int = 40) -
     return values
 
 
-def candle_open(bar: dict) -> float:
-    return to_float(bar.get("open"))
-
-
 def candle_close(bar: dict) -> float:
     return to_float(bar.get("close"))
 
@@ -327,6 +323,43 @@ def build_trade_plan(structure: dict, levels: dict, vwap: float) -> dict:
     return plan
 
 
+def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) -> tuple[str, bool]:
+    grade = "C"
+    chase = False
+
+    above_vwap = current_price > vwap
+    below_vwap = current_price < vwap
+
+    if structure["setup"] in ["BREAK AND HOLD", "RETEST HOLD"] and above_vwap:
+        if structure["volume_signal"] == "STRONG" and 40 <= rsi <= 70:
+            grade = "A+"
+        elif 40 <= rsi <= 75:
+            grade = "A"
+        else:
+            grade = "B"
+
+        if rsi >= 75:
+            chase = True
+            grade = "AVOID"
+
+    elif structure["setup"] in ["BREAKDOWN AND HOLD", "REJECTION"] and below_vwap:
+        if structure["volume_signal"] == "STRONG" and 30 <= rsi <= 60:
+            grade = "A+"
+        elif rsi <= 65:
+            grade = "A"
+        else:
+            grade = "B"
+
+        if rsi <= 25:
+            chase = True
+            grade = "AVOID"
+
+    else:
+        grade = "C"
+
+    return grade, chase
+
+
 # ======================
 # PREMIUM ALERT
 # ======================
@@ -355,7 +388,6 @@ def build_premium_message(
     reasons = []
     bias = "NEUTRAL"
     action = "WAIT"
-    grade = "C"
 
     above_vwap = qqq > vwap
     below_vwap = qqq < vwap
@@ -380,50 +412,52 @@ def build_premium_message(
     reasons.append(f"Nearest Resistance: {structure['nearest_resistance']:.2f}")
     reasons.append(f"RSI: {rsi:.1f}")
 
-    if (
-        qqq_change > 0
-        and spy_change > 0
-        and oil_change <= 0
-        and structure["setup"] in ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
-        and above_vwap
-    ):
-        bias = "BULLISH"
-        action = "CALL IDEA"
-        grade = "A" if structure["setup"] in ["BREAK AND HOLD", "RETEST HOLD"] and structure["volume_signal"] == "STRONG" else "B+"
-        reasons.append("Bullish alignment across market direction, VWAP, and structure.")
+    grade, chase = grade_trade(structure, vwap, rsi, qqq)
 
-        if rsi >= 75:
-            action = "AVOID CHASING"
-            grade = "C"
-            reasons.append("Upside is stretched. Wait for pullback or retest.")
+    if grade in ["A+", "A"]:
+        if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
+            bias = "BULLISH"
+            action = "CALL IDEA"
+            reasons.append("High-quality bullish alignment.")
+        elif structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
+            bias = "BEARISH"
+            action = "PUT IDEA"
+            reasons.append("High-quality bearish alignment.")
 
-    elif (
-        qqq_change < 0
-        and spy_change < 0
-        and oil_change > 0
-        and structure["setup"] in ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
-        and below_vwap
-    ):
-        bias = "BEARISH"
-        action = "PUT IDEA"
-        grade = "A" if structure["setup"] in ["BREAKDOWN AND HOLD", "REJECTION"] and structure["volume_signal"] == "STRONG" else "B+"
-        reasons.append("Bearish alignment across market direction, VWAP, and structure.")
+    elif grade == "B":
+        if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
+            bias = "BULLISH"
+            action = "CALL IDEA (LOWER QUALITY)"
+            reasons.append("Usable bullish setup, but not ideal.")
+        elif structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
+            bias = "BEARISH"
+            action = "PUT IDEA (LOWER QUALITY)"
+            reasons.append("Usable bearish setup, but not ideal.")
+        else:
+            bias = "MIXED"
+            action = "WAIT FOR CONFIRMATION"
+            reasons.append("Setup is only partially aligned.")
 
-        if rsi <= 25:
-            action = "AVOID CHASING"
-            grade = "C"
-            reasons.append("Downside is stretched. Wait for bounce then reject.")
+    elif grade == "AVOID":
+        if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
+            bias = "BULLISH"
+        elif structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
+            bias = "BEARISH"
+        else:
+            bias = "MIXED"
 
-    elif structure["setup"] == "NO CLEAN STRUCTURE":
-        bias = "NEUTRAL"
-        action = "WAIT"
-        grade = "C"
-        reasons.append("No clean setup yet.")
+        action = "🚨 YOU ARE CHASING — WAIT"
+        reasons.append("Setup is extended. Wait for retest or reset.")
+
     else:
-        bias = "MIXED"
-        action = "WAIT FOR CONFIRMATION"
-        grade = "C"
-        reasons.append("Conditions are not fully aligned.")
+        if structure["setup"] == "NO CLEAN STRUCTURE":
+            bias = "NEUTRAL"
+            action = "WAIT"
+            reasons.append("No clean setup yet.")
+        else:
+            bias = "MIXED"
+            action = "WAIT FOR CONFIRMATION"
+            reasons.append("Conditions are not fully aligned.")
 
     plan = build_trade_plan(structure, levels, vwap)
     reason_text = "\n".join([f"• {r}" for r in reasons])
