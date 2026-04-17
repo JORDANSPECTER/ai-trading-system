@@ -209,13 +209,15 @@ def detect_structure(bars: list, current_price: float, vwap: float, levels: dict
             "volume_signal": "UNKNOWN",
             "near_support": False,
             "near_resistance": False,
+            "nearest_support": 0.0,
+            "nearest_resistance": 0.0,
         }
 
     b1, b2, b3, b4 = bars[-4], bars[-3], bars[-2], bars[-1]
 
     h2, h3, h4 = candle_high(b2), candle_high(b3), candle_high(b4)
     l2, l3, l4 = candle_low(b2), candle_low(b3), candle_low(b4)
-    c3, c4 = candle_close(b3), candle_close(b4)
+    c4 = candle_close(b4)
     v2, v3, v4 = candle_volume(b2), candle_volume(b3), candle_volume(b4)
 
     higher_lows = l4 > l3 >= l2
@@ -229,11 +231,11 @@ def detect_structure(bars: list, current_price: float, vwap: float, levels: dict
     supports = levels["supports"] + [vwap]
     resistances = levels["resistances"] + [vwap]
 
-    nearest_support = nearest_level(current_price, supports)
-    nearest_resistance = nearest_level(current_price, resistances)
+    nearest_support_val = nearest_level(current_price, supports)
+    nearest_resistance_val = nearest_level(current_price, resistances)
 
-    near_support = distance_pct(current_price, nearest_support) <= 0.20
-    near_resistance = distance_pct(current_price, nearest_resistance) <= 0.20
+    near_support = distance_pct(current_price, nearest_support_val) <= 0.20
+    near_resistance = distance_pct(current_price, nearest_resistance_val) <= 0.20
 
     above_vwap = current_price > vwap
     below_vwap = current_price < vwap
@@ -268,16 +270,16 @@ def detect_structure(bars: list, current_price: float, vwap: float, levels: dict
         "volume_signal": volume_signal,
         "near_support": near_support,
         "near_resistance": near_resistance,
-        "nearest_support": nearest_support,
-        "nearest_resistance": nearest_resistance,
+        "nearest_support": nearest_support_val,
+        "nearest_resistance": nearest_resistance_val,
     }
 
 
 # ======================
-# SIGNAL LOGIC
+# PREMIUM SIGNAL LOGIC
 # ======================
 
-def build_signal_message(
+def build_premium_message(
     qqq_data: dict,
     spy_data: dict,
     oil_data: dict,
@@ -341,7 +343,7 @@ def build_signal_message(
         if rsi >= 75:
             action = "AVOID CHASING"
             grade = "C"
-            reasons.append("Upside is stretched. Wait for a pullback or retest.")
+            reasons.append("Upside is stretched. Wait for pullback or retest.")
 
     elif (
         qqq_change < 0
@@ -374,7 +376,7 @@ def build_signal_message(
     reason_text = "\n".join([f"• {r}" for r in reasons])
 
     return (
-        f"📡 UnBiased Trades Bot\n\n"
+        f"💎 UnBiased Trades Premium Alert\n\n"
         f"{SYMBOL}: {qqq:.2f} ({qqq_change:+.2f})\n"
         f"{SECONDARY_SYMBOL}: {spy:.2f} ({spy_change:+.2f})\n"
         f"{OIL_SYMBOL}: {oil:.2f} ({oil_change:+.2f})\n\n"
@@ -389,6 +391,51 @@ def build_signal_message(
         f"Day Low: {levels['day_low']:.2f}\n"
         f"Prev Close: {levels['prev_close']:.2f}\n\n"
         f"Reasons:\n{reason_text}\n\n"
+        f"Where information becomes execution."
+    )
+
+
+# ======================
+# FREE ALERT LOGIC
+# ======================
+
+def build_free_message(
+    qqq_data: dict,
+    spy_data: dict,
+    oil_data: dict,
+    structure: dict,
+) -> str:
+    qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
+    spy = to_float(spy_data.get("close") or spy_data.get("price"))
+    oil = to_float(oil_data.get("close") or oil_data.get("price"))
+
+    qqq_prev = to_float(qqq_data.get("previous_close"))
+    spy_prev = to_float(spy_data.get("previous_close"))
+    oil_prev = to_float(oil_data.get("previous_close"))
+
+    qqq_change = qqq - qqq_prev
+    spy_change = spy - spy_prev
+    oil_change = oil - oil_prev
+
+    bias = "NEUTRAL"
+
+    if qqq_change > 0 and spy_change > 0 and structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
+        bias = "BULLISH"
+    elif qqq_change < 0 and spy_change < 0 and structure["trend"] in ["BEARISH", "BEARISH LEAN"]:
+        bias = "BEARISH"
+    elif structure["trend"] == "CHOPPY":
+        bias = "CHOPPY"
+    else:
+        bias = "MIXED"
+
+    return (
+        f"📡 UnBiased Trades Free Alert\n\n"
+        f"{SYMBOL}: {qqq:.2f} ({qqq_change:+.2f})\n"
+        f"{SECONDARY_SYMBOL}: {spy:.2f} ({spy_change:+.2f})\n"
+        f"{OIL_SYMBOL}: {oil:.2f} ({oil_change:+.2f})\n\n"
+        f"Bias: {bias}\n"
+        f"Setup: {structure['setup']}\n"
+        f"Volume: {structure['volume_signal']}\n\n"
         f"Where information becomes execution."
     )
 
@@ -414,7 +461,14 @@ def main() -> None:
         levels = build_key_levels(qqq_data, bars)
         structure = detect_structure(bars, current_price, vwap, levels)
 
-        message = build_signal_message(
+        free_message = build_free_message(
+            qqq_data=qqq_data,
+            spy_data=spy_data,
+            oil_data=oil_data,
+            structure=structure,
+        )
+
+        premium_message = build_premium_message(
             qqq_data=qqq_data,
             spy_data=spy_data,
             oil_data=oil_data,
@@ -424,11 +478,14 @@ def main() -> None:
             levels=levels,
         )
 
-        log("Built signal message")
-        log(message)
+        log("Built free + premium messages")
+        log("FREE MESSAGE:")
+        log(free_message)
+        log("PREMIUM MESSAGE:")
+        log(premium_message)
 
-        send_discord(message)
-        send_telegram(message)
+        send_discord(free_message)
+        send_telegram(premium_message)
 
         log("Alerts sent successfully")
 
