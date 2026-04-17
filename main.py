@@ -1258,7 +1258,6 @@ def main() -> None:
 
             send_to_discord(decision.premium_message)
             send_to_telegram(decision.premium_message)
-
         else:
             log("❌ Failed to build market context")
 
