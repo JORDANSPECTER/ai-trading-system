@@ -112,6 +112,13 @@ def send_telegram(msg: str) -> None:
         raise Exception(f"Telegram failed {r.status_code} | {r.text}")
 
 
+def extract_grade_from_message(premium_message: str) -> str:
+    for line in premium_message.splitlines():
+        if line.startswith("Grade:"):
+            return line.replace("Grade:", "").strip()
+    return "UNKNOWN"
+
+
 # ======================
 # INDICATORS
 # ======================
@@ -568,13 +575,21 @@ def main() -> None:
             levels=levels,
         )
 
+        grade = extract_grade_from_message(premium_message)
+
         log("Built free + premium messages")
+        log(f"Premium grade detected: {grade}")
 
         send_discord(DISCORD_WEBHOOK_FREE, free_message, "FREE")
-        send_discord(DISCORD_WEBHOOK_PREMIUM, premium_message, "PREMIUM")
         send_telegram(premium_message)
 
-        log("Alerts sent successfully")
+        if grade in ["A+", "A"]:
+            send_discord(DISCORD_WEBHOOK_PREMIUM, premium_message, "PREMIUM")
+            log(f"Premium Discord alert sent for grade {grade}")
+        else:
+            log(f"Premium Discord alert blocked because grade was {grade}")
+
+        log("Alerts processed successfully")
 
     except Exception as e:
         log(f"ERROR: {e}")
