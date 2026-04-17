@@ -112,13 +112,6 @@ def send_telegram(msg: str) -> None:
         raise Exception(f"Telegram failed {r.status_code} | {r.text}")
 
 
-def extract_grade_from_message(premium_message: str) -> str:
-    for line in premium_message.splitlines():
-        if line.startswith("Grade:"):
-            return line.replace("Grade:", "").strip()
-    return "UNKNOWN"
-
-
 # ======================
 # INDICATORS
 # ======================
@@ -306,22 +299,18 @@ def build_trade_plan(structure: dict, levels: dict, vwap: float) -> dict:
         plan["entry"] = f"Break above {resistance:.2f} and hold"
         plan["stop"] = f"Below {vwap:.2f}"
         plan["target"] = f"{resistance + 1:.2f}+"
-
     elif structure["setup"] == "RETEST HOLD":
         plan["entry"] = f"Hold above {support:.2f} after retest"
         plan["stop"] = f"Below {support:.2f}"
         plan["target"] = f"{resistance:.2f}"
-
     elif structure["setup"] == "REJECTION":
         plan["entry"] = f"Reject at {resistance:.2f}"
         plan["stop"] = f"Above {resistance:.2f}"
         plan["target"] = f"{support:.2f}"
-
     elif structure["setup"] == "FAILED BOUNCE":
         plan["entry"] = f"Lower high below {vwap:.2f}"
         plan["stop"] = "Above VWAP"
         plan["target"] = f"{support:.2f}"
-
     elif structure["setup"] == "BREAKDOWN AND HOLD":
         plan["entry"] = f"Break below {support:.2f} and hold"
         plan["stop"] = f"Above {vwap:.2f}"
@@ -368,10 +357,10 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
 
 
 # ======================
-# PREMIUM ALERT
+# MESSAGE BUILDERS
 # ======================
 
-def build_premium_message(
+def build_premium_context(
     qqq_data: dict,
     spy_data: dict,
     oil_data: dict,
@@ -379,7 +368,7 @@ def build_premium_message(
     vwap: float,
     rsi: float,
     levels: dict,
-) -> str:
+) -> dict:
     qqq = to_float(qqq_data.get("close") or qqq_data.get("price"))
     spy = to_float(spy_data.get("close") or spy_data.get("price"))
     oil = to_float(oil_data.get("close") or oil_data.get("price"))
@@ -430,7 +419,6 @@ def build_premium_message(
             bias = "BEARISH"
             action = "PUT IDEA"
             reasons.append("High-quality bearish alignment.")
-
     elif grade == "B":
         if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
             bias = "BULLISH"
@@ -444,7 +432,6 @@ def build_premium_message(
             bias = "MIXED"
             action = "WAIT FOR CONFIRMATION"
             reasons.append("Setup is only partially aligned.")
-
     elif grade == "AVOID":
         if structure["trend"] in ["BULLISH", "BULLISH LEAN"]:
             bias = "BULLISH"
@@ -455,7 +442,6 @@ def build_premium_message(
 
         action = "🚨 YOU ARE CHASING — WAIT"
         reasons.append("Setup is extended. Wait for retest or reset.")
-
     else:
         if structure["setup"] == "NO CLEAN STRUCTURE":
             bias = "NEUTRAL"
@@ -467,16 +453,51 @@ def build_premium_message(
             reasons.append("Conditions are not fully aligned.")
 
     plan = build_trade_plan(structure, levels, vwap)
-    reason_text = "\n".join([f"• {r}" for r in reasons])
 
-    return (
+    return {
+        "qqq": qqq,
+        "spy": spy,
+        "oil": oil,
+        "qqq_change": qqq_change,
+        "spy_change": spy_change,
+        "oil_change": oil_change,
+        "bias": bias,
+        "action": action,
+        "grade": grade,
+        "reasons": reasons,
+        "plan": plan,
+    }
+
+
+def build_premium_message(
+    qqq_data: dict,
+    spy_data: dict,
+    oil_data: dict,
+    structure: dict,
+    vwap: float,
+    rsi: float,
+    levels: dict,
+) -> tuple[str, str]:
+    ctx = build_premium_context(
+        qqq_data=qqq_data,
+        spy_data=spy_data,
+        oil_data=oil_data,
+        structure=structure,
+        vwap=vwap,
+        rsi=rsi,
+        levels=levels,
+    )
+
+    reason_text = "\n".join([f"• {r}" for r in ctx["reasons"]])
+
+    message = (
         f"💎 UnBiased Trades Premium Alert\n\n"
-        f"{SYMBOL}: {qqq:.2f} ({qqq_change:+.2f})\n"
-        f"{SECONDARY_SYMBOL}: {spy:.2f} ({spy_change:+.2f})\n"
-        f"{OIL_SYMBOL}: {oil:.2f} ({oil_change:+.2f})\n\n"
-        f"Bias: {bias}\n"
-        f"Action: {action}\n"
-        f"Grade: {grade}\n"
+        f"{SYMBOL}: {ctx['qqq']:.2f} ({ctx['qqq_change']:+.2f})\n"
+        f"{SECONDARY_SYMBOL}: {ctx['spy']:.2f} ({ctx['spy_change']:+.2f})\n"
+        f"{OIL_SYMBOL}: {ctx['oil']:.2f} ({ctx['oil_change']:+.2f})\n\n"
+        f"Bias: {ctx['bias']}\n"
+        f"Action: {ctx['action']}\n"
+        f"Grade: {ctx['grade']}\n"
         f"Setup: {structure['setup']}\n"
         f"Volume: {structure['volume_signal']}\n"
         f"VWAP: {vwap:.2f}\n"
@@ -484,17 +505,15 @@ def build_premium_message(
         f"Day High: {levels['day_high']:.2f}\n"
         f"Day Low: {levels['day_low']:.2f}\n"
         f"Prev Close: {levels['prev_close']:.2f}\n\n"
-        f"Entry: {plan['entry']}\n"
-        f"Invalidation: {plan['stop']}\n"
-        f"Target: {plan['target']}\n\n"
+        f"Entry: {ctx['plan']['entry']}\n"
+        f"Invalidation: {ctx['plan']['stop']}\n"
+        f"Target: {ctx['plan']['target']}\n\n"
         f"Reasons:\n{reason_text}\n\n"
         f"Where information becomes execution."
     )
 
+    return message, ctx["grade"]
 
-# ======================
-# FREE ALERT
-# ======================
 
 def build_free_message(
     qqq_data: dict,
@@ -565,7 +584,7 @@ def main() -> None:
             structure=structure,
         )
 
-        premium_message = build_premium_message(
+        premium_message, grade = build_premium_message(
             qqq_data=qqq_data,
             spy_data=spy_data,
             oil_data=oil_data,
@@ -574,8 +593,6 @@ def main() -> None:
             rsi=rsi,
             levels=levels,
         )
-
-        grade = extract_grade_from_message(premium_message)
 
         log("Built free + premium messages")
         log(f"Premium grade detected: {grade}")
