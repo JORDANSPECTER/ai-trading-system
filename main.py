@@ -1,3 +1,66 @@
+# =========================================================
+# AI TRADING SYSTEM — LIVE DATA VERSION
+# =========================================================
+
+import os
+import time
+import json
+import math
+import traceback
+import requests
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Dict, Tuple
+
+
+# =========================================================
+# ENV VARIABLES
+# =========================================================
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+
+SYMBOL = os.getenv("SYMBOL", "QQQ")
+SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY")
+OIL_SYMBOL = os.getenv("OIL_SYMBOL", "USO")
+
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "900"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+
+ENABLE_DISCORD_ALERTS = os.getenv("ENABLE_DISCORD_ALERTS", "true").lower() == "true"
+ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "true").lower() == "true"
+ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
+
+
+# =========================================================
+# BASIC TEST / LOGGING HELPERS
+# =========================================================
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def validate_env() -> None:
+    log("Validating environment variables...")
+
+    if not DISCORD_WEBHOOK_URL:
+        log("WARNING: DISCORD_WEBHOOK_URL is missing")
+
+    if not TELEGRAM_BOT_TOKEN:
+        log("WARNING: TELEGRAM_BOT_TOKEN is missing")
+
+    if not TELEGRAM_CHAT_ID:
+        log("WARNING: TELEGRAM_CHAT_ID is missing")
+
+    if not TWELVE_DATA_API_KEY:
+        log("WARNING: TWELVE_DATA_API_KEY is missing")
+
+    log("Environment validation complete.")
+
 # ============================================================
 # AI TRADING SYSTEM — LIVE DATA VERSION
 # ============================================================
