@@ -326,29 +326,48 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     above_vwap = current_price > vwap
     below_vwap = current_price < vwap
 
-    if structure["setup"] in ["BREAK AND HOLD", "RETEST HOLD"] and above_vwap:
-        if structure["volume_signal"] == "STRONG" and 40 <= rsi <= 70:
+    bullish_setups = ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
+    bearish_setups = ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
+
+    # ======================
+    # BULLISH GRADING
+    # ======================
+    if structure["setup"] in bullish_setups and above_vwap:
+        if structure["volume_signal"] == "STRONG" and 45 <= rsi <= 72:
             grade = "A+"
         elif 40 <= rsi <= 75:
             grade = "A"
-        else:
+        elif 35 <= rsi <= 78:
             grade = "B"
+        else:
+            grade = "C"
 
-        if rsi >= 75:
+        if rsi >= 78:
             chase = True
             grade = "AVOID"
 
-    elif structure["setup"] in ["BREAKDOWN AND HOLD", "REJECTION"] and below_vwap:
-        if structure["volume_signal"] == "STRONG" and 30 <= rsi <= 60:
+    # ======================
+    # BEARISH GRADING
+    # ======================
+    elif structure["setup"] in bearish_setups and below_vwap:
+        if structure["volume_signal"] == "STRONG" and 28 <= rsi <= 58:
             grade = "A+"
-        elif rsi <= 65:
+        elif 25 <= rsi <= 65:
             grade = "A"
-        else:
+        elif 22 <= rsi <= 70:
             grade = "B"
+        else:
+            grade = "C"
 
-        if rsi <= 25:
+        if rsi <= 22:
             chase = True
             grade = "AVOID"
+
+    # ======================
+    # PARTIAL ALIGNMENT
+    # ======================
+    elif structure["setup"] in bullish_setups or structure["setup"] in bearish_setups:
+        grade = "B"
 
     else:
         grade = "C"
