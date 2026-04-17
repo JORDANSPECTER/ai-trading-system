@@ -1,3 +1,38 @@
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import requests
+import time
+import os
+from datetime import datetime
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    requests.post(url, data=payload)
+
+# ============================================================
+# MAIN LOOP (WE WILL UPGRADE THIS)
+# ============================================================
+
+def run():
+    send_telegram("✅ SYSTEM ONLINE")
+
+    while True:
+        send_telegram("📊 Running...")
+        time.sleep(300)
+
+if __name__ == "__main__":
+    run()
+
 # =========================================
 # FAKE AI OBJECTS FOR ALERT TEST
 # =========================================
