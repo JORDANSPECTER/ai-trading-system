@@ -29,7 +29,7 @@ SYSTEM_CONFIG = {
     "request_timeout": 15,
 }
 
-TELEGRAM_BOT_TOKEN = os.getenv("8288769897:AAGoa0PFwm_Z4fFc4_ZMuKuAu_UPJymnY8E")
+TELEGRAM_BOT_TOKEN = os.getenv("8636128819:AAFT9ibrwatP7O6wsTQi7wJVeQcuNqMLv4I")
 TELEGRAM_CHAT_ID = os.getenv("8661143355")
 TWELVE_DATA_API_KEY = os.getenv("a0fade1814bc4c878d6fa42c80616e02")
 
