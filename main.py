@@ -9,7 +9,8 @@ import requests
 # ENV
 # ======================
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE", "").strip()
+DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
@@ -67,10 +68,6 @@ def get_time_series(symbol: str, interval: str = "5min", outputsize: int = 40) -
     return values
 
 
-def candle_open(bar: dict) -> float:
-    return to_float(bar.get("open"))
-
-
 def candle_close(bar: dict) -> float:
     return to_float(bar.get("close"))
 
@@ -87,13 +84,21 @@ def candle_volume(bar: dict) -> float:
     return to_float(bar.get("volume"))
 
 
-def send_discord(msg: str) -> None:
+def send_discord(webhook_url: str, msg: str) -> None:
+    if not webhook_url:
+        log("Missing Discord webhook, skipping.")
+        return
+
     payload = {"content": msg[:1900]}
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+    r = requests.post(webhook_url, json=payload, timeout=20)
     log(f"Discord status: {r.status_code}")
 
 
 def send_telegram(msg: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Missing Telegram credentials, skipping.")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]}
     r = requests.post(url, data=payload, timeout=20)
@@ -222,10 +227,8 @@ def detect_structure(bars: list, current_price: float, vwap: float, levels: dict
 
     higher_lows = l4 > l3 >= l2
     lower_highs = h4 < h3 <= h2
-
     breakout = c4 > h3
     breakdown = c4 < l3
-
     strong_volume = v4 > max(v2, v3)
 
     supports = levels["supports"] + [vwap]
@@ -276,7 +279,7 @@ def detect_structure(bars: list, current_price: float, vwap: float, levels: dict
 
 
 # ======================
-# PREMIUM SIGNAL LOGIC
+# PREMIUM ALERT
 # ======================
 
 def build_premium_message(
@@ -396,7 +399,7 @@ def build_premium_message(
 
 
 # ======================
-# FREE ALERT LOGIC
+# FREE ALERT
 # ======================
 
 def build_free_message(
@@ -479,12 +482,9 @@ def main() -> None:
         )
 
         log("Built free + premium messages")
-        log("FREE MESSAGE:")
-        log(free_message)
-        log("PREMIUM MESSAGE:")
-        log(premium_message)
 
-        send_discord(free_message)
+        send_discord(DISCORD_WEBHOOK_FREE, free_message)
+        send_discord(DISCORD_WEBHOOK_PREMIUM, premium_message)
         send_telegram(premium_message)
 
         log("Alerts sent successfully")
