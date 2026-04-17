@@ -1,4 +1,817 @@
 # =========================================================
+# AI TRADING SYSTEM — CLEAN GITHUB ACTIONS VERSION
+# Run once -> send alerts -> exit
+# =========================================================
+
+import os
+import json
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Dict, Tuple
+
+import requests
+
+
+# =========================================================
+# ENV VARIABLES
+# =========================================================
+
+DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1494042156069949533/sxnwJnv036sXgcMy4vWnz1lFuK_hmi4p7OJk1Mbuaa83azTq9WugFPAPMMpWf1at21Wu", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("8636128819:AAFT9ibrwatP7O6wsTQi7wJVeQcuNqMLv4I", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("8661143355", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("b8760b201df4466b8082bc17c1ab1e9b", "").strip()
+
+SYMBOL = os.getenv("SYMBOL", "QQQ").strip().upper()
+SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").strip().upper()
+OIL_SYMBOL = os.getenv("OIL_SYMBOL", "USO").strip().upper()
+
+MAX_CHASE_DISTANCE_PCT = float(os.getenv("MAX_CHASE_DISTANCE_PCT", "0.35"))
+MIN_SCORE_FOR_ALERT = int(os.getenv("MIN_SCORE_FOR_ALERT", "55"))
+
+ENABLE_DISCORD_ALERTS = os.getenv("ENABLE_DISCORD_ALERTS", "true").lower() == "true"
+ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "true").lower() == "true"
+
+
+# =========================================================
+# LOGGING / HELPERS
+# =========================================================
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def validate_env() -> None:
+    log("Checking environment variables...")
+    log(f"DISCORD_WEBHOOK_URL: {'OK' if DISCORD_WEBHOOK_URL else 'MISSING'}")
+    log(f"TELEGRAM_BOT_TOKEN: {'OK' if TELEGRAM_BOT_TOKEN else 'MISSING'}")
+    log(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'MISSING'}")
+    log(f"TWELVE_DATA_API_KEY: {'OK' if TWELVE_DATA_API_KEY else 'MISSING'}")
+    log(f"SYMBOL: {SYMBOL}")
+    log(f"SECONDARY_SYMBOL: {SECONDARY_SYMBOL}")
+    log(f"OIL_SYMBOL: {OIL_SYMBOL}")
+
+
+# =========================================================
+# DATA MODELS
+# =========================================================
+
+@dataclass
+class MarketSnapshot:
+    symbol: str
+    last_price: float
+    open_price: float
+    high_price: float
+    low_price: float
+    prev_close: float
+    volume: float
+    timestamp: str = ""
+
+
+@dataclass
+class MarketContext:
+    symbol: str
+    current_price: float
+    secondary_price: float
+    oil_price: float
+
+    symbol_day_change_pct: float
+    secondary_day_change_pct: float
+    oil_day_change_pct: float
+    oil_day_change_dollars: float
+
+    vwap: float
+    rsi: float
+
+    prior_day_high: float
+    prior_day_low: float
+    premarket_high: float
+    premarket_low: float
+
+    key_supports: List[float] = field(default_factory=list)
+    key_resistances: List[float] = field(default_factory=list)
+    big_print_levels: List[float] = field(default_factory=list)
+
+    macro_bias: str = "neutral"
+    oil_trend: str = "neutral"
+
+
+@dataclass
+class StructureState:
+    above_vwap: bool = False
+    below_vwap: bool = False
+    vwap_reclaimed: bool = False
+    vwap_rejected: bool = False
+
+    breakout_with_volume: bool = False
+    rejection_at_level: bool = False
+    retest_hold: bool = False
+    failed_bounce: bool = False
+
+    higher_low: bool = False
+    lower_high: bool = False
+
+    near_support: bool = False
+    near_resistance: bool = False
+    near_big_print: bool = False
+
+    stretched_up: bool = False
+    stretched_down: bool = False
+
+
+@dataclass
+class BotDecision:
+    symbol: str
+    bias: str
+    grade: str
+    action: str
+    score: int
+    confidence: int
+    entry_zone: str
+    stop_zone: str
+    target_zone: str
+    premium_message: str
+    free_message: str
+    reasons: List[str] = field(default_factory=list)
+    blockers: List[str] = field(default_factory=list)
+    chase_blocked: bool = False
+    timestamp: str = ""
+
+
+# =========================================================
+# TWELVE DATA
+# =========================================================
+
+def twelve_price(symbol: str) -> Optional[MarketSnapshot]:
+    url = "https://api.twelvedata.com/quote"
+    params = {
+        "symbol": symbol,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+
+    r = requests.get(url, params=params, timeout=20)
+    data = r.json()
+
+    if data.get("status") == "error" or data.get("code"):
+        raise RuntimeError(f"Twelve Data quote error for {symbol}: {data}")
+
+    return MarketSnapshot(
+        symbol=symbol,
+        last_price=safe_float(data.get("close") or data.get("price")),
+        open_price=safe_float(data.get("open")),
+        high_price=safe_float(data.get("high")),
+        low_price=safe_float(data.get("low")),
+        prev_close=safe_float(data.get("previous_close")),
+        volume=safe_float(data.get("volume")),
+        timestamp=str(data.get("datetime", "")),
+    )
+
+
+def twelve_time_series(symbol: str, interval: str = "5min", outputsize: int = 30) -> List[Dict]:
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+
+    r = requests.get(url, params=params, timeout=20)
+    data = r.json()
+
+    if data.get("status") == "error" or data.get("code"):
+        raise RuntimeError(f"Twelve Data time_series error for {symbol}: {data}")
+
+    values = data.get("values", [])
+    values.reverse()
+    return values
+
+
+# =========================================================
+# CALCULATIONS
+# =========================================================
+
+def percent_change(current: float, previous: float) -> float:
+    if previous == 0:
+        return 0.0
+    return ((current - previous) / previous) * 100.0
+
+
+def calc_rsi_from_closes(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(delta))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_vwap_from_bars(bars: List[Dict]) -> float:
+    if not bars:
+        return 0.0
+
+    cumulative_pv = 0.0
+    cumulative_volume = 0.0
+
+    for bar in bars:
+        high_ = safe_float(bar.get("high"))
+        low_ = safe_float(bar.get("low"))
+        close_ = safe_float(bar.get("close"))
+        vol_ = safe_float(bar.get("volume"), 1.0)
+
+        typical_price = (high_ + low_ + close_) / 3.0
+        cumulative_pv += typical_price * vol_
+        cumulative_volume += vol_
+
+    if cumulative_volume == 0:
+        return 0.0
+
+    return cumulative_pv / cumulative_volume
+
+
+def avg_volume(bars: List[Dict], lookback: int = 10) -> float:
+    if not bars:
+        return 0.0
+    vols = [safe_float(x.get("volume")) for x in bars[-lookback:]]
+    return sum(vols) / max(len(vols), 1)
+
+
+def nearest_level(price: float, levels: List[float]) -> float:
+    if not levels:
+        return 0.0
+    return min(levels, key=lambda x: abs(x - price))
+
+
+def distance_pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return abs((a - b) / b) * 100.0
+
+
+# =========================================================
+# LEVEL BUILDERS
+# =========================================================
+
+def build_key_levels(primary: MarketSnapshot, bars: List[Dict]) -> Tuple[List[float], List[float], float, float]:
+    if not bars:
+        return [primary.low_price], [primary.high_price], primary.high_price, primary.low_price
+
+    highs = [safe_float(x.get("high")) for x in bars]
+    lows = [safe_float(x.get("low")) for x in bars]
+
+    premarket_high = max(highs) if highs else primary.high_price
+    premarket_low = min(lows) if lows else primary.low_price
+
+    supports = sorted({
+        round(primary.low_price, 2),
+        round(primary.prev_close, 2),
+        round(premarket_low, 2),
+    })
+
+    resistances = sorted({
+        round(primary.high_price, 2),
+        round(primary.open_price, 2),
+        round(premarket_high, 2),
+    })
+
+    return supports, resistances, premarket_high, premarket_low
+
+
+def build_synthetic_big_print_levels(primary: MarketSnapshot) -> List[float]:
+    if primary.prev_close == 0:
+        return []
+    return sorted({
+        round(primary.prev_close, 2),
+        round(primary.open_price, 2),
+    })
+
+
+# =========================================================
+# CONTEXT BUILDING
+# =========================================================
+
+def classify_oil_trend(day_change_pct: float, day_change_dollars: float) -> str:
+    if day_change_dollars >= 2.0 or day_change_pct >= 2.0:
+        return "strong_up"
+    if day_change_dollars <= -2.0 or day_change_pct <= -2.0:
+        return "strong_down"
+    if day_change_dollars > 0:
+        return "up"
+    if day_change_dollars < 0:
+        return "down"
+    return "neutral"
+
+
+def infer_macro_bias(symbol_change: float, oil_change_dollars: float) -> str:
+    if oil_change_dollars >= 2.0 and symbol_change < 0:
+        return "risk_off"
+    if oil_change_dollars <= -1.0 and symbol_change > 0:
+        return "risk_on"
+    return "neutral"
+
+
+def build_market_context() -> MarketContext:
+    primary = twelve_price(SYMBOL)
+    secondary = twelve_price(SECONDARY_SYMBOL)
+    oil = twelve_price(OIL_SYMBOL)
+    bars = twelve_time_series(SYMBOL, interval="5min", outputsize=30)
+
+    closes = [safe_float(x.get("close")) for x in bars if x.get("close") is not None]
+    vwap = calc_vwap_from_bars(bars)
+    rsi = calc_rsi_from_closes(closes)
+
+    supports, resistances, premarket_high, premarket_low = build_key_levels(primary, bars)
+    big_print_levels = build_synthetic_big_print_levels(primary)
+
+    symbol_day_change_pct = percent_change(primary.last_price, primary.prev_close)
+    secondary_day_change_pct = percent_change(secondary.last_price, secondary.prev_close)
+    oil_day_change_pct = percent_change(oil.last_price, oil.prev_close)
+    oil_day_change_dollars = oil.last_price - oil.prev_close
+
+    oil_trend = classify_oil_trend(oil_day_change_pct, oil_day_change_dollars)
+    macro_bias = infer_macro_bias(symbol_day_change_pct, oil_day_change_dollars)
+
+    return MarketContext(
+        symbol=SYMBOL,
+        current_price=primary.last_price,
+        secondary_price=secondary.last_price,
+        oil_price=oil.last_price,
+        symbol_day_change_pct=symbol_day_change_pct,
+        secondary_day_change_pct=secondary_day_change_pct,
+        oil_day_change_pct=oil_day_change_pct,
+        oil_day_change_dollars=oil_day_change_dollars,
+        vwap=vwap,
+        rsi=rsi,
+        prior_day_high=primary.high_price,
+        prior_day_low=primary.low_price,
+        premarket_high=premarket_high,
+        premarket_low=premarket_low,
+        key_supports=supports,
+        key_resistances=resistances,
+        big_print_levels=big_print_levels,
+        macro_bias=macro_bias,
+        oil_trend=oil_trend,
+    )
+
+
+# =========================================================
+# STRUCTURE DETECTION
+# =========================================================
+
+def detect_structure(context: MarketContext, bars: List[Dict]) -> StructureState:
+    st = StructureState()
+
+    price = context.current_price
+    vwap = context.vwap
+
+    st.above_vwap = price > vwap if vwap else False
+    st.below_vwap = price < vwap if vwap else False
+
+    if len(bars) >= 3:
+        c1 = safe_float(bars[-3].get("close"))
+        c2 = safe_float(bars[-2].get("close"))
+        c3 = safe_float(bars[-1].get("close"))
+
+        h1 = safe_float(bars[-3].get("high"))
+        h2 = safe_float(bars[-2].get("high"))
+        h3 = safe_float(bars[-1].get("high"))
+
+        l1 = safe_float(bars[-3].get("low"))
+        l2 = safe_float(bars[-2].get("low"))
+        l3 = safe_float(bars[-1].get("low"))
+
+        st.higher_low = l3 > l2 >= l1
+        st.lower_high = h3 < h2 <= h1
+
+        st.vwap_reclaimed = c2 < vwap and c3 > vwap if vwap else False
+        st.vwap_rejected = c2 > vwap and c3 < vwap if vwap else False
+
+        avg_vol = avg_volume(bars[:-1], lookback=10)
+        last_vol = safe_float(bars[-1].get("volume"))
+        st.breakout_with_volume = last_vol > (avg_vol * 1.25 if avg_vol else 0)
+
+    nearest_support = nearest_level(price, context.key_supports)
+    nearest_resistance = nearest_level(price, context.key_resistances)
+    nearest_print = nearest_level(price, context.big_print_levels)
+
+    st.near_support = distance_pct(price, nearest_support) <= 0.20 if nearest_support else False
+    st.near_resistance = distance_pct(price, nearest_resistance) <= 0.20 if nearest_resistance else False
+    st.near_big_print = distance_pct(price, nearest_print) <= 0.20 if nearest_print else False
+
+    st.retest_hold = st.above_vwap and st.near_support
+    st.rejection_at_level = st.below_vwap and st.near_resistance
+    st.failed_bounce = st.lower_high and st.below_vwap
+
+    st.stretched_up = context.rsi >= 70
+    st.stretched_down = context.rsi <= 30
+
+    return st
+
+
+# =========================================================
+# DECISION ENGINE
+# =========================================================
+
+def build_long_reasoning(context: MarketContext, st: StructureState) -> Tuple[int, List[str], List[str]]:
+    score = 0
+    reasons: List[str] = []
+    blockers: List[str] = []
+
+    if st.above_vwap:
+        score += 15
+        reasons.append("Price is above VWAP.")
+    else:
+        blockers.append("Price is not above VWAP for long bias.")
+
+    if st.vwap_reclaimed:
+        score += 15
+        reasons.append("VWAP reclaim confirmed.")
+    if st.retest_hold:
+        score += 12
+        reasons.append("Retest hold near support.")
+    if st.higher_low:
+        score += 12
+        reasons.append("Higher low structure present.")
+    if st.breakout_with_volume:
+        score += 12
+        reasons.append("Breakout candle has volume.")
+    if st.near_big_print:
+        score += 6
+        reasons.append("Price is near an important print/level.")
+    if context.macro_bias == "risk_on":
+        score += 8
+        reasons.append("Macro backdrop is leaning risk-on.")
+    if context.oil_trend in ["down", "strong_down"]:
+        score += 10
+        reasons.append("Oil pressure is easing, supportive for index upside.")
+    if st.stretched_up:
+        score -= 10
+        blockers.append("RSI is stretched up.")
+    if context.current_price >= context.premarket_high:
+        score += 8
+        reasons.append("Price is challenging or above premarket high.")
+
+    return score, reasons, blockers
+
+
+def build_short_reasoning(context: MarketContext, st: StructureState) -> Tuple[int, List[str], List[str]]:
+    score = 0
+    reasons: List[str] = []
+    blockers: List[str] = []
+
+    if st.below_vwap:
+        score += 15
+        reasons.append("Price is below VWAP.")
+    else:
+        blockers.append("Price is not below VWAP for short bias.")
+
+    if st.vwap_rejected:
+        score += 15
+        reasons.append("VWAP rejection confirmed.")
+    if st.rejection_at_level:
+        score += 12
+        reasons.append("Rejection at resistance.")
+    if st.failed_bounce:
+        score += 12
+        reasons.append("Failed bounce / lower high structure.")
+    if st.breakout_with_volume:
+        score += 8
+        reasons.append("Momentum candle has volume.")
+    if st.near_big_print:
+        score += 6
+        reasons.append("Price is near an important print/level.")
+    if context.macro_bias == "risk_off":
+        score += 8
+        reasons.append("Macro backdrop is leaning risk-off.")
+    if context.oil_trend in ["up", "strong_up"]:
+        score += 10
+        reasons.append("Oil pressure is rising, bearish for index upside.")
+    if st.stretched_down:
+        score -= 10
+        blockers.append("RSI is stretched down.")
+    if context.current_price <= context.premarket_low:
+        score += 8
+        reasons.append("Price is challenging or below premarket low.")
+
+    return score, reasons, blockers
+
+
+def detect_chase(context: MarketContext, st: StructureState, bias: str) -> Tuple[bool, str]:
+    price = context.current_price
+
+    if bias == "bullish":
+        ref = nearest_level(price, context.key_supports + [context.vwap] + context.big_print_levels)
+        d = distance_pct(price, ref) if ref else 0.0
+        if d > MAX_CHASE_DISTANCE_PCT and st.stretched_up:
+            return True, f"Long setup is extended {d:.2f}% away from support/VWAP."
+
+    if bias == "bearish":
+        ref = nearest_level(price, context.key_resistances + [context.vwap] + context.big_print_levels)
+        d = distance_pct(price, ref) if ref else 0.0
+        if d > MAX_CHASE_DISTANCE_PCT and st.stretched_down:
+            return True, f"Short setup is extended {d:.2f}% away from resistance/VWAP."
+
+    return False, ""
+
+
+def score_to_grade(score: int) -> str:
+    if score >= 85:
+        return "A+"
+    if score >= 75:
+        return "A"
+    if score >= 65:
+        return "B+"
+    if score >= 55:
+        return "B"
+    return "AVOID"
+
+
+def build_zones(context: MarketContext, bias: str) -> Tuple[str, str, str]:
+    if bias == "bullish":
+        entry = f"{nearest_level(context.current_price, context.key_supports + [context.vwap]):.2f} - {context.current_price:.2f}"
+        stop = f"Below {nearest_level(context.current_price, context.key_supports):.2f}"
+        target = f"{nearest_level(context.current_price, context.key_resistances):.2f} / {context.premarket_high:.2f}"
+        return entry, stop, target
+
+    entry = f"{context.current_price:.2f} - {nearest_level(context.current_price, context.key_resistances + [context.vwap]):.2f}"
+    stop = f"Above {nearest_level(context.current_price, context.key_resistances):.2f}"
+    target = f"{nearest_level(context.current_price, context.key_supports):.2f} / {context.premarket_low:.2f}"
+    return entry, stop, target
+
+
+def format_free_alert(context: MarketContext, bias: str, grade: str, action: str, reasons: List[str]) -> str:
+    headline = "BULLISH" if bias == "bullish" else "BEARISH"
+    top_reasons = reasons[:3] if reasons else ["Monitoring structure and key levels."]
+
+    lines = [
+        f"📊 {context.symbol} FREE ALERT",
+        f"Bias: {headline}",
+        f"Grade: {grade}",
+        f"Action: {action}",
+        f"Price: {context.current_price:.2f}",
+        f"VWAP: {context.vwap:.2f}",
+        f"Oil: {context.oil_price:.2f} ({context.oil_day_change_dollars:+.2f})",
+        "",
+        "Why it matters:",
+    ]
+
+    for reason in top_reasons:
+        lines.append(f"• {reason}")
+
+    lines.append("")
+    lines.append("UnBiased Trades 313")
+    return "\n".join(lines)
+
+
+def format_premium_alert(
+    context: MarketContext,
+    bias: str,
+    grade: str,
+    action: str,
+    score: int,
+    entry_zone: str,
+    stop_zone: str,
+    target_zone: str,
+    reasons: List[str],
+    blockers: List[str],
+) -> str:
+    headline = "BULLISH" if bias == "bullish" else "BEARISH"
+
+    lines = [
+        f"💎 {context.symbol} PREMIUM ALERT",
+        f"Bias: {headline}",
+        f"Grade: {grade}",
+        f"Action: {action}",
+        f"Score: {score}",
+        f"Price: {context.current_price:.2f}",
+        f"VWAP: {context.vwap:.2f}",
+        f"RSI: {context.rsi:.1f}",
+        f"{SECONDARY_SYMBOL}: {context.secondary_price:.2f} ({context.secondary_day_change_pct:+.2f}%)",
+        f"{OIL_SYMBOL}: {context.oil_price:.2f} ({context.oil_day_change_dollars:+.2f} / {context.oil_day_change_pct:+.2f}%)",
+        f"Macro Bias: {context.macro_bias}",
+        f"Oil Trend: {context.oil_trend}",
+        "",
+        f"Entry Zone: {entry_zone}",
+        f"Stop Zone: {stop_zone}",
+        f"Target Zone: {target_zone}",
+        "",
+        "Reasons:",
+    ]
+
+    if reasons:
+        for reason in reasons:
+            lines.append(f"• {reason}")
+    else:
+        lines.append("• No strong reasons currently.")
+
+    if blockers:
+        lines.append("")
+        lines.append("Blockers / Risks:")
+        for blocker in blockers:
+            lines.append(f"• {blocker}")
+
+    lines.append("")
+    lines.append("Levels:")
+    lines.append(f"• Supports: {', '.join([f'{x:.2f}' for x in context.key_supports])}")
+    lines.append(f"• Resistances: {', '.join([f'{x:.2f}' for x in context.key_resistances])}")
+    lines.append(f"• Big Prints: {', '.join([f'{x:.2f}' for x in context.big_print_levels])}")
+
+    lines.append("")
+    lines.append("UnBiased Trades 313 | Where information becomes execution.")
+    return "\n".join(lines)
+
+
+def make_decision(context: MarketContext, st: StructureState) -> BotDecision:
+    long_score, long_reasons, long_blockers = build_long_reasoning(context, st)
+    short_score, short_reasons, short_blockers = build_short_reasoning(context, st)
+
+    if long_score >= short_score:
+        bias = "bullish"
+        score = long_score
+        reasons = long_reasons
+        blockers = long_blockers
+    else:
+        bias = "bearish"
+        score = short_score
+        reasons = short_reasons
+        blockers = short_blockers
+
+    chase_blocked, chase_reason = detect_chase(context, st, bias)
+    if chase_blocked:
+        blockers.append(f"YOU ARE CHASING: {chase_reason}")
+        score -= 12
+
+    grade = score_to_grade(score)
+
+    if chase_blocked and grade in ["B+", "B"]:
+        grade = "AVOID"
+
+    if score < MIN_SCORE_FOR_ALERT:
+        grade = "AVOID"
+
+    if bias == "bullish":
+        action = "CALL IDEA" if grade != "AVOID" else "WAIT / NO CALL"
+    else:
+        action = "PUT IDEA" if grade != "AVOID" else "WAIT / NO PUT"
+
+    entry_zone, stop_zone, target_zone = build_zones(context, bias)
+    confidence = max(1, min(99, score))
+
+    premium_message = format_premium_alert(
+        context=context,
+        bias=bias,
+        grade=grade,
+        action=action,
+        score=score,
+        entry_zone=entry_zone,
+        stop_zone=stop_zone,
+        target_zone=target_zone,
+        reasons=reasons,
+        blockers=blockers,
+    )
+
+    free_message = format_free_alert(
+        context=context,
+        bias=bias,
+        grade=grade,
+        action=action,
+        reasons=reasons,
+    )
+
+    return BotDecision(
+        symbol=context.symbol,
+        bias=bias,
+        grade=grade,
+        action=action,
+        score=score,
+        confidence=confidence,
+        entry_zone=entry_zone,
+        stop_zone=stop_zone,
+        target_zone=target_zone,
+        premium_message=premium_message,
+        free_message=free_message,
+        reasons=reasons,
+        blockers=blockers,
+        chase_blocked=chase_blocked,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+# =========================================================
+# ALERT SENDERS
+# =========================================================
+
+def send_to_discord(message: str) -> bool:
+    if not ENABLE_DISCORD_ALERTS:
+        log("Discord alerts disabled.")
+        return False
+
+    if not DISCORD_WEBHOOK_URL:
+        log("Discord send skipped: missing webhook.")
+        return False
+
+    payload = {"content": message[:1900]}
+    response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+
+    if 200 <= response.status_code < 300:
+        log(f"Discord status: {response.status_code}")
+        return True
+
+    raise RuntimeError(f"Discord send failed: {response.status_code} | {response.text}")
+
+
+def send_to_telegram(message: str) -> bool:
+    if not ENABLE_TELEGRAM_ALERTS:
+        log("Telegram alerts disabled.")
+        return False
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram send skipped: missing token or chat id.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message[:4000],
+    }
+
+    response = requests.post(url, data=payload, timeout=20)
+
+    if 200 <= response.status_code < 300:
+        log(f"Telegram status: {response.status_code}")
+        return True
+
+    raise RuntimeError(f"Telegram send failed: {response.status_code} | {response.text}")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main() -> None:
+    log("🚀 SYSTEM STARTING")
+    validate_env()
+
+    try:
+        context = build_market_context()
+        bars = twelve_time_series(SYMBOL, interval="5min", outputsize=30)
+        structure = detect_structure(context, bars)
+        decision = make_decision(context, structure)
+
+        log(f"Decision: {decision.grade} | {decision.bias} | {decision.action}")
+        log(f"Score: {decision.score}")
+        log(f"Context snapshot: {json.dumps({
+            'symbol': context.symbol,
+            'price': context.current_price,
+            'vwap': context.vwap,
+            'rsi': context.rsi,
+            'oil_price': context.oil_price,
+            'oil_change_dollars': context.oil_day_change_dollars,
+            'macro_bias': context.macro_bias,
+            'oil_trend': context.oil_trend
+        }, default=str)}")
+
+        send_to_discord(decision.premium_message)
+        send_to_telegram(decision.premium_message)
+
+    except Exception as e:
+        log(f"Fatal run error: {e}")
+        log(traceback.format_exc())
+        raise
+
+    log("✅ Run complete. Exiting.")
+
+
+if __name__ == "__main__":
+    main()
+
+# =========================================================
 # AI TRADING SYSTEM — CLEAN MASTER BUILD
 # TOP SECTION (CORRECTED)
 # =========================================================
