@@ -365,12 +365,21 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     elif setup == "NO CLEAN STRUCTURE":
         score += 0
 
-    if setup in bullish_setups and above_vwap:
-        score += 3
-    elif setup in bearish_setups and below_vwap:
+   # VWAP logic (more flexible like your trading)
+if setup in bullish_setups:
+    if above_vwap:
         score += 3
     else:
-        score += 1
+        score += 2  # still give credit if slightly below VWAP
+
+elif setup in bearish_setups:
+    if below_vwap:
+        score += 3
+    else:
+        score += 2  # still give credit if slightly above VWAP
+
+else:
+    score += 1
 
     if volume_signal == "STRONG":
         score += 2
