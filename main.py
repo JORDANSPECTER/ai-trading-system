@@ -361,7 +361,7 @@ def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) 
     elif setup == "FAILED BOUNCE":
         score += 3
     elif setup == "WAIT FOR BREAK CONFIRMATION":
-        score += 3
+        score += 5
     elif setup == "NO CLEAN STRUCTURE":
         score += 0
 
