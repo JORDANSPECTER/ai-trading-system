@@ -1,4 +1,127 @@
 # =========================================================
+# ENV VARIABLES
+# =========================================================
+
+import os
+import requests
+import json
+from datetime import datetime
+
+DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1494042156069949533/sxnwJnv036sXgcMy4vWnz1lFuK_hmi4p7OJk1Mbuaa83azTq9WugFPAPMMpWf1at21Wu", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("8288769897:AAGoa0PFwm_Z4fFc4_ZMuKuAu_UPJymnY8E", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("8661143355", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("a0fade1814bc4c878d6fa42c80616e02", "").strip()
+
+SYMBOL = os.getenv("SYMBOL", "QQQ").strip().upper()
+SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").strip().upper()
+OIL_SYMBOL = os.getenv("OIL_SYMBOL", "USO").strip().upper()
+
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+
+
+# =========================================================
+# LOGGING + ENV CHECK
+# =========================================================
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def validate_env() -> None:
+    log("Checking environment variables...")
+
+    log(f"TWELVE_DATA_API_KEY: {'OK' if TWELVE_DATA_API_KEY else 'MISSING'}")
+    log(f"DISCORD_WEBHOOK_URL: {'OK' if DISCORD_WEBHOOK_URL else 'MISSING'}")
+    log(f"TELEGRAM_BOT_TOKEN: {'OK' if TELEGRAM_BOT_TOKEN else 'MISSING'}")
+    log(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'MISSING'}")
+
+    log(f"Primary symbol: {SYMBOL}")
+    log(f"Secondary symbol: {SECONDARY_SYMBOL}")
+    log(f"Oil symbol: {OIL_SYMBOL}")
+
+
+# =========================================================
+# TEST: TWELVE DATA
+# =========================================================
+
+def test_twelve_data(symbol: str = SYMBOL) -> None:
+    if not TWELVE_DATA_API_KEY:
+        log("Twelve Data test skipped (no API key)")
+        return
+
+    try:
+        url = "https://api.twelvedata.com/quote"
+        params = {
+            "symbol": symbol,
+            "apikey": TWELVE_DATA_API_KEY
+        }
+
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+
+        log(f"{symbol} DATA:")
+        log(json.dumps(data, indent=2)[:800])
+
+    except Exception as e:
+        log(f"Twelve Data error: {e}")
+
+
+# =========================================================
+# TEST: DISCORD
+# =========================================================
+
+def send_discord_test() -> None:
+    if not DISCORD_WEBHOOK_URL:
+        log("Discord skipped (no webhook)")
+        return
+
+    try:
+        payload = {"content": "🧪 Discord test working"}
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+
+        log(f"Discord status: {r.status_code}")
+
+    except Exception as e:
+        log(f"Discord error: {e}")
+
+
+# =========================================================
+# TEST: TELEGRAM
+# =========================================================
+
+def send_telegram_test() -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram skipped (missing token/chat id)")
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": "🧪 Telegram test working"
+        }
+
+        r = requests.post(url, data=payload, timeout=10)
+
+        log(f"Telegram status: {r.status_code}")
+
+    except Exception as e:
+        log(f"Telegram error: {e}")
+
+
+# =========================================================
+# STARTUP TEST RUN
+# =========================================================
+
+if __name__ == "__main__":
+    log("🚀 SYSTEM STARTING")
+    validate_env()
+    test_twelve_data()
+    send_discord_test()
+    send_telegram_test()
+
+# =========================================================
 # AI TRADING SYSTEM — CLEAN MASTER BUILD
 # Alert Engine + Discord + Telegram + Twelve Data
 # =========================================================
