@@ -1,4 +1,1013 @@
 # =========================================================
+# AI TRADING SYSTEM — CLEAN MASTER BUILD
+# Alert Engine + Discord + Telegram + Twelve Data
+# =========================================================
+
+import os
+import time
+import json
+import traceback
+import requests
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Dict, Tuple
+
+# =========================================================
+# ENV VARIABLES
+# =========================================================
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
+SYMBOL = os.getenv("SYMBOL", "QQQ").strip().upper()
+SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").strip().upper()
+OIL_SYMBOL = os.getenv("OIL_SYMBOL", "USO").strip().upper()
+
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "900"))
+
+ENABLE_DISCORD_ALERTS = os.getenv("ENABLE_DISCORD_ALERTS", "true").lower() == "true"
+ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "true").lower() == "true"
+ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
+
+MAX_CHASE_DISTANCE_PCT = float(os.getenv("MAX_CHASE_DISTANCE_PCT", "0.35"))
+MIN_SCORE_FOR_ALERT = int(os.getenv("MIN_SCORE_FOR_ALERT", "55"))
+
+# =========================================================
+# RUNTIME STATE
+# =========================================================
+
+BOT_ACTIVE = True
+LAST_HEARTBEAT_TS = 0.0
+LAST_ALERT_SIGNATURE = ""
+LAST_TELEGRAM_UPDATE_ID = 0
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def safe_float(value, default=0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+# =========================================================
+# DATA MODELS
+# =========================================================
+
+@dataclass
+class MarketSnapshot:
+    symbol: str
+    last_price: float
+    open_price: float
+    high_price: float
+    low_price: float
+    prev_close: float
+    volume: float
+    timestamp: str = ""
+
+
+@dataclass
+class MarketContext:
+    symbol: str
+    current_price: float
+    secondary_price: float
+    oil_price: float
+
+    symbol_day_change_pct: float
+    secondary_day_change_pct: float
+    oil_day_change_pct: float
+    oil_day_change_dollars: float
+
+    vwap: float
+    rsi: float
+
+    prior_day_high: float
+    prior_day_low: float
+    premarket_high: float
+    premarket_low: float
+
+    key_supports: List[float] = field(default_factory=list)
+    key_resistances: List[float] = field(default_factory=list)
+    big_print_levels: List[float] = field(default_factory=list)
+
+    macro_bias: str = "neutral"
+    oil_trend: str = "neutral"
+
+
+@dataclass
+class StructureState:
+    above_vwap: bool = False
+    below_vwap: bool = False
+    vwap_reclaimed: bool = False
+    vwap_rejected: bool = False
+
+    breakout_with_volume: bool = False
+    rejection_at_level: bool = False
+    retest_hold: bool = False
+    failed_bounce: bool = False
+
+    higher_low: bool = False
+    lower_high: bool = False
+
+    near_support: bool = False
+    near_resistance: bool = False
+    near_big_print: bool = False
+
+    stretched_up: bool = False
+    stretched_down: bool = False
+
+
+@dataclass
+class BotDecision:
+    symbol: str
+    bias: str
+    grade: str
+    action: str
+    confidence: int
+    score: int
+    entry_zone: str
+    stop_zone: str
+    target_zone: str
+    premium_message: str
+    free_message: str
+    reasons: List[str] = field(default_factory=list)
+    blockers: List[str] = field(default_factory=list)
+    chase_blocked: bool = False
+    timestamp: str = ""
+
+
+# =========================================================
+# ENV VALIDATION
+# =========================================================
+
+def validate_env() -> None:
+    log("Validating environment variables...")
+
+    if not TWELVE_DATA_API_KEY:
+        log("WARNING: TWELVE_DATA_API_KEY missing")
+    if not DISCORD_WEBHOOK_URL:
+        log("WARNING: DISCORD_WEBHOOK_URL missing")
+    if not TELEGRAM_BOT_TOKEN:
+        log("WARNING: TELEGRAM_BOT_TOKEN missing")
+    if not TELEGRAM_CHAT_ID:
+        log("WARNING: TELEGRAM_CHAT_ID missing")
+
+    log("Environment validation complete.")
+
+
+# =========================================================
+# TWELVE DATA HELPERS
+# =========================================================
+
+def twelve_price(symbol: str) -> Optional[MarketSnapshot]:
+    url = "https://api.twelvedata.com/quote"
+    params = {
+        "symbol": symbol,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
+
+        if "code" in data and data.get("status") == "error":
+            log(f"Twelve Data quote error for {symbol}: {data}")
+            return None
+
+        last_price = safe_float(data.get("close") or data.get("price"))
+        open_price = safe_float(data.get("open"))
+        high_price = safe_float(data.get("high"))
+        low_price = safe_float(data.get("low"))
+        prev_close = safe_float(data.get("previous_close"))
+        volume = safe_float(data.get("volume"))
+
+        return MarketSnapshot(
+            symbol=symbol,
+            last_price=last_price,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            prev_close=prev_close,
+            volume=volume,
+            timestamp=str(data.get("datetime", "")),
+        )
+    except Exception as e:
+        log(f"Error getting quote for {symbol}: {e}")
+        return None
+
+
+def twelve_time_series(symbol: str, interval: str = "5min", outputsize: int = 30) -> List[Dict]:
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
+
+        if "code" in data and data.get("status") == "error":
+            log(f"Twelve Data time_series error for {symbol}: {data}")
+            return []
+
+        values = data.get("values", [])
+        values.reverse()  # oldest -> newest
+        return values
+    except Exception as e:
+        log(f"Error getting time series for {symbol}: {e}")
+        return []
+
+
+# =========================================================
+# CALC HELPERS
+# =========================================================
+
+def percent_change(current: float, previous: float) -> float:
+    if previous == 0:
+        return 0.0
+    return ((current - previous) / previous) * 100.0
+
+
+def calc_rsi_from_closes(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(delta))
+
+    recent_gains = gains[-period:]
+    recent_losses = losses[-period:]
+
+    avg_gain = sum(recent_gains) / period
+    avg_loss = sum(recent_losses) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_vwap_from_bars(bars: List[Dict]) -> float:
+    if not bars:
+        return 0.0
+
+    cumulative_pv = 0.0
+    cumulative_volume = 0.0
+
+    for bar in bars:
+        high_ = safe_float(bar.get("high"))
+        low_ = safe_float(bar.get("low"))
+        close_ = safe_float(bar.get("close"))
+        vol_ = safe_float(bar.get("volume"), 1.0)
+
+        typical_price = (high_ + low_ + close_) / 3.0
+        cumulative_pv += typical_price * vol_
+        cumulative_volume += vol_
+
+    if cumulative_volume == 0:
+        return 0.0
+
+    return cumulative_pv / cumulative_volume
+
+
+def avg_volume(bars: List[Dict], lookback: int = 10) -> float:
+    if not bars:
+        return 0.0
+    vols = [safe_float(x.get("volume")) for x in bars[-lookback:]]
+    return sum(vols) / max(len(vols), 1)
+
+
+def nearest_level(price: float, levels: List[float]) -> float:
+    if not levels:
+        return 0.0
+    return min(levels, key=lambda x: abs(x - price))
+
+
+def distance_pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return abs((a - b) / b) * 100.0
+
+
+# =========================================================
+# LEVEL BUILDERS
+# =========================================================
+
+def build_key_levels(primary: MarketSnapshot, bars: List[Dict]) -> Tuple[List[float], List[float], float, float]:
+    if not bars:
+        return [primary.low_price], [primary.high_price], primary.high_price, primary.low_price
+
+    highs = [safe_float(x.get("high")) for x in bars]
+    lows = [safe_float(x.get("low")) for x in bars]
+
+    premarket_high = max(highs) if highs else primary.high_price
+    premarket_low = min(lows) if lows else primary.low_price
+
+    supports = sorted({
+        round(primary.low_price, 2),
+        round(primary.prev_close, 2),
+        round(premarket_low, 2),
+    })
+
+    resistances = sorted({
+        round(primary.high_price, 2),
+        round(primary.open_price, 2),
+        round(premarket_high, 2),
+    })
+
+    return supports, resistances, premarket_high, premarket_low
+
+
+def build_synthetic_big_print_levels(primary: MarketSnapshot) -> List[float]:
+    if primary.prev_close == 0:
+        return []
+
+    return sorted({
+        round(primary.prev_close, 2),
+        round(primary.open_price, 2),
+    })
+
+
+# =========================================================
+# CONTEXT BUILDER
+# =========================================================
+
+def classify_oil_trend(day_change_pct: float, day_change_dollars: float) -> str:
+    if day_change_dollars >= 2.0 or day_change_pct >= 2.0:
+        return "strong_up"
+    if day_change_dollars <= -2.0 or day_change_pct <= -2.0:
+        return "strong_down"
+    if day_change_dollars > 0:
+        return "up"
+    if day_change_dollars < 0:
+        return "down"
+    return "neutral"
+
+
+def infer_macro_bias(symbol_change: float, oil_change: float) -> str:
+    if oil_change >= 2.0 and symbol_change < 0:
+        return "risk_off"
+    if oil_change <= -1.0 and symbol_change > 0:
+        return "risk_on"
+    return "neutral"
+
+
+def build_market_context() -> Optional[MarketContext]:
+    primary = twelve_price(SYMBOL)
+    secondary = twelve_price(SECONDARY_SYMBOL)
+    oil = twelve_price(OIL_SYMBOL)
+    bars = twelve_time_series(SYMBOL, interval="5min", outputsize=30)
+
+    if not primary or not secondary or not oil:
+        log("Failed to build full market context.")
+        return None
+
+    closes = [safe_float(x.get("close")) for x in bars if x.get("close") is not None]
+    vwap = calc_vwap_from_bars(bars)
+    rsi = calc_rsi_from_closes(closes)
+
+    supports, resistances, premarket_high, premarket_low = build_key_levels(primary, bars)
+    big_print_levels = build_synthetic_big_print_levels(primary)
+
+    symbol_day_change_pct = percent_change(primary.last_price, primary.prev_close)
+    secondary_day_change_pct = percent_change(secondary.last_price, secondary.prev_close)
+    oil_day_change_pct = percent_change(oil.last_price, oil.prev_close)
+    oil_day_change_dollars = oil.last_price - oil.prev_close
+
+    oil_trend = classify_oil_trend(oil_day_change_pct, oil_day_change_dollars)
+    macro_bias = infer_macro_bias(symbol_day_change_pct, oil_day_change_dollars)
+
+    return MarketContext(
+        symbol=SYMBOL,
+        current_price=primary.last_price,
+        secondary_price=secondary.last_price,
+        oil_price=oil.last_price,
+        symbol_day_change_pct=symbol_day_change_pct,
+        secondary_day_change_pct=secondary_day_change_pct,
+        oil_day_change_pct=oil_day_change_pct,
+        oil_day_change_dollars=oil_day_change_dollars,
+        vwap=vwap,
+        rsi=rsi,
+        prior_day_high=primary.high_price,
+        prior_day_low=primary.low_price,
+        premarket_high=premarket_high,
+        premarket_low=premarket_low,
+        key_supports=supports,
+        key_resistances=resistances,
+        big_print_levels=big_print_levels,
+        macro_bias=macro_bias,
+        oil_trend=oil_trend,
+    )
+
+
+# =========================================================
+# STRUCTURE DETECTION
+# =========================================================
+
+def detect_structure(context: MarketContext, bars: List[Dict]) -> StructureState:
+    st = StructureState()
+
+    price = context.current_price
+    vwap = context.vwap
+
+    st.above_vwap = price > vwap if vwap else False
+    st.below_vwap = price < vwap if vwap else False
+
+    if len(bars) >= 3:
+        c1 = safe_float(bars[-3].get("close"))
+        c2 = safe_float(bars[-2].get("close"))
+        c3 = safe_float(bars[-1].get("close"))
+
+        h1 = safe_float(bars[-3].get("high"))
+        h2 = safe_float(bars[-2].get("high"))
+        h3 = safe_float(bars[-1].get("high"))
+
+        l1 = safe_float(bars[-3].get("low"))
+        l2 = safe_float(bars[-2].get("low"))
+        l3 = safe_float(bars[-1].get("low"))
+
+        st.higher_low = l3 > l2 >= l1
+        st.lower_high = h3 < h2 <= h1
+
+        st.vwap_reclaimed = c2 < vwap and c3 > vwap if vwap else False
+        st.vwap_rejected = c2 > vwap and c3 < vwap if vwap else False
+
+        avg_vol = avg_volume(bars[:-1], lookback=10)
+        last_vol = safe_float(bars[-1].get("volume"))
+        st.breakout_with_volume = last_vol > (avg_vol * 1.25 if avg_vol else 0)
+
+    nearest_support = nearest_level(price, context.key_supports)
+    nearest_resistance = nearest_level(price, context.key_resistances)
+    nearest_print = nearest_level(price, context.big_print_levels)
+
+    st.near_support = distance_pct(price, nearest_support) <= 0.20 if nearest_support else False
+    st.near_resistance = distance_pct(price, nearest_resistance) <= 0.20 if nearest_resistance else False
+    st.near_big_print = distance_pct(price, nearest_print) <= 0.20 if nearest_print else False
+
+    st.retest_hold = st.above_vwap and st.near_support
+    st.rejection_at_level = st.below_vwap and st.near_resistance
+    st.failed_bounce = st.lower_high and st.below_vwap
+
+    st.stretched_up = context.rsi >= 70
+    st.stretched_down = context.rsi <= 30
+
+    return st
+
+
+# =========================================================
+# DECISION ENGINE
+# =========================================================
+
+def build_long_reasoning(context: MarketContext, st: StructureState) -> Tuple[int, List[str], List[str]]:
+    score = 0
+    reasons = []
+    blockers = []
+
+    if st.above_vwap:
+        score += 15
+        reasons.append("Price is above VWAP.")
+    else:
+        blockers.append("Price is not above VWAP for long bias.")
+
+    if st.vwap_reclaimed:
+        score += 15
+        reasons.append("VWAP reclaim confirmed.")
+    if st.retest_hold:
+        score += 12
+        reasons.append("Retest hold near support.")
+    if st.higher_low:
+        score += 12
+        reasons.append("Higher low structure present.")
+    if st.breakout_with_volume:
+        score += 12
+        reasons.append("Breakout candle has volume.")
+    if st.near_big_print:
+        score += 6
+        reasons.append("Price is near an important print/level.")
+    if context.macro_bias == "risk_on":
+        score += 8
+        reasons.append("Macro backdrop is leaning risk-on.")
+    if context.oil_trend in ["down", "strong_down"]:
+        score += 10
+        reasons.append("Oil pressure is easing, supportive for index upside.")
+    if st.stretched_up:
+        score -= 10
+        blockers.append("RSI is stretched up.")
+    if context.current_price >= context.premarket_high:
+        score += 8
+        reasons.append("Price is challenging or above premarket high.")
+
+    return score, reasons, blockers
+
+
+def build_short_reasoning(context: MarketContext, st: StructureState) -> Tuple[int, List[str], List[str]]:
+    score = 0
+    reasons = []
+    blockers = []
+
+    if st.below_vwap:
+        score += 15
+        reasons.append("Price is below VWAP.")
+    else:
+        blockers.append("Price is not below VWAP for short bias.")
+
+    if st.vwap_rejected:
+        score += 15
+        reasons.append("VWAP rejection confirmed.")
+    if st.rejection_at_level:
+        score += 12
+        reasons.append("Rejection at resistance.")
+    if st.failed_bounce:
+        score += 12
+        reasons.append("Failed bounce / lower high structure.")
+    if st.breakout_with_volume:
+        score += 8
+        reasons.append("Momentum candle has volume.")
+    if st.near_big_print:
+        score += 6
+        reasons.append("Price is near an important print/level.")
+    if context.macro_bias == "risk_off":
+        score += 8
+        reasons.append("Macro backdrop is leaning risk-off.")
+    if context.oil_trend in ["up", "strong_up"]:
+        score += 10
+        reasons.append("Oil pressure is rising, bearish for index upside.")
+    if st.stretched_down:
+        score -= 10
+        blockers.append("RSI is stretched down.")
+    if context.current_price <= context.premarket_low:
+        score += 8
+        reasons.append("Price is challenging or below premarket low.")
+
+    return score, reasons, blockers
+
+
+def detect_chase(context: MarketContext, st: StructureState, bias: str) -> Tuple[bool, str]:
+    price = context.current_price
+
+    if bias == "bullish":
+        ref = nearest_level(price, context.key_supports + [context.vwap] + context.big_print_levels)
+        d = distance_pct(price, ref) if ref else 0.0
+        if d > MAX_CHASE_DISTANCE_PCT and st.stretched_up:
+            return True, f"Long setup is extended {d:.2f}% away from support/VWAP."
+    elif bias == "bearish":
+        ref = nearest_level(price, context.key_resistances + [context.vwap] + context.big_print_levels)
+        d = distance_pct(price, ref) if ref else 0.0
+        if d > MAX_CHASE_DISTANCE_PCT and st.stretched_down:
+            return True, f"Short setup is extended {d:.2f}% away from resistance/VWAP."
+
+    return False, ""
+
+
+def score_to_grade(score: int) -> str:
+    if score >= 85:
+        return "A+"
+    if score >= 75:
+        return "A"
+    if score >= 65:
+        return "B+"
+    if score >= 55:
+        return "B"
+    return "AVOID"
+
+
+def build_zones(context: MarketContext, bias: str) -> Tuple[str, str, str]:
+    if bias == "bullish":
+        entry = f"{nearest_level(context.current_price, context.key_supports + [context.vwap]):.2f} - {context.current_price:.2f}"
+        stop = f"Below {nearest_level(context.current_price, context.key_supports):.2f}"
+        target = f"{nearest_level(context.current_price, context.key_resistances):.2f} / {context.premarket_high:.2f}"
+        return entry, stop, target
+
+    entry = f"{context.current_price:.2f} - {nearest_level(context.current_price, context.key_resistances + [context.vwap]):.2f}"
+    stop = f"Above {nearest_level(context.current_price, context.key_resistances):.2f}"
+    target = f"{nearest_level(context.current_price, context.key_supports):.2f} / {context.premarket_low:.2f}"
+    return entry, stop, target
+
+
+def make_decision(context: MarketContext, st: StructureState) -> BotDecision:
+    long_score, long_reasons, long_blockers = build_long_reasoning(context, st)
+    short_score, short_reasons, short_blockers = build_short_reasoning(context, st)
+
+    if long_score >= short_score:
+        bias = "bullish"
+        score = long_score
+        reasons = long_reasons
+        blockers = long_blockers
+    else:
+        bias = "bearish"
+        score = short_score
+        reasons = short_reasons
+        blockers = short_blockers
+
+    chase_blocked, chase_reason = detect_chase(context, st, bias)
+    if chase_blocked:
+        blockers.append(f"YOU ARE CHASING: {chase_reason}")
+        score -= 12
+
+    grade = score_to_grade(score)
+
+    if chase_blocked and grade in ["B+", "B"]:
+        grade = "AVOID"
+
+    if score < MIN_SCORE_FOR_ALERT:
+        grade = "AVOID"
+
+    if bias == "bullish":
+        action = "CALL IDEA" if grade != "AVOID" else "WAIT / NO CALL"
+    else:
+        action = "PUT IDEA" if grade != "AVOID" else "WAIT / NO PUT"
+
+    entry_zone, stop_zone, target_zone = build_zones(context, bias)
+    confidence = max(1, min(99, score))
+
+    premium_message = format_premium_alert(
+        context=context,
+        bias=bias,
+        grade=grade,
+        action=action,
+        score=score,
+        entry_zone=entry_zone,
+        stop_zone=stop_zone,
+        target_zone=target_zone,
+        reasons=reasons,
+        blockers=blockers,
+    )
+
+    free_message = format_free_alert(
+        context=context,
+        bias=bias,
+        grade=grade,
+        action=action,
+        reasons=reasons,
+    )
+
+    return BotDecision(
+        symbol=context.symbol,
+        bias=bias,
+        grade=grade,
+        action=action,
+        confidence=confidence,
+        score=score,
+        entry_zone=entry_zone,
+        stop_zone=stop_zone,
+        target_zone=target_zone,
+        premium_message=premium_message,
+        free_message=free_message,
+        reasons=reasons,
+        blockers=blockers,
+        chase_blocked=chase_blocked,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+# =========================================================
+# FORMATTERS
+# =========================================================
+
+def format_free_alert(context: MarketContext, bias: str, grade: str, action: str, reasons: List[str]) -> str:
+    headline = "BULLISH" if bias == "bullish" else "BEARISH"
+    top_reasons = reasons[:3] if reasons else ["Monitoring structure and key levels."]
+
+    lines = [
+        f"📊 {context.symbol} FREE ALERT",
+        f"Bias: {headline}",
+        f"Grade: {grade}",
+        f"Action: {action}",
+        f"Price: {context.current_price:.2f}",
+        f"VWAP: {context.vwap:.2f}",
+        f"Oil: {context.oil_price:.2f} ({context.oil_day_change_dollars:+.2f})",
+        "",
+        "Why it matters:",
+    ]
+
+    for r in top_reasons:
+        lines.append(f"• {r}")
+
+    lines.append("")
+    lines.append("UnBiased Trades 313")
+    return "\n".join(lines)
+
+
+def format_premium_alert(
+    context: MarketContext,
+    bias: str,
+    grade: str,
+    action: str,
+    score: int,
+    entry_zone: str,
+    stop_zone: str,
+    target_zone: str,
+    reasons: List[str],
+    blockers: List[str],
+) -> str:
+    headline = "BULLISH" if bias == "bullish" else "BEARISH"
+
+    lines = [
+        f"💎 {context.symbol} PREMIUM ALERT",
+        f"Bias: {headline}",
+        f"Grade: {grade}",
+        f"Action: {action}",
+        f"Score: {score}",
+        f"Price: {context.current_price:.2f}",
+        f"VWAP: {context.vwap:.2f}",
+        f"RSI: {context.rsi:.1f}",
+        f"{SECONDARY_SYMBOL}: {context.secondary_price:.2f} ({context.secondary_day_change_pct:+.2f}%)",
+        f"{OIL_SYMBOL}: {context.oil_price:.2f} ({context.oil_day_change_dollars:+.2f} / {context.oil_day_change_pct:+.2f}%)",
+        f"Macro Bias: {context.macro_bias}",
+        f"Oil Trend: {context.oil_trend}",
+        "",
+        f"Entry Zone: {entry_zone}",
+        f"Stop Zone: {stop_zone}",
+        f"Target Zone: {target_zone}",
+        "",
+        "Reasons:",
+    ]
+
+    if reasons:
+        for r in reasons:
+            lines.append(f"• {r}")
+    else:
+        lines.append("• No strong reasons currently.")
+
+    if blockers:
+        lines.append("")
+        lines.append("Blockers / Risks:")
+        for b in blockers:
+            lines.append(f"• {b}")
+
+    lines.append("")
+    lines.append("Levels:")
+    lines.append(f"• Supports: {', '.join([f'{x:.2f}' for x in context.key_supports])}")
+    lines.append(f"• Resistances: {', '.join([f'{x:.2f}' for x in context.key_resistances])}")
+    lines.append(f"• Big Prints: {', '.join([f'{x:.2f}' for x in context.big_print_levels])}")
+
+    lines.append("")
+    lines.append("UnBiased Trades 313 | Where information becomes execution.")
+    return "\n".join(lines)
+
+
+# =========================================================
+# DISCORD
+# =========================================================
+
+def send_to_discord(message: str) -> bool:
+    if not ENABLE_DISCORD_ALERTS or not DISCORD_WEBHOOK_URL:
+        return False
+
+    try:
+        payload = {"content": message[:1900]}
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+        ok = 200 <= r.status_code < 300
+        if not ok:
+            log(f"Discord send failed: {r.status_code} {r.text}")
+        return ok
+    except Exception as e:
+        log(f"Discord error: {e}")
+        return False
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def telegram_api_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+
+
+def send_to_telegram(message: str, chat_id: Optional[str] = None) -> bool:
+    if not ENABLE_TELEGRAM_ALERTS or not TELEGRAM_BOT_TOKEN:
+        return False
+
+    try:
+        payload = {
+            "chat_id": chat_id or TELEGRAM_CHAT_ID,
+            "text": message[:4000],
+        }
+        r = requests.post(telegram_api_url("sendMessage"), data=payload, timeout=20)
+        ok = 200 <= r.status_code < 300
+        if not ok:
+            log(f"Telegram send failed: {r.status_code} {r.text}")
+        return ok
+    except Exception as e:
+        log(f"Telegram error: {e}")
+        return False
+
+
+def get_telegram_updates() -> List[Dict]:
+    global LAST_TELEGRAM_UPDATE_ID
+
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+
+    try:
+        params = {
+            "timeout": 1,
+            "offset": LAST_TELEGRAM_UPDATE_ID + 1,
+        }
+        r = requests.get(telegram_api_url("getUpdates"), params=params, timeout=15)
+        data = r.json()
+
+        if not data.get("ok"):
+            return []
+
+        updates = data.get("result", [])
+        if updates:
+            LAST_TELEGRAM_UPDATE_ID = max(u["update_id"] for u in updates)
+        return updates
+    except Exception as e:
+        log(f"Failed to get Telegram updates: {e}")
+        return []
+
+
+def process_telegram_commands() -> None:
+    global BOT_ACTIVE
+
+    updates = get_telegram_updates()
+
+    for update in updates:
+        message = update.get("message", {})
+        text = (message.get("text") or "").strip().lower()
+        chat_id = str(message.get("chat", {}).get("id", TELEGRAM_CHAT_ID))
+
+        if not text.startswith("/"):
+            continue
+
+        if text == "/start":
+            send_to_telegram("✅ Bot connected. Commands: /status /heartbeat /test /kill /resume", chat_id)
+
+        elif text == "/status":
+            status_msg = (
+                f"🤖 System Status\n"
+                f"BOT_ACTIVE: {BOT_ACTIVE}\n"
+                f"SYMBOL: {SYMBOL}\n"
+                f"SECONDARY_SYMBOL: {SECONDARY_SYMBOL}\n"
+                f"OIL_SYMBOL: {OIL_SYMBOL}\n"
+                f"POLL_INTERVAL: {POLL_INTERVAL}\n"
+                f"HEARTBEAT_INTERVAL: {HEARTBEAT_INTERVAL}"
+            )
+            send_to_telegram(status_msg, chat_id)
+
+        elif text == "/heartbeat":
+            send_heartbeat(force=True, telegram_chat_id=chat_id)
+
+        elif text == "/test":
+            send_to_telegram("🧪 Telegram test alert working.", chat_id)
+            send_to_discord("🧪 Discord test alert working.")
+
+        elif text == "/kill":
+            BOT_ACTIVE = False
+            send_to_telegram("🛑 Bot paused. Use /resume to restart alerts.", chat_id)
+
+        elif text == "/resume":
+            BOT_ACTIVE = True
+            send_to_telegram("✅ Bot resumed.", chat_id)
+
+
+# =========================================================
+# HEARTBEAT
+# =========================================================
+
+def send_heartbeat(force: bool = False, telegram_chat_id: Optional[str] = None) -> None:
+    global LAST_HEARTBEAT_TS
+
+    now = time.time()
+    if not force and (now - LAST_HEARTBEAT_TS < HEARTBEAT_INTERVAL):
+        return
+
+    LAST_HEARTBEAT_TS = now
+
+    message = (
+        f"💓 HEARTBEAT\n"
+        f"System online\n"
+        f"BOT_ACTIVE: {BOT_ACTIVE}\n"
+        f"Primary: {SYMBOL}\n"
+        f"Secondary: {SECONDARY_SYMBOL}\n"
+        f"Oil: {OIL_SYMBOL}\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    if ENABLE_DISCORD_ALERTS:
+        send_to_discord(message)
+    if ENABLE_TELEGRAM_ALERTS:
+        send_to_telegram(message, telegram_chat_id)
+
+
+# =========================================================
+# ALERT FILTERS
+# =========================================================
+
+def decision_signature(decision: BotDecision) -> str:
+    return f"{decision.symbol}|{decision.bias}|{decision.grade}|{decision.action}|{decision.entry_zone}|{decision.target_zone}"
+
+
+def should_send_alert(decision: BotDecision) -> bool:
+    global LAST_ALERT_SIGNATURE
+
+    if decision.grade == "AVOID":
+        return False
+
+    sig = decision_signature(decision)
+    if sig == LAST_ALERT_SIGNATURE:
+        return False
+
+    LAST_ALERT_SIGNATURE = sig
+    return True
+
+
+# =========================================================
+# MAIN ANALYSIS PASS
+# =========================================================
+
+def run_analysis_cycle() -> None:
+    if not BOT_ACTIVE:
+        log("Bot paused. Skipping analysis cycle.")
+        return
+
+    context = build_market_context()
+    if not context:
+        log("No context available this cycle.")
+        return
+
+    bars = twelve_time_series(SYMBOL, interval="5min", outputsize=30)
+    st = detect_structure(context, bars)
+    decision = make_decision(context, st)
+
+    log(
+        f"Decision | symbol={decision.symbol} bias={decision.bias} "
+        f"grade={decision.grade} score={decision.score} action={decision.action}"
+    )
+
+    if should_send_alert(decision):
+        if ENABLE_DISCORD_ALERTS:
+            send_to_discord(decision.premium_message)
+        if ENABLE_TELEGRAM_ALERTS:
+            send_to_telegram(decision.premium_message)
+    else:
+        log("No new alert sent.")
+
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+def main() -> None:
+    log("System booted.")
+    validate_env()
+
+    if ENABLE_HEARTBEAT:
+        send_heartbeat(force=True)
+
+    while True:
+        try:
+            process_telegram_commands()
+
+            if ENABLE_HEARTBEAT:
+                send_heartbeat()
+
+            run_analysis_cycle()
+            time.sleep(POLL_INTERVAL)
+
+        except KeyboardInterrupt:
+            log("Keyboard interrupt received. Exiting.")
+            break
+        except Exception as e:
+            log(f"Fatal loop error: {e}")
+            log(traceback.format_exc())
+            time.sleep(15)
+
+
+# =========================================================
+# ENTRY
+# =========================================================
+
+if __name__ == "__main__":
+    main()
+
+# =========================================================
 # AI TRADING SYSTEM — LIVE DATA VERSION
 # =========================================================
 
