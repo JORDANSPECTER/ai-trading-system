@@ -320,59 +320,91 @@ def build_trade_plan(structure: dict, levels: dict, vwap: float) -> dict:
 
 
 def grade_trade(structure: dict, vwap: float, rsi: float, current_price: float) -> tuple[str, bool]:
-    grade = "C"
+    score = 0
     chase = False
 
     above_vwap = current_price > vwap
     below_vwap = current_price < vwap
 
+    setup = structure.get("setup", "")
+    volume_signal = structure.get("volume_signal", "NORMAL")
+
     bullish_setups = ["BREAK AND HOLD", "RETEST HOLD", "WAIT FOR BREAK CONFIRMATION"]
     bearish_setups = ["BREAKDOWN AND HOLD", "REJECTION", "FAILED BOUNCE"]
 
     # ======================
-    # BULLISH GRADING
+    # SETUP QUALITY
     # ======================
-    if structure["setup"] in bullish_setups and above_vwap:
-        if structure["volume_signal"] == "STRONG" and 45 <= rsi <= 72:
-            grade = "A+"
-        elif 40 <= rsi <= 75:
-            grade = "A"
-        elif 35 <= rsi <= 78:
-            grade = "B"
-        else:
-            grade = "C"
-
-        if rsi >= 78:
-            chase = True
-            grade = "AVOID"
-
-    # ======================
-    # BEARISH GRADING
-    # ======================
-    elif structure["setup"] in bearish_setups and below_vwap:
-        if structure["volume_signal"] == "STRONG" and 28 <= rsi <= 58:
-            grade = "A+"
-        elif 25 <= rsi <= 65:
-            grade = "A"
-        elif 22 <= rsi <= 70:
-            grade = "B"
-        else:
-            grade = "C"
-
-        if rsi <= 22:
-            chase = True
-            grade = "AVOID"
+    if setup == "BREAK AND HOLD":
+        score += 4
+    elif setup == "RETEST HOLD":
+        score += 4
+    elif setup == "BREAKDOWN AND HOLD":
+        score += 4
+    elif setup == "REJECTION":
+        score += 4
+    elif setup == "FAILED BOUNCE":
+        score += 3
+    elif setup == "WAIT FOR BREAK CONFIRMATION":
+        score += 3
+    elif setup == "NO CLEAN STRUCTURE":
+        score += 0
 
     # ======================
-    # PARTIAL ALIGNMENT
+    # VWAP ALIGNMENT
     # ======================
-    elif structure["setup"] in bullish_setups or structure["setup"] in bearish_setups:
-        grade = "B"
-
+    if setup in bullish_setups and above_vwap:
+        score += 3
+    elif setup in bearish_setups and below_vwap:
+        score += 3
     else:
-        grade = "C"
+        score += 1  # partial credit instead of auto-killing the grade
 
-    return grade, chase
+    # ======================
+    # VOLUME
+    # ======================
+    if volume_signal == "STRONG":
+        score += 2
+    else:
+        score += 1
+
+    # ======================
+    # RSI QUALITY
+    # ======================
+    if setup in bullish_setups:
+        if 45 <= rsi <= 72:
+            score += 3
+        elif 35 <= rsi <= 78:
+            score += 2
+        elif rsi > 78:
+            chase = True
+        else:
+            score += 1
+
+    elif setup in bearish_setups:
+        if 28 <= rsi <= 58:
+            score += 3
+        elif 22 <= rsi <= 70:
+            score += 2
+        elif rsi < 22:
+            chase = True
+        else:
+            score += 1
+
+    # ======================
+    # FINAL GRADE
+    # ======================
+    if chase:
+        return "AVOID", True
+
+    if score >= 11:
+        return "A+", False
+    elif score >= 9:
+        return "A", False
+    elif score >= 7:
+        return "B", False
+    else:
+        return "C", False
 
 
 # ======================
