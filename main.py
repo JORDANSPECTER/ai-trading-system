@@ -2401,7 +2401,7 @@ def run() -> None:
     last_heartbeat = time.time()
 
     
-        try:
+try:
             for symbol in SYSTEM_CONFIG["symbols_allowed"]:
                 run_symbol(symbol)
 
