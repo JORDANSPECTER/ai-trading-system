@@ -1249,7 +1249,7 @@ def main() -> None:
     if ENABLE_HEARTBEAT:
         send_heartbeat(force=True)
 
-    try:
+try:
     process_telegram_commands()
 
     if ENABLE_HEARTBEAT:
