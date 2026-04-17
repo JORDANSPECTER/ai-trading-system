@@ -1243,25 +1243,30 @@ def run_analysis_cycle() -> None:
 # =========================================================
 
 def main() -> None:
-    log("System booted.")
+    log("🚀 SYSTEM STARTING")
     validate_env()
 
-    if ENABLE_HEARTBEAT:
-        send_heartbeat(force=True)
+    try:
+        context = build_market_context()
 
-try:
-    process_telegram_commands()
+        if context:
+            bars = twelve_time_series(SYMBOL, interval="5min", outputsize=30)
+            st = detect_structure(context, bars)
+            decision = make_decision(context, st)
 
-    if ENABLE_HEARTBEAT:
-        send_heartbeat()
+            log(f"Decision: {decision.grade} | {decision.bias} | {decision.action}")
 
-    run_analysis_cycle()
+            send_to_discord(decision.premium_message)
+            send_to_telegram(decision.premium_message)
 
-except KeyboardInterrupt:
-    log("Keyboard interrupt received. Exiting.")
-except Exception as e:
-    log(f"Fatal loop error: {e}")
-    log(traceback.format_exc())
+        else:
+            log("❌ Failed to build market context")
+
+    except Exception as e:
+        log(f"Fatal run error: {e}")
+        log(traceback.format_exc())
+
+    log("✅ Run complete. Exiting.")
 
 # =========================================================
 # ENTRY
@@ -2395,7 +2400,7 @@ def run() -> None:
 
     last_heartbeat = time.time()
 
-    while True:
+    
         try:
             for symbol in SYSTEM_CONFIG["symbols_allowed"]:
                 run_symbol(symbol)
@@ -3333,7 +3338,7 @@ def run() -> None:
 
     last_heartbeat = time.time()
 
-    while True:
+    
         try:
             for symbol in SYSTEM_CONFIG["symbols_allowed"]:
                 run_symbol(symbol)
