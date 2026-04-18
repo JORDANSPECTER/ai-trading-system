@@ -1,1569 +1,983 @@
 import os
-import time
-import csv
 import json
+import math
+import time
+import traceback
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
 import requests
-from pathlib import Path
-from zoneinfo import ZoneInfo
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, date, timedelta
 
-# =========================================================
-# CONFIG
-# =========================================================
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
-DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE", "")
-DISCORD_WEBHOOK_EXECUTION = os.getenv("DISCORD_WEBHOOK_EXECUTION", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+# ============================================================
+# NORMALIZED ELITE MAIN.PY
+# ============================================================
+# PURPOSE
+# - Clean production alert engine
+# - One scoring engine
+# - One formatter
+# - One routing layer
+# - One main loop
+#
+# NOTES
+# - This version is built for alerting / analysis / routing.
+# - It does NOT place live broker orders.
+# - It is designed so option pricing, fill tracking, and
+#   execution memory can plug in cleanly next.
+# ============================================================
 
-LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
-RUN_ONCE = os.getenv("RUN_ONCE", "true").lower() == "true"
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-WATCHLIST = [x.strip().upper() for x in os.getenv("WATCHLIST", "QQQ,SPY").split(",") if x.strip()]
 
-# =========================================================
-# EXECUTION ENGINE
-# =========================================================
-A_PLUS_ONLY_MODE = os.getenv("A_PLUS_ONLY_MODE", "false").lower() == "true"
-ALLOW_B_MICRO_SIZE = os.getenv("ALLOW_B_MICRO_SIZE", "true").lower() == "true"
+# ============================================================
+# ENV / CONFIG
+# ============================================================
 
-DEFAULT_ORDER_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
-B_MICRO_QTY = int(os.getenv("B_MICRO_QTY", "1"))
+def env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
-CHASE_DISTANCE_PCT = float(os.getenv("CHASE_DISTANCE_PCT", "0.15"))
-MIN_RSI_CALL = float(os.getenv("MIN_RSI_CALL", "55"))
-MAX_RSI_PUT = float(os.getenv("MAX_RSI_PUT", "45"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))
 
-# =========================================================
-# ELITE RISK / MANAGEMENT
-# =========================================================
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
-MAX_NEW_TRADES_PER_DAY = int(os.getenv("MAX_NEW_TRADES_PER_DAY", "4"))
-ENTRY_CUTOFF_HOUR_ET = int(os.getenv("ENTRY_CUTOFF_HOUR_ET", "15"))
-ENTRY_CUTOFF_MINUTE_ET = int(os.getenv("ENTRY_CUTOFF_MINUTE_ET", "0"))
-FORCE_EXIT_HOUR_ET = int(os.getenv("FORCE_EXIT_HOUR_ET", "15"))
-FORCE_EXIT_MINUTE_ET = int(os.getenv("FORCE_EXIT_MINUTE_ET", "45"))
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
 
-CALL_TP_UNDERLYING_PCT = float(os.getenv("CALL_TP_UNDERLYING_PCT", "0.35"))
-CALL_SL_UNDERLYING_PCT = float(os.getenv("CALL_SL_UNDERLYING_PCT", "0.20"))
-PUT_TP_UNDERLYING_PCT = float(os.getenv("PUT_TP_UNDERLYING_PCT", "0.35"))
-PUT_SL_UNDERLYING_PCT = float(os.getenv("PUT_SL_UNDERLYING_PCT", "0.20"))
-BREAK_EVEN_TRIGGER_PCT = float(os.getenv("BREAK_EVEN_TRIGGER_PCT", "0.20"))
-MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "120"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 
-# =========================================================
-# FILES
-# =========================================================
-OPEN_TRADES_FILE = os.getenv("OPEN_TRADES_FILE", "open_trades.json")
-TRADE_LOG_FILE = os.getenv("TRADE_LOG_FILE", "trade_log.csv")
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
 
-# =========================================================
-# OPTIONS SETTINGS / PRICING ENGINE
-# =========================================================
-OPTIONS_DTE_FALLBACK_DAYS = int(os.getenv("OPTIONS_DTE_FALLBACK_DAYS", "5"))
-OPTIONS_STRIKE_STEP_BUFFER = float(os.getenv("OPTIONS_STRIKE_STEP_BUFFER", "0.0"))
 
-OPTION_QUOTE_FEED = os.getenv("OPTION_QUOTE_FEED", "indicative")
-MAX_OPTION_SPREAD_ABS = float(os.getenv("MAX_OPTION_SPREAD_ABS", "0.30"))
-MAX_OPTION_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "20"))
-BUY_LIMIT_SPREAD_FACTOR = float(os.getenv("BUY_LIMIT_SPREAD_FACTOR", "0.85"))
-SELL_LIMIT_SPREAD_FACTOR = float(os.getenv("SELL_LIMIT_SPREAD_FACTOR", "0.15"))
-MIN_OPTION_ASK = float(os.getenv("MIN_OPTION_ASK", "0.05"))
-MIN_OPTION_BID = float(os.getenv("MIN_OPTION_BID", "0.01"))
-ALLOW_MARKET_ORDERS_DURING_RTH = os.getenv("ALLOW_MARKET_ORDERS_DURING_RTH", "false").lower() == "true"
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-# =========================================================
-# CONSTANTS
-# =========================================================
-GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "A+": 4}
-BULLISH_CONFIRM_BONUS = 15
-BEARISH_CONFIRM_BONUS = 15
-CONFLICT_PENALTY = 20
-MIXED_PENALTY = 5
 
-# =========================================================
-# OPTIONAL ALPACA IMPORT
-# =========================================================
-alpaca_client = None
-alpaca_options_ready = False
-
-try:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import (
-        MarketOrderRequest,
-        LimitOrderRequest,
-        GetOptionContractsRequest,
-    )
-    from alpaca.trading.enums import (
-        OrderSide,
-        TimeInForce,
-        ContractType,
-        AssetStatus,
-    )
-
-    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
-        alpaca_client = TradingClient(
-            api_key=ALPACA_API_KEY,
-            secret_key=ALPACA_SECRET_KEY,
-            paper=ALPACA_PAPER,
-        )
-        alpaca_options_ready = True
-
-except Exception as e:
-    print(f"[ALPACA IMPORT WARNING] {e}", flush=True)
-    alpaca_client = None
-    alpaca_options_ready = False
-
-# =========================================================
-# ETF MAJOR CONSTITUENTS
-# =========================================================
-ETF_CONSTITUENTS = {
-    "QQQ": [
-        {"symbol": "AAPL", "weight": 9.0},
-        {"symbol": "MSFT", "weight": 8.5},
-        {"symbol": "NVDA", "weight": 8.0},
-        {"symbol": "AMZN", "weight": 5.5},
-        {"symbol": "META", "weight": 4.5},
-        {"symbol": "GOOGL", "weight": 4.0},
-        {"symbol": "TSLA", "weight": 3.0},
-        {"symbol": "AVGO", "weight": 3.0},
-        {"symbol": "NFLX", "weight": 2.0},
-        {"symbol": "AMD", "weight": 2.0},
-    ],
-    "SPY": [
-        {"symbol": "AAPL", "weight": 7.0},
-        {"symbol": "MSFT", "weight": 6.8},
-        {"symbol": "NVDA", "weight": 6.0},
-        {"symbol": "AMZN", "weight": 3.8},
-        {"symbol": "META", "weight": 2.8},
-        {"symbol": "GOOGL", "weight": 2.2},
-        {"symbol": "BRK.B", "weight": 1.8},
-        {"symbol": "XOM", "weight": 1.3},
-        {"symbol": "JPM", "weight": 1.2},
-        {"symbol": "LLY", "weight": 1.5},
-        {"symbol": "TSLA", "weight": 1.3},
-    ],
-}
-
-# =========================================================
-# DATA MODELS
-# =========================================================
 @dataclass
-class ConstituentSnapshot:
+class Config:
+    # Core
+    twelve_data_api_key: str
+    poll_seconds: int
+    state_file: str
+
+    # Symbols
+    primary_symbol: str
+    secondary_symbol: str
+    oil_symbol: str
+    volatility_symbol: str
+
+    # Telegram
+    telegram_bot_token: str
+    telegram_chat_id: str
+    telegram_enabled: bool
+
+    # Discord webhooks
+    discord_free_webhook: str
+    discord_premium_webhook: str
+    discord_daily_levels_webhook: str
+    discord_enabled: bool
+
+    # Cooldowns / anti-spam
+    alert_cooldown_seconds: int
+    daily_levels_cooldown_seconds: int
+    dedupe_price_rounding: int
+
+    # Premium / grade routing
+    premium_min_grade: str
+    free_min_grade: str
+    send_sub_a_to_premium: bool
+
+    # Thresholds
+    min_score_for_free: int
+    min_score_for_premium: int
+    min_volume_bias_score: int
+    oil_impact_threshold: float
+    price_change_threshold_pct: float
+    vwap_distance_threshold_pct: float
+
+    # Daily levels
+    daily_levels_enabled: bool
+    daily_levels_only_once_per_day: bool
+
+    # Risk / info
+    risk_warning_text: str
+
+    # Debug
+    debug: bool
+
+
+def load_config() -> Config:
+    return Config(
+        twelve_data_api_key=env_str("TWELVE_DATA_API_KEY"),
+        poll_seconds=env_int("POLL_SECONDS", 60),
+        state_file=env_str("STATE_FILE", "elite_state.json"),
+
+        primary_symbol=env_str("PRIMARY_SYMBOL", "QQQ"),
+        secondary_symbol=env_str("SECONDARY_SYMBOL", "SPY"),
+        oil_symbol=env_str("OIL_SYMBOL", "USO"),
+        volatility_symbol=env_str("VOLATILITY_SYMBOL", "VIX"),
+
+        telegram_bot_token=env_str("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=env_str("TELEGRAM_CHAT_ID"),
+        telegram_enabled=env_bool("TELEGRAM_ENABLED", True),
+
+        discord_free_webhook=env_str("DISCORD_FREE_WEBHOOK"),
+        discord_premium_webhook=env_str("DISCORD_PREMIUM_WEBHOOK"),
+        discord_daily_levels_webhook=env_str("DISCORD_DAILY_LEVELS_WEBHOOK"),
+        discord_enabled=env_bool("DISCORD_ENABLED", True),
+
+        alert_cooldown_seconds=env_int("ALERT_COOLDOWN_SECONDS", 900),
+        daily_levels_cooldown_seconds=env_int("DAILY_LEVELS_COOLDOWN_SECONDS", 21600),
+        dedupe_price_rounding=env_int("DEDUPE_PRICE_ROUNDING", 2),
+
+        premium_min_grade=env_str("PREMIUM_MIN_GRADE", "A"),
+        free_min_grade=env_str("FREE_MIN_GRADE", "B"),
+        send_sub_a_to_premium=env_bool("SEND_SUB_A_TO_PREMIUM", True),
+
+        min_score_for_free=env_int("MIN_SCORE_FOR_FREE", 60),
+        min_score_for_premium=env_int("MIN_SCORE_FOR_PREMIUM", 80),
+        min_volume_bias_score=env_int("MIN_VOLUME_BIAS_SCORE", 1),
+        oil_impact_threshold=env_float("OIL_IMPACT_THRESHOLD", 1.25),
+        price_change_threshold_pct=env_float("PRICE_CHANGE_THRESHOLD_PCT", 0.35),
+        vwap_distance_threshold_pct=env_float("VWAP_DISTANCE_THRESHOLD_PCT", 0.15),
+
+        daily_levels_enabled=env_bool("DAILY_LEVELS_ENABLED", True),
+        daily_levels_only_once_per_day=env_bool("DAILY_LEVELS_ONLY_ONCE_PER_DAY", True),
+
+        risk_warning_text=env_str(
+            "RISK_WARNING_TEXT",
+            "Educational alert only. Not financial advice. Wait for confirmation at key levels."
+        ),
+
+        debug=env_bool("DEBUG", False),
+    )
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+@dataclass
+class Quote:
     symbol: str
     price: float
-    vwap: float
+    open_price: float
+    high: float
+    low: float
+    previous_close: float
     change_pct: float
-    volume_ratio: float = 1.0
-    weight: float = 1.0
-
-    @property
-    def above_vwap(self) -> bool:
-        return self.price > self.vwap
-
-    @property
-    def below_vwap(self) -> bool:
-        return self.price < self.vwap
+    timestamp: str
 
 
 @dataclass
-class ConstituentInternals:
-    etf_symbol: str
-    aligned_bullish_weight: float
-    aligned_bearish_weight: float
-    bullish_participation: float
-    bearish_participation: float
-    breadth_score: float
-    leadership_score: float
-    confirmation_bias: str
-    summary: str
-    leaders_up: List[str] = field(default_factory=list)
-    leaders_down: List[str] = field(default_factory=list)
-    conflicts: List[str] = field(default_factory=list)
+class IndicatorPack:
+    symbol: str
+    vwap: Optional[float] = None
+    rsi: Optional[float] = None
+    ema9: Optional[float] = None
+    ema20: Optional[float] = None
 
 
 @dataclass
 class MarketContext:
-    symbol: str
-    current_price: float
-    vwap: float
-    rsi: float
-    change_pct: float
-    volume_ratio: float
-    above_vwap: bool
-    below_vwap: bool
-    constituent_internals: Optional[ConstituentInternals] = None
-    constituent_snapshots: List[ConstituentSnapshot] = field(default_factory=list)
+    primary: Quote
+    secondary: Quote
+    oil: Optional[Quote]
+    volatility: Optional[Quote]
+    primary_indicators: IndicatorPack
+    secondary_indicators: IndicatorPack
+    previous_day_high: Optional[float] = None
+    previous_day_low: Optional[float] = None
+    premarket_high: Optional[float] = None
+    premarket_low: Optional[float] = None
 
 
 @dataclass
-class TradePlan:
-    symbol: str
-    action: str
-    grade: str
+class SetupScore:
     score: int
-    confidence: float
-    reasons: List[str] = field(default_factory=list)
-    execution_qty: int = 0
-    execution_tier: str = "NONE"
-    chasing: bool = False
-
-# =========================================================
-# TIME / UTILS
-# =========================================================
-def now_et() -> datetime:
-    return datetime.now(ZoneInfo("America/New_York"))
+    grade: str
+    direction: str
+    reasons: List[str]
+    premium_reasons: List[str]
+    risk_flags: List[str]
 
 
-def safe_float(value, default=0.0) -> float:
+@dataclass
+class AlertPayload:
+    alert_type: str                   # TRADE_ALERT / DAILY_LEVELS / INFO
+    symbol: str
+    title: str
+    body: str
+    grade: str
+    direction: str
+    score: int
+    tags: List[str]
+    key: str                         # used for dedupe
+    timestamp_utc: str
+
+
+@dataclass
+class FillRecord:
+    timestamp_utc: str
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_price: Optional[float]
+    target_price: Optional[float]
+    notes: str = ""
+
+
+@dataclass
+class PersistentState:
+    last_alert_times: Dict[str, float] = field(default_factory=dict)
+    last_daily_levels_date: str = ""
+    last_market_snapshot: Dict[str, float] = field(default_factory=dict)
+    fill_history: List[Dict] = field(default_factory=list)
+
+    @staticmethod
+    def load(path: str) -> "PersistentState":
+        if not os.path.exists(path):
+            return PersistentState()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return PersistentState(
+                last_alert_times=raw.get("last_alert_times", {}),
+                last_daily_levels_date=raw.get("last_daily_levels_date", ""),
+                last_market_snapshot=raw.get("last_market_snapshot", {}),
+                fill_history=raw.get("fill_history", []),
+            )
+        except Exception:
+            return PersistentState()
+
+    def save(self, path: str) -> None:
+        payload = {
+            "last_alert_times": self.last_alert_times,
+            "last_daily_levels_date": self.last_daily_levels_date,
+            "last_market_snapshot": self.last_market_snapshot,
+            "fill_history": self.fill_history,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today_utc_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def safe_float(value: Optional[str], default: float = 0.0) -> float:
     try:
+        if value is None or value == "":
+            return default
         return float(value)
     except Exception:
-        return float(default)
+        return default
 
 
-def passes_grade_threshold(grade: str, threshold: str) -> bool:
-    return GRADE_ORDER.get(grade, 0) >= GRADE_ORDER.get(threshold, 0)
+def pct_change(current_value: float, base_value: float) -> float:
+    if base_value == 0:
+        return 0.0
+    return ((current_value - base_value) / base_value) * 100.0
 
 
-def is_regular_market_hours_et() -> bool:
-    current = now_et()
-    if current.weekday() > 4:
-        return False
-    current_minutes = current.hour * 60 + current.minute
-    return (9 * 60 + 30) <= current_minutes <= (16 * 60)
-
-
-def entry_cutoff_reached() -> bool:
-    current = now_et()
-    cutoff_minutes = ENTRY_CUTOFF_HOUR_ET * 60 + ENTRY_CUTOFF_MINUTE_ET
-    return (current.hour * 60 + current.minute) >= cutoff_minutes
-
-
-def force_exit_reached() -> bool:
-    current = now_et()
-    cutoff_minutes = FORCE_EXIT_HOUR_ET * 60 + FORCE_EXIT_MINUTE_ET
-    return (current.hour * 60 + current.minute) >= cutoff_minutes
-
-
-def round_option_limit_price(price: float) -> float:
-    if price >= 1.0:
-        return round(price + 1e-12, 2)
-    return round(price + 1e-12, 4)
-
-# =========================================================
-# ALERTS
-# =========================================================
-def send_discord_free(message: str) -> None:
-    if not DISCORD_WEBHOOK_FREE:
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK_FREE, json={"content": message}, timeout=12)
-    except Exception as e:
-        print(f"[DISCORD FREE ERROR] {e}", flush=True)
-
-
-def send_discord_execution(message: str) -> None:
-    if not DISCORD_WEBHOOK_EXECUTION:
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK_EXECUTION, json={"content": message}, timeout=12)
-    except Exception as e:
-        print(f"[DISCORD EXEC ERROR] {e}", flush=True)
-
-
-def send_telegram(message: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, data=payload, timeout=12)
-    except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}", flush=True)
-
-
-def broadcast_free(message: str) -> None:
-    if not message:
-        return
-    print(message, flush=True)
-    send_discord_free(message)
-    send_telegram(message)
-
-
-def broadcast_execution(message: str) -> None:
-    if not message:
-        return
-    print(message, flush=True)
-    send_discord_execution(message)
-    send_telegram(message)
-
-# =========================================================
-# STATE / LOGGING
-# =========================================================
-def ensure_trade_log_exists() -> None:
-    path = Path(TRADE_LOG_FILE)
-    if path.exists():
-        return
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "timestamp",
-            "event",
-            "underlying",
-            "option_symbol",
-            "action",
-            "grade",
-            "execution_tier",
-            "qty",
-            "entry_underlying",
-            "current_underlying",
-            "underlying_move_pct",
-            "reason",
-            "order_id",
-        ])
-
-
-def log_trade_event(
-    event: str,
-    underlying: str,
-    option_symbol: str,
-    action: str,
-    grade: str,
-    execution_tier: str,
-    qty: int,
-    entry_underlying: float,
-    current_underlying: float,
-    underlying_move_pct: float,
-    reason: str,
-    order_id: str,
-) -> None:
-    ensure_trade_log_exists()
-    with open(TRADE_LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            now_et().isoformat(),
-            event,
-            underlying,
-            option_symbol,
-            action,
-            grade,
-            execution_tier,
-            qty,
-            round(entry_underlying, 4),
-            round(current_underlying, 4),
-            round(underlying_move_pct, 4),
-            reason,
-            order_id,
-        ])
-
-
-def load_state() -> Dict:
-    path = Path(OPEN_TRADES_FILE)
-    if not path.exists():
-        return {"open_trades": [], "recent_closures": {}, "daily_entries": {}}
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"open_trades": [], "recent_closures": {}, "daily_entries": {}}
-
-
-def normalize_state(state: Dict) -> Dict:
-    state.setdefault("open_trades", [])
-    state.setdefault("recent_closures", {})
-    state.setdefault("daily_entries", {})
-
-    for trade in state["open_trades"]:
-        trade.setdefault("underlying", "")
-        trade.setdefault("option_symbol", "")
-        trade.setdefault("action", "")
-        trade.setdefault("grade", "B")
-        trade.setdefault("score", 0)
-        trade.setdefault("execution_tier", "NONE")
-        trade.setdefault("qty", 0)
-        trade.setdefault("entry_underlying", 0.0)
-        trade.setdefault("entry_time", now_et().isoformat())
-        trade.setdefault("entry_order_id", None)
-
-        trade.setdefault("entry_order_status", "submitted")
-        trade.setdefault("entry_fill_price", None)
-        trade.setdefault("entry_filled_qty", 0)
-        trade.setdefault("entry_fill_alert_sent", False)
-
-        trade.setdefault("exit_order_id", None)
-        trade.setdefault("exit_order_status", None)
-        trade.setdefault("exit_fill_price", None)
-        trade.setdefault("exit_filled_qty", 0)
-        trade.setdefault("exit_fill_alert_sent", False)
-
-        trade.setdefault("be_armed", False)
-        trade.setdefault("strike", "NA")
-        trade.setdefault("expiry", "NA")
-
-    return state
-
-
-def save_state(state: Dict) -> None:
-    with open(OPEN_TRADES_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-# =========================================================
-# MARKET DATA
-# =========================================================
-def fetch_twelve_time_series(symbol: str, interval: str = "1min", outputsize: int = 80) -> List[Dict]:
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
-
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
-        "timezone": "America/New_York",
-    }
-
-    response = requests.get(url, params=params, timeout=20)
-    data = response.json()
-
-    if "values" not in data:
-        raise RuntimeError(f"Twelve Data error for {symbol}: {data}")
-
-    return list(reversed(data["values"]))
-
-
-def compute_vwap_from_bars(bars: List[Dict]) -> float:
-    cumulative_pv = 0.0
-    cumulative_vol = 0.0
-    for bar in bars:
-        high = safe_float(bar.get("high"))
-        low = safe_float(bar.get("low"))
-        close = safe_float(bar.get("close"))
-        volume = safe_float(bar.get("volume"), 1.0)
-        typical_price = (high + low + close) / 3.0
-        cumulative_pv += typical_price * volume
-        cumulative_vol += volume
-
-    if cumulative_vol <= 0:
-        return safe_float(bars[-1].get("close"))
-    return cumulative_pv / cumulative_vol
-
-
-def compute_rsi_from_closes(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
-
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def compute_volume_ratio(bars: List[Dict], lookback: int = 20) -> float:
-    volumes = [safe_float(b.get("volume"), 0.0) for b in bars if b.get("volume") is not None]
-    if len(volumes) < 2:
-        return 1.0
-
-    recent = volumes[-1]
-    baseline_window = volumes[-(lookback + 1):-1] if len(volumes) > lookback else volumes[:-1]
-    if not baseline_window:
-        return 1.0
-
-    baseline = sum(baseline_window) / len(baseline_window)
-    if baseline <= 0:
-        return 1.0
-
-    return recent / baseline
-
-
-def get_symbol_snapshot(symbol: str) -> Optional[Dict]:
-    try:
-        bars = fetch_twelve_time_series(symbol=symbol, interval="1min", outputsize=80)
-        if len(bars) < 5:
-            return None
-
-        closes = [safe_float(b["close"]) for b in bars]
-        latest = bars[-1]
-        prev_close = closes[-2] if len(closes) >= 2 else closes[-1]
-
-        price = safe_float(latest["close"])
-        vwap = compute_vwap_from_bars(bars)
-        rsi = compute_rsi_from_closes(closes)
-        change_pct = ((price - prev_close) / prev_close * 100.0) if prev_close else 0.0
-        volume_ratio = compute_volume_ratio(bars)
-
-        return {
-            "price": price,
-            "vwap": vwap,
-            "rsi": rsi,
-            "change_pct": change_pct,
-            "volume_ratio": volume_ratio,
-        }
-    except Exception as e:
-        print(f"[SNAPSHOT ERROR] {symbol}: {e}", flush=True)
-        return None
-
-# =========================================================
-# OPTION QUOTES / PRICING ENGINE
-# =========================================================
-def get_option_latest_quote(option_symbol: str) -> Optional[Dict]:
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        return None
-
-    base_url = "https://data.alpaca.markets/v1beta1/options/quotes/latest"
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-    }
-    params = {
-        "symbols": option_symbol,
-        "feed": OPTION_QUOTE_FEED,
-    }
-
-    try:
-        response = requests.get(base_url, headers=headers, params=params, timeout=12)
-        response.raise_for_status()
-        data = response.json()
-        quotes = data.get("quotes", {})
-        quote = quotes.get(option_symbol)
-        if not quote:
-            return None
-
-        bid = safe_float(quote.get("bp"), 0.0)
-        ask = safe_float(quote.get("ap"), 0.0)
-        bid_size = safe_float(quote.get("bs"), 0.0)
-        ask_size = safe_float(quote.get("as"), 0.0)
-
-        if ask <= 0:
-            return None
-
-        spread_abs = max(0.0, ask - bid)
-        spread_pct = (spread_abs / ask * 100.0) if ask > 0 else 999.0
-
-        return {
-            "bid": bid,
-            "ask": ask,
-            "bid_size": bid_size,
-            "ask_size": ask_size,
-            "spread_abs": spread_abs,
-            "spread_pct": spread_pct,
-        }
-    except Exception as e:
-        print(f"[OPTION QUOTE ERROR] {option_symbol}: {e}", flush=True)
-        return None
-
-
-def quote_is_tradeable(quote: Dict) -> Tuple[bool, str]:
-    if not quote:
-        return False, "No option quote available."
-    if quote["ask"] < MIN_OPTION_ASK:
-        return False, f"Ask too low ({quote['ask']:.4f})."
-    if quote["bid"] < MIN_OPTION_BID:
-        return False, f"Bid too low ({quote['bid']:.4f})."
-    if quote["spread_abs"] > MAX_OPTION_SPREAD_ABS:
-        return False, f"Spread too wide (${quote['spread_abs']:.4f})."
-    if quote["spread_pct"] > MAX_OPTION_SPREAD_PCT:
-        return False, f"Spread too wide ({quote['spread_pct']:.2f}%)."
-    return True, "Quote acceptable."
-
-
-def compute_buy_limit_from_quote(quote: Dict) -> float:
-    bid = quote["bid"]
-    ask = quote["ask"]
-    spread = max(0.0, ask - bid)
-    raw = bid + (spread * BUY_LIMIT_SPREAD_FACTOR)
-    raw = min(raw, ask)
-    raw = max(raw, MIN_OPTION_ASK)
-    return round_option_limit_price(raw)
-
-
-def compute_sell_limit_from_quote(quote: Dict) -> float:
-    bid = quote["bid"]
-    ask = quote["ask"]
-    spread = max(0.0, ask - bid)
-    raw = bid + (spread * SELL_LIMIT_SPREAD_FACTOR)
-    raw = max(raw, bid)
-    return round_option_limit_price(max(raw, MIN_OPTION_BID))
-
-# =========================================================
-# CONSTITUENT ENGINE
-# =========================================================
-def load_constituent_snapshots(etf_symbol: str) -> List[ConstituentSnapshot]:
-    snapshots: List[ConstituentSnapshot] = []
-
-    for item in ETF_CONSTITUENTS.get(etf_symbol, []):
-        data = get_symbol_snapshot(item["symbol"])
-        if not data:
-            continue
-
-        snapshots.append(
-            ConstituentSnapshot(
-                symbol=item["symbol"],
-                price=safe_float(data["price"]),
-                vwap=safe_float(data["vwap"]),
-                change_pct=safe_float(data["change_pct"]),
-                volume_ratio=safe_float(data.get("volume_ratio", 1.0)),
-                weight=safe_float(item["weight"]),
-            )
-        )
-    return snapshots
-
-
-def analyze_constituent_internals(etf_symbol: str, snapshots: List[ConstituentSnapshot]) -> ConstituentInternals:
-    if not snapshots:
-        return ConstituentInternals(
-            etf_symbol=etf_symbol,
-            aligned_bullish_weight=0.0,
-            aligned_bearish_weight=0.0,
-            bullish_participation=0.0,
-            bearish_participation=0.0,
-            breadth_score=0.0,
-            leadership_score=0.0,
-            confirmation_bias="NEUTRAL",
-            summary=f"{etf_symbol} internals unavailable.",
-            leaders_up=[],
-            leaders_down=[],
-            conflicts=["No constituent data available."],
-        )
-
-    total_weight = sum(x.weight for x in snapshots) or 1.0
-    bullish_weight = 0.0
-    bearish_weight = 0.0
-    bullish_names = 0
-    bearish_names = 0
-    leaders_up = []
-    leaders_down = []
-    conflicts = []
-    leadership_raw = []
-
-    for snap in snapshots:
-        weighted_push = snap.weight * abs(snap.change_pct)
-        if snap.above_vwap and snap.change_pct > 0:
-            bullish_weight += snap.weight
-            bullish_names += 1
-            leadership_raw.append(weighted_push)
-            if snap.weight >= 3.0:
-                leaders_up.append(snap.symbol)
-        elif snap.below_vwap and snap.change_pct < 0:
-            bearish_weight += snap.weight
-            bearish_names += 1
-            leadership_raw.append(-weighted_push)
-            if snap.weight >= 3.0:
-                leaders_down.append(snap.symbol)
-        else:
-            conflicts.append(snap.symbol)
-
-    bullish_participation = bullish_names / len(snapshots)
-    bearish_participation = bearish_names / len(snapshots)
-    aligned_bullish_weight = bullish_weight / total_weight
-    aligned_bearish_weight = bearish_weight / total_weight
-    breadth_score = bullish_participation - bearish_participation
-    leadership_score = sum(leadership_raw) / total_weight if leadership_raw else 0.0
-
-    if aligned_bullish_weight >= 0.55 and bullish_participation >= 0.50:
-        bias = "BULLISH_CONFIRMATION"
-        summary = f"{etf_symbol} internals bullish."
-    elif aligned_bearish_weight >= 0.55 and bearish_participation >= 0.50:
-        bias = "BEARISH_CONFIRMATION"
-        summary = f"{etf_symbol} internals bearish."
-    else:
-        bias = "MIXED"
-        summary = f"{etf_symbol} internals mixed."
-
-    return ConstituentInternals(
-        etf_symbol=etf_symbol,
-        aligned_bullish_weight=aligned_bullish_weight,
-        aligned_bearish_weight=aligned_bearish_weight,
-        bullish_participation=bullish_participation,
-        bearish_participation=bearish_participation,
-        breadth_score=breadth_score,
-        leadership_score=leadership_score,
-        confirmation_bias=bias,
-        summary=summary,
-        leaders_up=leaders_up,
-        leaders_down=leaders_down,
-        conflicts=conflicts,
-    )
-
-
-def enrich_context_with_constituents(context: MarketContext) -> MarketContext:
-    if context.symbol not in ETF_CONSTITUENTS:
-        return context
-    context.constituent_snapshots = load_constituent_snapshots(context.symbol)
-    context.constituent_internals = analyze_constituent_internals(context.symbol, context.constituent_snapshots)
-    return context
-
-# =========================================================
-# DECISION ENGINE
-# =========================================================
-def score_to_grade(score: int) -> str:
+def grade_from_score(score: int) -> str:
     if score >= 90:
         return "A+"
-    if score >= 75:
+    if score >= 80:
         return "A"
-    if score >= 55:
+    if score >= 70:
         return "B"
-    return "C"
+    if score >= 60:
+        return "C"
+    return "D"
 
 
-def build_market_context(symbol: str) -> Optional[MarketContext]:
-    data = get_symbol_snapshot(symbol)
-    if not data:
+def grade_rank(grade: str) -> int:
+    order = {
+        "A+": 5,
+        "A": 4,
+        "B": 3,
+        "C": 2,
+        "D": 1,
+    }
+    return order.get(grade.upper(), 0)
+
+
+def debug_log(cfg: Config, message: str) -> None:
+    if cfg.debug:
+        print(f"[DEBUG] {message}")
+
+
+# ============================================================
+# TWELVE DATA CLIENT
+# ============================================================
+
+class TwelveDataClient:
+    BASE_URL = "https://api.twelvedata.com"
+
+    def __init__(self, api_key: str, cfg: Config):
+        self.api_key = api_key
+        self.cfg = cfg
+
+    def _get(self, endpoint: str, params: Dict) -> Dict:
+        params = dict(params)
+        params["apikey"] = self.api_key
+        url = f"{self.BASE_URL}/{endpoint}"
+
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, dict) and data.get("status") == "error":
+            raise RuntimeError(f"Twelve Data error: {data}")
+        return data
+
+    def get_quote(self, symbol: str) -> Quote:
+        data = self._get("quote", {"symbol": symbol})
+
+        price = safe_float(data.get("close"))
+        open_price = safe_float(data.get("open"))
+        high = safe_float(data.get("high"))
+        low = safe_float(data.get("low"))
+        previous_close = safe_float(data.get("previous_close"))
+
+        change_pct_val = safe_float(data.get("percent_change"))
+        if change_pct_val == 0 and previous_close > 0:
+            change_pct_val = pct_change(price, previous_close)
+
+        return Quote(
+            symbol=symbol,
+            price=price,
+            open_price=open_price,
+            high=high,
+            low=low,
+            previous_close=previous_close,
+            change_pct=change_pct_val,
+            timestamp=now_utc_iso(),
+        )
+
+    def get_indicator(self, symbol: str, indicator: str, interval: str = "1min", outputsize: int = 1) -> Optional[float]:
+        try:
+            data = self._get(
+                indicator,
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "outputsize": outputsize,
+                },
+            )
+            values = data.get("values", [])
+            if not values:
+                return None
+
+            latest = values[0]
+            # Twelve Data field name can vary by endpoint
+            for key in ["vwap", "rsi", "ema"]:
+                if key in latest:
+                    return safe_float(latest[key], None)
+            return None
+        except Exception as e:
+            debug_log(self.cfg, f"Indicator error {symbol} {indicator}: {e}")
+            return None
+
+    def get_indicator_pack(self, symbol: str) -> IndicatorPack:
+        return IndicatorPack(
+            symbol=symbol,
+            vwap=self.get_indicator(symbol, "vwap", interval="1min"),
+            rsi=self.get_indicator(symbol, "rsi", interval="5min"),
+            ema9=self.get_indicator(symbol, "ema", interval="5min"),
+            ema20=self.get_indicator(symbol, "ema", interval="15min"),
+        )
+
+
+# ============================================================
+# MARKET BUILDER
+# ============================================================
+
+def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext:
+    primary_quote = client.get_quote(cfg.primary_symbol)
+    secondary_quote = client.get_quote(cfg.secondary_symbol)
+
+    oil_quote = None
+    volatility_quote = None
+
+    try:
+        oil_quote = client.get_quote(cfg.oil_symbol)
+    except Exception as e:
+        debug_log(cfg, f"Oil quote unavailable: {e}")
+
+    try:
+        volatility_quote = client.get_quote(cfg.volatility_symbol)
+    except Exception as e:
+        debug_log(cfg, f"Volatility quote unavailable: {e}")
+
+    primary_ind = client.get_indicator_pack(cfg.primary_symbol)
+    secondary_ind = client.get_indicator_pack(cfg.secondary_symbol)
+
+    # Elite placeholders:
+    # These can later be replaced by true premarket and prior-day logic
+    previous_day_high = max(primary_quote.open_price, primary_quote.high)
+    previous_day_low = min(primary_quote.open_price, primary_quote.low)
+    premarket_high = primary_quote.high
+    premarket_low = primary_quote.low
+
+    return MarketContext(
+        primary=primary_quote,
+        secondary=secondary_quote,
+        oil=oil_quote,
+        volatility=volatility_quote,
+        primary_indicators=primary_ind,
+        secondary_indicators=secondary_ind,
+        previous_day_high=previous_day_high,
+        previous_day_low=previous_day_low,
+        premarket_high=premarket_high,
+        premarket_low=premarket_low,
+    )
+
+
+# ============================================================
+# ELITE OPTION PRICING PLACEHOLDER
+# ============================================================
+
+def norm_cdf(x: float) -> float:
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def black_scholes_call_price(spot: float, strike: float, time_to_expiry_years: float, rate: float, volatility: float) -> Optional[float]:
+    try:
+        if spot <= 0 or strike <= 0 or time_to_expiry_years <= 0 or volatility <= 0:
+            return None
+        d1 = (math.log(spot / strike) + (rate + 0.5 * volatility**2) * time_to_expiry_years) / (volatility * math.sqrt(time_to_expiry_years))
+        d2 = d1 - volatility * math.sqrt(time_to_expiry_years)
+        return spot * norm_cdf(d1) - strike * math.exp(-rate * time_to_expiry_years) * norm_cdf(d2)
+    except Exception:
         return None
 
-    context = MarketContext(
-        symbol=symbol,
-        current_price=safe_float(data["price"]),
-        vwap=safe_float(data["vwap"]),
-        rsi=safe_float(data["rsi"]),
-        change_pct=safe_float(data["change_pct"]),
-        volume_ratio=safe_float(data["volume_ratio"]),
-        above_vwap=safe_float(data["price"]) > safe_float(data["vwap"]),
-        below_vwap=safe_float(data["price"]) < safe_float(data["vwap"]),
-    )
-    return enrich_context_with_constituents(context)
+
+# ============================================================
+# EXECUTION MEMORY / FILL TRACKING PLACEHOLDER
+# ============================================================
+
+def add_fill_record(state: PersistentState, record: FillRecord) -> None:
+    state.fill_history.append(asdict(record))
+    if len(state.fill_history) > 500:
+        state.fill_history = state.fill_history[-500:]
 
 
-def make_hybrid_decision(context: MarketContext) -> TradePlan:
-    reasons = []
+# ============================================================
+# SCORING ENGINE
+# ============================================================
+
+def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
     score = 50
-    action = "NO_TRADE"
+    reasons: List[str] = []
+    premium_reasons: List[str] = []
+    risk_flags: List[str] = []
 
-    if context.above_vwap:
-        score += 12
-        reasons.append("Price is above VWAP.")
-    elif context.below_vwap:
-        score += 12
-        reasons.append("Price is below VWAP.")
+    price = ctx.primary.price
+    vwap = ctx.primary_indicators.vwap
+    rsi = ctx.primary_indicators.rsi
+    ema9 = ctx.primary_indicators.ema9
+    ema20 = ctx.primary_indicators.ema20
 
-    if context.above_vwap and context.rsi >= 55:
-        score += 10
-        reasons.append("Bullish RSI alignment.")
-    elif context.below_vwap and context.rsi <= 45:
-        score += 10
-        reasons.append("Bearish RSI alignment.")
+    oil_change = ctx.oil.change_pct if ctx.oil else 0.0
+    vol_change = ctx.volatility.change_pct if ctx.volatility else 0.0
+
+    bullish_points = 0
+    bearish_points = 0
+
+    # -------------------------
+    # VWAP logic
+    # -------------------------
+    if vwap is not None:
+        if price > vwap:
+            score += 10
+            bullish_points += 1
+            reasons.append(f"{ctx.primary.symbol} is above VWAP ({vwap:.2f}).")
+        elif price < vwap:
+            score += 10
+            bearish_points += 1
+            reasons.append(f"{ctx.primary.symbol} is below VWAP ({vwap:.2f}).")
+
+        distance_pct = abs(pct_change(price, vwap))
+        if distance_pct < cfg.vwap_distance_threshold_pct:
+            score += 5
+            premium_reasons.append("Price is trading tight around VWAP, which improves reaction quality.")
+        else:
+            risk_flags.append("Price is extended away from VWAP.")
     else:
-        reasons.append("RSI is neutral or not fully aligned.")
+        risk_flags.append("VWAP unavailable.")
 
-    if context.volume_ratio >= 1.20:
+    # -------------------------
+    # RSI logic
+    # -------------------------
+    if rsi is not None:
+        if 48 <= rsi <= 62:
+            score += 8
+            reasons.append(f"RSI is healthy at {rsi:.1f}.")
+        elif rsi > 70:
+            score -= 6
+            risk_flags.append(f"RSI is hot at {rsi:.1f}.")
+        elif rsi < 30:
+            score -= 6
+            risk_flags.append(f"RSI is weak at {rsi:.1f}.")
+    else:
+        risk_flags.append("RSI unavailable.")
+
+    # -------------------------
+    # EMA logic
+    # -------------------------
+    if ema9 is not None and ema20 is not None:
+        if ema9 > ema20:
+            score += 7
+            bullish_points += 1
+            reasons.append("Short-term momentum is bullish (EMA9 > EMA20).")
+        elif ema9 < ema20:
+            score += 7
+            bearish_points += 1
+            reasons.append("Short-term momentum is bearish (EMA9 < EMA20).")
+    else:
+        risk_flags.append("EMA trend data unavailable.")
+
+    # -------------------------
+    # Price action / daily range
+    # -------------------------
+    if ctx.primary.previous_close > 0:
+        if abs(ctx.primary.change_pct) >= cfg.price_change_threshold_pct:
+            score += 8
+            reasons.append(f"Price is moving with intent ({ctx.primary.change_pct:+.2f}%).")
+        else:
+            risk_flags.append("Move is small so far; chop risk is higher.")
+
+    # -------------------------
+    # Oil macro influence
+    # -------------------------
+    if ctx.oil:
+        if abs(oil_change) >= cfg.oil_impact_threshold:
+            premium_reasons.append(f"Oil is making a meaningful move ({ctx.oil.symbol} {oil_change:+.2f}%).")
+            # User logic preference:
+            # rising oil often pressures growth / index risk
+            if oil_change > 0:
+                bearish_points += 1
+                reasons.append("Oil pressure favors caution on long-side index continuation.")
+            else:
+                bullish_points += 1
+                reasons.append("Oil relief supports index stabilization or upside continuation.")
+
+    # -------------------------
+    # Volatility context
+    # -------------------------
+    if ctx.volatility:
+        if vol_change > 2.0:
+            bearish_points += 1
+            risk_flags.append(f"{ctx.volatility.symbol} is elevated ({vol_change:+.2f}%).")
+        elif vol_change < -2.0:
+            bullish_points += 1
+            premium_reasons.append(f"{ctx.volatility.symbol} is easing ({vol_change:+.2f}%).")
+
+    # -------------------------
+    # Key levels
+    # -------------------------
+    if ctx.previous_day_high and price > ctx.previous_day_high:
         score += 8
-
-    if context.above_vwap and context.change_pct > 0:
+        bullish_points += 1
+        reasons.append("Price is above the prior-day high zone.")
+    elif ctx.previous_day_low and price < ctx.previous_day_low:
         score += 8
-    elif context.below_vwap and context.change_pct < 0:
-        score += 8
+        bearish_points += 1
+        reasons.append("Price is below the prior-day low zone.")
 
-    if context.above_vwap and context.rsi >= 52:
-        action = "BUY_CALL"
-    elif context.below_vwap and context.rsi <= 48:
-        action = "BUY_PUT"
+    # -------------------------
+    # Direction decision
+    # -------------------------
+    if bullish_points > bearish_points:
+        direction = "BULLISH"
+        score += 5
+    elif bearish_points > bullish_points:
+        direction = "BEARISH"
+        score += 5
+    else:
+        direction = "NEUTRAL"
+        score -= 5
+        risk_flags.append("Bullish and bearish evidence is mixed.")
 
-    return TradePlan(
-        symbol=context.symbol,
-        action=action,
-        grade=score_to_grade(score),
+    # Clamp
+    score = max(0, min(score, 100))
+    grade = grade_from_score(score)
+
+    return SetupScore(
         score=score,
-        confidence=max(0.0, min(score / 100.0, 0.99)),
+        grade=grade,
+        direction=direction,
         reasons=reasons,
+        premium_reasons=premium_reasons,
+        risk_flags=risk_flags,
     )
 
 
-def detect_chasing(context: MarketContext) -> Tuple[bool, str]:
-    if context.vwap <= 0:
-        return False, "VWAP unavailable for chase check."
+# ============================================================
+# DAILY LEVELS ENGINE
+# ============================================================
 
-    distance_pct = abs((context.current_price - context.vwap) / context.vwap) * 100.0
-    if distance_pct >= CHASE_DISTANCE_PCT:
-        return True, f"Price is extended {distance_pct:.2f}% from VWAP."
-    return False, f"Price extension acceptable at {distance_pct:.2f}% from VWAP."
+def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
+    symbol = ctx.primary.symbol
+    title = f"📍 {symbol} Daily Levels"
+    tags = ["daily-levels", symbol.lower()]
 
+    lines = [
+        f"Symbol: {symbol}",
+        f"Current Price: {ctx.primary.price:.2f}",
+        f"Previous Day High: {ctx.previous_day_high:.2f}" if ctx.previous_day_high is not None else "Previous Day High: n/a",
+        f"Previous Day Low: {ctx.previous_day_low:.2f}" if ctx.previous_day_low is not None else "Previous Day Low: n/a",
+        f"Premarket High: {ctx.premarket_high:.2f}" if ctx.premarket_high is not None else "Premarket High: n/a",
+        f"Premarket Low: {ctx.premarket_low:.2f}" if ctx.premarket_low is not None else "Premarket Low: n/a",
+    ]
 
-def assign_execution_tier(plan: TradePlan, context: MarketContext) -> TradePlan:
-    plan.execution_qty = 0
-    plan.execution_tier = "NONE"
+    if ctx.primary_indicators.vwap is not None:
+        lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
+    if ctx.primary_indicators.rsi is not None:
+        lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
 
-    if plan.grade == "A+":
-        plan.execution_tier = "FULL"
-        plan.execution_qty = DEFAULT_ORDER_QTY
-    elif plan.grade == "A":
-        plan.execution_tier = "STANDARD"
-        plan.execution_qty = DEFAULT_ORDER_QTY
-    elif plan.grade == "B" and ALLOW_B_MICRO_SIZE and context.volume_ratio >= 3.0:
-        plan.execution_tier = "MICRO"
-        plan.execution_qty = B_MICRO_QTY
+    lines.append("")
+    lines.append("Watch for acceptance / rejection at these levels before entry.")
+    lines.append(cfg.risk_warning_text)
 
-    return plan
+    body = "\n".join(lines)
 
-
-def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> TradePlan:
-    ci = context.constituent_internals
-    if ci:
-        if plan.action == "BUY_CALL":
-            if ci.confirmation_bias == "BULLISH_CONFIRMATION":
-                plan.score += BULLISH_CONFIRM_BONUS
-            elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
-                plan.score -= CONFLICT_PENALTY
-            else:
-                plan.score -= MIXED_PENALTY
-        elif plan.action == "BUY_PUT":
-            if ci.confirmation_bias == "BEARISH_CONFIRMATION":
-                plan.score += BEARISH_CONFIRM_BONUS
-            elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
-                plan.score -= CONFLICT_PENALTY
-            else:
-                plan.score -= MIXED_PENALTY
-
-    if plan.action == "BUY_CALL" and context.rsi >= MIN_RSI_CALL:
-        plan.score += 5
-    elif plan.action == "BUY_CALL":
-        plan.score -= 5
-
-    if plan.action == "BUY_PUT" and context.rsi <= MAX_RSI_PUT:
-        plan.score += 5
-    elif plan.action == "BUY_PUT":
-        plan.score -= 5
-
-    chasing, _ = detect_chasing(context)
-    plan.chasing = chasing
-    if chasing:
-        plan.score -= 15
-
-    plan.grade = score_to_grade(plan.score)
-    plan.confidence = max(0.0, min(plan.score / 100.0, 0.99))
-    return assign_execution_tier(plan, context)
-
-
-def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List[str]]:
-    if plan.action == "NO_TRADE":
-        return "AVOID", ["Blocked: no clear directional action."]
-    if A_PLUS_ONLY_MODE and plan.grade != "A+":
-        return "AVOID", ["Blocked: A+ sniper mode active."]
-    if plan.chasing:
-        return "AVOID", ["Blocked: trade is chasing away from decision zone."]
-    if plan.confidence < MIN_CONFIDENCE and plan.grade != "B":
-        return "AVOID", ["Blocked: confidence too low."]
-    if context.constituent_internals:
-        ci = context.constituent_internals
-        if plan.action == "BUY_CALL" and ci.confirmation_bias == "BEARISH_CONFIRMATION":
-            return "AVOID", ["Blocked: bearish internals against call."]
-        if plan.action == "BUY_PUT" and ci.confirmation_bias == "BULLISH_CONFIRMATION":
-            return "AVOID", ["Blocked: bullish internals against put."]
-    if context.volume_ratio < 0.85:
-        return "AVOID", ["Blocked: volume too weak."]
-
-    if plan.grade == "B":
-        if not ALLOW_B_MICRO_SIZE or plan.execution_tier != "MICRO":
-            return "AVOID", ["Blocked: B trade not approved."]
-    elif not passes_grade_threshold(plan.grade, "A"):
-        return "AVOID", ["Blocked: below A."]
-
-    if plan.execution_qty <= 0:
-        return "AVOID", ["Blocked: zero quantity."]
-
-    return "EXECUTE", [f"Execution filter passed. Tier={plan.execution_tier}, Qty={plan.execution_qty}"]
-
-# =========================================================
-# FREE ALERT
-# =========================================================
-def build_free_alert(plan: TradePlan, context: MarketContext, status: str) -> str:
-    if status != "EXECUTE":
-        return ""
-
-    confidence_score = max(1, min(100, int(round(plan.confidence * 100))))
-    return (
-        f"📊 MARKET INSIGHT — {context.symbol}\n\n"
-        f"A strong setup is active.\n"
-        f"Timing: CONFIRMED\n"
-        f"Confidence: {confidence_score}/100\n"
-        f"Key Level: {context.vwap:.2f}\n\n"
-        f"Join premium for execution access."
+    return AlertPayload(
+        alert_type="DAILY_LEVELS",
+        symbol=symbol,
+        title=title,
+        body=body,
+        grade="INFO",
+        direction="LEVELS",
+        score=0,
+        tags=tags,
+        key=f"DAILY_LEVELS::{symbol}::{today_utc_date()}",
+        timestamp_utc=now_utc_iso(),
     )
 
-# =========================================================
-# OPTIONS CONTRACT PICKER
-# =========================================================
-def candidate_expirations() -> List[date]:
-    today = now_et().date()
-    return [today + timedelta(days=i) for i in range(OPTIONS_DTE_FALLBACK_DAYS + 1)]
+
+# ============================================================
+# TRADE ALERT BUILDER
+# ============================================================
+
+def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
+    symbol = ctx.primary.symbol
+
+    emoji = "🟢" if setup.direction == "BULLISH" else "🔴" if setup.direction == "BEARISH" else "🟡"
+    title = f"{emoji} {symbol} {setup.direction} Setup | Grade {setup.grade} | Score {setup.score}"
+
+    lines: List[str] = [
+        f"Symbol: {symbol}",
+        f"Direction: {setup.direction}",
+        f"Grade: {setup.grade}",
+        f"Score: {setup.score}",
+        f"Price: {ctx.primary.price:.2f}",
+        f"Day Change: {ctx.primary.change_pct:+.2f}%",
+    ]
+
+    if ctx.primary_indicators.vwap is not None:
+        lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
+    if ctx.primary_indicators.rsi is not None:
+        lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
+
+    if ctx.oil:
+        lines.append(f"{ctx.oil.symbol}: {ctx.oil.change_pct:+.2f}%")
+    if ctx.volatility:
+        lines.append(f"{ctx.volatility.symbol}: {ctx.volatility.change_pct:+.2f}%")
+
+    if setup.reasons:
+        lines.append("")
+        lines.append("Core reasons:")
+        for reason in setup.reasons[:5]:
+            lines.append(f"• {reason}")
+
+    if setup.premium_reasons:
+        lines.append("")
+        lines.append("Institutional / premium context:")
+        for reason in setup.premium_reasons[:4]:
+            lines.append(f"• {reason}")
+
+    if setup.risk_flags:
+        lines.append("")
+        lines.append("Risk flags:")
+        for flag in setup.risk_flags[:4]:
+            lines.append(f"• {flag}")
+
+    lines.append("")
+    lines.append(cfg.risk_warning_text)
+
+    body = "\n".join(lines)
+
+    rounded_price = round(ctx.primary.price, cfg.dedupe_price_rounding)
+    key = f"TRADE::{symbol}::{setup.direction}::{setup.grade}::{rounded_price}"
+
+    tags = [
+        symbol.lower(),
+        setup.direction.lower(),
+        f"grade-{setup.grade.lower().replace('+', 'plus')}",
+        "trade-alert",
+    ]
+
+    return AlertPayload(
+        alert_type="TRADE_ALERT",
+        symbol=symbol,
+        title=title,
+        body=body,
+        grade=setup.grade,
+        direction=setup.direction,
+        score=setup.score,
+        tags=tags,
+        key=key,
+        timestamp_utc=now_utc_iso(),
+    )
 
 
-def pick_option_contract(underlying: str, action: str, underlying_price: float):
-    if not alpaca_client or not alpaca_options_ready:
-        return None
+# ============================================================
+# NOTIFIERS
+# ============================================================
 
-    contract_type = ContractType.CALL if action == "BUY_CALL" else ContractType.PUT
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str, enabled: bool):
+        self.token = token
+        self.chat_id = chat_id
+        self.enabled = enabled
 
-    for exp in candidate_expirations():
-        try:
-            req = GetOptionContractsRequest(
-                underlying_symbols=[underlying],
-                status=AssetStatus.ACTIVE,
-                expiration_date_gte=exp,
-                expiration_date_lte=exp,
-                type=contract_type,
-            )
-            result = alpaca_client.get_option_contracts(req)
-            contracts = getattr(result, "option_contracts", []) or []
-
-            ranked = []
-            for contract in contracts:
-                strike = safe_float(getattr(contract, "strike_price", 0.0))
-                symbol = getattr(contract, "symbol", "")
-                if strike <= 0 or not symbol:
-                    continue
-
-                target = underlying_price + OPTIONS_STRIKE_STEP_BUFFER if action == "BUY_CALL" else underlying_price - OPTIONS_STRIKE_STEP_BUFFER
-                ranked.append((abs(strike - target), contract))
-
-            if ranked:
-                ranked.sort(key=lambda x: x[0])
-                return ranked[0][1]
-        except Exception as e:
-            print(f"[OPTION PICKER WARN] {underlying} {action} {exp}: {e}", flush=True)
-
-    return None
-
-# =========================================================
-# ALPACA ORDER STATUS / FILL TRACKING
-# =========================================================
-def get_order_status(order_id: str):
-    if not alpaca_client or not order_id:
-        return None
-    try:
-        return alpaca_client.get_order_by_id(order_id)
-    except Exception as e:
-        print(f"[ORDER STATUS ERROR] {order_id}: {e}", flush=True)
-        return None
-
-
-def normalize_order_status(order_obj) -> str:
-    if order_obj is None:
-        return "unknown"
-    status = getattr(order_obj, "status", None)
-    if status is None:
-        return "unknown"
-    try:
-        return str(status).split(".")[-1].lower()
-    except Exception:
-        return str(status).lower()
-
-
-def order_is_fill_like(status: str) -> bool:
-    return status in {"filled", "partially_filled"}
-
-
-def order_fill_price(order_obj) -> float:
-    return safe_float(getattr(order_obj, "filled_avg_price", None), 0.0)
-
-
-def order_filled_qty(order_obj) -> float:
-    return safe_float(getattr(order_obj, "filled_qty", None), 0.0)
-
-# =========================================================
-# STATE HELPERS
-# =========================================================
-def get_today_key() -> str:
-    return now_et().strftime("%Y-%m-%d")
-
-
-def get_open_trades_for_symbol(state: Dict, symbol: str) -> List[Dict]:
-    return [t for t in state.get("open_trades", []) if t.get("underlying") == symbol]
-
-
-def get_daily_entry_count(state: Dict) -> int:
-    return int(state.get("daily_entries", {}).get(get_today_key(), 0))
-
-
-def increment_daily_entry_count(state: Dict) -> None:
-    today_key = get_today_key()
-    daily_entries = state.setdefault("daily_entries", {})
-    daily_entries[today_key] = int(daily_entries.get(today_key, 0)) + 1
-
-
-def set_recent_closure(state: Dict, symbol: str) -> None:
-    state.setdefault("recent_closures", {})[symbol] = now_et().isoformat()
-
-
-def cooldown_active(state: Dict, symbol: str) -> bool:
-    recent = state.get("recent_closures", {}).get(symbol)
-    if not recent:
-        return False
-    try:
-        last_close = datetime.fromisoformat(recent)
-        return (now_et() - last_close).total_seconds() < COOLDOWN_MINUTES * 60
-    except Exception:
-        return False
-
-
-def can_open_new_trade(state: Dict, context: MarketContext) -> Tuple[bool, str]:
-    if len(state.get("open_trades", [])) >= MAX_OPEN_TRADES:
-        return False, "Max open trades reached."
-    if get_open_trades_for_symbol(state, context.symbol):
-        return False, f"Open trade already exists for {context.symbol}."
-    if get_daily_entry_count(state) >= MAX_NEW_TRADES_PER_DAY:
-        return False, "Max new trades per day reached."
-    if cooldown_active(state, context.symbol):
-        return False, f"Cooldown active for {context.symbol}."
-    if entry_cutoff_reached():
-        return False, "Entry cutoff reached."
-    return True, "Entry allowed."
-
-# =========================================================
-# ENTRY / EXIT EXECUTION
-# =========================================================
-def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) -> None:
-    qty = max(0, int(plan.execution_qty))
-    if qty <= 0:
-        return
-
-    allowed, reason = can_open_new_trade(state, context)
-    if not allowed:
-        broadcast_execution(f"⛔ ENTRY BLOCKED\nUnderlying: {context.symbol}\nReason: {reason}")
-        return
-
-    if not LIVE_TRADING:
-        broadcast_execution(
-            f"[PAPER MODE LOCAL] ENTRY TRACKED\nUnderlying: {context.symbol}\nAction: {plan.action}\nGrade: {plan.grade}\nTier: {plan.execution_tier}\nQty: {qty}"
-        )
-        return
-
-    if alpaca_client is None:
-        broadcast_execution("❌ LIVE_TRADING is ON but Alpaca is not connected.")
-        return
-
-    try:
-        contract = pick_option_contract(context.symbol, plan.action, context.current_price)
-        if contract is None:
-            broadcast_execution(f"❌ No option contract found for {context.symbol} {plan.action}")
+    def send(self, text: str) -> None:
+        if not self.enabled or not self.token or not self.chat_id:
             return
 
-        option_symbol = getattr(contract, "symbol", None)
-        strike_price = getattr(contract, "strike_price", "NA")
-        expiration_date = getattr(contract, "expiration_date", "NA")
-
-        if not option_symbol:
-            broadcast_execution(f"❌ Contract object missing symbol for {context.symbol} {plan.action}")
-            return
-
-        quote = get_option_latest_quote(option_symbol)
-        ok, quote_reason = quote_is_tradeable(quote)
-        if not ok:
-            broadcast_execution(
-                f"⛔ ENTRY BLOCKED — BAD OPTION QUOTE\n"
-                f"Underlying: {context.symbol}\n"
-                f"Contract: {option_symbol}\n"
-                f"Reason: {quote_reason}"
-            )
-            return
-
-        if is_regular_market_hours_et() and ALLOW_MARKET_ORDERS_DURING_RTH:
-            order_request = MarketOrderRequest(
-                symbol=option_symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            )
-            order_type_used = "MARKET"
-            limit_price_used = None
-        else:
-            limit_price_used = compute_buy_limit_from_quote(quote)
-            order_request = LimitOrderRequest(
-                symbol=option_symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                limit_price=limit_price_used,
-            )
-            order_type_used = "LIMIT"
-
-        order = alpaca_client.submit_order(order_data=order_request)
-
-        trade_record = {
-            "underlying": context.symbol,
-            "option_symbol": option_symbol,
-            "action": plan.action,
-            "grade": plan.grade,
-            "score": plan.score,
-            "execution_tier": plan.execution_tier,
-            "qty": qty,
-            "entry_underlying": context.current_price,
-            "entry_time": now_et().isoformat(),
-            "entry_order_id": str(order.id),
-            "entry_order_status": "submitted",
-            "entry_fill_price": None,
-            "entry_filled_qty": 0,
-            "entry_fill_alert_sent": False,
-            "exit_order_id": None,
-            "exit_order_status": None,
-            "exit_fill_price": None,
-            "exit_filled_qty": 0,
-            "exit_fill_alert_sent": False,
-            "be_armed": False,
-            "strike": str(strike_price),
-            "expiry": str(expiration_date),
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
         }
-        state["open_trades"].append(trade_record)
-        increment_daily_entry_count(state)
-        save_state(state)
-
-        broadcast_execution(
-            f"✅ ALPACA OPTION ORDER SENT\n"
-            f"Underlying: {context.symbol}\n"
-            f"Contract: {option_symbol}\n"
-            f"Action: {plan.action}\n"
-            f"Qty: {qty}\n"
-            f"Order Type: {order_type_used}\n"
-            f"Bid: {quote['bid']:.4f}\n"
-            f"Ask: {quote['ask']:.4f}\n"
-            f"Spread: ${quote['spread_abs']:.4f} ({quote['spread_pct']:.2f}%)\n"
-            f"Limit Price: {limit_price_used if limit_price_used is not None else 'N/A'}\n"
-            f"Strike: {strike_price}\n"
-            f"Expiry: {expiration_date}\n"
-            f"Grade: {plan.grade}\n"
-            f"Score: {plan.score}\n"
-            f"Tier: {plan.execution_tier}\n"
-            f"Order ID: {order.id}"
-        )
-
-        log_trade_event(
-            event="ENTRY",
-            underlying=context.symbol,
-            option_symbol=option_symbol,
-            action=plan.action,
-            grade=plan.grade,
-            execution_tier=plan.execution_tier,
-            qty=qty,
-            entry_underlying=context.current_price,
-            current_underlying=context.current_price,
-            underlying_move_pct=0.0,
-            reason="entry_sent_real_quote_pricing",
-            order_id=str(order.id),
-        )
-
-    except Exception as e:
-        broadcast_execution(f"❌ ALPACA OPTION ENTRY FAILED: {e}")
+        response = requests.post(url, json=payload, timeout=20)
+        response.raise_for_status()
 
 
-def compute_directional_move_pct(trade: Dict, current_underlying: float) -> float:
-    entry = safe_float(trade.get("entry_underlying"), 0.0)
-    if entry <= 0:
-        return 0.0
+class DiscordNotifier:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
 
-    raw_move = ((current_underlying - entry) / entry) * 100.0
-    return raw_move if trade.get("action") == "BUY_CALL" else -raw_move
-
-
-def should_exit_trade(trade: Dict, current_underlying: float) -> Tuple[bool, str, float]:
-    move_pct = compute_directional_move_pct(trade, current_underlying)
-    action = trade.get("action", "BUY_CALL")
-
-    tp = CALL_TP_UNDERLYING_PCT if action == "BUY_CALL" else PUT_TP_UNDERLYING_PCT
-    sl = CALL_SL_UNDERLYING_PCT if action == "BUY_CALL" else PUT_SL_UNDERLYING_PCT
-
-    try:
-        entry_time = datetime.fromisoformat(trade["entry_time"])
-    except Exception:
-        entry_time = now_et()
-
-    age_minutes = max(0, (now_et() - entry_time).total_seconds() / 60.0)
-
-    if move_pct >= BREAK_EVEN_TRIGGER_PCT and not trade.get("be_armed", False):
-        trade["be_armed"] = True
-        return False, "break_even_armed", move_pct
-
-    if move_pct >= tp:
-        return True, "take_profit_hit", move_pct
-
-    effective_stop = 0.0 if trade.get("be_armed", False) else -sl
-    if move_pct <= effective_stop:
-        return True, "break_even_exit" if trade.get("be_armed", False) else "stop_hit", move_pct
-
-    if age_minutes >= MAX_HOLD_MINUTES:
-        return True, "max_hold_time_exit", move_pct
-
-    if force_exit_reached():
-        return True, "forced_end_of_day_exit", move_pct
-
-    return False, "hold", move_pct
+    def send(self, webhook_url: str, content: str) -> None:
+        if not self.enabled or not webhook_url:
+            return
+        payload = {"content": content}
+        response = requests.post(webhook_url, json=payload, timeout=20)
+        response.raise_for_status()
 
 
-def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move_pct: float, state: Dict) -> None:
-    if alpaca_client is None:
-        broadcast_execution(f"❌ EXIT FAILED — Alpaca not connected for {trade.get('underlying')}")
-        return
+# ============================================================
+# FORMATTERS
+# ============================================================
 
-    option_symbol = trade["option_symbol"]
-    qty = int(trade["qty"])
+def format_for_telegram(alert: AlertPayload) -> str:
+    return f"{alert.title}\n\n{alert.body}\n\nUTC: {alert.timestamp_utc}"
 
-    try:
-        quote = get_option_latest_quote(option_symbol)
-        ok, quote_reason = quote_is_tradeable(quote)
-        if not ok:
-            broadcast_execution(
-                f"⛔ EXIT BLOCKED — BAD OPTION QUOTE\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {option_symbol}\n"
-                f"Reason: {quote_reason}"
-            )
+
+def format_for_discord(alert: AlertPayload) -> str:
+    hashtags = " ".join(f"#{tag}" for tag in alert.tags[:6])
+    return f"**{alert.title}**\n```{alert.body}```\n{hashtags}\nUTC: {alert.timestamp_utc}"
+
+
+# ============================================================
+# ROUTING RULES
+# ============================================================
+
+def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
+    current_ts = time.time()
+    last_ts = state.last_alert_times.get(key, 0)
+    return (current_ts - last_ts) >= cooldown_seconds
+
+
+def mark_sent(state: PersistentState, key: str) -> None:
+    state.last_alert_times[key] = time.time()
+
+
+def route_alert(
+    alert: AlertPayload,
+    cfg: Config,
+    state: PersistentState,
+    telegram: TelegramNotifier,
+    discord: DiscordNotifier
+) -> None:
+    # DAILY LEVELS ROUTING
+    if alert.alert_type == "DAILY_LEVELS":
+        if not cfg.daily_levels_enabled:
             return
 
-        if is_regular_market_hours_et() and ALLOW_MARKET_ORDERS_DURING_RTH:
-            order_request = MarketOrderRequest(
-                symbol=option_symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-            )
-            order_type_used = "MARKET"
-            limit_price_used = None
-        else:
-            limit_price_used = compute_sell_limit_from_quote(quote)
-            order_request = LimitOrderRequest(
-                symbol=option_symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-                limit_price=limit_price_used,
-            )
-            order_type_used = "LIMIT"
+        if cfg.daily_levels_only_once_per_day and state.last_daily_levels_date == today_utc_date():
+            return
 
-        order = alpaca_client.submit_order(order_data=order_request)
+        if not should_send_by_cooldown(state, alert.key, cfg.daily_levels_cooldown_seconds):
+            return
 
-        broadcast_execution(
-            f"🔒 EXIT ORDER SENT\n"
-            f"Underlying: {trade['underlying']}\n"
-            f"Contract: {option_symbol}\n"
-            f"Action: SELL TO CLOSE\n"
-            f"Qty: {qty}\n"
-            f"Order Type: {order_type_used}\n"
-            f"Bid: {quote['bid']:.4f}\n"
-            f"Ask: {quote['ask']:.4f}\n"
-            f"Spread: ${quote['spread_abs']:.4f} ({quote['spread_pct']:.2f}%)\n"
-            f"Limit Price: {limit_price_used if limit_price_used is not None else 'N/A'}\n"
-            f"Reason: {reason}\n"
-            f"Underlying Move: {move_pct:.2f}%\n"
-            f"Order ID: {order.id}"
-        )
+        msg_discord = format_for_discord(alert)
+        msg_telegram = format_for_telegram(alert)
 
-        log_trade_event(
-            event="EXIT",
-            underlying=trade["underlying"],
-            option_symbol=option_symbol,
-            action=trade["action"],
-            grade=trade["grade"],
-            execution_tier=trade["execution_tier"],
-            qty=qty,
-            entry_underlying=safe_float(trade["entry_underlying"]),
-            current_underlying=current_underlying,
-            underlying_move_pct=move_pct,
-            reason=reason,
-            order_id=str(order.id),
-        )
+        if cfg.discord_daily_levels_webhook:
+            discord.send(cfg.discord_daily_levels_webhook, msg_discord)
 
-        trade["exit_order_id"] = str(order.id)
-        trade["exit_order_status"] = "submitted"
-        trade["exit_fill_price"] = None
-        trade["exit_filled_qty"] = 0
-        trade["exit_fill_alert_sent"] = False
-        save_state(state)
+        if cfg.telegram_enabled:
+            telegram.send(msg_telegram)
 
-    except Exception as e:
-        broadcast_execution(
-            f"❌ ALPACA OPTION EXIT FAILED\n"
-            f"Underlying: {trade.get('underlying')}\n"
-            f"Contract: {option_symbol}\n"
-            f"Reason: {reason}\n"
-            f"Error: {e}"
-        )
-
-# =========================================================
-# FILL TRACKING
-# =========================================================
-def update_entry_fills(state: Dict) -> None:
-    changed = False
-
-    for trade in state.get("open_trades", []):
-        order_id = trade.get("entry_order_id")
-        if not order_id:
-            continue
-
-        order_obj = get_order_status(order_id)
-        status = normalize_order_status(order_obj)
-        prev_status = trade.get("entry_order_status")
-
-        trade["entry_order_status"] = status
-        trade["entry_filled_qty"] = order_filled_qty(order_obj)
-
-        fill_price = order_fill_price(order_obj)
-        if fill_price > 0:
-            trade["entry_fill_price"] = fill_price
-
-        if status != prev_status:
-            broadcast_execution(
-                f"📥 ENTRY ORDER STATUS UPDATE\n"
-                f"Underlying: {trade.get('underlying', 'N/A')}\n"
-                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
-                f"Order ID: {order_id}\n"
-                f"Status: {status}\n"
-                f"Filled Qty: {trade.get('entry_filled_qty', 0)}\n"
-                f"Avg Fill Price: {trade.get('entry_fill_price') if trade.get('entry_fill_price') else 'N/A'}"
-            )
-            changed = True
-
-        if order_is_fill_like(status) and not trade.get("entry_fill_alert_sent", False):
-            broadcast_execution(
-                f"✅ ENTRY FILL CONFIRMED\n"
-                f"Underlying: {trade.get('underlying', 'N/A')}\n"
-                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
-                f"Status: {status}\n"
-                f"Filled Qty: {trade.get('entry_filled_qty', 0)}\n"
-                f"Avg Fill Price: {trade.get('entry_fill_price') if trade.get('entry_fill_price') else 'N/A'}"
-            )
-
-            log_trade_event(
-                event="ENTRY_FILL",
-                underlying=trade.get("underlying", ""),
-                option_symbol=trade.get("option_symbol", ""),
-                action=trade.get("action", ""),
-                grade=trade.get("grade", "B"),
-                execution_tier=trade.get("execution_tier", "NONE"),
-                qty=int(trade.get("qty", 0)),
-                entry_underlying=safe_float(trade.get("entry_underlying"), 0.0),
-                current_underlying=safe_float(trade.get("entry_underlying"), 0.0),
-                underlying_move_pct=0.0,
-                reason=status,
-                order_id=order_id,
-            )
-
-            trade["entry_fill_alert_sent"] = True
-            changed = True
-
-    if changed:
-        save_state(state)
-
-
-def update_exit_fills(state: Dict) -> None:
-    changed = False
-
-    for trade in state.get("open_trades", []):
-        exit_order_id = trade.get("exit_order_id")
-        if not exit_order_id:
-            continue
-
-        order_obj = get_order_status(exit_order_id)
-        status = normalize_order_status(order_obj)
-        prev_status = trade.get("exit_order_status")
-
-        trade["exit_order_status"] = status
-        trade["exit_filled_qty"] = order_filled_qty(order_obj)
-
-        fill_price = order_fill_price(order_obj)
-        if fill_price > 0:
-            trade["exit_fill_price"] = fill_price
-
-        if status != prev_status:
-            broadcast_execution(
-                f"📤 EXIT ORDER STATUS UPDATE\n"
-                f"Underlying: {trade.get('underlying', 'N/A')}\n"
-                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
-                f"Order ID: {exit_order_id}\n"
-                f"Status: {status}\n"
-                f"Filled Qty: {trade.get('exit_filled_qty', 0)}\n"
-                f"Avg Fill Price: {trade.get('exit_fill_price') if trade.get('exit_fill_price') else 'N/A'}"
-            )
-            changed = True
-
-        if status == "filled" and not trade.get("exit_fill_alert_sent", False):
-            entry_fill = safe_float(trade.get("entry_fill_price"), 0.0)
-            exit_fill = safe_float(trade.get("exit_fill_price"), 0.0)
-            pnl_pct = ((exit_fill - entry_fill) / entry_fill * 100.0) if entry_fill > 0 else 0.0
-
-            broadcast_execution(
-                f"🏁 TRADE CLOSED\n"
-                f"Underlying: {trade.get('underlying', 'N/A')}\n"
-                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
-                f"Entry Fill: {entry_fill if entry_fill > 0 else 'N/A'}\n"
-                f"Exit Fill: {exit_fill if exit_fill > 0 else 'N/A'}\n"
-                f"PnL: {pnl_pct:.2f}%\n"
-                f"Grade: {trade.get('grade', 'B')}\n"
-                f"Tier: {trade.get('execution_tier', 'NONE')}"
-            )
-
-            log_trade_event(
-                event="EXIT_FILL",
-                underlying=trade.get("underlying", ""),
-                option_symbol=trade.get("option_symbol", ""),
-                action=trade.get("action", ""),
-                grade=trade.get("grade", "B"),
-                execution_tier=trade.get("execution_tier", "NONE"),
-                qty=int(trade.get("qty", 0)),
-                entry_underlying=safe_float(trade.get("entry_underlying"), 0.0),
-                current_underlying=safe_float(trade.get("entry_underlying"), 0.0),
-                underlying_move_pct=0.0,
-                reason=f"pnl_pct={pnl_pct:.2f}",
-                order_id=exit_order_id,
-            )
-
-            trade["exit_fill_alert_sent"] = True
-            changed = True
-
-    if changed:
-        save_state(state)
-
-
-def purge_filled_exits(state: Dict) -> None:
-    remaining = []
-    changed = False
-
-    for trade in state.get("open_trades", []):
-        if trade.get("exit_order_status") == "filled":
-            set_recent_closure(state, trade.get("underlying", ""))
-            changed = True
-            continue
-        remaining.append(trade)
-
-    if changed:
-        state["open_trades"] = remaining
-        save_state(state)
-
-# =========================================================
-# OPEN TRADE MANAGEMENT
-# =========================================================
-def manage_open_trades(state: Dict) -> None:
-    update_entry_fills(state)
-    update_exit_fills(state)
-    purge_filled_exits(state)
-
-    open_trades = list(state.get("open_trades", []))
-    if not open_trades:
+        mark_sent(state, alert.key)
+        state.last_daily_levels_date = today_utc_date()
         return
 
-    for trade in open_trades:
-        if trade.get("exit_order_id"):
-            continue
+    # TRADE ALERT ROUTING
+    if alert.alert_type == "TRADE_ALERT":
+        if not should_send_by_cooldown(state, alert.key, cfg.alert_cooldown_seconds):
+            return
 
-        snapshot = get_symbol_snapshot(trade.get("underlying", ""))
-        if not snapshot:
-            continue
+        msg_discord = format_for_discord(alert)
+        msg_telegram = format_for_telegram(alert)
 
-        current_underlying = safe_float(snapshot["price"])
-        should_exit, reason, move_pct = should_exit_trade(trade, current_underlying)
+        # Telegram always gets qualified trade alerts
+        if cfg.telegram_enabled:
+            telegram.send(msg_telegram)
 
-        if reason == "break_even_armed":
-            save_state(state)
-            broadcast_execution(
-                f"🛡 BREAK-EVEN ARMED\n"
-                f"Underlying: {trade.get('underlying', 'N/A')}\n"
-                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
-                f"Underlying Move: {move_pct:.2f}%"
-            )
-            continue
+        # Free Discord threshold
+        if grade_rank(alert.grade) >= grade_rank(cfg.free_min_grade) and alert.score >= cfg.min_score_for_free:
+            if cfg.discord_free_webhook:
+                discord.send(cfg.discord_free_webhook, msg_discord)
 
-        if should_exit:
-            submit_option_exit(trade, current_underlying, reason, move_pct, state)
+        # Premium Discord threshold
+        if grade_rank(alert.grade) >= grade_rank(cfg.premium_min_grade) and alert.score >= cfg.min_score_for_premium:
+            if cfg.discord_premium_webhook:
+                discord.send(cfg.discord_premium_webhook, msg_discord)
         else:
-            broadcast_execution(
-                f"📡 OPEN TRADE CHECK\n"
-                f"Underlying: {trade.get('underlying', 'N/A')}\n"
-                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
-                f"Action: {trade.get('action', 'N/A')}\n"
-                f"Grade: {trade.get('grade', 'N/A')}\n"
-                f"Underlying Entry: {safe_float(trade.get('entry_underlying'), 0.0):.2f}\n"
-                f"Underlying Now: {current_underlying:.2f}\n"
-                f"Underlying Move: {move_pct:.2f}%\n"
-                f"Break-Even Armed: {trade.get('be_armed', False)}"
-            )
+            # User preference path:
+            # still allow sub-A qualified alerts to land in premium if enabled
+            if cfg.send_sub_a_to_premium and cfg.discord_premium_webhook:
+                discord.send(cfg.discord_premium_webhook, msg_discord)
 
-# =========================================================
-# MAIN
-# =========================================================
-def run_symbol(symbol: str, state: Dict) -> None:
-    context = build_market_context(symbol)
-    if not context:
-        print(f"[WARN] Could not build context for {symbol}", flush=True)
+        mark_sent(state, alert.key)
         return
 
-    plan = make_hybrid_decision(context)
-    plan = apply_constituent_confirmation(context, plan)
-    status, _ = execution_filter(plan, context)
 
-    free_msg = build_free_alert(plan, context, status)
-    if free_msg:
-        broadcast_free(free_msg)
+# ============================================================
+# DECISION ENGINE
+# ============================================================
 
-    if status == "EXECUTE":
-        submit_option_entry(plan, context, state)
+def generate_trade_alert_if_valid(ctx: MarketContext, cfg: Config) -> Optional[AlertPayload]:
+    setup = score_setup(ctx, cfg)
+
+    # Filter out neutral / weak conditions
+    if setup.direction == "NEUTRAL":
+        return None
+
+    # Minimum meaningful setup
+    if setup.score < min(cfg.min_score_for_free, cfg.min_score_for_premium):
+        return None
+
+    return build_trade_alert(ctx, setup, cfg)
 
 
-def run_cycle(state: Dict) -> None:
-    manage_open_trades(state)
+# ============================================================
+# HEARTBEAT / INFO
+# ============================================================
 
-    for symbol in WATCHLIST:
-        run_symbol(symbol, state)
-        time.sleep(2)
+def print_snapshot(ctx: MarketContext, cfg: Config) -> None:
+    primary_vwap = f"{ctx.primary_indicators.vwap:.2f}" if ctx.primary_indicators.vwap is not None else "n/a"
+    primary_rsi = f"{ctx.primary_indicators.rsi:.1f}" if ctx.primary_indicators.rsi is not None else "n/a"
+    oil_info = f"{ctx.oil.symbol} {ctx.oil.change_pct:+.2f}%" if ctx.oil else "Oil n/a"
+    vol_info = f"{ctx.volatility.symbol} {ctx.volatility.change_pct:+.2f}%" if ctx.volatility else "Vol n/a"
 
-
-def main() -> None:
-    ensure_trade_log_exists()
-    state = normalize_state(load_state())
-    save_state(state)
-
-    broadcast_execution(
-        "🚀 ELITE EXECUTION ENGINE STARTED\n"
-        f"Watchlist: {', '.join(WATCHLIST)}\n"
-        f"LIVE_TRADING: {LIVE_TRADING}\n"
-        f"ALPACA_PAPER: {ALPACA_PAPER}\n"
-        f"Alpaca Connected: {alpaca_client is not None}\n"
-        f"Alpaca Options Ready: {alpaca_options_ready}\n"
-        f"Option Feed: {OPTION_QUOTE_FEED}\n"
-        f"Open Trades Loaded: {len(state.get('open_trades', []))}\n"
-        f"RUN_ONCE: {RUN_ONCE}"
+    print(
+        f"[{now_utc_iso()}] "
+        f"{ctx.primary.symbol} {ctx.primary.price:.2f} ({ctx.primary.change_pct:+.2f}%) | "
+        f"VWAP {primary_vwap} | RSI {primary_rsi} | "
+        f"{oil_info} | {vol_info}"
     )
 
-    if alpaca_client is not None:
-        try:
-            account = alpaca_client.get_account()
-            broadcast_execution(
-                "✅ ALPACA CONNECTION OK\n"
-                f"Status: {account.status}\n"
-                f"Buying Power: {account.buying_power}\n"
-                f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}"
-            )
-        except Exception as e:
-            broadcast_execution(f"❌ ALPACA CONNECTION FAILED: {e}")
 
-    if RUN_ONCE:
-        run_cycle(state)
-        return
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def run_engine() -> None:
+    cfg = load_config()
+
+    if not cfg.twelve_data_api_key:
+        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
+
+    state = PersistentState.load(cfg.state_file)
+    client = TwelveDataClient(cfg.twelve_data_api_key, cfg)
+
+    telegram = TelegramNotifier(
+        token=cfg.telegram_bot_token,
+        chat_id=cfg.telegram_chat_id,
+        enabled=cfg.telegram_enabled,
+    )
+    discord = DiscordNotifier(enabled=cfg.discord_enabled)
+
+    print("Elite normalized engine starting...")
+    print(f"Primary symbol: {cfg.primary_symbol}")
+    print(f"Secondary symbol: {cfg.secondary_symbol}")
+    print(f"Oil symbol: {cfg.oil_symbol}")
+    print(f"Poll seconds: {cfg.poll_seconds}")
 
     while True:
         try:
-            run_cycle(state)
-        except Exception as e:
-            broadcast_execution(f"❌ MAIN LOOP ERROR: {e}")
-        time.sleep(POLL_SECONDS)
+            ctx = build_market_context(client, cfg)
+            print_snapshot(ctx, cfg)
 
+            # 1) Daily levels alert path
+            daily_levels_alert = build_daily_levels_alert(ctx, cfg)
+            route_alert(daily_levels_alert, cfg, state, telegram, discord)
+
+            # 2) Trade alert path
+            trade_alert = generate_trade_alert_if_valid(ctx, cfg)
+            if trade_alert:
+                route_alert(trade_alert, cfg, state, telegram, discord)
+
+            # Save lightweight market snapshot
+            state.last_market_snapshot = {
+                "primary_price": ctx.primary.price,
+                "primary_change_pct": ctx.primary.change_pct,
+                "oil_change_pct": ctx.oil.change_pct if ctx.oil else 0.0,
+                "vol_change_pct": ctx.volatility.change_pct if ctx.volatility else 0.0,
+                "updated_at": time.time(),
+            }
+
+            state.save(cfg.state_file)
+
+        except KeyboardInterrupt:
+            print("Shutting down cleanly...")
+            state.save(cfg.state_file)
+            break
+
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            traceback.print_exc()
+
+        time.sleep(cfg.poll_seconds)
+
+
+# ============================================================
+# ENTRY
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    run_engine()
