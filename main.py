@@ -1,7 +1,11 @@
 import os
 import csv
 import requests
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timedelta
+
+import matplotlib.pyplot as plt
 
 # =========================
 # ENV VARIABLES
@@ -13,11 +17,19 @@ DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE")
 DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM")
 DISCORD_WEBHOOK_PREMIUM_LEVELS = os.getenv("DISCORD_WEBHOOK_PREMIUM_LEVELS")
 
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+
+BOT_MODE = os.getenv("BOT_MODE", "test_all").strip().lower()
+
 # =========================
 # FILE PATHS
 # =========================
 TRADE_LOG_FILE = "trade_log.csv"
 CLOSED_TRADE_LOG_FILE = "closed_trade_log.csv"
+ARTIFACTS_DIR = "artifacts"
+PNL_CHART_FILE = "pnl_chart.png"
 
 # =========================
 # GLOBAL TRADE STORE
@@ -70,6 +82,7 @@ def parse_dt(value):
     except Exception:
         return None
 
+
 # =========================
 # SEND FUNCTIONS
 # =========================
@@ -117,6 +130,7 @@ def send_discord_premium(message):
 def send_discord_premium_levels(message):
     webhook = DISCORD_WEBHOOK_PREMIUM_LEVELS or DISCORD_WEBHOOK_PREMIUM
     send_discord(webhook, message)
+
 
 # =========================
 # CSV / JOURNAL LOGGING
@@ -176,6 +190,7 @@ def load_closed_trades():
         for row in reader:
             rows.append(row)
     return rows
+
 
 # =========================
 # STATE 4 - ENTRY DISCIPLINE
@@ -275,6 +290,7 @@ def apply_state_4_discipline(decision, context):
         "timing": timing,
         "reasons": reasons
     }
+
 
 # =========================
 # STATE 5 - SIZE ENGINE
@@ -379,6 +395,7 @@ def calculate_confidence_and_size(decision, context, discipline):
         "size_notes": size_notes
     }
 
+
 # =========================
 # STATE 6 - TRADE MANAGEMENT
 # =========================
@@ -450,6 +467,7 @@ def build_trade_management_plan(decision, context, discipline, sizing):
         "move_stop_rule": move_stop_rule,
         "management_notes": management_notes
     }
+
 
 # =========================
 # STATE 7 - OPTIONS CONTRACT ENGINE
@@ -576,6 +594,7 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
         "reasons": reasons,
         "blockers": blockers
     }
+
 
 # =========================
 # STATE 8 - LIVE TRADE MANAGER
@@ -715,6 +734,7 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
         "closed": trade["closed"],
     }
     return summary
+
 
 # =========================
 # STATE 9/10 - REPORTING ENGINE
@@ -935,6 +955,86 @@ Generated: {now_str()}
 {build_dashboard_snapshot(filter_rows_by_days(load_closed_trades(), 7), label="LAST 7 DAYS")}
 """.strip()
 
+
+# =========================
+# STATE 12 - EMAIL + PNL CHART
+# =========================
+def generate_pnl_chart():
+    rows = load_closed_trades()
+    if not rows:
+        print("No data for chart")
+        return None
+
+    pnl = []
+    cumulative = 0.0
+
+    for r in rows:
+        change = safe_float(r.get("contract_pnl_pct", 0.0))
+        cumulative += change
+        pnl.append(cumulative)
+
+    if not pnl:
+        return None
+
+    plt.figure()
+    plt.plot(pnl)
+    plt.title("UnBiased Bot PnL Curve")
+    plt.xlabel("Trades")
+    plt.ylabel("Cumulative %")
+    plt.savefig(PNL_CHART_FILE)
+    plt.close()
+
+    return PNL_CHART_FILE
+
+
+def send_email_report(subject, body):
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+        print("Email not configured")
+        print("EMAIL_SENDER exists:", bool(EMAIL_SENDER))
+        print("EMAIL_PASSWORD exists:", bool(EMAIL_PASSWORD))
+        print("EMAIL_RECEIVER exists:", bool(EMAIL_RECEIVER))
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+    msg.set_content(body)
+
+    for file_path in [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]:
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                msg.add_attachment(
+                    f.read(),
+                    maintype="application",
+                    subtype="octet-stream",
+                    filename=os.path.basename(file_path),
+                )
+
+    chart = generate_pnl_chart()
+    if chart and os.path.exists(chart):
+        with open(chart, "rb") as f:
+            msg.add_attachment(
+                f.read(),
+                maintype="image",
+                subtype="png",
+                filename="pnl_chart.png",
+            )
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        print("Email sent successfully")
+    except Exception as e:
+        print(f"Email failed: {e}")
+
+
+def send_weekly_email_report():
+    body = build_email_ready_weekly_body()
+    send_email_report("UNBIASED BOT WEEKLY REPORT", body)
+
+
 # =========================
 # FORMATTERS
 # =========================
@@ -1142,6 +1242,7 @@ def format_live_management_update(summary):
 
     return "\n".join(lines)
 
+
 # =========================
 # ROUTING
 # =========================
@@ -1164,10 +1265,11 @@ def route_alerts(decision, context):
     symbol = str(get_attr(context, "symbol", "QQQ")).upper()
 
     if execution_grade in ["A+", "A"] and size_label in ["AGGRESSIVE", "NORMAL"] and options_allowed:
+        alert_text = format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan)
         register_open_trade(symbol, context, discipline, sizing, management, options_plan)
         send_telegram(format_telegram_alert(decision, context, discipline, sizing, management, options_plan))
-        send_discord_premium(format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan))
-        send_discord_premium_levels(format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan))
+        send_discord_premium(alert_text)
+        send_discord_premium_levels(alert_text)
         send_discord_free(format_discord_free_teaser(decision, context, discipline, sizing))
 
     elif execution_grade == "WATCHLIST" or size_label == "NO EXECUTION" or not options_allowed:
@@ -1180,6 +1282,7 @@ def route_alerts(decision, context):
 
     elif execution_grade == "AVOID":
         print(f"[AVOID] No alert sent for {symbol}")
+
 
 # =========================
 # LIVE / REPORT ROUTES
@@ -1217,6 +1320,7 @@ def print_email_ready_weekly_body():
     print("\n=== EMAIL READY WEEKLY BODY ===\n")
     print(body)
     print("\n===============================\n")
+
 
 # =========================
 # TEST HELPERS
@@ -1286,12 +1390,10 @@ def test_reports():
     send_weekly_report()
     print_email_ready_weekly_body()
 
+
 # =========================
 # STATE 11 - LOG BACKUP + ROUTER
 # =========================
-BOT_MODE = os.getenv("BOT_MODE", "test_all").strip().lower()
-
-
 def run_trade_alert_mode():
     send_test_alert()
 
@@ -1310,6 +1412,10 @@ def run_weekly_report_mode():
 
 def run_dashboard_mode():
     send_performance_summary()
+
+
+def run_email_weekly_mode():
+    send_weekly_email_report()
 
 
 def run_test_all_mode():
@@ -1332,26 +1438,29 @@ def run_bot_mode():
         run_weekly_report_mode()
     elif BOT_MODE == "dashboard":
         run_dashboard_mode()
+    elif BOT_MODE == "email_weekly":
+        run_email_weekly_mode()
     else:
         run_test_all_mode()
 
 
 def save_logs_to_artifact_folder():
-    folder = "artifacts"
-    os.makedirs(folder, exist_ok=True)
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
     files_to_save = [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]
+    if os.path.exists(PNL_CHART_FILE):
+        files_to_save.append(PNL_CHART_FILE)
 
     for f in files_to_save:
         if os.path.exists(f):
             try:
-                with open(f, "r", encoding="utf-8") as src:
+                with open(f, "rb") as src:
                     data = src.read()
 
-                with open(os.path.join(folder, f), "w", encoding="utf-8") as dst:
+                with open(os.path.join(ARTIFACTS_DIR, os.path.basename(f)), "wb") as dst:
                     dst.write(data)
 
-                print(f"Saved {f} to artifacts/")
+                print(f"Saved {f} to {ARTIFACTS_DIR}/")
             except Exception as e:
                 print(f"Error saving {f}: {e}")
         else:
@@ -1368,6 +1477,7 @@ def load_logs_if_exist():
 
 def end_of_run_cleanup():
     print("\n=== END OF RUN CLEANUP ===")
+    generate_pnl_chart()
     save_logs_to_artifact_folder()
     print("Logs prepared for upload")
 
