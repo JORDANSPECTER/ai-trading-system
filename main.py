@@ -1,8 +1,7 @@
 import os
 import json
-import math
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -284,13 +283,15 @@ class TwelveDataClient:
         response = requests.get(f"{self.BASE_URL}/{endpoint}", params=params, timeout=20)
         response.raise_for_status()
         data = response.json()
+
         if isinstance(data, dict) and data.get("status") == "error":
             raise RuntimeError(f"Twelve Data error: {data}")
         return data
 
     def get_quote(self, symbol: str) -> Quote:
         if not symbol:
-            raise RuntimeError("Symbol is blank. Check your GitHub secrets.")
+            raise RuntimeError("Symbol is blank. Check GitHub secrets.")
+
         data = self._get("quote", {"symbol": symbol})
 
         price = safe_float(data.get("close"), 0.0)
@@ -320,6 +321,7 @@ class TwelveDataClient:
             values = data.get("values", [])
             if not values:
                 return None
+
             latest = values[0]
             if endpoint == "vwap":
                 return safe_float(latest.get("vwap"), None)
@@ -536,6 +538,7 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
 
 def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
     emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
+
     lines = [
         f"Symbol: {ctx.primary.symbol}",
         f"Direction: {setup.direction}",
@@ -670,6 +673,7 @@ def route_alert(
     msg_discord = format_for_discord(alert)
     msg_telegram = format_for_telegram(alert)
 
+    # DAILY LEVELS -> FREE DAILY LEVELS CHANNEL ONLY
     if alert.alert_type == "DAILY_LEVELS":
         if not cfg.daily_levels_enabled:
             return
@@ -688,20 +692,17 @@ def route_alert(
         state.last_daily_levels_date = today_utc_date()
         return
 
+    # TRADE ALERTS
     if alert.alert_type != "TRADE_ALERT":
         return
 
     if not should_send_by_cooldown(state, alert.key, cfg.alert_cooldown_seconds):
         return
 
-    # Telegram gets trade alerts too
     if cfg.telegram_enabled:
         telegram.send(msg_telegram)
 
-    # STRICT ROUTING:
-    # A / A+ = PREMIUM ONLY
-    # B / C = FREE ONLY
-    # D = nothing
+    # A / A+ -> PREMIUM DAILY LEVELS CHANNEL
     if (
         grade_rank(alert.grade) >= grade_rank(cfg.premium_min_grade)
         and alert.score >= cfg.min_score_for_premium
@@ -709,6 +710,7 @@ def route_alert(
         if cfg.discord_premium_webhook:
             discord.send(cfg.discord_premium_webhook, msg_discord)
 
+    # B / C -> FREE ALERTS CHANNEL
     elif (
         grade_rank(alert.grade) >= grade_rank(cfg.free_min_grade)
         and alert.score >= cfg.min_score_for_free
@@ -765,6 +767,7 @@ def run_once() -> None:
         "vol_change_pct": ctx.volatility.change_pct if ctx.volatility else 0.0,
         "updated_at": time.time(),
     }
+
     state.save(cfg.state_file)
     print("Run complete.")
 
