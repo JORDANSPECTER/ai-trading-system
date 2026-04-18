@@ -33,7 +33,7 @@ jobs:
             echo '{"last_alert_times": {}, "last_market_snapshot": {}, "execution_submitted_signals": {}}' > elite_state.json
           fi
           if [ ! -f performance_state.json ]; then
-            echo '{"history": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
+            echo '{"history": [], "pending_signals": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
           fi
 
       - name: Install dependencies
@@ -100,6 +100,10 @@ jobs:
           EVENING_REPORT_MINUTE_ET: ${{ secrets.EVENING_REPORT_MINUTE_ET }}
           WEEKLY_REPORT_HOUR_ET: ${{ secrets.WEEKLY_REPORT_HOUR_ET }}
           WEEKLY_REPORT_MINUTE_ET: ${{ secrets.WEEKLY_REPORT_MINUTE_ET }}
+
+          TRACKING_ENABLED: ${{ secrets.TRACKING_ENABLED }}
+          TRACKING_TARGET_PCT: ${{ secrets.TRACKING_TARGET_PCT }}
+          TRACKING_FAIL_PCT: ${{ secrets.TRACKING_FAIL_PCT }}
         run: |
           python main.py
 
