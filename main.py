@@ -1,946 +1,701 @@
 import os
 import time
 import math
-import json
 import requests
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
-
 
 # =========================================================
 # CONFIG
 # =========================================================
-
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
-
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-DISCORD_PREMIUM_WEBHOOK_URL = os.getenv("DISCORD_PREMIUM_WEBHOOK_URL", "")
+WATCHLIST = ["QQQ", "SPY"]
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
-STATE_FILE = os.getenv("STATE_FILE", "system_state.json")
-ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "30"))
+# Execution standards
+MIN_EXECUTION_GRADE = "A"
+GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "A+": 4}
 
+# Risk / scoring
+BULLISH_CONFIRM_BONUS = 15
+BEARISH_CONFIRM_BONUS = 15
+CONFLICT_PENALTY = 20
+MIXED_PENALTY = 5
+
+# =========================================================
+# ETF MAJOR CONSTITUENTS
+# =========================================================
+ETF_CONSTITUENTS = {
+    "QQQ": [
+        {"symbol": "AAPL", "weight": 9.0},
+        {"symbol": "MSFT", "weight": 8.5},
+        {"symbol": "NVDA", "weight": 8.0},
+        {"symbol": "AMZN", "weight": 5.5},
+        {"symbol": "META", "weight": 4.5},
+        {"symbol": "GOOGL", "weight": 4.0},
+        {"symbol": "TSLA", "weight": 3.0},
+        {"symbol": "AVGO", "weight": 3.0},
+        {"symbol": "NFLX", "weight": 2.0},
+        {"symbol": "AMD", "weight": 2.0},
+    ],
+    "SPY": [
+        {"symbol": "AAPL", "weight": 7.0},
+        {"symbol": "MSFT", "weight": 6.8},
+        {"symbol": "NVDA", "weight": 6.0},
+        {"symbol": "AMZN", "weight": 3.8},
+        {"symbol": "META", "weight": 2.8},
+        {"symbol": "GOOGL", "weight": 2.2},
+        {"symbol": "BRK.B", "weight": 1.8},
+        {"symbol": "XOM", "weight": 1.3},
+        {"symbol": "JPM", "weight": 1.2},
+        {"symbol": "LLY", "weight": 1.5},
+        {"symbol": "TSLA", "weight": 1.3},
+    ]
+}
 
 # =========================================================
 # DATA MODELS
 # =========================================================
-
 @dataclass
-class MarketBar:
+class ConstituentSnapshot:
     symbol: str
     price: float
-    open_price: float = 0.0
-    high: float = 0.0
-    low: float = 0.0
-    volume: float = 0.0
-    prev_close: float = 0.0
-    timestamp: str = ""
+    vwap: float
+    change_pct: float
+    volume_ratio: float = 1.0
+    weight: float = 1.0
+
+    @property
+    def above_vwap(self) -> bool:
+        return self.price > self.vwap
+
+    @property
+    def below_vwap(self) -> bool:
+        return self.price < self.vwap
 
 
 @dataclass
-class OpenPosition:
+class ConstituentInternals:
+    etf_symbol: str
+    aligned_bullish_weight: float
+    aligned_bearish_weight: float
+    bullish_participation: float
+    bearish_participation: float
+    breadth_score: float
+    leadership_score: float
+    confirmation_bias: str
+    summary: str
+    leaders_up: List[str] = field(default_factory=list)
+    leaders_down: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MarketContext:
     symbol: str
-    direction: str              # "LONG", "SHORT", "CALL", "PUT"
-    market_value: float
-    risk_value: float
-    cluster: str
-    beta_weighted_delta: float = 0.0
-
-
-@dataclass
-class MarketStressState:
-    vix: float = 0.0
-    vix_prev_close: float = 0.0
-    spy_move_pct: float = 0.0
-    qqq_move_pct: float = 0.0
-    gap_move_pct: float = 0.0
-
-    breadth_breaking_down: bool = False
-    liquidity_thin: bool = False
-    slippage_spike: bool = False
-    abnormal_spread: bool = False
-    trading_halt_detected: bool = False
-    data_stale: bool = False
-    execution_disconnect: bool = False
-    rejected_orders_spiking: bool = False
-    regime_break_detected: bool = False
-
-
-@dataclass
-class RiskSnapshot:
-    equity: float
-    cash: float
-    daily_pnl: float
-    weekly_pnl: float
-    unrealized_pnl: float
-    realized_pnl: float
-    open_positions: List[OpenPosition] = field(default_factory=list)
-
-
-@dataclass
-class BlackSwanConfig:
-    daily_loss_limit_pct: float = 2.5
-    weekly_loss_limit_pct: float = 5.0
-
-    max_gross_exposure_pct: float = 60.0
-    max_net_exposure_pct: float = 35.0
-    max_symbol_exposure_pct: float = 20.0
-    max_cluster_exposure_pct: float = 30.0
-
-    vix_reduce_risk: float = 22.0
-    vix_hard_stop: float = 32.0
-    gap_move_hard_stop_pct: float = 2.0
-    intraday_index_shock_pct: float = 1.75
-
-    abnormal_size_multiplier: float = 0.50
-    severe_size_multiplier: float = 0.25
-
-    max_rejected_orders_before_lock: int = 2
-    allow_new_trades_after_lock: bool = False
-
-
-@dataclass
-class BlackSwanDecision:
-    status: str                 # "ALLOW", "REDUCE_SIZE", "BLOCK_NEW", "FORCE_EXIT_ALL", "FLAT_AND_LOCK"
-    size_multiplier: float
-    reasons: List[str]
-    alert: str
-    lock_trading: bool = False
-
-
-@dataclass
-class SystemLockState:
-    trading_locked: bool = False
-    lock_reason: str = ""
-    locked_at: str = ""
+    current_price: float
+    vwap: float
+    rsi: float
+    change_pct: float
+    volume_ratio: float
+    above_vwap: bool
+    below_vwap: bool
+    constituent_internals: Optional[ConstituentInternals] = None
+    constituent_snapshots: List[ConstituentSnapshot] = field(default_factory=list)
 
 
 @dataclass
 class TradePlan:
     symbol: str
-    action: str                 # "ENTER_CALL", "ENTER_PUT", "HOLD", "EXIT_ALL"
+    action: str
     grade: str
+    score: int
     confidence: float
-    size: int
-    entry_price: float
-    trigger_level: Optional[float]
-    stop_level: Optional[float]
-    target_level: Optional[float]
     reasons: List[str] = field(default_factory=list)
-    alerts: List[str] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
-
-
-@dataclass
-class EngineState:
-    lock_state: SystemLockState = field(default_factory=SystemLockState)
-    rejected_order_count: int = 0
-    last_heartbeat_ts: float = 0.0
-    last_alert_hash: str = ""
-    last_prices: Dict[str, float] = field(default_factory=dict)
-
 
 # =========================================================
-# UTILITIES
+# HELPERS
 # =========================================================
-
-def now_iso() -> str:
-    return datetime.utcnow().isoformat()
-
-
 def safe_float(value, default=0.0) -> float:
     try:
         return float(value)
     except Exception:
-        return default
+        return float(default)
 
 
-def pct_change(current: float, reference: float) -> float:
-    if reference == 0:
-        return 0.0
-    return ((current - reference) / reference) * 100.0
-
-
-def pct_of_equity(value: float, equity: float) -> float:
-    if equity <= 0:
-        return 0.0
-    return (value / equity) * 100.0
-
-
-def infer_cluster(symbol: str) -> str:
-    s = symbol.upper()
-    if s in ["SPY", "QQQ", "SPX", "NDX", "AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA"]:
-        return "INDEX_TECH"
-    if s in ["XOM", "CVX", "USO"]:
-        return "ENERGY"
-    if s in ["JPM", "BAC", "GS"]:
-        return "FINANCIALS"
-    return "OTHER"
-
-
-def hash_text(text: str) -> str:
-    return str(abs(hash(text)))
-
-
-# =========================================================
-# STATE FILE
-# =========================================================
-
-def load_engine_state() -> EngineState:
-    if not os.path.exists(STATE_FILE):
-        return EngineState()
-
+def send_discord(message: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        lock_raw = data.get("lock_state", {})
-        return EngineState(
-            lock_state=SystemLockState(
-                trading_locked=lock_raw.get("trading_locked", False),
-                lock_reason=lock_raw.get("lock_reason", ""),
-                locked_at=lock_raw.get("locked_at", ""),
-            ),
-            rejected_order_count=data.get("rejected_order_count", 0),
-            last_heartbeat_ts=data.get("last_heartbeat_ts", 0.0),
-            last_alert_hash=data.get("last_alert_hash", ""),
-            last_prices=data.get("last_prices", {}),
-        )
-    except Exception:
-        return EngineState()
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+    except Exception as e:
+        print(f"[DISCORD ERROR] {e}")
 
 
-def save_engine_state(state: EngineState) -> None:
-    payload = {
-        "lock_state": asdict(state.lock_state),
-        "rejected_order_count": state.rejected_order_count,
-        "last_heartbeat_ts": state.last_heartbeat_ts,
-        "last_alert_hash": state.last_alert_hash,
-        "last_prices": state.last_prices,
-    }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-
-
-# =========================================================
-# ALERTS
-# =========================================================
-
-def send_telegram_message(message: str) -> bool:
+def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
+        return
     try:
-        r = requests.post(url, json=payload, timeout=15)
-        return r.ok
-    except Exception:
-        return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}")
 
 
-def send_discord_message(message: str, premium: bool = False) -> bool:
-    webhook_url = DISCORD_PREMIUM_WEBHOOK_URL if premium else DISCORD_WEBHOOK_URL
-    if not webhook_url:
-        return False
-
-    try:
-        r = requests.post(webhook_url, json={"content": message}, timeout=15)
-        return r.ok
-    except Exception:
-        return False
-
-
-def send_alert(message: str, premium: bool = False) -> None:
-    send_telegram_message(message)
-    send_discord_message(message, premium=premium)
+def broadcast(message: str) -> None:
+    print(message)
+    send_discord(message)
+    send_telegram(message)
 
 
 # =========================================================
 # MARKET DATA
 # =========================================================
-
-def fetch_twelve_quote(symbol: str) -> Optional[MarketBar]:
+def fetch_twelve_time_series(symbol: str, interval: str = "1min", outputsize: int = 80) -> List[Dict]:
     if not TWELVE_DATA_API_KEY:
-        return None
+        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
 
-    url = "https://api.twelvedata.com/quote"
+    url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "apikey": TWELVE_DATA_API_KEY
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "timezone": "America/New_York",
     }
+    r = requests.get(url, params=params, timeout=20)
+    data = r.json()
 
+    if "values" not in data:
+        raise RuntimeError(f"Twelve Data error for {symbol}: {data}")
+
+    values = list(reversed(data["values"]))  # oldest -> newest
+    return values
+
+
+def compute_vwap_from_bars(bars: List[Dict]) -> float:
+    cumulative_pv = 0.0
+    cumulative_vol = 0.0
+
+    for bar in bars:
+        high = safe_float(bar.get("high"))
+        low = safe_float(bar.get("low"))
+        close = safe_float(bar.get("close"))
+        volume = safe_float(bar.get("volume"), 1.0)
+
+        typical_price = (high + low + close) / 3.0
+        cumulative_pv += typical_price * volume
+        cumulative_vol += volume
+
+    if cumulative_vol <= 0:
+        return safe_float(bars[-1].get("close"))
+
+    return cumulative_pv / cumulative_vol
+
+
+def compute_rsi_from_closes(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_volume_ratio(bars: List[Dict], lookback: int = 20) -> float:
+    volumes = [safe_float(b.get("volume"), 0.0) for b in bars if b.get("volume") is not None]
+    if len(volumes) < 2:
+        return 1.0
+
+    recent = volumes[-1]
+    baseline_window = volumes[-(lookback + 1):-1] if len(volumes) > lookback else volumes[:-1]
+    if not baseline_window:
+        return 1.0
+
+    baseline = sum(baseline_window) / len(baseline_window)
+    if baseline <= 0:
+        return 1.0
+
+    return recent / baseline
+
+
+def get_symbol_snapshot(symbol: str) -> Optional[Dict]:
     try:
-        r = requests.get(url, params=params, timeout=20)
-        data = r.json()
-
-        if "code" in data and data.get("status") == "error":
+        bars = fetch_twelve_time_series(symbol=symbol, interval="1min", outputsize=80)
+        if len(bars) < 5:
             return None
 
-        price = safe_float(data.get("close") or data.get("price"))
-        open_price = safe_float(data.get("open"))
-        high = safe_float(data.get("high"))
-        low = safe_float(data.get("low"))
-        prev_close = safe_float(data.get("previous_close"))
-        volume = safe_float(data.get("volume"))
+        closes = [safe_float(b["close"]) for b in bars]
+        latest = bars[-1]
+        prev_close = closes[-2] if len(closes) >= 2 else closes[-1]
 
-        return MarketBar(
-            symbol=symbol,
-            price=price,
-            open_price=open_price,
-            high=high,
-            low=low,
-            volume=volume,
-            prev_close=prev_close,
-            timestamp=now_iso()
-        )
-    except Exception:
+        price = safe_float(latest["close"])
+        vwap = compute_vwap_from_bars(bars)
+        rsi = compute_rsi_from_closes(closes)
+        change_pct = ((price - prev_close) / prev_close * 100.0) if prev_close else 0.0
+        volume_ratio = compute_volume_ratio(bars)
+
+        return {
+            "price": price,
+            "vwap": vwap,
+            "rsi": rsi,
+            "change_pct": change_pct,
+            "volume_ratio": volume_ratio,
+            "bars": bars,
+        }
+    except Exception as e:
+        print(f"[SNAPSHOT ERROR] {symbol}: {e}")
         return None
 
 
-def fetch_market_snapshot(symbols: List[str]) -> Dict[str, MarketBar]:
-    out = {}
-    for symbol in symbols:
-        bar = fetch_twelve_quote(symbol)
-        if bar:
-            out[symbol] = bar
-    return out
-
-
 # =========================================================
-# BLACK SWAN HELPERS
+# CONSTITUENT ENGINE
 # =========================================================
+def load_constituent_snapshots(etf_symbol: str) -> List[ConstituentSnapshot]:
+    snapshots: List[ConstituentSnapshot] = []
 
-def calc_gross_exposure_pct(snapshot: RiskSnapshot) -> float:
-    gross = sum(abs(p.market_value) for p in snapshot.open_positions)
-    return pct_of_equity(gross, snapshot.equity)
+    for item in ETF_CONSTITUENTS.get(etf_symbol, []):
+        symbol = item["symbol"]
+        weight = item["weight"]
 
+        data = get_symbol_snapshot(symbol)
+        if not data:
+            continue
 
-def calc_net_exposure_pct(snapshot: RiskSnapshot) -> float:
-    net = sum(p.market_value for p in snapshot.open_positions)
-    return pct_of_equity(abs(net), snapshot.equity)
-
-
-def calc_symbol_exposures(snapshot: RiskSnapshot) -> Dict[str, float]:
-    exposures = {}
-    for p in snapshot.open_positions:
-        exposures[p.symbol] = exposures.get(p.symbol, 0.0) + abs(p.market_value)
-    return {k: pct_of_equity(v, snapshot.equity) for k, v in exposures.items()}
-
-
-def calc_cluster_exposures(snapshot: RiskSnapshot) -> Dict[str, float]:
-    exposures = {}
-    for p in snapshot.open_positions:
-        exposures[p.cluster] = exposures.get(p.cluster, 0.0) + abs(p.market_value)
-    return {k: pct_of_equity(v, snapshot.equity) for k, v in exposures.items()}
-
-
-def max_dict_item(d: Dict[str, float]) -> Optional[Tuple[str, float]]:
-    if not d:
-        return None
-    k = max(d, key=d.get)
-    return k, d[k]
-
-
-# =========================================================
-# BLACK SWAN ENGINE
-# =========================================================
-
-def evaluate_black_swan_risk(
-    snapshot: RiskSnapshot,
-    stress: MarketStressState,
-    config: BlackSwanConfig,
-    rejected_order_count: int = 0
-) -> BlackSwanDecision:
-
-    daily_loss_pct = pct_of_equity(abs(min(snapshot.daily_pnl, 0.0)), snapshot.equity)
-    weekly_loss_pct = pct_of_equity(abs(min(snapshot.weekly_pnl, 0.0)), snapshot.equity)
-
-    gross_exposure_pct = calc_gross_exposure_pct(snapshot)
-    net_exposure_pct = calc_net_exposure_pct(snapshot)
-    symbol_exposures = calc_symbol_exposures(snapshot)
-    cluster_exposures = calc_cluster_exposures(snapshot)
-
-    reasons = []
-
-    if daily_loss_pct >= config.daily_loss_limit_pct:
-        reasons.append(f"Daily loss breached: {daily_loss_pct:.2f}%")
-        return BlackSwanDecision(
-            status="FLAT_AND_LOCK",
-            size_multiplier=0.0,
-            reasons=reasons,
-            alert="🛑 BLACK SWAN LOCK: daily loss limit breached. Flatten all positions and lock system.",
-            lock_trading=True
+        snapshots.append(
+            ConstituentSnapshot(
+                symbol=symbol,
+                price=safe_float(data["price"]),
+                vwap=safe_float(data["vwap"]),
+                change_pct=safe_float(data["change_pct"]),
+                volume_ratio=safe_float(data.get("volume_ratio", 1.0)),
+                weight=safe_float(weight),
+            )
         )
 
-    if weekly_loss_pct >= config.weekly_loss_limit_pct:
-        reasons.append(f"Weekly loss breached: {weekly_loss_pct:.2f}%")
-        return BlackSwanDecision(
-            status="FLAT_AND_LOCK",
-            size_multiplier=0.0,
-            reasons=reasons,
-            alert="🛑 BLACK SWAN LOCK: weekly loss limit breached. Flatten all positions and lock system.",
-            lock_trading=True
+    return snapshots
+
+
+def analyze_constituent_internals(
+    etf_symbol: str,
+    snapshots: List[ConstituentSnapshot]
+) -> ConstituentInternals:
+    if not snapshots:
+        return ConstituentInternals(
+            etf_symbol=etf_symbol,
+            aligned_bullish_weight=0.0,
+            aligned_bearish_weight=0.0,
+            bullish_participation=0.0,
+            bearish_participation=0.0,
+            breadth_score=0.0,
+            leadership_score=0.0,
+            confirmation_bias="NEUTRAL",
+            summary=f"{etf_symbol} internals unavailable.",
+            leaders_up=[],
+            leaders_down=[],
+            conflicts=["No constituent data available."]
         )
 
-    infra_fail_reasons = []
+    total_weight = sum(x.weight for x in snapshots) or 1.0
 
-    if stress.execution_disconnect:
-        infra_fail_reasons.append("Execution disconnect detected")
-    if stress.data_stale:
-        infra_fail_reasons.append("Data stale")
-    if stress.trading_halt_detected:
-        infra_fail_reasons.append("Trading halt detected")
-    if stress.rejected_orders_spiking:
-        infra_fail_reasons.append("Rejected orders spiking")
-    if rejected_order_count >= config.max_rejected_orders_before_lock:
-        infra_fail_reasons.append(f"Rejected orders >= {config.max_rejected_orders_before_lock}")
-    if stress.slippage_spike and stress.abnormal_spread:
-        infra_fail_reasons.append("Slippage spike with abnormal spread")
+    bullish_weight = 0.0
+    bearish_weight = 0.0
+    bullish_names = 0
+    bearish_names = 0
 
-    if infra_fail_reasons:
-        return BlackSwanDecision(
-            status="FLAT_AND_LOCK",
-            size_multiplier=0.0,
-            reasons=infra_fail_reasons,
-            alert="🚨 BLACK SWAN LOCK: broker/data/execution compromised. Flatten and lock trading.",
-            lock_trading=True
+    leaders_up = []
+    leaders_down = []
+    conflicts = []
+    leadership_raw = []
+
+    for snap in snapshots:
+        weighted_push = snap.weight * abs(snap.change_pct)
+
+        if snap.above_vwap and snap.change_pct > 0:
+            bullish_weight += snap.weight
+            bullish_names += 1
+            leadership_raw.append(weighted_push)
+            if snap.weight >= 3.0:
+                leaders_up.append(snap.symbol)
+
+        elif snap.below_vwap and snap.change_pct < 0:
+            bearish_weight += snap.weight
+            bearish_names += 1
+            leadership_raw.append(-weighted_push)
+            if snap.weight >= 3.0:
+                leaders_down.append(snap.symbol)
+
+        else:
+            conflicts.append(snap.symbol)
+
+    bullish_participation = bullish_names / len(snapshots)
+    bearish_participation = bearish_names / len(snapshots)
+
+    aligned_bullish_weight = bullish_weight / total_weight
+    aligned_bearish_weight = bearish_weight / total_weight
+    breadth_score = bullish_participation - bearish_participation
+    leadership_score = sum(leadership_raw) / total_weight if leadership_raw else 0.0
+
+    if aligned_bullish_weight >= 0.55 and bullish_participation >= 0.50:
+        bias = "BULLISH_CONFIRMATION"
+        summary = (
+            f"{etf_symbol} internals bullish: "
+            f"{bullish_names}/{len(snapshots)} aligned, "
+            f"{aligned_bullish_weight:.0%} weighted support."
+        )
+    elif aligned_bearish_weight >= 0.55 and bearish_participation >= 0.50:
+        bias = "BEARISH_CONFIRMATION"
+        summary = (
+            f"{etf_symbol} internals bearish: "
+            f"{bearish_names}/{len(snapshots)} aligned, "
+            f"{aligned_bearish_weight:.0%} weighted pressure."
+        )
+    else:
+        bias = "MIXED"
+        summary = (
+            f"{etf_symbol} internals mixed: "
+            f"{bullish_names} bullish vs {bearish_names} bearish aligned names."
         )
 
-    shock_detected = False
-    shock_reasons = []
-
-    if stress.vix >= config.vix_hard_stop:
-        shock_detected = True
-        shock_reasons.append(f"VIX hard stop triggered ({stress.vix:.2f})")
-
-    if abs(stress.gap_move_pct) >= config.gap_move_hard_stop_pct:
-        shock_detected = True
-        shock_reasons.append(f"Gap move too large ({stress.gap_move_pct:.2f}%)")
-
-    if abs(stress.spy_move_pct) >= config.intraday_index_shock_pct:
-        shock_detected = True
-        shock_reasons.append(f"SPY shock move ({stress.spy_move_pct:.2f}%)")
-
-    if abs(stress.qqq_move_pct) >= config.intraday_index_shock_pct:
-        shock_detected = True
-        shock_reasons.append(f"QQQ shock move ({stress.qqq_move_pct:.2f}%)")
-
-    if shock_detected and stress.liquidity_thin:
-        shock_reasons.append("Liquidity thin during shock")
-        return BlackSwanDecision(
-            status="FLAT_AND_LOCK",
-            size_multiplier=0.0,
-            reasons=shock_reasons,
-            alert="⚠️ BLACK SWAN LOCK: shock regime with weak liquidity. Flatten all and lock.",
-            lock_trading=True
-        )
-
-    if shock_detected:
-        return BlackSwanDecision(
-            status="BLOCK_NEW",
-            size_multiplier=0.0,
-            reasons=shock_reasons,
-            alert="⚠️ BLACK SWAN DEFENSE: shock conditions detected. Block new trades.",
-            lock_trading=False
-        )
-
-    if gross_exposure_pct >= config.max_gross_exposure_pct:
-        reasons.append(f"Gross exposure too high ({gross_exposure_pct:.2f}%)")
-        return BlackSwanDecision(
-            status="BLOCK_NEW",
-            size_multiplier=0.0,
-            reasons=reasons,
-            alert="⛔ BLOCK NEW TRADES: gross exposure cap reached.",
-            lock_trading=False
-        )
-
-    if net_exposure_pct >= config.max_net_exposure_pct:
-        reasons.append(f"Net exposure too high ({net_exposure_pct:.2f}%)")
-        return BlackSwanDecision(
-            status="BLOCK_NEW",
-            size_multiplier=0.0,
-            reasons=reasons,
-            alert="⛔ BLOCK NEW TRADES: net exposure cap reached.",
-            lock_trading=False
-        )
-
-    max_symbol = max_dict_item(symbol_exposures)
-    if max_symbol and max_symbol[1] >= config.max_symbol_exposure_pct:
-        reasons.append(f"Symbol concentration too high: {max_symbol[0]} = {max_symbol[1]:.2f}%")
-        return BlackSwanDecision(
-            status="BLOCK_NEW",
-            size_multiplier=0.0,
-            reasons=reasons,
-            alert=f"⛔ BLOCK NEW TRADES: symbol concentration cap hit on {max_symbol[0]}.",
-            lock_trading=False
-        )
-
-    max_cluster = max_dict_item(cluster_exposures)
-    if max_cluster and max_cluster[1] >= config.max_cluster_exposure_pct:
-        reasons.append(f"Cluster concentration too high: {max_cluster[0]} = {max_cluster[1]:.2f}%")
-        return BlackSwanDecision(
-            status="BLOCK_NEW",
-            size_multiplier=0.0,
-            reasons=reasons,
-            alert=f"⛔ BLOCK NEW TRADES: correlated cluster cap hit on {max_cluster[0]}.",
-            lock_trading=False
-        )
-
-    reduce_reasons = []
-
-    if stress.vix >= config.vix_reduce_risk:
-        reduce_reasons.append(f"VIX elevated ({stress.vix:.2f})")
-    if stress.regime_break_detected:
-        reduce_reasons.append("Regime break detected")
-    if stress.breadth_breaking_down:
-        reduce_reasons.append("Breadth deterioration")
-    if stress.liquidity_thin:
-        reduce_reasons.append("Liquidity thin")
-    if stress.slippage_spike:
-        reduce_reasons.append("Slippage spike")
-    if stress.abnormal_spread:
-        reduce_reasons.append("Abnormal spread")
-
-    if len(reduce_reasons) >= 3:
-        return BlackSwanDecision(
-            status="REDUCE_SIZE",
-            size_multiplier=config.severe_size_multiplier,
-            reasons=reduce_reasons,
-            alert=f"⚠️ SEVERE RISK REDUCTION: {' | '.join(reduce_reasons)}. Cut size aggressively.",
-            lock_trading=False
-        )
-
-    if len(reduce_reasons) >= 1:
-        return BlackSwanDecision(
-            status="REDUCE_SIZE",
-            size_multiplier=config.abnormal_size_multiplier,
-            reasons=reduce_reasons,
-            alert=f"⚠️ RISK REDUCTION: {' | '.join(reduce_reasons)}. Trade smaller.",
-            lock_trading=False
-        )
-
-    return BlackSwanDecision(
-        status="ALLOW",
-        size_multiplier=1.0,
-        reasons=["No black swan constraints triggered"],
-        alert="✅ Risk layer clear. Trading allowed.",
-        lock_trading=False
+    return ConstituentInternals(
+        etf_symbol=etf_symbol,
+        aligned_bullish_weight=aligned_bullish_weight,
+        aligned_bearish_weight=aligned_bearish_weight,
+        bullish_participation=bullish_participation,
+        bearish_participation=bearish_participation,
+        breadth_score=breadth_score,
+        leadership_score=leadership_score,
+        confirmation_bias=bias,
+        summary=summary,
+        leaders_up=leaders_up,
+        leaders_down=leaders_down,
+        conflicts=conflicts,
     )
 
 
-# =========================================================
-# PLAN ENGINE
-# =========================================================
+def enrich_context_with_constituents(context: MarketContext) -> MarketContext:
+    if context.symbol not in ETF_CONSTITUENTS:
+        return context
 
-def classify_grade(confidence: float) -> str:
-    if confidence >= 0.90:
+    snapshots = load_constituent_snapshots(context.symbol)
+    internals = analyze_constituent_internals(context.symbol, snapshots)
+
+    context.constituent_snapshots = snapshots
+    context.constituent_internals = internals
+    return context
+
+
+# =========================================================
+# CONTEXT + DECISION ENGINE
+# =========================================================
+def build_market_context(symbol: str) -> Optional[MarketContext]:
+    data = get_symbol_snapshot(symbol)
+    if not data:
+        return None
+
+    context = MarketContext(
+        symbol=symbol,
+        current_price=safe_float(data["price"]),
+        vwap=safe_float(data["vwap"]),
+        rsi=safe_float(data["rsi"]),
+        change_pct=safe_float(data["change_pct"]),
+        volume_ratio=safe_float(data["volume_ratio"]),
+        above_vwap=safe_float(data["price"]) > safe_float(data["vwap"]),
+        below_vwap=safe_float(data["price"]) < safe_float(data["vwap"]),
+    )
+
+    context = enrich_context_with_constituents(context)
+    return context
+
+
+def score_to_grade(score: int) -> str:
+    if score >= 90:
         return "A+"
-    if confidence >= 0.82:
+    if score >= 75:
         return "A"
-    if confidence >= 0.74:
-        return "B+"
-    if confidence >= 0.65:
+    if score >= 55:
         return "B"
-    if confidence >= 0.55:
-        return "C"
-    return "AVOID"
+    return "C"
 
 
-def detect_basic_signal(bar: MarketBar) -> TradePlan:
-    move_from_open = pct_change(bar.price, bar.open_price) if bar.open_price else 0.0
-    gap_pct = pct_change(bar.open_price, bar.prev_close) if bar.prev_close and bar.open_price else 0.0
-
-    action = "HOLD"
-    confidence = 0.50
+def make_hybrid_decision(context: MarketContext) -> TradePlan:
     reasons = []
-    tags = []
+    score = 50
+    action = "NO_TRADE"
 
-    if move_from_open > 0.45:
-        action = "ENTER_CALL"
-        confidence = 0.76
-        reasons.append(f"{bar.symbol} showing positive expansion from open ({move_from_open:.2f}%).")
-        tags.extend(["bullish", "expansion"])
-    elif move_from_open < -0.45:
-        action = "ENTER_PUT"
-        confidence = 0.76
-        reasons.append(f"{bar.symbol} showing negative expansion from open ({move_from_open:.2f}%).")
-        tags.extend(["bearish", "expansion"])
+    # VWAP
+    if context.above_vwap:
+        score += 12
+        reasons.append("Price is above VWAP.")
+    elif context.below_vwap:
+        score += 12
+        reasons.append("Price is below VWAP.")
+
+    # Momentum / RSI
+    if context.above_vwap and context.rsi >= 55:
+        score += 10
+        reasons.append("Bullish RSI alignment.")
+    elif context.below_vwap and context.rsi <= 45:
+        score += 10
+        reasons.append("Bearish RSI alignment.")
     else:
-        reasons.append(f"{bar.symbol} is inside neutral range from open ({move_from_open:.2f}%).")
-        tags.append("neutral")
+        reasons.append("RSI is neutral or not fully aligned.")
 
-    if abs(gap_pct) >= 1.0:
-        confidence += 0.05
-        reasons.append(f"Gap context present ({gap_pct:.2f}%).")
+    # Volume
+    if context.volume_ratio >= 1.20:
+        score += 8
+        reasons.append(f"Volume expansion present ({context.volume_ratio:.2f}x).")
+    else:
+        reasons.append(f"Volume not expanding strongly ({context.volume_ratio:.2f}x).")
 
-    confidence = min(confidence, 0.95)
-    grade = classify_grade(confidence)
+    # Price change
+    if context.above_vwap and context.change_pct > 0:
+        score += 8
+        reasons.append("Price change supports bullish continuation.")
+    elif context.below_vwap and context.change_pct < 0:
+        score += 8
+        reasons.append("Price change supports bearish continuation.")
+    else:
+        reasons.append("Price change is not cleanly aligned.")
+
+    # Initial action guess
+    if context.above_vwap and context.rsi >= 52:
+        action = "BUY_CALL"
+    elif context.below_vwap and context.rsi <= 48:
+        action = "BUY_PUT"
+    else:
+        action = "NO_TRADE"
+
+    grade = score_to_grade(score)
+    confidence = max(0.0, min(score / 100.0, 0.99))
 
     return TradePlan(
-        symbol=bar.symbol,
-        action=action if grade != "AVOID" else "HOLD",
+        symbol=context.symbol,
+        action=action,
         grade=grade,
+        score=score,
         confidence=confidence,
-        size=1,
-        entry_price=bar.price,
-        trigger_level=bar.open_price if bar.open_price else None,
-        stop_level=bar.low if action == "ENTER_CALL" else (bar.high if action == "ENTER_PUT" else None),
-        target_level=(bar.price * 1.01) if action == "ENTER_CALL" else ((bar.price * 0.99) if action == "ENTER_PUT" else None),
         reasons=reasons,
-        alerts=[],
-        tags=tags
     )
 
 
-def apply_black_swan_override_to_plan(plan: TradePlan, black_swan: BlackSwanDecision) -> TradePlan:
-    plan.reasons.extend(black_swan.reasons)
-    plan.alerts.append(black_swan.alert)
-
-    if black_swan.status == "ALLOW":
+def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> TradePlan:
+    ci = context.constituent_internals
+    if not ci:
         return plan
 
-    if black_swan.status == "REDUCE_SIZE":
-        plan.size = max(1, int(round(plan.size * black_swan.size_multiplier))) if plan.size > 0 else 0
-        plan.confidence = max(0.0, plan.confidence * 0.85)
-        plan.reasons.append("Black swan defense reduced size.")
-        return plan
+    plan.reasons.append(ci.summary)
 
-    if black_swan.status == "BLOCK_NEW":
-        if plan.action in ["ENTER_CALL", "ENTER_PUT", "BUY", "SELL", "OPEN"]:
-            plan.action = "HOLD"
-        plan.size = 0
-        plan.confidence = min(plan.confidence, 0.20)
-        plan.reasons.append("Black swan defense blocked new trades.")
-        return plan
+    if plan.action == "BUY_CALL":
+        if ci.confirmation_bias == "BULLISH_CONFIRMATION":
+            plan.score += BULLISH_CONFIRM_BONUS
+            plan.reasons.append(
+                f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
+            )
+        elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
+            plan.score -= CONFLICT_PENALTY
+            plan.reasons.append(
+                f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
+            )
+        else:
+            plan.score -= MIXED_PENALTY
+            plan.reasons.append("Call setup has mixed internal participation.")
 
-    if black_swan.status in ["FORCE_EXIT_ALL", "FLAT_AND_LOCK"]:
-        plan.action = "EXIT_ALL"
-        plan.size = 0
-        plan.confidence = 1.0
-        plan.reasons.append("Black swan defense forced exit / flat lock.")
-        return plan
+    elif plan.action == "BUY_PUT":
+        if ci.confirmation_bias == "BEARISH_CONFIRMATION":
+            plan.score += BEARISH_CONFIRM_BONUS
+            plan.reasons.append(
+                f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
+            )
+        elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
+            plan.score -= CONFLICT_PENALTY
+            plan.reasons.append(
+                f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
+            )
+        else:
+            plan.score -= MIXED_PENALTY
+            plan.reasons.append("Put setup has mixed internal participation.")
 
+    plan.grade = score_to_grade(plan.score)
+    plan.confidence = max(0.0, min(plan.score / 100.0, 0.99))
     return plan
 
 
 # =========================================================
-# LOCK MANAGEMENT
+# EXECUTION FILTER
 # =========================================================
-
-def update_system_lock(lock_state: SystemLockState, black_swan: BlackSwanDecision) -> SystemLockState:
-    if black_swan.lock_trading:
-        lock_state.trading_locked = True
-        lock_state.lock_reason = black_swan.alert
-        if not lock_state.locked_at:
-            lock_state.locked_at = now_iso()
-    return lock_state
+def passes_grade_threshold(grade: str, threshold: str) -> bool:
+    return GRADE_ORDER.get(grade, 0) >= GRADE_ORDER.get(threshold, 0)
 
 
-def manual_unlock_if_allowed(state: EngineState, config: BlackSwanConfig) -> None:
-    if state.lock_state.trading_locked and config.allow_new_trades_after_lock:
-        state.lock_state.trading_locked = False
-        state.lock_state.lock_reason = ""
-        state.lock_state.locked_at = ""
+def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List[str]]:
+    notes = []
+    ci = context.constituent_internals
 
+    if plan.action == "NO_TRADE":
+        notes.append("Blocked: no clear directional action.")
+        return "AVOID", notes
 
-def can_trade(lock_state: SystemLockState) -> bool:
-    return not lock_state.trading_locked
+    if not passes_grade_threshold(plan.grade, MIN_EXECUTION_GRADE):
+        notes.append(f"Blocked: grade {plan.grade} is below execution threshold {MIN_EXECUTION_GRADE}.")
+        return "AVOID", notes
 
+    if ci:
+        if plan.action == "BUY_CALL" and ci.confirmation_bias == "BEARISH_CONFIRMATION":
+            notes.append("Blocked: ETF internals are bearish against bullish setup.")
+            return "AVOID", notes
 
-# =========================================================
-# EXECUTION PLACEHOLDERS
-# =========================================================
+        if plan.action == "BUY_PUT" and ci.confirmation_bias == "BULLISH_CONFIRMATION":
+            notes.append("Blocked: ETF internals are bullish against bearish setup.")
+            return "AVOID", notes
 
-def flatten_all_positions(snapshot: RiskSnapshot) -> None:
-    if snapshot.open_positions:
-        send_alert("🛑 EMERGENCY FLATTEN: flattening all positions now.", premium=True)
+        if ci.confirmation_bias == "MIXED":
+            notes.append("Caution: constituent internals are mixed.")
 
+    if context.volume_ratio < 0.85:
+        notes.append("Blocked: volume too weak.")
+        return "AVOID", notes
 
-def cancel_open_orders() -> None:
-    send_alert("🧹 CANCEL OPEN ORDERS: cancelling all open orders.", premium=True)
-
-
-# =========================================================
-# STRESS MODEL
-# =========================================================
-
-def build_market_stress_state(market: Dict[str, MarketBar], state: EngineState) -> MarketStressState:
-    spy = market.get("SPY")
-    qqq = market.get("QQQ")
-    vix = market.get("VIX") or market.get("^VIX")
-
-    spy_move = pct_change(spy.price, spy.prev_close) if spy and spy.prev_close else 0.0
-    qqq_move = pct_change(qqq.price, qqq.prev_close) if qqq and qqq.prev_close else 0.0
-    gap_move = pct_change(spy.open_price, spy.prev_close) if spy and spy.prev_close and spy.open_price else 0.0
-
-    vix_value = vix.price if vix else 0.0
-    vix_prev = vix.prev_close if vix else 0.0
-
-    breadth_breaking_down = (spy_move < -1.0 and qqq_move < -1.0)
-    liquidity_thin = False
-    slippage_spike = False
-    abnormal_spread = False
-    trading_halt_detected = False
-    data_stale = len(market) == 0
-    execution_disconnect = False
-    rejected_orders_spiking = state.rejected_order_count >= 2
-    regime_break_detected = abs(spy_move) > 1.0 or abs(qqq_move) > 1.0
-
-    return MarketStressState(
-        vix=vix_value,
-        vix_prev_close=vix_prev,
-        spy_move_pct=spy_move,
-        qqq_move_pct=qqq_move,
-        gap_move_pct=gap_move,
-        breadth_breaking_down=breadth_breaking_down,
-        liquidity_thin=liquidity_thin,
-        slippage_spike=slippage_spike,
-        abnormal_spread=abnormal_spread,
-        trading_halt_detected=trading_halt_detected,
-        data_stale=data_stale,
-        execution_disconnect=execution_disconnect,
-        rejected_orders_spiking=rejected_orders_spiking,
-        regime_break_detected=regime_break_detected
-    )
+    notes.append("Execution filter passed.")
+    return "EXECUTE", notes
 
 
 # =========================================================
-# ACCOUNT SNAPSHOT PLACEHOLDER
+# ALERT FORMATTING
 # =========================================================
+def build_constituent_summary_for_alert(context: MarketContext) -> str:
+    ci = context.constituent_internals
+    if not ci:
+        return "Constituent internals: unavailable."
 
-def build_risk_snapshot(state: EngineState) -> RiskSnapshot:
-    # Replace this with live broker/account values when you connect execution.
-    return RiskSnapshot(
-        equity=100000.0,
-        cash=100000.0,
-        daily_pnl=0.0,
-        weekly_pnl=0.0,
-        unrealized_pnl=0.0,
-        realized_pnl=0.0,
-        open_positions=[]
-    )
+    if ci.confirmation_bias == "BULLISH_CONFIRMATION":
+        return (
+            f"📈 Internals bullish | "
+            f"Leaders up: {', '.join(ci.leaders_up[:4]) or 'none'} | "
+            f"Bull participation: {ci.bullish_participation:.0%}"
+        )
+    elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
+        return (
+            f"📉 Internals bearish | "
+            f"Leaders down: {', '.join(ci.leaders_down[:4]) or 'none'} | "
+            f"Bear participation: {ci.bearish_participation:.0%}"
+        )
+    else:
+        return (
+            f"⚖️ Internals mixed | "
+            f"Conflicts: {', '.join(ci.conflicts[:5]) or 'none'}"
+        )
 
 
-# =========================================================
-# FORMATTERS
-# =========================================================
+def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: List[str]) -> str:
+    emoji = "🟢" if plan.action == "BUY_CALL" else "🔴" if plan.action == "BUY_PUT" else "⚪"
+    now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
 
-def format_plan_alert(plan: TradePlan) -> str:
     lines = [
-        f"📊 {plan.symbol} PLAN",
+        f"{emoji} {context.symbol} FRAMEWORK UPDATE",
+        f"Time: {now_str}",
+        f"Price: {context.current_price:.2f}",
+        f"VWAP: {context.vwap:.2f}",
+        f"RSI: {context.rsi:.1f}",
+        f"Change: {context.change_pct:.2f}%",
+        f"Vol Ratio: {context.volume_ratio:.2f}x",
         f"Action: {plan.action}",
         f"Grade: {plan.grade}",
-        f"Confidence: {plan.confidence:.2f}",
-        f"Size: {plan.size}",
-        f"Entry: {plan.entry_price:.2f}",
+        f"Score: {plan.score}",
+        f"Confidence: {plan.confidence:.0%}",
+        build_constituent_summary_for_alert(context),
+        "Reasons:",
     ]
 
-    if plan.trigger_level is not None:
-        lines.append(f"Trigger: {plan.trigger_level:.2f}")
-    if plan.stop_level is not None:
-        lines.append(f"Stop: {plan.stop_level:.2f}")
-    if plan.target_level is not None:
-        lines.append(f"Target: {plan.target_level:.2f}")
+    for reason in plan.reasons[:6]:
+        lines.append(f"- {reason}")
 
-    if plan.reasons:
-        lines.append("Reasons:")
-        lines.extend([f"- {r}" for r in plan.reasons[:5]])
+    lines.append("Execution Filter:")
+    for note in notes:
+        lines.append(f"- {note}")
 
-    if plan.alerts:
-        lines.append("Risk:")
-        lines.extend([f"- {a}" for a in plan.alerts[:3]])
+    lines.append(f"Final Status: {status}")
+    if LIVE_TRADING:
+        lines.append("Mode: LIVE")
+    else:
+        lines.append("Mode: ALERT / PAPER")
 
     return "\n".join(lines)
 
 
-def format_heartbeat(state: EngineState, stress: MarketStressState) -> str:
-    status = "LOCKED" if state.lock_state.trading_locked else "ACTIVE"
-    return (
-        f"💓 HEARTBEAT\n"
-        f"Status: {status}\n"
-        f"Lock Reason: {state.lock_state.lock_reason or 'None'}\n"
-        f"Rejected Orders: {state.rejected_order_count}\n"
-        f"VIX: {stress.vix:.2f}\n"
-        f"SPY Move: {stress.spy_move_pct:.2f}%\n"
-        f"QQQ Move: {stress.qqq_move_pct:.2f}%"
-    )
-
-
 # =========================================================
-# CORE LOOP
+# LIVE EXECUTION PLACEHOLDER
 # =========================================================
-
-def should_send_heartbeat(state: EngineState) -> bool:
-    if not ENABLE_HEARTBEAT:
-        return False
-    elapsed = time.time() - state.last_heartbeat_ts
-    return elapsed >= HEARTBEAT_MINUTES * 60
-
-
-def analyze_symbol(
-    symbol: str,
-    market: Dict[str, MarketBar],
-    black_swan: BlackSwanDecision
-) -> Optional[TradePlan]:
-    bar = market.get(symbol)
-    if not bar:
-        return None
-
-    plan = detect_basic_signal(bar)
-    plan = apply_black_swan_override_to_plan(plan, black_swan)
-    return plan
-
-
-def maybe_send_plan_alert(state: EngineState, plan: TradePlan) -> None:
-    text = format_plan_alert(plan)
-    text_hash = hash_text(text)
-
-    if text_hash == state.last_alert_hash:
+def execute_trade(plan: TradePlan, context: MarketContext) -> None:
+    if not LIVE_TRADING:
+        print(f"[PAPER] {plan.action} {context.symbol} | Grade {plan.grade} | Score {plan.score}")
         return
 
-    premium = plan.grade in ["A+", "A", "B+"]
-    send_alert(text, premium=premium)
-    state.last_alert_hash = text_hash
+    # Replace this with your broker execution later.
+    print(f"[LIVE PLACEHOLDER] {plan.action} {context.symbol} | Grade {plan.grade} | Score {plan.score}")
 
 
-def process_cycle(state: EngineState, config: BlackSwanConfig) -> None:
-    symbols_to_fetch = list(set(SYMBOLS + ["SPY", "QQQ", "VIX"]))
-    market = fetch_market_snapshot(symbols_to_fetch)
+# =========================================================
+# MAIN LOOP
+# =========================================================
+def run_symbol(symbol: str) -> None:
+    context = build_market_context(symbol)
+    if not context:
+        print(f"[WARN] Could not build context for {symbol}")
+        return
 
-    for sym, bar in market.items():
-        state.last_prices[sym] = bar.price
+    plan = make_hybrid_decision(context)
+    plan = apply_constituent_confirmation(context, plan)
+    status, notes = execution_filter(plan, context)
 
-    snapshot = build_risk_snapshot(state)
-    stress = build_market_stress_state(market, state)
+    message = build_alert(plan, context, status, notes)
+    broadcast(message)
 
-    black_swan = evaluate_black_swan_risk(
-        snapshot=snapshot,
-        stress=stress,
-        config=config,
-        rejected_order_count=state.rejected_order_count
+    if status == "EXECUTE":
+        execute_trade(plan, context)
+
+
+def main() -> None:
+    startup = (
+        "🚀 UnBiased Framework started\n"
+        f"Watchlist: {', '.join(WATCHLIST)}\n"
+        f"Mode: {'LIVE' if LIVE_TRADING else 'ALERT / PAPER'}\n"
+        "Constituent engine active: TSLA, AMZN, AAPL, MSFT, NVDA, META, GOOGL and more."
     )
-
-    state.lock_state = update_system_lock(state.lock_state, black_swan)
-
-    if black_swan.status in ["FORCE_EXIT_ALL", "FLAT_AND_LOCK"]:
-        cancel_open_orders()
-        flatten_all_positions(snapshot)
-        send_alert(black_swan.alert, premium=True)
-
-    if should_send_heartbeat(state):
-        send_alert(format_heartbeat(state, stress), premium=False)
-        state.last_heartbeat_ts = time.time()
-
-    for symbol in SYMBOLS:
-        plan = analyze_symbol(symbol, market, black_swan)
-        if not plan:
-            continue
-
-        if state.lock_state.trading_locked:
-            plan.action = "HOLD"
-            plan.size = 0
-            plan.reasons.append(f"System locked: {state.lock_state.lock_reason}")
-
-        maybe_send_plan_alert(state, plan)
-
-
-# =========================================================
-# COMMANDS
-# =========================================================
-
-def run_status(config: BlackSwanConfig) -> None:
-    state = load_engine_state()
-    snapshot = build_risk_snapshot(state)
-    market = fetch_market_snapshot(list(set(SYMBOLS + ["SPY", "QQQ", "VIX"])))
-    stress = build_market_stress_state(market, state)
-    black_swan = evaluate_black_swan_risk(snapshot, stress, config, state.rejected_order_count)
-
-    print("========== STATUS ==========")
-    print(f"Trading Locked: {state.lock_state.trading_locked}")
-    print(f"Lock Reason: {state.lock_state.lock_reason}")
-    print(f"Rejected Orders: {state.rejected_order_count}")
-    print(f"Black Swan Status: {black_swan.status}")
-    print(f"Black Swan Alert: {black_swan.alert}")
-    print("============================")
-
-
-def run_unlock() -> None:
-    state = load_engine_state()
-    state.lock_state = SystemLockState()
-    save_engine_state(state)
-    msg = "🔓 MANUAL RESET: trading lock cleared."
-    print(msg)
-    send_alert(msg, premium=True)
-
-
-def run_flatten() -> None:
-    state = load_engine_state()
-    snapshot = build_risk_snapshot(state)
-    cancel_open_orders()
-    flatten_all_positions(snapshot)
-    state.lock_state.trading_locked = True
-    state.lock_state.lock_reason = "Manual flatten invoked."
-    state.lock_state.locked_at = now_iso()
-    save_engine_state(state)
-    msg = "🛑 MANUAL FLATTEN: all positions should be flattened and system locked."
-    print(msg)
-    send_alert(msg, premium=True)
-
-
-def run_once(config: BlackSwanConfig) -> None:
-    state = load_engine_state()
-    process_cycle(state, config)
-    save_engine_state(state)
-
-
-def run_loop(config: BlackSwanConfig) -> None:
-    state = load_engine_state()
-    send_alert("🚀 Analyzer started.", premium=False)
+    broadcast(startup)
 
     while True:
         try:
-            process_cycle(state, config)
-            save_engine_state(state)
-        except KeyboardInterrupt:
-            send_alert("🛑 Analyzer stopped manually.", premium=False)
-            save_engine_state(state)
-            break
+            for symbol in WATCHLIST:
+                run_symbol(symbol)
+                time.sleep(2)
         except Exception as e:
-            msg = f"❌ MAIN LOOP ERROR: {type(e).__name__}: {e}"
-            print(msg)
-            send_alert(msg, premium=True)
-            save_engine_state(state)
+            err = f"❌ MAIN LOOP ERROR: {e}"
+            print(err)
+            send_telegram(err)
 
         time.sleep(POLL_SECONDS)
 
 
-# =========================================================
-# MAIN
-# =========================================================
-
 if __name__ == "__main__":
-    config = BlackSwanConfig()
-
-    command = os.getenv("BOT_COMMAND", "run").strip().lower()
-
-    if command == "status":
-        run_status(config)
-    elif command == "unlock":
-        run_unlock()
-    elif command == "flatten":
-        run_flatten()
-    elif command == "once":
-        run_once(config)
-    else:
-        run_loop(config)
+    main()
