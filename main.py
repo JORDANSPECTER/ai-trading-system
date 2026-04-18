@@ -2,9 +2,9 @@ import os
 import json
 import time
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -108,10 +108,6 @@ def format_money(v: float) -> str:
     return f"${v:,.2f}"
 
 
-def format_pct(v: float) -> str:
-    return f"{v:+.2f}%"
-
-
 def parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
@@ -174,6 +170,7 @@ class Config:
     risk_warning_text: str
     debug: bool
 
+    # Execution
     execution_enabled: bool
     execution_min_grade: str
     alpaca_api_key: str
@@ -185,6 +182,7 @@ class Config:
     max_open_positions: int
     default_time_in_force: str
 
+    # Reports
     daily_reports_enabled: bool
     weekly_reports_enabled: bool
     morning_report_hour_et: int
@@ -194,9 +192,30 @@ class Config:
     weekly_report_hour_et: int
     weekly_report_minute_et: int
 
+    # Tracking
     tracking_enabled: bool
     tracking_target_pct: float
     tracking_fail_pct: float
+
+    # Risk Engine
+    risk_enabled: bool
+    kill_switch_enabled: bool
+    session_filter_enabled: bool
+    allow_midday_entries: bool
+    market_quality_enabled: bool
+    max_daily_loss: float
+    max_drawdown_pct: float
+    max_trades_per_day: int
+    one_trade_per_symbol: bool
+    cooldown_minutes_after_loss_cluster: int
+    max_consecutive_losses: int
+    max_order_notional: float
+    max_symbol_exposure: float
+    max_portfolio_exposure: float
+    duplicate_signal_window_minutes: int
+    vix_spike_block_pct: float
+    max_vwap_distance_pct: float
+    probation_size_multiplier: float
 
 
 def load_config() -> Config:
@@ -264,6 +283,25 @@ def load_config() -> Config:
         tracking_enabled=env_bool("TRACKING_ENABLED", True),
         tracking_target_pct=env_float("TRACKING_TARGET_PCT", 0.30),
         tracking_fail_pct=env_float("TRACKING_FAIL_PCT", 0.20),
+
+        risk_enabled=env_bool("RISK_ENABLED", True),
+        kill_switch_enabled=env_bool("KILL_SWITCH_ENABLED", False),
+        session_filter_enabled=env_bool("SESSION_FILTER_ENABLED", True),
+        allow_midday_entries=env_bool("ALLOW_MIDDAY_ENTRIES", False),
+        market_quality_enabled=env_bool("MARKET_QUALITY_ENABLED", True),
+        max_daily_loss=env_float("MAX_DAILY_LOSS", 300.0),
+        max_drawdown_pct=env_float("MAX_DRAWDOWN_PCT", 3.0),
+        max_trades_per_day=env_int("MAX_TRADES_PER_DAY", 3),
+        one_trade_per_symbol=env_bool("ONE_TRADE_PER_SYMBOL", True),
+        cooldown_minutes_after_loss_cluster=env_int("COOLDOWN_MINUTES_AFTER_LOSS_CLUSTER", 45),
+        max_consecutive_losses=env_int("MAX_CONSECUTIVE_LOSSES", 2),
+        max_order_notional=env_float("MAX_ORDER_NOTIONAL", 500.0),
+        max_symbol_exposure=env_float("MAX_SYMBOL_EXPOSURE", 1000.0),
+        max_portfolio_exposure=env_float("MAX_PORTFOLIO_EXPOSURE", 2000.0),
+        duplicate_signal_window_minutes=env_int("DUPLICATE_SIGNAL_WINDOW_MINUTES", 30),
+        vix_spike_block_pct=env_float("VIX_SPIKE_BLOCK_PCT", 4.0),
+        max_vwap_distance_pct=env_float("MAX_VWAP_DISTANCE_PCT", 0.35),
+        probation_size_multiplier=env_float("PROBATION_SIZE_MULTIPLIER", 0.5),
     )
 
 
@@ -331,10 +369,33 @@ class AlertPayload:
 
 
 @dataclass
+class OrderIntent:
+    signal_key: str
+    symbol: str
+    direction: str
+    grade: str
+    score: int
+    reference_price: float
+    requested_notional: float
+
+
+@dataclass
+class RiskDecision:
+    action: str  # ALLOW / ALLOW_REDUCED / BLOCK_TEMP / BLOCK_HARD / REDUCE_ONLY / KILL_SWITCH_ACTIVE
+    size_multiplier: float
+    reason_codes: List[str]
+    state_after: str
+
+
+@dataclass
 class PersistentState:
     last_alert_times: Dict[str, float] = field(default_factory=dict)
     last_market_snapshot: Dict[str, float] = field(default_factory=dict)
     execution_submitted_signals: Dict[str, Any] = field(default_factory=dict)
+    risk_state: str = "ACTIVE"
+    risk_state_until_utc: str = ""
+    risk_peak_equity: float = 0.0
+    risk_audit: List[Dict[str, Any]] = field(default_factory=list)
 
     @staticmethod
     def load(path: str) -> "PersistentState":
@@ -347,6 +408,10 @@ class PersistentState:
                 last_alert_times=raw.get("last_alert_times", {}),
                 last_market_snapshot=raw.get("last_market_snapshot", {}),
                 execution_submitted_signals=raw.get("execution_submitted_signals", {}),
+                risk_state=raw.get("risk_state", "ACTIVE"),
+                risk_state_until_utc=raw.get("risk_state_until_utc", ""),
+                risk_peak_equity=raw.get("risk_peak_equity", 0.0),
+                risk_audit=raw.get("risk_audit", []),
             )
         except Exception:
             return PersistentState()
@@ -356,6 +421,10 @@ class PersistentState:
             "last_alert_times": self.last_alert_times,
             "last_market_snapshot": self.last_market_snapshot,
             "execution_submitted_signals": self.execution_submitted_signals,
+            "risk_state": self.risk_state,
+            "risk_state_until_utc": self.risk_state_until_utc,
+            "risk_peak_equity": self.risk_peak_equity,
+            "risk_audit": self.risk_audit[-1000:],
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -415,7 +484,6 @@ class TwelveDataClient:
         response = requests.get(f"{self.BASE_URL}/{endpoint}", params=params, timeout=20)
         response.raise_for_status()
         data = response.json()
-
         if isinstance(data, dict) and data.get("status") == "error":
             raise RuntimeError(f"Twelve Data error: {data}")
         return data
@@ -425,7 +493,6 @@ class TwelveDataClient:
             raise RuntimeError("Symbol is blank. Check GitHub secrets.")
 
         data = self._get("quote", {"symbol": symbol})
-
         price = safe_float(data.get("close"), 0.0)
         open_price = safe_float(data.get("open"), 0.0)
         high = safe_float(data.get("high"), 0.0)
@@ -453,7 +520,6 @@ class TwelveDataClient:
             values = data.get("values", [])
             if not values:
                 return None
-
             latest = values[0]
             if endpoint == "vwap":
                 return safe_float(latest.get("vwap"), None)
@@ -500,11 +566,6 @@ def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext
     primary_indicators = client.get_indicator_pack(cfg.primary_symbol)
     secondary_indicators = client.get_indicator_pack(cfg.secondary_symbol)
 
-    previous_day_high = primary.high
-    previous_day_low = primary.low
-    premarket_high = primary.high
-    premarket_low = primary.low
-
     return MarketContext(
         primary=primary,
         secondary=secondary,
@@ -512,10 +573,10 @@ def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext
         volatility=volatility,
         primary_indicators=primary_indicators,
         secondary_indicators=secondary_indicators,
-        previous_day_high=previous_day_high,
-        previous_day_low=previous_day_low,
-        premarket_high=premarket_high,
-        premarket_low=premarket_low,
+        previous_day_high=primary.high,
+        previous_day_low=primary.low,
+        premarket_high=primary.high,
+        premarket_low=primary.low,
     )
 
 
@@ -589,9 +650,7 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
         risk_flags.append("Move is still small; chop risk is higher.")
 
     if ctx.oil and abs(ctx.oil.change_pct) >= cfg.oil_impact_threshold:
-        premium_reasons.append(
-            f"Oil is making a meaningful move ({ctx.oil.symbol} {ctx.oil.change_pct:+.2f}%)."
-        )
+        premium_reasons.append(f"Oil is making a meaningful move ({ctx.oil.symbol} {ctx.oil.change_pct:+.2f}%).")
         if ctx.oil.change_pct > 0:
             bearish_points += 1
             reasons.append("Oil pressure favors caution on long-side index continuation.")
@@ -621,14 +680,7 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
     score = max(0, min(score, 100))
     grade = grade_from_score(score)
 
-    return SetupScore(
-        score=score,
-        grade=grade,
-        direction=direction,
-        reasons=reasons,
-        premium_reasons=premium_reasons,
-        risk_flags=risk_flags,
-    )
+    return SetupScore(score, grade, direction, reasons, premium_reasons, risk_flags)
 
 
 # ============================================================
@@ -644,12 +696,10 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
         f"Premarket High: {ctx.premarket_high:.2f}" if ctx.premarket_high is not None else "Premarket High: n/a",
         f"Premarket Low: {ctx.premarket_low:.2f}" if ctx.premarket_low is not None else "Premarket Low: n/a",
     ]
-
     if ctx.primary_indicators.vwap is not None:
         lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
     if ctx.primary_indicators.rsi is not None:
         lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
-
     lines.append("")
     lines.append("Watch for acceptance / rejection at these levels before entry.")
     lines.append(cfg.risk_warning_text)
@@ -670,7 +720,6 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
 
 def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
     emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
-
     lines = [
         f"Symbol: {ctx.primary.symbol}",
         f"Direction: {setup.direction}",
@@ -679,7 +728,6 @@ def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> Ale
         f"Price: {ctx.primary.price:.2f}",
         f"Day Change: {ctx.primary.change_pct:+.2f}%",
     ]
-
     if ctx.primary_indicators.vwap is not None:
         lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
     if ctx.primary_indicators.rsi is not None:
@@ -720,12 +768,7 @@ def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> Ale
         grade=setup.grade,
         direction=setup.direction,
         score=setup.score,
-        tags=[
-            ctx.primary.symbol.lower(),
-            setup.direction.lower(),
-            f"grade-{setup.grade.lower().replace('+', 'plus')}",
-            "trade-alert",
-        ],
+        tags=[ctx.primary.symbol.lower(), setup.direction.lower(), f"grade-{setup.grade.lower().replace('+', 'plus')}", "trade-alert"],
         key=f"TRADE::{ctx.primary.symbol}::{setup.direction}::{setup.grade}::{rounded_price}",
         timestamp_utc=now_utc_iso(),
     )
@@ -753,12 +796,11 @@ class TelegramNotifier:
     def send(self, text: str) -> None:
         if not self.enabled or not self.token or not self.chat_id:
             return
-        response = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{self.token}/sendMessage",
             json={"chat_id": self.chat_id, "text": text},
             timeout=20,
-        )
-        response.raise_for_status()
+        ).raise_for_status()
 
 
 class DiscordNotifier:
@@ -768,8 +810,7 @@ class DiscordNotifier:
     def send(self, webhook_url: str, content: str) -> None:
         if not self.enabled or not webhook_url:
             return
-        response = requests.post(webhook_url, json={"content": content}, timeout=20)
-        response.raise_for_status()
+        requests.post(webhook_url, json={"content": content}, timeout=20).raise_for_status()
 
 
 def format_for_telegram(alert: AlertPayload) -> str:
@@ -782,69 +823,312 @@ def format_for_discord(alert: AlertPayload) -> str:
 
 
 # ============================================================
-# ROUTING
+# RISK ENGINE
 # ============================================================
 
-def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
-    current_ts = time.time()
-    last_ts = state.last_alert_times.get(key, 0)
-    return (current_ts - last_ts) >= cooldown_seconds
+def current_session_label() -> str:
+    current = now_et()
+    mins = current.hour * 60 + current.minute
+    if 9 * 60 + 30 <= mins < 10 * 60 + 30:
+        return "OPEN"
+    if 10 * 60 + 30 <= mins < 14 * 60:
+        return "MIDDAY"
+    if 14 * 60 <= mins <= 16 * 60:
+        return "POWER_HOUR"
+    return "OFF_HOURS"
 
 
-def mark_sent(state: PersistentState, key: str) -> None:
-    state.last_alert_times[key] = time.time()
+def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
+    state.risk_audit.append(
+        {
+            "ts_utc": now_utc_iso(),
+            "event_type": event_type,
+            "details": details,
+        }
+    )
+    state.risk_audit = state.risk_audit[-1000:]
 
 
-def route_alert(
-    alert: AlertPayload,
-    cfg: Config,
-    state: PersistentState,
-    telegram: TelegramNotifier,
-    discord: DiscordNotifier
-) -> None:
-    msg_discord = format_for_discord(alert)
-    msg_telegram = format_for_telegram(alert)
+def is_state_active(state: PersistentState) -> bool:
+    if state.risk_state_until_utc:
+        try:
+            if now_utc() >= parse_iso(state.risk_state_until_utc):
+                state.risk_state = "ACTIVE"
+                state.risk_state_until_utc = ""
+        except Exception:
+            pass
+    return state.risk_state == "ACTIVE"
 
-    if alert.alert_type == "DAILY_LEVELS":
-        if not cfg.daily_levels_enabled:
-            return
-        if not is_daily_levels_window():
-            return
-        if not should_send_by_cooldown(state, alert.key, cfg.daily_levels_cooldown_seconds):
-            return
 
-        if cfg.discord_daily_levels_webhook:
-            discord.send(cfg.discord_daily_levels_webhook, msg_discord)
-        if cfg.telegram_enabled:
-            telegram.send(msg_telegram)
+def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> None:
+    state.risk_state = new_state
+    if minutes > 0:
+        until_dt = now_utc().timestamp() + minutes * 60
+        state.risk_state_until_utc = datetime.fromtimestamp(until_dt, timezone.utc).isoformat()
+    else:
+        state.risk_state_until_utc = ""
 
-        mark_sent(state, alert.key)
-        return
 
-    if alert.alert_type != "TRADE_ALERT":
-        return
+class ExposureService:
+    def __init__(self, executor: "ExecutionEngine"):
+        self.executor = executor
 
-    if not should_send_by_cooldown(state, alert.key, cfg.alert_cooldown_seconds):
-        return
+    def get_positions(self) -> List[Any]:
+        return safe_get_positions(self.executor)
 
-    if cfg.telegram_enabled:
-        telegram.send(msg_telegram)
+    def portfolio_exposure(self) -> float:
+        total = 0.0
+        for pos in self.get_positions():
+            try:
+                total += abs(float(getattr(pos, "market_value", 0.0)))
+            except Exception:
+                pass
+        return total
 
-    if (
-        grade_rank(alert.grade) >= grade_rank(cfg.premium_min_grade)
-        and alert.score >= cfg.min_score_for_premium
-    ):
-        if cfg.discord_premium_webhook:
-            discord.send(cfg.discord_premium_webhook, msg_discord)
+    def symbol_exposure(self, symbol: str) -> float:
+        total = 0.0
+        for pos in self.get_positions():
+            try:
+                if str(pos.symbol).upper() == symbol.upper():
+                    total += abs(float(getattr(pos, "market_value", 0.0)))
+            except Exception:
+                pass
+        return total
 
-    elif (
-        grade_rank(alert.grade) >= grade_rank(cfg.free_min_grade)
-        and alert.score >= cfg.min_score_for_free
-    ):
-        if cfg.discord_free_webhook:
-            discord.send(cfg.discord_free_webhook, msg_discord)
+    def has_symbol_position(self, symbol: str) -> bool:
+        for pos in self.get_positions():
+            try:
+                if str(pos.symbol).upper() == symbol.upper():
+                    return True
+            except Exception:
+                pass
+        return False
 
-    mark_sent(state, alert.key)
+    def open_position_count(self) -> int:
+        return len(self.get_positions())
+
+
+def trades_today_count(perf: PerformanceState) -> int:
+    today = today_et_str()
+    return sum(1 for x in perf.history if x.get("type") == "execution" and x.get("date_et") == today)
+
+
+def consecutive_losses_today(perf: PerformanceState) -> int:
+    today = today_et_str()
+    outcomes = [x for x in perf.history if x.get("type") == "tracked_outcome" and x.get("date_et") == today]
+    outcomes.sort(key=lambda x: x.get("ts_utc", ""))
+    count = 0
+    for item in reversed(outcomes):
+        if item.get("final_status") == "LOSS":
+            count += 1
+        elif item.get("final_status") == "WIN":
+            break
+    return count
+
+
+def realized_signal_pnl_estimate_today(perf: PerformanceState) -> float:
+    today = today_et_str()
+    tracked = [x for x in perf.history if x.get("type") == "tracked_outcome" and x.get("date_et") == today]
+    pnl = 0.0
+    for item in tracked:
+        status = item.get("final_status")
+        if status == "WIN":
+            pnl += 1.0
+        elif status == "LOSS":
+            pnl -= 1.0
+    return pnl
+
+
+class PreTradeRiskEngine:
+    def __init__(self, cfg: Config, state: PersistentState, perf: PerformanceState, executor: "ExecutionEngine", exposure: ExposureService):
+        self.cfg = cfg
+        self.state = state
+        self.perf = perf
+        self.executor = executor
+        self.exposure = exposure
+
+    def _sync_peak_equity(self) -> None:
+        equity = safe_get_account_equity(self.executor)
+        if equity > 0 and equity > self.state.risk_peak_equity:
+            self.state.risk_peak_equity = equity
+
+    def _check_state(self, reasons: List[str]) -> Optional[RiskDecision]:
+        if self.cfg.kill_switch_enabled:
+            set_risk_state(self.state, "KILL_SWITCH")
+            reasons.append("KILL_SWITCH_ACTIVE")
+            return RiskDecision("KILL_SWITCH_ACTIVE", 0.0, reasons, self.state.risk_state)
+
+        if not is_state_active(self.state):
+            if self.state.risk_state == "COOLDOWN":
+                reasons.append("COOLDOWN_ACTIVE")
+                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+            if self.state.risk_state == "BREACH":
+                reasons.append("RISK_BREACH_ACTIVE")
+                return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+            if self.state.risk_state == "SOFT_BLOCK":
+                reasons.append("SOFT_BLOCK_ACTIVE")
+                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+            if self.state.risk_state == "PROBATION":
+                reasons.append("PROBATION_ACTIVE")
+                return None
+        return None
+
+    def _check_daily_loss_and_drawdown(self, reasons: List[str]) -> Optional[RiskDecision]:
+        self._sync_peak_equity()
+
+        pseudo_realized = realized_signal_pnl_estimate_today(self.perf) * self.cfg.max_order_notional * (self.cfg.tracking_target_pct / 100.0)
+        if abs(min(pseudo_realized, 0.0)) >= self.cfg.max_daily_loss:
+            set_risk_state(self.state, "BREACH")
+            reasons.append("MAX_DAILY_LOSS_BREACH")
+            return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        equity = safe_get_account_equity(self.executor)
+        if equity > 0 and self.state.risk_peak_equity > 0:
+            dd_pct = ((self.state.risk_peak_equity - equity) / self.state.risk_peak_equity) * 100.0
+            if dd_pct >= self.cfg.max_drawdown_pct:
+                set_risk_state(self.state, "BREACH")
+                reasons.append("MAX_DRAWDOWN_BREACH")
+                return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        reasons.append("DAILY_LOSS_OK")
+        reasons.append("DRAWDOWN_OK")
+        return None
+
+    def _check_strategy_health(self, reasons: List[str]) -> Optional[RiskDecision]:
+        losses = consecutive_losses_today(self.perf)
+        if losses >= self.cfg.max_consecutive_losses:
+            set_risk_state(self.state, "COOLDOWN", self.cfg.cooldown_minutes_after_loss_cluster)
+            reasons.append("LOSS_CLUSTER_COOLDOWN")
+            return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        reasons.append("LOSS_CLUSTER_OK")
+        return None
+
+    def _check_trade_count(self, reasons: List[str]) -> Optional[RiskDecision]:
+        if trades_today_count(self.perf) >= self.cfg.max_trades_per_day:
+            set_risk_state(self.state, "SOFT_BLOCK", 60)
+            reasons.append("MAX_TRADES_PER_DAY_REACHED")
+            return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        reasons.append("TRADE_COUNT_OK")
+        return None
+
+    def _check_duplicate(self, intent: OrderIntent, reasons: List[str]) -> Optional[RiskDecision]:
+        for entry in self.perf.history:
+            if entry.get("signal_key") != intent.signal_key and entry.get("symbol") == intent.symbol and entry.get("type") == "execution":
+                ts = entry.get("ts_utc")
+                if ts and minutes_since(ts) <= self.cfg.duplicate_signal_window_minutes:
+                    reasons.append("DUPLICATE_SIGNAL_WINDOW")
+                    return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        if intent.signal_key in self.state.execution_submitted_signals:
+            reasons.append("DUPLICATE_SIGNAL_KEY")
+            return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        reasons.append("DUPLICATE_OK")
+        return None
+
+    def _check_exposure(self, intent: OrderIntent, reasons: List[str]) -> Optional[RiskDecision]:
+        if intent.requested_notional > self.cfg.max_order_notional:
+            reasons.append("MAX_ORDER_NOTIONAL_BREACH")
+            return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        portfolio_exposure = self.exposure.portfolio_exposure()
+        symbol_exposure = self.exposure.symbol_exposure(intent.symbol)
+
+        if self.cfg.one_trade_per_symbol and self.exposure.has_symbol_position(intent.symbol):
+            reasons.append("ONE_TRADE_PER_SYMBOL_BLOCK")
+            return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        if self.exposure.open_position_count() >= self.cfg.max_open_positions:
+            reasons.append("MAX_OPEN_POSITIONS_BLOCK")
+            return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        if symbol_exposure + intent.requested_notional > self.cfg.max_symbol_exposure:
+            reasons.append("MAX_SYMBOL_EXPOSURE_BREACH")
+            return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        if portfolio_exposure + intent.requested_notional > self.cfg.max_portfolio_exposure:
+            # haircut before full block
+            if portfolio_exposure < self.cfg.max_portfolio_exposure:
+                remaining = self.cfg.max_portfolio_exposure - portfolio_exposure
+                if remaining > 0:
+                    mult = max(0.1, min(1.0, remaining / max(intent.requested_notional, 0.01)))
+                    reasons.append("PORTFOLIO_EXPOSURE_HAIRCUT")
+                    return RiskDecision("ALLOW_REDUCED", mult, reasons, "ACTIVE")
+            reasons.append("MAX_PORTFOLIO_EXPOSURE_BREACH")
+            return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        reasons.append("EXPOSURE_OK")
+        return None
+
+    def _check_session_and_market_quality(self, ctx: MarketContext, reasons: List[str]) -> Optional[RiskDecision]:
+        if self.cfg.session_filter_enabled:
+            session = current_session_label()
+            if session == "OFF_HOURS":
+                reasons.append("SESSION_OFF_HOURS_BLOCK")
+                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+            if session == "MIDDAY" and not self.cfg.allow_midday_entries:
+                reasons.append("SESSION_MIDDAY_BLOCK")
+                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+            reasons.append(f"SESSION_{session}_OK")
+
+        if self.cfg.market_quality_enabled:
+            if ctx.volatility and ctx.volatility.change_pct >= self.cfg.vix_spike_block_pct:
+                reasons.append("VOLATILITY_SPIKE_BLOCK")
+                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+            if ctx.primary_indicators.vwap is not None:
+                dist = abs(pct_change(ctx.primary.price, ctx.primary_indicators.vwap))
+                if dist > self.cfg.max_vwap_distance_pct:
+                    reasons.append("PRICE_COLLAR_VWAP_DISTANCE_BLOCK")
+                    return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+            reasons.append("MARKET_QUALITY_OK")
+
+        return None
+
+    def evaluate(self, intent: OrderIntent, ctx: MarketContext) -> RiskDecision:
+        reasons: List[str] = []
+
+        if not self.cfg.risk_enabled:
+            reasons.append("RISK_ENGINE_DISABLED")
+            return RiskDecision("ALLOW", 1.0, reasons, self.state.risk_state)
+
+        decision = self._check_state(reasons)
+        if decision:
+            return decision
+
+        decision = self._check_daily_loss_and_drawdown(reasons)
+        if decision:
+            return decision
+
+        decision = self._check_strategy_health(reasons)
+        if decision:
+            return decision
+
+        decision = self._check_trade_count(reasons)
+        if decision:
+            return decision
+
+        decision = self._check_duplicate(intent, reasons)
+        if decision:
+            return decision
+
+        decision = self._check_exposure(intent, reasons)
+        if decision:
+            return decision
+
+        decision = self._check_session_and_market_quality(ctx, reasons)
+        if decision:
+            return decision
+
+        if self.state.risk_state == "PROBATION":
+            reasons.append("PROBATION_SIZE_REDUCTION")
+            return RiskDecision("ALLOW_REDUCED", self.cfg.probation_size_multiplier, reasons, self.state.risk_state)
+
+        reasons.append("PRETRADE_RISK_OK")
+        return RiskDecision("ALLOW", 1.0, reasons, "ACTIVE")
 
 
 # ============================================================
@@ -864,72 +1148,34 @@ class ExecutionEngine:
                 paper=cfg.alpaca_paper,
             )
 
-    def _eligible(self, alert: AlertPayload) -> tuple[bool, str]:
+    def _eligible(self, alert: AlertPayload) -> Tuple[bool, str]:
         if not self.cfg.execution_enabled:
             return False, "Execution disabled"
-
         if self.client is None:
             return False, "Missing Alpaca credentials"
-
         if alert.alert_type != "TRADE_ALERT":
             return False, "Not a trade alert"
-
         if grade_rank(alert.grade) < grade_rank(self.cfg.execution_min_grade):
             return False, f"Grade below execution threshold ({self.cfg.execution_min_grade})"
-
-        if alert.key in self.state.execution_submitted_signals:
-            return False, "Signal already executed"
-
         return True, "OK"
 
-    def _get_positions(self):
-        try:
-            return self.client.get_all_positions()
-        except Exception:
-            return []
-
-    def _open_position_count(self) -> int:
-        try:
-            return len(self._get_positions())
-        except Exception:
-            return 0
-
-    def _has_symbol_position(self, symbol: str) -> bool:
-        try:
-            positions = self._get_positions()
-            for pos in positions:
-                if str(pos.symbol).upper() == symbol.upper():
-                    return True
-            return False
-        except Exception:
-            return False
-
-    def _qty_from_price(self, price: float) -> float:
+    def qty_from_price(self, price: float, notional: float) -> float:
         if price <= 0:
             return 0.0
-
-        raw_qty = self.cfg.max_position_notional / price
-
+        raw_qty = notional / price
         if self.cfg.allow_fractional:
             return round(raw_qty, 4)
-
         return max(1, math.floor(raw_qty))
 
-    def maybe_execute(self, alert: AlertPayload, ctx: MarketContext) -> Dict[str, Any]:
+    def execute(self, alert: AlertPayload, ctx: MarketContext, notional: float) -> Dict[str, Any]:
         ok, reason = self._eligible(alert)
         if not ok:
             return {"executed": False, "reason": reason}
 
-        if self._open_position_count() >= self.cfg.max_open_positions:
-            return {"executed": False, "reason": "Max open positions reached"}
-
-        if self._has_symbol_position(alert.symbol):
-            return {"executed": False, "reason": f"Position already exists in {alert.symbol}"}
-
         if alert.direction == "BEARISH" and not self.cfg.allow_shorts:
             return {"executed": False, "reason": "Bearish execution blocked because ALLOW_SHORTS=false"}
 
-        qty = self._qty_from_price(ctx.primary.price)
+        qty = self.qty_from_price(ctx.primary.price, notional)
         if qty <= 0:
             return {"executed": False, "reason": "Calculated qty <= 0"}
 
@@ -952,6 +1198,7 @@ class ExecutionEngine:
                 "grade": alert.grade,
                 "direction": alert.direction,
                 "qty": qty,
+                "notional": notional,
                 "price_snapshot": ctx.primary.price,
                 "client_order_id": client_order_id,
                 "submitted_at": now_utc_iso(),
@@ -963,6 +1210,7 @@ class ExecutionEngine:
                 "symbol": alert.symbol,
                 "qty": qty,
                 "side": side.value,
+                "notional": notional,
                 "client_order_id": client_order_id,
                 "alpaca_order_id": str(order.id),
                 "alpaca_status": str(order.status),
@@ -1001,65 +1249,67 @@ def safe_get_positions(executor: ExecutionEngine) -> List[Any]:
 
 
 # ============================================================
-# WIN RATE + TRACKING ENGINE
+# TRACKING
 # ============================================================
 
 TRACK_WINDOWS_MIN = [5, 15, 30, 60]
 
 
 def record_signal(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, cfg: Config) -> None:
-    signal_entry = {
-        "ts_utc": now_utc_iso(),
-        "date_et": today_et_str(),
-        "week_key": week_key_et(),
-        "type": "signal",
-        "symbol": alert.symbol,
-        "grade": alert.grade,
-        "direction": alert.direction,
-        "score": alert.score,
-        "price_snapshot": ctx.primary.price,
-        "change_pct": ctx.primary.change_pct,
-        "signal_key": alert.key,
-    }
-    perf.history.append(signal_entry)
-
-    if cfg.tracking_enabled:
-        pending = {
-            "signal_key": alert.key,
+    perf.history.append(
+        {
+            "ts_utc": now_utc_iso(),
+            "date_et": today_et_str(),
+            "week_key": week_key_et(),
+            "type": "signal",
             "symbol": alert.symbol,
             "grade": alert.grade,
             "direction": alert.direction,
             "score": alert.score,
-            "entry_price": ctx.primary.price,
-            "created_at_utc": now_utc_iso(),
-            "date_et": today_et_str(),
-            "week_key": week_key_et(),
-            "checkpoints": {},  # "5","15","30","60"
-            "final_status": "PENDING",
-            "target_pct": cfg.tracking_target_pct,
-            "fail_pct": cfg.tracking_fail_pct,
+            "price_snapshot": ctx.primary.price,
+            "signal_key": alert.key,
         }
-        perf.pending_signals.append(pending)
+    )
+
+    if cfg.tracking_enabled:
+        perf.pending_signals.append(
+            {
+                "signal_key": alert.key,
+                "symbol": alert.symbol,
+                "grade": alert.grade,
+                "direction": alert.direction,
+                "score": alert.score,
+                "entry_price": ctx.primary.price,
+                "created_at_utc": now_utc_iso(),
+                "date_et": today_et_str(),
+                "week_key": week_key_et(),
+                "checkpoints": {},
+                "final_status": "PENDING",
+                "target_pct": cfg.tracking_target_pct,
+                "fail_pct": cfg.tracking_fail_pct,
+            }
+        )
 
 
 def record_execution(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, result: Dict[str, Any]) -> None:
-    entry = {
-        "ts_utc": now_utc_iso(),
-        "date_et": today_et_str(),
-        "week_key": week_key_et(),
-        "type": "execution",
-        "symbol": alert.symbol,
-        "grade": alert.grade,
-        "direction": alert.direction,
-        "score": alert.score,
-        "qty": result.get("qty", 0),
-        "side": result.get("side", ""),
-        "price_snapshot": ctx.primary.price,
-        "alpaca_order_id": result.get("alpaca_order_id", ""),
-        "alpaca_status": result.get("alpaca_status", ""),
-        "signal_key": alert.key,
-    }
-    perf.history.append(entry)
+    perf.history.append(
+        {
+            "ts_utc": now_utc_iso(),
+            "date_et": today_et_str(),
+            "week_key": week_key_et(),
+            "type": "execution",
+            "symbol": alert.symbol,
+            "grade": alert.grade,
+            "direction": alert.direction,
+            "score": alert.score,
+            "qty": result.get("qty", 0),
+            "side": result.get("side", ""),
+            "price_snapshot": ctx.primary.price,
+            "alpaca_order_id": result.get("alpaca_order_id", ""),
+            "alpaca_status": result.get("alpaca_status", ""),
+            "signal_key": alert.key,
+        }
+    )
 
 
 def compute_signal_status(direction: str, move_pct: float, target_pct: float, fail_pct: float) -> str:
@@ -1069,30 +1319,29 @@ def compute_signal_status(direction: str, move_pct: float, target_pct: float, fa
         if move_pct <= -fail_pct:
             return "LOSS"
         return "PENDING"
-
     if direction == "BEARISH":
         if move_pct <= -target_pct:
             return "WIN"
         if move_pct >= fail_pct:
             return "LOSS"
         return "PENDING"
-
     return "PENDING"
 
 
 def update_pending_signal_from_quote(pending: Dict[str, Any], quote_price: float) -> None:
     age_min = minutes_since(pending["created_at_utc"])
     entry_price = float(pending["entry_price"])
-    direction = pending["direction"]
-    target_pct = float(pending["target_pct"])
-    fail_pct = float(pending["fail_pct"])
-
     move_pct = pct_change(quote_price, entry_price)
 
     for window in TRACK_WINDOWS_MIN:
         key = str(window)
         if age_min >= window and key not in pending["checkpoints"]:
-            status = compute_signal_status(direction, move_pct, target_pct, fail_pct)
+            status = compute_signal_status(
+                pending["direction"],
+                move_pct,
+                float(pending["target_pct"]),
+                float(pending["fail_pct"]),
+            )
             pending["checkpoints"][key] = {
                 "minutes": window,
                 "price": quote_price,
@@ -1112,15 +1361,15 @@ def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, c
         return
 
     still_pending: List[Dict[str, Any]] = []
-    symbol_quote_cache: Dict[str, float] = {}
+    cache: Dict[str, float] = {}
 
     for pending in perf.pending_signals:
         symbol = pending["symbol"]
 
         try:
-            if symbol not in symbol_quote_cache:
-                symbol_quote_cache[symbol] = client.get_quote(symbol).price
-            current_price = symbol_quote_cache[symbol]
+            if symbol not in cache:
+                cache[symbol] = client.get_quote(symbol).price
+            current_price = cache[symbol]
             update_pending_signal_from_quote(pending, current_price)
         except Exception as e:
             debug_log(cfg, f"tracking quote failed for {symbol}: {e}")
@@ -1145,7 +1394,6 @@ def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, c
                 }
             )
         elif age_min >= 120:
-            # Force-close old signals that never hit win/loss thresholds by 2h mark
             pending["final_status"] = "NEUTRAL"
             perf.history.append(
                 {
@@ -1170,7 +1418,7 @@ def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, c
 
 
 # ============================================================
-# REPORTING
+# REPORTS
 # ============================================================
 
 def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1184,33 +1432,19 @@ def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     symbol_outcomes: Dict[str, Dict[str, int]] = {}
 
     for item in signals:
-        grade = item.get("grade", "UNK")
-        symbol = item.get("symbol", "UNK")
-        grade_counts[grade] = grade_counts.get(grade, 0) + 1
-        symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+        grade_counts[item["grade"]] = grade_counts.get(item["grade"], 0) + 1
+        symbol_counts[item["symbol"]] = symbol_counts.get(item["symbol"], 0) + 1
 
     for item in tracked:
-        grade = item.get("grade", "UNK")
-        symbol = item.get("symbol", "UNK")
-        status = item.get("final_status", "PENDING")
+        grade = item["grade"]
+        symbol = item["symbol"]
+        status = item["final_status"]
 
-        if grade not in grade_outcomes:
-            grade_outcomes[grade] = {"WIN": 0, "LOSS": 0, "NEUTRAL": 0}
-        if symbol not in symbol_outcomes:
-            symbol_outcomes[symbol] = {"WIN": 0, "LOSS": 0, "NEUTRAL": 0}
+        grade_outcomes.setdefault(grade, {"WIN": 0, "LOSS": 0, "NEUTRAL": 0})
+        symbol_outcomes.setdefault(symbol, {"WIN": 0, "LOSS": 0, "NEUTRAL": 0})
 
-        if status not in grade_outcomes[grade]:
-            grade_outcomes[grade][status] = 0
-        if status not in symbol_outcomes[symbol]:
-            symbol_outcomes[symbol][status] = 0
-
-        grade_outcomes[grade][status] += 1
-        symbol_outcomes[symbol][status] += 1
-
-    top_symbol = max(symbol_counts, key=symbol_counts.get) if symbol_counts else "n/a"
-    bullish = sum(1 for x in signals if x.get("direction") == "BULLISH")
-    bearish = sum(1 for x in signals if x.get("direction") == "BEARISH")
-    avg_score = round(sum(x.get("score", 0) for x in signals) / len(signals), 2) if signals else 0.0
+        grade_outcomes[grade][status] = grade_outcomes[grade].get(status, 0) + 1
+        symbol_outcomes[symbol][status] = symbol_outcomes[symbol].get(status, 0) + 1
 
     wins = sum(1 for x in tracked if x.get("final_status") == "WIN")
     losses = sum(1 for x in tracked if x.get("final_status") == "LOSS")
@@ -1230,17 +1464,14 @@ def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "symbol_counts": symbol_counts,
         "grade_outcomes": grade_outcomes,
         "symbol_outcomes": symbol_outcomes,
-        "top_symbol": top_symbol,
-        "bullish": bullish,
-        "bearish": bearish,
-        "avg_score": avg_score,
+        "top_symbol": max(symbol_counts, key=symbol_counts.get) if symbol_counts else "n/a",
+        "avg_score": round(sum(x.get("score", 0) for x in signals) / len(signals), 2) if signals else 0.0,
     }
 
 
 def best_rate_bucket(outcomes: Dict[str, Dict[str, int]]) -> str:
     best_name = "n/a"
     best_rate = -1.0
-
     for name, bucket in outcomes.items():
         wins = bucket.get("WIN", 0)
         losses = bucket.get("LOSS", 0)
@@ -1251,14 +1482,12 @@ def best_rate_bucket(outcomes: Dict[str, Dict[str, int]]) -> str:
         if rate > best_rate:
             best_rate = rate
             best_name = f"{name} ({rate:.1f}%)"
-
     return best_name
 
 
-def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, mode: str) -> str:
+def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, state: PersistentState, mode: str) -> str:
     date_key = today_et_str()
-    day_history = [x for x in perf.history if x.get("date_et") == date_key]
-    summary = summarize_period(day_history)
+    summary = summarize_period([x for x in perf.history if x.get("date_et") == date_key])
 
     equity = safe_get_account_equity(executor)
     last_equity = safe_get_account_last_equity(executor)
@@ -1271,146 +1500,66 @@ def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: Execu
         "",
         f"Signals Today: {summary['signals']}",
         f"Executions Today: {summary['executions']}",
-        f"Tracked Outcomes Today: {summary['tracked']}",
+        f"Tracked Outcomes: {summary['tracked']}",
         f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
         f"Win Rate: {summary['win_rate']:.2f}%",
-        f"Avg Signal Score: {summary['avg_score']}",
-        f"Bullish / Bearish Signals: {summary['bullish']} / {summary['bearish']}",
-        f"Most Active Symbol: {summary['top_symbol']}",
-        f"Best Grade So Far: {best_rate_bucket(summary['grade_outcomes'])}",
-        f"Best Symbol So Far: {best_rate_bucket(summary['symbol_outcomes'])}",
-        "",
-        f"Account Equity: {format_money(equity)}" if equity else "Account Equity: n/a",
-        f"Equity Change vs Last Equity: {format_money(equity_change)}" if equity and last_equity else "Equity Change vs Last Equity: n/a",
-        f"Open Positions: {len(positions)}",
-        "",
-        "Grade Breakdown:",
-    ]
-
-    if summary["grade_counts"]:
-        for grade, count in sorted(summary["grade_counts"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
-            lines.append(f"• {grade}: {count}")
-    else:
-        lines.append("• No signals recorded yet")
-
-    if summary["grade_outcomes"]:
-        lines.append("")
-        lines.append("Grade Win Rates:")
-        for grade, bucket in sorted(summary["grade_outcomes"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
-            wins = bucket.get("WIN", 0)
-            losses = bucket.get("LOSS", 0)
-            decided = wins + losses
-            rate = (wins / decided) * 100.0 if decided else 0.0
-            lines.append(f"• {grade}: {wins}W / {losses}L | {rate:.1f}%")
-
-    if positions:
-        lines.append("")
-        lines.append("Open Positions Snapshot:")
-        for pos in positions[:8]:
-            try:
-                symbol = str(pos.symbol)
-                qty = getattr(pos, "qty", "n/a")
-                unrealized = safe_float(getattr(pos, "unrealized_pl", 0), 0.0)
-                lines.append(f"• {symbol} | Qty: {qty} | Unrealized: {format_money(unrealized)}")
-            except Exception:
-                pass
-
-    return "\n".join(lines)
-
-
-def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine) -> str:
-    wk = week_key_et()
-    week_history = [x for x in perf.history if x.get("week_key") == wk]
-    summary = summarize_period(week_history)
-
-    equity = safe_get_account_equity(executor)
-    positions = safe_get_positions(executor)
-
-    lines = [
-        "📈 Weekly Performance Report",
-        f"Week: {wk}",
-        "",
-        f"Signals This Week: {summary['signals']}",
-        f"Executions This Week: {summary['executions']}",
-        f"Tracked Outcomes This Week: {summary['tracked']}",
-        f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
-        f"Weekly Win Rate: {summary['win_rate']:.2f}%",
         f"Avg Signal Score: {summary['avg_score']}",
         f"Most Active Symbol: {summary['top_symbol']}",
         f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
         f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
         "",
-        f"Current Account Equity: {format_money(equity)}" if equity else "Current Account Equity: n/a",
-        f"Open Positions Right Now: {len(positions)}",
-        "",
-        "Weekly Grade Breakdown:",
+        f"Risk State: {state.risk_state}",
+        f"Peak Equity: {format_money(state.risk_peak_equity)}" if state.risk_peak_equity else "Peak Equity: n/a",
+        f"Account Equity: {format_money(equity)}" if equity else "Account Equity: n/a",
+        f"Equity Change vs Last Equity: {format_money(equity_change)}" if equity and last_equity else "Equity Change vs Last Equity: n/a",
+        f"Open Positions: {len(positions)}",
     ]
-
-    if summary["grade_counts"]:
-        for grade, count in sorted(summary["grade_counts"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
-            lines.append(f"• {grade}: {count}")
-    else:
-        lines.append("• No weekly signals recorded yet")
-
-    if summary["grade_outcomes"]:
-        lines.append("")
-        lines.append("Weekly Grade Win Rates:")
-        for grade, bucket in sorted(summary["grade_outcomes"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
-            wins = bucket.get("WIN", 0)
-            losses = bucket.get("LOSS", 0)
-            decided = wins + losses
-            rate = (wins / decided) * 100.0 if decided else 0.0
-            lines.append(f"• {grade}: {wins}W / {losses}L | {rate:.1f}%")
-
-    if summary["symbol_outcomes"]:
-        lines.append("")
-        lines.append("Weekly Symbol Win Rates:")
-        for symbol, bucket in sorted(summary["symbol_outcomes"].items(), key=lambda x: x[0]):
-            wins = bucket.get("WIN", 0)
-            losses = bucket.get("LOSS", 0)
-            decided = wins + losses
-            rate = (wins / decided) * 100.0 if decided else 0.0
-            lines.append(f"• {symbol}: {wins}W / {losses}L | {rate:.1f}%")
-
     return "\n".join(lines)
 
 
-def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, discord: DiscordNotifier) -> None:
+def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, state: PersistentState) -> str:
+    wk = week_key_et()
+    summary = summarize_period([x for x in perf.history if x.get("week_key") == wk])
+    equity = safe_get_account_equity(executor)
+
+    lines = [
+        "📈 Weekly Performance Report",
+        f"Week: {wk}",
+        "",
+        f"Signals: {summary['signals']}",
+        f"Executions: {summary['executions']}",
+        f"Tracked Outcomes: {summary['tracked']}",
+        f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
+        f"Weekly Win Rate: {summary['win_rate']:.2f}%",
+        f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
+        f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
+        "",
+        f"Risk State: {state.risk_state}",
+        f"Current Equity: {format_money(equity)}" if equity else "Current Equity: n/a",
+    ]
+    return "\n".join(lines)
+
+
+def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, state: PersistentState, discord: DiscordNotifier) -> None:
     current = now_et()
     date_key = current.strftime("%Y-%m-%d")
     wk = week_key_et()
 
     if cfg.daily_reports_enabled:
-        if (
-            current.hour == cfg.morning_report_hour_et
-            and current.minute < 20
-            and perf.last_daily_morning_report_date != date_key
-        ):
-            text = build_daily_report_text(cfg, perf, executor, "morning")
+        if current.hour == cfg.morning_report_hour_et and current.minute < 20 and perf.last_daily_morning_report_date != date_key:
             if cfg.discord_daily_performance_webhook:
-                discord.send(cfg.discord_daily_performance_webhook, text)
+                discord.send(cfg.discord_daily_performance_webhook, build_daily_report_text(cfg, perf, executor, state, "morning"))
             perf.last_daily_morning_report_date = date_key
 
-        if (
-            current.hour == cfg.evening_report_hour_et
-            and current.minute < 20
-            and perf.last_daily_evening_report_date != date_key
-        ):
-            text = build_daily_report_text(cfg, perf, executor, "evening")
+        if current.hour == cfg.evening_report_hour_et and current.minute < 20 and perf.last_daily_evening_report_date != date_key:
             if cfg.discord_daily_performance_webhook:
-                discord.send(cfg.discord_daily_performance_webhook, text)
+                discord.send(cfg.discord_daily_performance_webhook, build_daily_report_text(cfg, perf, executor, state, "evening"))
             perf.last_daily_evening_report_date = date_key
 
     if cfg.weekly_reports_enabled:
-        if (
-            current.weekday() == 6
-            and current.hour == cfg.weekly_report_hour_et
-            and current.minute < 20
-            and perf.last_weekly_report_key != wk
-        ):
-            text = build_weekly_report_text(cfg, perf, executor)
+        if current.weekday() == 6 and current.hour == cfg.weekly_report_hour_et and current.minute < 20 and perf.last_weekly_report_key != wk:
             if cfg.discord_weekly_performance_webhook:
-                discord.send(cfg.discord_weekly_performance_webhook, text)
+                discord.send(cfg.discord_weekly_performance_webhook, build_weekly_report_text(cfg, perf, executor, state))
             perf.last_weekly_report_key = wk
 
 
@@ -1427,9 +1576,69 @@ def print_snapshot(ctx: MarketContext) -> None:
     )
 
 
+def append_risk_to_alert(alert: AlertPayload, decision: RiskDecision) -> AlertPayload:
+    extra = [
+        "",
+        "Risk Decision:",
+        f"• Action: {decision.action}",
+        f"• State: {decision.state_after}",
+        f"• Size Multiplier: {decision.size_multiplier:.2f}",
+        "• Reason Codes:",
+    ]
+    for code in decision.reason_codes[:8]:
+        extra.append(f"  - {code}")
+
+    alert.body = alert.body + "\n" + "\n".join(extra)
+    return alert
+
+
+def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
+    current_ts = time.time()
+    last_ts = state.last_alert_times.get(key, 0)
+    return (current_ts - last_ts) >= cooldown_seconds
+
+
+def mark_sent(state: PersistentState, key: str) -> None:
+    state.last_alert_times[key] = time.time()
+
+
+def route_alert(alert: AlertPayload, cfg: Config, state: PersistentState, telegram: TelegramNotifier, discord: DiscordNotifier) -> None:
+    msg_discord = format_for_discord(alert)
+    msg_telegram = format_for_telegram(alert)
+
+    if alert.alert_type == "DAILY_LEVELS":
+        if not cfg.daily_levels_enabled or not is_daily_levels_window():
+            return
+        if not should_send_by_cooldown(state, alert.key, cfg.daily_levels_cooldown_seconds):
+            return
+        if cfg.discord_daily_levels_webhook:
+            discord.send(cfg.discord_daily_levels_webhook, msg_discord)
+        if cfg.telegram_enabled:
+            telegram.send(msg_telegram)
+        mark_sent(state, alert.key)
+        return
+
+    if alert.alert_type != "TRADE_ALERT":
+        return
+
+    if not should_send_by_cooldown(state, alert.key, cfg.alert_cooldown_seconds):
+        return
+
+    if cfg.telegram_enabled:
+        telegram.send(msg_telegram)
+
+    if grade_rank(alert.grade) >= grade_rank(cfg.premium_min_grade) and alert.score >= cfg.min_score_for_premium:
+        if cfg.discord_premium_webhook:
+            discord.send(cfg.discord_premium_webhook, msg_discord)
+    elif grade_rank(alert.grade) >= grade_rank(cfg.free_min_grade) and alert.score >= cfg.min_score_for_free:
+        if cfg.discord_free_webhook:
+            discord.send(cfg.discord_free_webhook, msg_discord)
+
+    mark_sent(state, alert.key)
+
+
 def run_once() -> None:
     cfg = load_config()
-
     if not cfg.twelve_data_api_key:
         raise RuntimeError("Missing TWELVE_DATA_API_KEY")
 
@@ -1437,51 +1646,80 @@ def run_once() -> None:
     perf = PerformanceState.load(cfg.performance_state_file)
     client = TwelveDataClient(cfg.twelve_data_api_key, cfg)
 
-    telegram = TelegramNotifier(
-        token=cfg.telegram_bot_token,
-        chat_id=cfg.telegram_chat_id,
-        enabled=cfg.telegram_enabled,
-    )
-    discord = DiscordNotifier(enabled=cfg.discord_enabled)
+    telegram = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.telegram_enabled)
+    discord = DiscordNotifier(cfg.discord_enabled)
     executor = ExecutionEngine(cfg, state)
 
-    # update older pending signals before creating new one
     evaluate_pending_signals(client, perf, cfg)
 
     ctx = build_market_context(client, cfg)
     print_snapshot(ctx)
 
+    # daily levels
     daily_levels_alert = build_daily_levels_alert(ctx, cfg)
     route_alert(daily_levels_alert, cfg, state, telegram, discord)
 
+    # trade signal
     trade_alert = generate_trade_alert_if_valid(ctx, cfg)
     if trade_alert:
-        route_alert(trade_alert, cfg, state, telegram, discord)
         record_signal(perf, trade_alert, ctx, cfg)
 
-        exec_result = executor.maybe_execute(trade_alert, ctx)
-        print(f"Execution result: {exec_result}")
+        intent = OrderIntent(
+            signal_key=trade_alert.key,
+            symbol=trade_alert.symbol,
+            direction=trade_alert.direction,
+            grade=trade_alert.grade,
+            score=trade_alert.score,
+            reference_price=ctx.primary.price,
+            requested_notional=min(cfg.max_position_notional, cfg.max_order_notional),
+        )
 
-        if exec_result.get("executed"):
-            record_execution(perf, trade_alert, ctx, exec_result)
-            exec_msg = (
-                f"🚀 EXECUTED {trade_alert.symbol}\n"
-                f"Direction: {trade_alert.direction}\n"
-                f"Grade: {trade_alert.grade}\n"
-                f"Qty: {exec_result['qty']}\n"
-                f"Side: {exec_result['side']}\n"
-                f"Price snapshot: {ctx.primary.price:.2f}\n"
-                f"Order ID: {exec_result['alpaca_order_id']}\n"
-                f"Status: {exec_result['alpaca_status']}"
+        exposure = ExposureService(executor)
+        risk_engine = PreTradeRiskEngine(cfg, state, perf, executor, exposure)
+        risk_decision = risk_engine.evaluate(intent, ctx)
+        record_risk_audit(state, "RISK_DECISION", {"intent": asdict(intent), "decision": asdict(risk_decision)})
+
+        trade_alert = append_risk_to_alert(trade_alert, risk_decision)
+        route_alert(trade_alert, cfg, state, telegram, discord)
+
+        if risk_decision.action in {"ALLOW", "ALLOW_REDUCED"}:
+            exec_notional = intent.requested_notional * risk_decision.size_multiplier
+            exec_result = executor.execute(trade_alert, ctx, exec_notional)
+            print(f"Execution result: {exec_result}")
+
+            if exec_result.get("executed"):
+                record_execution(perf, trade_alert, ctx, exec_result)
+                exec_msg = (
+                    f"🚀 EXECUTED {trade_alert.symbol}\n"
+                    f"Direction: {trade_alert.direction}\n"
+                    f"Grade: {trade_alert.grade}\n"
+                    f"Qty: {exec_result['qty']}\n"
+                    f"Notional: {format_money(exec_result['notional'])}\n"
+                    f"Risk Action: {risk_decision.action}\n"
+                    f"Price snapshot: {ctx.primary.price:.2f}\n"
+                    f"Order ID: {exec_result['alpaca_order_id']}\n"
+                    f"Status: {exec_result['alpaca_status']}"
+                )
+                if cfg.discord_premium_webhook:
+                    discord.send(cfg.discord_premium_webhook, exec_msg)
+                if cfg.telegram_enabled:
+                    telegram.send(exec_msg)
+            else:
+                record_risk_audit(state, "EXECUTION_SKIPPED", exec_result)
+        else:
+            print(f"Execution blocked by risk engine: {risk_decision.action}")
+            block_msg = (
+                f"🛑 RISK BLOCKED {trade_alert.symbol}\n"
+                f"Action: {risk_decision.action}\n"
+                f"State: {risk_decision.state_after}\n"
+                f"Reasons: {', '.join(risk_decision.reason_codes[:6])}"
             )
             if cfg.discord_premium_webhook:
-                discord.send(cfg.discord_premium_webhook, exec_msg)
+                discord.send(cfg.discord_premium_webhook, block_msg)
             if cfg.telegram_enabled:
-                telegram.send(exec_msg)
-        else:
-            print(f"Execution skipped: {exec_result.get('reason')}")
+                telegram.send(block_msg)
 
-    maybe_send_reports(cfg, perf, executor, discord)
+    maybe_send_reports(cfg, perf, executor, state, discord)
 
     state.last_market_snapshot = {
         "primary_price": ctx.primary.price,
