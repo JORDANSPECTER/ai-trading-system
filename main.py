@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import requests
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
@@ -14,20 +13,42 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-WATCHLIST = ["QQQ", "SPY"]
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+WATCHLIST = ["QQQ", "SPY"]
 
-# Execution standards
 MIN_EXECUTION_GRADE = "A"
 GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "A+": 4}
 
-# Risk / scoring
 BULLISH_CONFIRM_BONUS = 15
 BEARISH_CONFIRM_BONUS = 15
 CONFLICT_PENALTY = 20
 MIXED_PENALTY = 5
+
+DEFAULT_ORDER_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
+
+# =========================================================
+# OPTIONAL ALPACA IMPORT
+# =========================================================
+alpaca_client = None
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        alpaca_client = TradingClient(
+            api_key=ALPACA_API_KEY,
+            secret_key=ALPACA_SECRET_KEY,
+            paper=ALPACA_PAPER,
+        )
+except Exception as e:
+    print(f"[ALPACA IMPORT WARNING] {e}")
+    alpaca_client = None
 
 # =========================================================
 # ETF MAJOR CONSTITUENTS
@@ -57,7 +78,7 @@ ETF_CONSTITUENTS = {
         {"symbol": "JPM", "weight": 1.2},
         {"symbol": "LLY", "weight": 1.5},
         {"symbol": "TSLA", "weight": 1.3},
-    ]
+    ],
 }
 
 # =========================================================
@@ -121,7 +142,7 @@ class TradePlan:
     reasons: List[str] = field(default_factory=list)
 
 # =========================================================
-# HELPERS
+# UTILS
 # =========================================================
 def safe_float(value, default=0.0) -> float:
     try:
@@ -130,6 +151,12 @@ def safe_float(value, default=0.0) -> float:
         return float(default)
 
 
+def passes_grade_threshold(grade: str, threshold: str) -> bool:
+    return GRADE_ORDER.get(grade, 0) >= GRADE_ORDER.get(threshold, 0)
+
+# =========================================================
+# ALERTS
+# =========================================================
 def send_discord(message: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
@@ -155,7 +182,6 @@ def broadcast(message: str) -> None:
     send_discord(message)
     send_telegram(message)
 
-
 # =========================================================
 # MARKET DATA
 # =========================================================
@@ -171,14 +197,14 @@ def fetch_twelve_time_series(symbol: str, interval: str = "1min", outputsize: in
         "apikey": TWELVE_DATA_API_KEY,
         "timezone": "America/New_York",
     }
-    r = requests.get(url, params=params, timeout=20)
-    data = r.json()
+
+    response = requests.get(url, params=params, timeout=20)
+    data = response.json()
 
     if "values" not in data:
         raise RuntimeError(f"Twelve Data error for {symbol}: {data}")
 
-    values = list(reversed(data["values"]))  # oldest -> newest
-    return values
+    return list(reversed(data["values"]))  # oldest -> newest
 
 
 def compute_vwap_from_bars(bars: List[Dict]) -> float:
@@ -267,7 +293,6 @@ def get_symbol_snapshot(symbol: str) -> Optional[Dict]:
         print(f"[SNAPSHOT ERROR] {symbol}: {e}")
         return None
 
-
 # =========================================================
 # CONSTITUENT ENGINE
 # =========================================================
@@ -296,10 +321,7 @@ def load_constituent_snapshots(etf_symbol: str) -> List[ConstituentSnapshot]:
     return snapshots
 
 
-def analyze_constituent_internals(
-    etf_symbol: str,
-    snapshots: List[ConstituentSnapshot]
-) -> ConstituentInternals:
+def analyze_constituent_internals(etf_symbol: str, snapshots: List[ConstituentSnapshot]) -> ConstituentInternals:
     if not snapshots:
         return ConstituentInternals(
             etf_symbol=etf_symbol,
@@ -311,9 +333,7 @@ def analyze_constituent_internals(
             leadership_score=0.0,
             confirmation_bias="NEUTRAL",
             summary=f"{etf_symbol} internals unavailable.",
-            leaders_up=[],
-            leaders_down=[],
-            conflicts=["No constituent data available."]
+            conflicts=["No constituent data available."],
         )
 
     total_weight = sum(x.weight for x in snapshots) or 1.0
@@ -322,11 +342,10 @@ def analyze_constituent_internals(
     bearish_weight = 0.0
     bullish_names = 0
     bearish_names = 0
-
-    leaders_up = []
-    leaders_down = []
-    conflicts = []
-    leadership_raw = []
+    leaders_up: List[str] = []
+    leaders_down: List[str] = []
+    conflicts: List[str] = []
+    leadership_raw: List[float] = []
 
     for snap in snapshots:
         weighted_push = snap.weight * abs(snap.change_pct)
@@ -337,20 +356,17 @@ def analyze_constituent_internals(
             leadership_raw.append(weighted_push)
             if snap.weight >= 3.0:
                 leaders_up.append(snap.symbol)
-
         elif snap.below_vwap and snap.change_pct < 0:
             bearish_weight += snap.weight
             bearish_names += 1
             leadership_raw.append(-weighted_push)
             if snap.weight >= 3.0:
                 leaders_down.append(snap.symbol)
-
         else:
             conflicts.append(snap.symbol)
 
     bullish_participation = bullish_names / len(snapshots)
     bearish_participation = bearish_names / len(snapshots)
-
     aligned_bullish_weight = bullish_weight / total_weight
     aligned_bearish_weight = bearish_weight / total_weight
     breadth_score = bullish_participation - bearish_participation
@@ -358,24 +374,13 @@ def analyze_constituent_internals(
 
     if aligned_bullish_weight >= 0.55 and bullish_participation >= 0.50:
         bias = "BULLISH_CONFIRMATION"
-        summary = (
-            f"{etf_symbol} internals bullish: "
-            f"{bullish_names}/{len(snapshots)} aligned, "
-            f"{aligned_bullish_weight:.0%} weighted support."
-        )
+        summary = f"{etf_symbol} internals bullish: {bullish_names}/{len(snapshots)} aligned, {aligned_bullish_weight:.0%} weighted support."
     elif aligned_bearish_weight >= 0.55 and bearish_participation >= 0.50:
         bias = "BEARISH_CONFIRMATION"
-        summary = (
-            f"{etf_symbol} internals bearish: "
-            f"{bearish_names}/{len(snapshots)} aligned, "
-            f"{aligned_bearish_weight:.0%} weighted pressure."
-        )
+        summary = f"{etf_symbol} internals bearish: {bearish_names}/{len(snapshots)} aligned, {aligned_bearish_weight:.0%} weighted pressure."
     else:
         bias = "MIXED"
-        summary = (
-            f"{etf_symbol} internals mixed: "
-            f"{bullish_names} bullish vs {bearish_names} bearish aligned names."
-        )
+        summary = f"{etf_symbol} internals mixed: {bullish_names} bullish vs {bearish_names} bearish aligned names."
 
     return ConstituentInternals(
         etf_symbol=etf_symbol,
@@ -404,10 +409,19 @@ def enrich_context_with_constituents(context: MarketContext) -> MarketContext:
     context.constituent_internals = internals
     return context
 
+# =========================================================
+# DECISION ENGINE
+# =========================================================
+def score_to_grade(score: int) -> str:
+    if score >= 90:
+        return "A+"
+    if score >= 75:
+        return "A"
+    if score >= 55:
+        return "B"
+    return "C"
 
-# =========================================================
-# CONTEXT + DECISION ENGINE
-# =========================================================
+
 def build_market_context(symbol: str) -> Optional[MarketContext]:
     data = get_symbol_snapshot(symbol)
     if not data:
@@ -423,27 +437,14 @@ def build_market_context(symbol: str) -> Optional[MarketContext]:
         above_vwap=safe_float(data["price"]) > safe_float(data["vwap"]),
         below_vwap=safe_float(data["price"]) < safe_float(data["vwap"]),
     )
-
-    context = enrich_context_with_constituents(context)
-    return context
-
-
-def score_to_grade(score: int) -> str:
-    if score >= 90:
-        return "A+"
-    if score >= 75:
-        return "A"
-    if score >= 55:
-        return "B"
-    return "C"
+    return enrich_context_with_constituents(context)
 
 
 def make_hybrid_decision(context: MarketContext) -> TradePlan:
-    reasons = []
+    reasons: List[str] = []
     score = 50
     action = "NO_TRADE"
 
-    # VWAP
     if context.above_vwap:
         score += 12
         reasons.append("Price is above VWAP.")
@@ -451,7 +452,6 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
         score += 12
         reasons.append("Price is below VWAP.")
 
-    # Momentum / RSI
     if context.above_vwap and context.rsi >= 55:
         score += 10
         reasons.append("Bullish RSI alignment.")
@@ -461,14 +461,12 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
     else:
         reasons.append("RSI is neutral or not fully aligned.")
 
-    # Volume
     if context.volume_ratio >= 1.20:
         score += 8
         reasons.append(f"Volume expansion present ({context.volume_ratio:.2f}x).")
     else:
         reasons.append(f"Volume not expanding strongly ({context.volume_ratio:.2f}x).")
 
-    # Price change
     if context.above_vwap and context.change_pct > 0:
         score += 8
         reasons.append("Price change supports bullish continuation.")
@@ -478,7 +476,6 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
     else:
         reasons.append("Price change is not cleanly aligned.")
 
-    # Initial action guess
     if context.above_vwap and context.rsi >= 52:
         action = "BUY_CALL"
     elif context.below_vwap and context.rsi <= 48:
@@ -486,15 +483,12 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
     else:
         action = "NO_TRADE"
 
-    grade = score_to_grade(score)
-    confidence = max(0.0, min(score / 100.0, 0.99))
-
     return TradePlan(
         symbol=context.symbol,
         action=action,
-        grade=grade,
+        grade=score_to_grade(score),
         score=score,
-        confidence=confidence,
+        confidence=max(0.0, min(score / 100.0, 0.99)),
         reasons=reasons,
     )
 
@@ -509,29 +503,20 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
     if plan.action == "BUY_CALL":
         if ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score += BULLISH_CONFIRM_BONUS
-            plan.reasons.append(
-                f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
         elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(
-                f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
         else:
             plan.score -= MIXED_PENALTY
             plan.reasons.append("Call setup has mixed internal participation.")
-
     elif plan.action == "BUY_PUT":
         if ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score += BEARISH_CONFIRM_BONUS
-            plan.reasons.append(
-                f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
         elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(
-                f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
         else:
             plan.score -= MIXED_PENALTY
             plan.reasons.append("Put setup has mixed internal participation.")
@@ -541,15 +526,8 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
     return plan
 
 
-# =========================================================
-# EXECUTION FILTER
-# =========================================================
-def passes_grade_threshold(grade: str, threshold: str) -> bool:
-    return GRADE_ORDER.get(grade, 0) >= GRADE_ORDER.get(threshold, 0)
-
-
 def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List[str]]:
-    notes = []
+    notes: List[str] = []
     ci = context.constituent_internals
 
     if plan.action == "NO_TRADE":
@@ -579,9 +557,62 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
     notes.append("Execution filter passed.")
     return "EXECUTE", notes
 
+# =========================================================
+# ALPACA EXECUTION
+# =========================================================
+def execute_trade(plan: TradePlan, context: MarketContext) -> None:
+    if not LIVE_TRADING:
+        print(f"[PAPER MODE LOCAL] {plan.action} {context.symbol} | Grade {plan.grade} | Score {plan.score}")
+        return
+
+    if alpaca_client is None:
+        msg = "❌ LIVE_TRADING is ON but Alpaca is not connected. Check ALPACA_API_KEY / ALPACA_SECRET_KEY / dependency install."
+        print(msg)
+        send_telegram(msg)
+        send_discord(msg)
+        return
+
+    try:
+        if plan.action == "BUY_CALL":
+            side = OrderSide.BUY
+        elif plan.action == "BUY_PUT":
+            side = OrderSide.SELL
+        else:
+            print(f"[SKIP] No executable action: {plan.action}")
+            return
+
+        order_request = MarketOrderRequest(
+            symbol=context.symbol,
+            qty=DEFAULT_ORDER_QTY,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+        )
+
+        order = alpaca_client.submit_order(order_data=order_request)
+
+        msg = (
+            f"✅ ALPACA ORDER SENT\n"
+            f"Symbol: {context.symbol}\n"
+            f"Action: {plan.action}\n"
+            f"Side: {side.value}\n"
+            f"Qty: {DEFAULT_ORDER_QTY}\n"
+            f"Grade: {plan.grade}\n"
+            f"Score: {plan.score}\n"
+            f"Broker Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
+            f"Order ID: {order.id}"
+        )
+        print(msg)
+        send_telegram(msg)
+        send_discord(msg)
+
+    except Exception as e:
+        err = f"❌ ALPACA ORDER FAILED: {e}"
+        print(err)
+        send_telegram(err)
+        send_discord(err)
 
 # =========================================================
-# ALERT FORMATTING
+# ALERT FORMAT
 # =========================================================
 def build_constituent_summary_for_alert(context: MarketContext) -> str:
     ci = context.constituent_internals
@@ -589,22 +620,10 @@ def build_constituent_summary_for_alert(context: MarketContext) -> str:
         return "Constituent internals: unavailable."
 
     if ci.confirmation_bias == "BULLISH_CONFIRMATION":
-        return (
-            f"📈 Internals bullish | "
-            f"Leaders up: {', '.join(ci.leaders_up[:4]) or 'none'} | "
-            f"Bull participation: {ci.bullish_participation:.0%}"
-        )
-    elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
-        return (
-            f"📉 Internals bearish | "
-            f"Leaders down: {', '.join(ci.leaders_down[:4]) or 'none'} | "
-            f"Bear participation: {ci.bearish_participation:.0%}"
-        )
-    else:
-        return (
-            f"⚖️ Internals mixed | "
-            f"Conflicts: {', '.join(ci.conflicts[:5]) or 'none'}"
-        )
+        return f"📈 Internals bullish | Leaders up: {', '.join(ci.leaders_up[:4]) or 'none'} | Bull participation: {ci.bullish_participation:.0%}"
+    if ci.confirmation_bias == "BEARISH_CONFIRMATION":
+        return f"📉 Internals bearish | Leaders down: {', '.join(ci.leaders_down[:4]) or 'none'} | Bear participation: {ci.bearish_participation:.0%}"
+    return f"⚖️ Internals mixed | Conflicts: {', '.join(ci.conflicts[:5]) or 'none'}"
 
 
 def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: List[str]) -> str:
@@ -635,25 +654,10 @@ def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: Lis
         lines.append(f"- {note}")
 
     lines.append(f"Final Status: {status}")
-    if LIVE_TRADING:
-        lines.append("Mode: LIVE")
-    else:
-        lines.append("Mode: ALERT / PAPER")
+    lines.append(f"LIVE_TRADING: {LIVE_TRADING}")
+    lines.append(f"ALPACA_PAPER: {ALPACA_PAPER}")
 
     return "\n".join(lines)
-
-
-# =========================================================
-# LIVE EXECUTION PLACEHOLDER
-# =========================================================
-def execute_trade(plan: TradePlan, context: MarketContext) -> None:
-    if not LIVE_TRADING:
-        print(f"[PAPER] {plan.action} {context.symbol} | Grade {plan.grade} | Score {plan.score}")
-        return
-
-    # Replace this with your broker execution later.
-    print(f"[LIVE PLACEHOLDER] {plan.action} {context.symbol} | Grade {plan.grade} | Score {plan.score}")
-
 
 # =========================================================
 # MAIN LOOP
@@ -679,8 +683,10 @@ def main() -> None:
     startup = (
         "🚀 UnBiased Framework started\n"
         f"Watchlist: {', '.join(WATCHLIST)}\n"
-        f"Mode: {'LIVE' if LIVE_TRADING else 'ALERT / PAPER'}\n"
-        "Constituent engine active: TSLA, AMZN, AAPL, MSFT, NVDA, META, GOOGL and more."
+        f"LIVE_TRADING: {LIVE_TRADING}\n"
+        f"ALPACA_PAPER: {ALPACA_PAPER}\n"
+        f"Alpaca Connected: {alpaca_client is not None}\n"
+        "Constituent engine active."
     )
     broadcast(startup)
 
@@ -693,6 +699,7 @@ def main() -> None:
             err = f"❌ MAIN LOOP ERROR: {e}"
             print(err)
             send_telegram(err)
+            send_discord(err)
 
         time.sleep(POLL_SECONDS)
 
