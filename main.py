@@ -25,6 +25,7 @@ def send_telegram(message):
         "text": message,
         "parse_mode": "Markdown"
     }
+
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
@@ -35,6 +36,7 @@ def send_discord(webhook, message):
     if not webhook:
         print("Discord webhook missing")
         return
+
     try:
         requests.post(webhook, json={"content": message}, timeout=10)
     except Exception as e:
@@ -48,22 +50,21 @@ def send_discord_premium(message):
 def send_discord_free(message):
     send_discord(DISCORD_WEBHOOK_FREE, message)
 
+
 # =========================
-# ENTRY DISCIPLINE ENGINE
+# HELPERS
 # =========================
 def get_attr(obj, name, default=None):
     return getattr(obj, name, default)
 
 
+# =========================
+# STATE 4 - ENTRY DISCIPLINE
+# =========================
 def evaluate_entry_timing(decision, context):
-    """
-    Returns timing profile used to block chasing and downgrade late entries.
-    """
-
     current_price = float(get_attr(context, "current_price", 0.0) or 0.0)
     trigger_level = float(get_attr(context, "trigger_level", current_price) or current_price)
 
-    # Optional fields your real system can provide
     entry_zone_high = float(get_attr(context, "entry_zone_high", trigger_level) or trigger_level)
     entry_zone_low = float(get_attr(context, "entry_zone_low", trigger_level) or trigger_level)
     atr_push = float(get_attr(context, "atr_push", 0.0) or 0.0)
@@ -148,10 +149,6 @@ def evaluate_entry_timing(decision, context):
 
 
 def apply_state_4_discipline(decision, context):
-    """
-    Modifies routing behavior based on entry quality.
-    Does not have to rewrite your whole AI grade engine — it adds a discipline layer on top.
-    """
     timing = evaluate_entry_timing(decision, context)
 
     original_grade = get_attr(decision, "grade", "C")
@@ -162,11 +159,9 @@ def apply_state_4_discipline(decision, context):
         for r in timing["chasing_reasons"]:
             reasons.append(r)
 
-    # Block B-grade execution unless momentum confirms
     if original_grade in ["B+", "B"] and not timing["b_grade_execution_allowed"]:
         reasons.append("B-grade blocked from premium execution until momentum confirms.")
         execution_grade = "WATCHLIST"
-    # A/A+ can still downgrade to watchlist if chasing
     elif original_grade in ["A+", "A"] and not timing["premium_execution_allowed"]:
         reasons.append("High-grade setup downgraded to watchlist because entry timing is no longer clean.")
         execution_grade = "WATCHLIST"
@@ -180,10 +175,136 @@ def apply_state_4_discipline(decision, context):
         "reasons": reasons
     }
 
+
+# =========================
+# STATE 5 - SIZE ENGINE
+# =========================
+def calculate_confidence_and_size(decision, context, discipline):
+    reasons = discipline["reasons"]
+    original_grade = discipline["original_grade"]
+    execution_grade = discipline["execution_grade"]
+    timing = discipline["timing"]
+
+    breakout_with_volume = bool(get_attr(context, "breakout_with_volume", False))
+    momentum_confirmed = bool(get_attr(context, "momentum_confirmed", False))
+    retest_hold = bool(get_attr(context, "retest_hold", False))
+    above_vwap = bool(get_attr(context, "above_vwap", False))
+    below_vwap = bool(get_attr(context, "below_vwap", False))
+    near_key_level = bool(get_attr(context, "near_key_level", True))
+    oil_aligned = bool(get_attr(context, "oil_aligned", True))
+    market_breadth_aligned = bool(get_attr(context, "market_breadth_aligned", True))
+    sector_aligned = bool(get_attr(context, "sector_aligned", True))
+    big_print_aligned = bool(get_attr(context, "big_print_aligned", True))
+
+    confidence_score = 0
+
+    if original_grade == "A+":
+        confidence_score += 30
+    elif original_grade == "A":
+        confidence_score += 25
+    elif original_grade == "B+":
+        confidence_score += 18
+    elif original_grade == "B":
+        confidence_score += 14
+    elif original_grade == "C":
+        confidence_score += 8
+
+    if execution_grade == "WATCHLIST":
+        confidence_score -= 18
+
+    if timing["timing_label"] == "IDEAL":
+        confidence_score += 15
+    elif timing["timing_label"] == "CONFIRMED":
+        confidence_score += 12
+    elif timing["timing_label"] == "RETEST":
+        confidence_score += 14
+    elif timing["timing_label"] == "LATE":
+        confidence_score -= 20
+
+    if breakout_with_volume:
+        confidence_score += 8
+
+    if momentum_confirmed:
+        confidence_score += 10
+
+    if retest_hold:
+        confidence_score += 12
+
+    if above_vwap or below_vwap:
+        confidence_score += 8
+
+    if near_key_level:
+        confidence_score += 8
+    else:
+        confidence_score -= 8
+
+    if oil_aligned:
+        confidence_score += 4
+    else:
+        confidence_score -= 4
+
+    if market_breadth_aligned:
+        confidence_score += 4
+    else:
+        confidence_score -= 4
+
+    if sector_aligned:
+        confidence_score += 4
+    else:
+        confidence_score -= 4
+
+    if big_print_aligned:
+        confidence_score += 5
+    else:
+        confidence_score -= 5
+
+    if timing["is_chasing"]:
+        confidence_score -= 15
+
+    confidence_score = max(0, min(100, confidence_score))
+
+    if execution_grade in ["A+", "A"] and confidence_score >= 80:
+        size_label = "AGGRESSIVE"
+        risk_multiplier = 1.25
+    elif execution_grade in ["A+", "A", "B+", "B"] and confidence_score >= 60:
+        size_label = "NORMAL"
+        risk_multiplier = 1.00
+    elif execution_grade == "WATCHLIST":
+        size_label = "NO EXECUTION"
+        risk_multiplier = 0.00
+    else:
+        size_label = "SMALL"
+        risk_multiplier = 0.50
+
+    if timing["is_chasing"]:
+        size_label = "NO EXECUTION"
+        risk_multiplier = 0.00
+
+    size_notes = []
+
+    if size_label == "AGGRESSIVE":
+        size_notes.append("Multiple conditions are aligned.")
+        size_notes.append("Timing is clean enough for higher conviction sizing.")
+    elif size_label == "NORMAL":
+        size_notes.append("Setup is valid, but not peak conviction.")
+    elif size_label == "SMALL":
+        size_notes.append("Reduce exposure due to weaker alignment.")
+    elif size_label == "NO EXECUTION":
+        size_notes.append("Do not size into this move.")
+        size_notes.append("Wait for a reclaim, retest, or better timing.")
+
+    return {
+        "confidence_score": confidence_score,
+        "size_label": size_label,
+        "risk_multiplier": risk_multiplier,
+        "size_notes": size_notes
+    }
+
+
 # =========================
 # FORMATTERS
 # =========================
-def format_telegram_alert(decision, context, discipline):
+def format_telegram_alert(decision, context, discipline, sizing):
     timing = discipline["timing"]
     return f"""
 🚨 {context.symbol} TRADE ALERT
@@ -191,17 +312,24 @@ def format_telegram_alert(decision, context, discipline):
 Grade: {discipline['execution_grade']}
 Original Grade: {discipline['original_grade']}
 Timing: {timing['timing_label']}
+Confidence: {sizing['confidence_score']}/100
+Size: {sizing['size_label']}
+Risk Multiplier: {sizing['risk_multiplier']}x
+
 Price: {context.current_price}
 Trigger: {context.trigger_level}
 
 Entry Logic:
 {chr(10).join(['- ' + r for r in discipline['reasons']])}
 
+Size Notes:
+{chr(10).join(['- ' + r for r in sizing['size_notes']])}
+
 Time: {datetime.now().strftime('%H:%M:%S')}
 """.strip()
 
 
-def format_discord_premium_alert(decision, context, discipline):
+def format_discord_premium_alert(decision, context, discipline, sizing):
     timing = discipline["timing"]
     return f"""
 💎 PREMIUM EXECUTION — {context.symbol}
@@ -209,6 +337,10 @@ def format_discord_premium_alert(decision, context, discipline):
 Grade: {discipline['execution_grade']}
 Original Grade: {discipline['original_grade']}
 Timing: {timing['timing_label']}
+Confidence: {sizing['confidence_score']}/100
+
+📏 Size: {sizing['size_label']}
+⚖️ Risk Multiplier: {sizing['risk_multiplier']}x
 
 Price: {context.current_price}
 Trigger Level: {context.trigger_level}
@@ -216,11 +348,13 @@ Distance From Trigger: {timing['distance_from_trigger_pct']}%
 
 {chr(10).join(['• ' + r for r in discipline['reasons']])}
 
+{chr(10).join(['• ' + r for r in sizing['size_notes']])}
+
 ⚡ Clean execution conditions are present.
 """.strip()
 
 
-def format_discord_watchlist_alert(decision, context, discipline):
+def format_discord_watchlist_alert(decision, context, discipline, sizing):
     timing = discipline["timing"]
     chasing_block = ""
     if timing["is_chasing"]:
@@ -232,6 +366,9 @@ def format_discord_watchlist_alert(decision, context, discipline):
 Original Grade: {discipline['original_grade']}
 Execution Status: {discipline['execution_grade']}
 Timing: {timing['timing_label']}
+Confidence: {sizing['confidence_score']}/100
+
+📏 Size: {sizing['size_label']}
 
 Price: {context.current_price}
 Trigger Level: {context.trigger_level}
@@ -240,30 +377,36 @@ Distance From Trigger: {timing['distance_from_trigger_pct']}%
 
 {chr(10).join(['• ' + r for r in discipline['reasons']])}
 
+{chr(10).join(['• ' + r for r in sizing['size_notes']])}
+
 Patience > forcing entries.
 Wait for reclaim, retest, or momentum confirmation.
 """.strip()
 
 
-def format_discord_free_teaser(decision, context, discipline):
+def format_discord_free_teaser(decision, context, discipline, sizing):
     timing = discipline["timing"]
     return f"""
 📊 MARKET INSIGHT — {context.symbol}
 
 A strong setup is active.
 Timing: {timing['timing_label']}
+Confidence: {sizing['confidence_score']}/100
 Key Level: {context.trigger_level}
 
 Join premium for execution access.
 """.strip()
 
 
-def format_discord_educational_alert(decision, context, discipline):
+def format_discord_educational_alert(decision, context, discipline, sizing):
     timing = discipline["timing"]
     return f"""
 📘 MARKET CONTEXT — {context.symbol}
 
 Timing: {timing['timing_label']}
+Confidence: {sizing['confidence_score']}/100
+Suggested Size: {sizing['size_label']}
+
 Price: {context.current_price}
 Key Level: {context.trigger_level}
 
@@ -272,31 +415,33 @@ Key Level: {context.trigger_level}
 This is informational, not confirmed execution.
 """.strip()
 
+
 # =========================
 # ROUTING LOGIC
 # =========================
 def route_alerts(decision, context):
     discipline = apply_state_4_discipline(decision, context)
+    sizing = calculate_confidence_and_size(decision, context, discipline)
+
     execution_grade = discipline["execution_grade"]
+    size_label = sizing["size_label"]
 
-    # A+ / A with clean timing only
-    if execution_grade in ["A+", "A"]:
-        send_telegram(format_telegram_alert(decision, context, discipline))
-        send_discord_premium(format_discord_premium_alert(decision, context, discipline))
-        send_discord_free(format_discord_free_teaser(decision, context, discipline))
+    if execution_grade in ["A+", "A"] and size_label in ["AGGRESSIVE", "NORMAL"]:
+        send_telegram(format_telegram_alert(decision, context, discipline, sizing))
+        send_discord_premium(format_discord_premium_alert(decision, context, discipline, sizing))
+        send_discord_free(format_discord_free_teaser(decision, context, discipline, sizing))
 
-    # Watchlist path (downgraded from chase / late entry / weak momentum)
-    elif execution_grade == "WATCHLIST":
-        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline))
-        send_discord_free(format_discord_educational_alert(decision, context, discipline))
+    elif execution_grade == "WATCHLIST" or size_label == "NO EXECUTION":
+        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing))
+        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing))
 
-    # B / C still informational only
     elif execution_grade in ["B+", "B", "C"]:
-        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline))
-        send_discord_free(format_discord_educational_alert(decision, context, discipline))
+        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing))
+        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing))
 
     elif execution_grade == "AVOID":
         print(f"[AVOID] No alert sent for {context.symbol}")
+
 
 # =========================
 # TEST FUNCTION
@@ -312,26 +457,31 @@ def send_test_alert():
 
     class DummyContext:
         symbol = "QQQ"
-        current_price = 616.85
+        current_price = 616.10
         trigger_level = 616.00
 
-        # Optional timing fields
-        entry_zone_low = 615.90
+        entry_zone_low = 615.95
         entry_zone_high = 616.20
-        atr_push = 0.42
-        extension_pct = 0.48
-        bars_since_breakout = 4
-        momentum_confirmed = False
-        retest_hold = False
+        atr_push = 0.12
+        extension_pct = 0.08
+        bars_since_breakout = 1
+        momentum_confirmed = True
+        retest_hold = True
         breakout_with_volume = True
-        near_key_level = False
+        near_key_level = True
         above_vwap = True
         below_vwap = False
+
+        oil_aligned = True
+        market_breadth_aligned = True
+        sector_aligned = True
+        big_print_aligned = True
 
     decision = DummyDecision()
     context = DummyContext()
 
     route_alerts(decision, context)
+
 
 # =========================
 # MAIN
