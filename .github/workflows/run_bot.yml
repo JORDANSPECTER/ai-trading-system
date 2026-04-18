@@ -1,24 +1,18 @@
-name: Run Trading Bot
+name: Run UnBiased Bot
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * 1-5"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       DISCORD_WEBHOOK_FREE: ${{ secrets.DISCORD_WEBHOOK_FREE }}
       DISCORD_WEBHOOK_PREMIUM: ${{ secrets.DISCORD_WEBHOOK_PREMIUM }}
       DISCORD_WEBHOOK_PREMIUM_LEVELS: ${{ secrets.DISCORD_WEBHOOK_PREMIUM_LEVELS }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-      SYMBOL: ${{ vars.SYMBOL }}
-      SECONDARY_SYMBOL: ${{ vars.SECONDARY_SYMBOL }}
-      OIL_SYMBOL: ${{ vars.OIL_SYMBOL }}
 
     steps:
       - name: Checkout repo
@@ -30,7 +24,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests
 
       - name: Run bot
         run: python main.py
