@@ -5,7 +5,7 @@ import requests
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 # =========================================================
 # CONFIG
@@ -47,14 +47,26 @@ MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))
 
 PNL_LOG_FILE = os.getenv("PNL_LOG_FILE", "trade_log.csv")
 
+# options contract selection
+OPTIONS_DTE_FALLBACK_DAYS = int(os.getenv("OPTIONS_DTE_FALLBACK_DAYS", "5"))
+OPTIONS_STRIKE_STEP_BUFFER = float(os.getenv("OPTIONS_STRIKE_STEP_BUFFER", "0.0"))
+
 # =========================================================
 # OPTIONAL ALPACA IMPORT
 # =========================================================
 alpaca_client = None
+alpaca_options_ready = False
+
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
+    from alpaca.trading.enums import (
+        OrderSide,
+        TimeInForce,
+        ContractType,
+        AssetStatus,
+        OrderClass,
+    )
 
     if ALPACA_API_KEY and ALPACA_SECRET_KEY:
         alpaca_client = TradingClient(
@@ -62,9 +74,12 @@ try:
             secret_key=ALPACA_SECRET_KEY,
             paper=ALPACA_PAPER,
         )
+        alpaca_options_ready = True
+
 except Exception as e:
     print(f"[ALPACA IMPORT WARNING] {e}")
     alpaca_client = None
+    alpaca_options_ready = False
 
 # =========================================================
 # ETF MAJOR CONSTITUENTS
@@ -227,11 +242,12 @@ def ensure_trade_log_exists() -> None:
             "volume_ratio",
             "order_id",
             "status",
-            "pnl"
+            "pnl",
+            "broker_symbol"
         ])
 
 
-def log_trade_entry(plan: TradePlan, context: MarketContext, order_id: str = "") -> None:
+def log_trade_entry(plan: TradePlan, context: MarketContext, order_id: str = "", broker_symbol: str = "") -> None:
     ensure_trade_log_exists()
 
     with open(PNL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
@@ -252,7 +268,8 @@ def log_trade_entry(plan: TradePlan, context: MarketContext, order_id: str = "")
             round(context.volume_ratio, 4),
             order_id,
             "OPEN",
-            ""
+            "",
+            broker_symbol
         ])
 
 # =========================================================
@@ -723,6 +740,67 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
     return "EXECUTE", notes
 
 # =========================================================
+# OPTIONS CONTRACT PICKER
+# =========================================================
+def _get_candidate_expirations() -> List[date]:
+    today = date.today()
+    return [today + timedelta(days=i) for i in range(OPTIONS_DTE_FALLBACK_DAYS + 1)]
+
+
+def pick_option_contract(underlying: str, action: str, underlying_price: float):
+    if not alpaca_client or not alpaca_options_ready:
+        return None
+
+    if action == "BUY_CALL":
+        contract_type = ContractType.CALL
+    elif action == "BUY_PUT":
+        contract_type = ContractType.PUT
+    else:
+        return None
+
+    expirations = _get_candidate_expirations()
+
+    for exp in expirations:
+        try:
+            req = GetOptionContractsRequest(
+                underlying_symbols=[underlying],
+                status=AssetStatus.ACTIVE,
+                expiration_date_gte=exp,
+                expiration_date_lte=exp,
+                type=contract_type,
+            )
+            result = alpaca_client.get_option_contracts(req)
+            contracts = getattr(result, "option_contracts", []) or []
+
+            if not contracts:
+                continue
+
+            valid_contracts = []
+            for c in contracts:
+                strike = safe_float(getattr(c, "strike_price", 0.0))
+                if strike <= 0:
+                    continue
+
+                # bullish: prefer near ATM / slightly OTM calls
+                if action == "BUY_CALL":
+                    distance = abs((strike - (underlying_price + OPTIONS_STRIKE_STEP_BUFFER)))
+                else:
+                    distance = abs((strike - (underlying_price - OPTIONS_STRIKE_STEP_BUFFER)))
+
+                valid_contracts.append((distance, c))
+
+            if not valid_contracts:
+                continue
+
+            valid_contracts.sort(key=lambda x: x[0])
+            return valid_contracts[0][1]
+
+        except Exception as e:
+            print(f"[OPTION PICKER WARN] {underlying} {action} {exp}: {e}")
+
+    return None
+
+# =========================================================
 # ALPACA EXECUTION
 # =========================================================
 def execute_trade(plan: TradePlan, context: MarketContext) -> None:
@@ -738,7 +816,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
             f"Grade {plan.grade} | Score {plan.score} | Tier {plan.execution_tier} | Qty {qty}"
         )
         print(msg)
-        log_trade_entry(plan, context, "PAPER_LOCAL")
+        log_trade_entry(plan, context, "PAPER_LOCAL", context.symbol)
         return
 
     if alpaca_client is None:
@@ -749,29 +827,51 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
         return
 
     try:
-        if plan.action == "BUY_CALL":
-            side = OrderSide.BUY
-        elif plan.action == "BUY_PUT":
-            side = OrderSide.SELL
-        else:
-            print(f"[SKIP] No executable action: {plan.action}")
+        contract = pick_option_contract(
+            underlying=context.symbol,
+            action=plan.action,
+            underlying_price=context.current_price,
+        )
+
+        if contract is None:
+            msg = f"❌ No option contract found for {context.symbol} {plan.action}"
+            print(msg)
+            send_telegram(msg)
+            send_discord(msg)
             return
 
+        option_symbol = getattr(contract, "symbol", None)
+        strike_price = getattr(contract, "strike_price", "NA")
+        expiration_date = getattr(contract, "expiration_date", "NA")
+
+        if not option_symbol:
+            msg = f"❌ Contract object missing symbol for {context.symbol} {plan.action}"
+            print(msg)
+            send_telegram(msg)
+            send_discord(msg)
+            return
+
+        # Long call or long put = BUY the option contract
+        order_side = OrderSide.BUY
+
         order_request = MarketOrderRequest(
-            symbol=context.symbol,
+            symbol=option_symbol,
             qty=qty,
-            side=side,
+            side=order_side,
             time_in_force=TimeInForce.DAY,
         )
 
         order = alpaca_client.submit_order(order_data=order_request)
 
         msg = (
-            f"✅ ALPACA ORDER SENT\n"
-            f"Symbol: {context.symbol}\n"
+            f"✅ ALPACA OPTION ORDER SENT\n"
+            f"Underlying: {context.symbol}\n"
+            f"Contract: {option_symbol}\n"
             f"Action: {plan.action}\n"
-            f"Side: {side.value}\n"
+            f"Side: {order_side.value}\n"
             f"Qty: {qty}\n"
+            f"Strike: {strike_price}\n"
+            f"Expiry: {expiration_date}\n"
             f"Grade: {plan.grade}\n"
             f"Score: {plan.score}\n"
             f"Tier: {plan.execution_tier}\n"
@@ -782,10 +882,10 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
         send_telegram(msg)
         send_discord(msg)
 
-        log_trade_entry(plan, context, str(order.id))
+        log_trade_entry(plan, context, str(order.id), option_symbol)
 
     except Exception as e:
-        err = f"❌ ALPACA ORDER FAILED: {e}"
+        err = f"❌ ALPACA OPTION ORDER FAILED: {e}"
         print(err)
         send_telegram(err)
         send_discord(err)
@@ -870,9 +970,9 @@ def main() -> None:
         f"LIVE_TRADING: {LIVE_TRADING}\n"
         f"ALPACA_PAPER: {ALPACA_PAPER}\n"
         f"Alpaca Connected: {alpaca_client is not None}\n"
+        f"Alpaca Options Ready: {alpaca_options_ready}\n"
         f"A_PLUS_ONLY_MODE: {A_PLUS_ONLY_MODE}\n"
         f"ALLOW_B_MICRO_SIZE: {ALLOW_B_MICRO_SIZE}\n"
-        "Execution engine upgraded.\n"
         f"Discord Free Connected: {bool(DISCORD_WEBHOOK_FREE)}"
     )
     broadcast(startup)
