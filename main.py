@@ -241,13 +241,17 @@ def send_telegram(message: str) -> None:
         print(f"[TELEGRAM ERROR] {e}", flush=True)
 
 
-def broadcast_framework(message: str) -> None:
+def broadcast_free(message: str) -> None:
+    if not message:
+        return
     print(message, flush=True)
     send_discord_free(message)
     send_telegram(message)
 
 
 def broadcast_execution(message: str) -> None:
+    if not message:
+        return
     print(message, flush=True)
     send_discord_execution(message)
     send_telegram(message)
@@ -764,6 +768,25 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
     return "EXECUTE", notes
 
 # =========================================================
+# FREE ALERT FORMAT
+# =========================================================
+def build_free_alert(plan: TradePlan, context: MarketContext, status: str) -> str:
+    if status != "EXECUTE":
+        return ""
+
+    confidence_score = max(1, min(100, int(round(plan.confidence * 100))))
+    key_level = context.vwap
+
+    return (
+        f"📊 MARKET INSIGHT — {context.symbol}\n\n"
+        f"A strong setup is active.\n"
+        f"Timing: CONFIRMED\n"
+        f"Confidence: {confidence_score}/100\n"
+        f"Key Level: {key_level:.2f}\n\n"
+        f"Join premium for execution access."
+    )
+
+# =========================================================
 # OPTIONS CONTRACT PICKER
 # =========================================================
 def candidate_expirations() -> List[date]:
@@ -912,57 +935,6 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
         broadcast_execution(f"❌ ALPACA OPTION ORDER FAILED: {e}")
 
 # =========================================================
-# ALERT FORMAT
-# =========================================================
-def build_constituent_summary_for_alert(context: MarketContext) -> str:
-    ci = context.constituent_internals
-    if not ci:
-        return "Constituent internals: unavailable."
-
-    if ci.confirmation_bias == "BULLISH_CONFIRMATION":
-        return f"📈 Internals bullish | Leaders up: {', '.join(ci.leaders_up[:4]) or 'none'} | Bull participation: {ci.bullish_participation:.0%}"
-    if ci.confirmation_bias == "BEARISH_CONFIRMATION":
-        return f"📉 Internals bearish | Leaders down: {', '.join(ci.leaders_down[:4]) or 'none'} | Bear participation: {ci.bearish_participation:.0%}"
-    return f"⚖️ Internals mixed | Conflicts: {', '.join(ci.conflicts[:5]) or 'none'}"
-
-
-def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: List[str]) -> str:
-    emoji = "🟢" if plan.action == "BUY_CALL" else "🔴" if plan.action == "BUY_PUT" else "⚪"
-    timestamp = now_et().strftime("%Y-%m-%d %I:%M:%S %p ET")
-
-    lines = [
-        f"{emoji} {context.symbol} FRAMEWORK UPDATE",
-        f"Time: {timestamp}",
-        f"Price: {context.current_price:.2f}",
-        f"VWAP: {context.vwap:.2f}",
-        f"RSI: {context.rsi:.1f}",
-        f"Change: {context.change_pct:.2f}%",
-        f"Vol Ratio: {context.volume_ratio:.2f}x",
-        f"Action: {plan.action}",
-        f"Grade: {plan.grade}",
-        f"Score: {plan.score}",
-        f"Confidence: {plan.confidence:.0%}",
-        build_constituent_summary_for_alert(context),
-        "Reasons:",
-    ]
-
-    for reason in plan.reasons[:8]:
-        lines.append(f"- {reason}")
-
-    lines.append("Execution Filter:")
-    for note in notes:
-        lines.append(f"- {note}")
-
-    lines.append(f"Execution Tier: {plan.execution_tier}")
-    lines.append(f"Execution Qty: {plan.execution_qty}")
-    lines.append(f"Chasing: {plan.chasing}")
-    lines.append(f"Final Status: {status}")
-    lines.append(f"LIVE_TRADING: {LIVE_TRADING}")
-    lines.append(f"ALPACA_PAPER: {ALPACA_PAPER}")
-
-    return "\n".join(lines)
-
-# =========================================================
 # MAIN
 # =========================================================
 def run_symbol(symbol: str) -> None:
@@ -975,11 +947,11 @@ def run_symbol(symbol: str) -> None:
     plan = apply_constituent_confirmation(context, plan)
     status, notes = execution_filter(plan, context)
 
-    # Framework alerts go ONLY to free + telegram
-    broadcast_framework(build_alert(plan, context, status, notes))
+    free_msg = build_free_alert(plan, context, status)
+    if free_msg:
+        broadcast_free(free_msg)
 
     if status == "EXECUTE":
-        # Execution alerts go ONLY to execution channel + telegram
         execute_trade(plan, context)
 
 
@@ -992,7 +964,7 @@ def run_cycle() -> None:
 def main() -> None:
     ensure_trade_log_exists()
 
-    startup = (
+    startup_exec = (
         "🚀 UnBiased Framework started\n"
         f"Watchlist: {', '.join(WATCHLIST)}\n"
         f"LIVE_TRADING: {LIVE_TRADING}\n"
@@ -1005,7 +977,7 @@ def main() -> None:
         f"Discord Free Connected: {bool(DISCORD_WEBHOOK_FREE)}\n"
         f"Discord Execution Connected: {bool(DISCORD_WEBHOOK_EXECUTION)}"
     )
-    broadcast_framework(startup)
+    broadcast_execution(startup_exec)
 
     if alpaca_client is not None:
         try:
