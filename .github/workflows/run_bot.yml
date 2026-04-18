@@ -36,7 +36,7 @@ jobs:
             echo '{"history": [], "pending_signals": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
           fi
           if [ ! -f control_state.json ]; then
-            echo '{"desired_state": "AUTO", "kill_switch": false, "override_minutes": 0, "operator": "", "note": "", "command_id": "", "last_applied_command_id": "", "last_applied_at_utc": "", "admin_log": []}' > control_state.json
+            echo '{"desired_state": "AUTO", "kill_switch": false, "override_minutes": 0, "operator": "", "note": "", "command_id": "", "last_applied_command_id": "", "last_applied_at_utc": "", "telegram_update_offset": 0, "admin_log": []}' > control_state.json
           fi
 
       - name: Install dependencies
@@ -62,8 +62,10 @@ jobs:
           DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
 
           TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
+          TELEGRAM_CONTROL_ENABLED: ${{ secrets.TELEGRAM_CONTROL_ENABLED }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
 
           DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED }}
           DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
