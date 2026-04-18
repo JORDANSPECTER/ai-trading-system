@@ -2,10 +2,11 @@ import os
 import time
 import csv
 import json
+import math
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, date, timedelta
 
@@ -42,7 +43,7 @@ MAX_RSI_PUT = float(os.getenv("MAX_RSI_PUT", "45"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))
 
 # =========================================================
-# RISK / ELITE MANAGEMENT
+# ELITE RISK / MANAGEMENT
 # =========================================================
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
 MAX_NEW_TRADES_PER_DAY = int(os.getenv("MAX_NEW_TRADES_PER_DAY", "4"))
@@ -70,7 +71,16 @@ TRADE_LOG_FILE = os.getenv("TRADE_LOG_FILE", "trade_log.csv")
 # =========================================================
 OPTIONS_DTE_FALLBACK_DAYS = int(os.getenv("OPTIONS_DTE_FALLBACK_DAYS", "5"))
 OPTIONS_STRIKE_STEP_BUFFER = float(os.getenv("OPTIONS_STRIKE_STEP_BUFFER", "0.0"))
-DEFAULT_OPTION_LIMIT_PRICE = float(os.getenv("DEFAULT_OPTION_LIMIT_PRICE", "1.00"))
+
+# Real pricing engine
+OPTION_QUOTE_FEED = os.getenv("OPTION_QUOTE_FEED", "indicative")
+MAX_OPTION_SPREAD_ABS = float(os.getenv("MAX_OPTION_SPREAD_ABS", "0.30"))
+MAX_OPTION_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "20"))
+BUY_LIMIT_SPREAD_FACTOR = float(os.getenv("BUY_LIMIT_SPREAD_FACTOR", "0.85"))
+SELL_LIMIT_SPREAD_FACTOR = float(os.getenv("SELL_LIMIT_SPREAD_FACTOR", "0.15"))
+MIN_OPTION_ASK = float(os.getenv("MIN_OPTION_ASK", "0.05"))
+MIN_OPTION_BID = float(os.getenv("MIN_OPTION_BID", "0.01"))
+ALLOW_MARKET_ORDERS_DURING_RTH = os.getenv("ALLOW_MARKET_ORDERS_DURING_RTH", "false").lower() == "true"
 
 GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "A+": 4}
 BULLISH_CONFIRM_BONUS = 15
@@ -243,6 +253,12 @@ def force_exit_reached() -> bool:
     cutoff_minutes = FORCE_EXIT_HOUR_ET * 60 + FORCE_EXIT_MINUTE_ET
     current_minutes = current.hour * 60 + current.minute
     return current_minutes >= cutoff_minutes
+
+
+def round_option_limit_price(price: float) -> float:
+    if price >= 1.0:
+        return round(price + 1e-12, 2)
+    return round(price + 1e-12, 4)
 
 # =========================================================
 # ALERTS
@@ -478,6 +494,88 @@ def get_symbol_snapshot(symbol: str) -> Optional[Dict]:
         return None
 
 # =========================================================
+# OPTION QUOTES / PRICING ENGINE
+# =========================================================
+def get_option_latest_quote(option_symbol: str) -> Optional[Dict]:
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return None
+
+    base_url = "https://data.alpaca.markets/v1beta1/options/quotes/latest"
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+    }
+    params = {
+        "symbols": option_symbol,
+        "feed": OPTION_QUOTE_FEED,
+    }
+
+    try:
+        response = requests.get(base_url, headers=headers, params=params, timeout=12)
+        response.raise_for_status()
+        data = response.json()
+        quotes = data.get("quotes", {})
+        quote = quotes.get(option_symbol)
+        if not quote:
+            return None
+
+        bid = safe_float(quote.get("bp"), 0.0)
+        ask = safe_float(quote.get("ap"), 0.0)
+        bid_size = safe_float(quote.get("bs"), 0.0)
+        ask_size = safe_float(quote.get("as"), 0.0)
+
+        if ask <= 0:
+            return None
+
+        spread_abs = max(0.0, ask - bid)
+        spread_pct = (spread_abs / ask * 100.0) if ask > 0 else 999.0
+
+        return {
+            "bid": bid,
+            "ask": ask,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "spread_abs": spread_abs,
+            "spread_pct": spread_pct,
+        }
+    except Exception as e:
+        print(f"[OPTION QUOTE ERROR] {option_symbol}: {e}", flush=True)
+        return None
+
+
+def quote_is_tradeable(quote: Dict) -> Tuple[bool, str]:
+    if not quote:
+        return False, "No option quote available."
+    if quote["ask"] < MIN_OPTION_ASK:
+        return False, f"Ask too low ({quote['ask']:.4f})."
+    if quote["bid"] < MIN_OPTION_BID:
+        return False, f"Bid too low ({quote['bid']:.4f})."
+    if quote["spread_abs"] > MAX_OPTION_SPREAD_ABS:
+        return False, f"Spread too wide (${quote['spread_abs']:.4f})."
+    if quote["spread_pct"] > MAX_OPTION_SPREAD_PCT:
+        return False, f"Spread too wide ({quote['spread_pct']:.2f}%)."
+    return True, "Quote acceptable."
+
+
+def compute_buy_limit_from_quote(quote: Dict) -> float:
+    bid = quote["bid"]
+    ask = quote["ask"]
+    spread = max(0.0, ask - bid)
+    raw = bid + (spread * BUY_LIMIT_SPREAD_FACTOR)
+    raw = min(raw, ask)
+    raw = max(raw, MIN_OPTION_ASK)
+    return round_option_limit_price(raw)
+
+
+def compute_sell_limit_from_quote(quote: Dict) -> float:
+    bid = quote["bid"]
+    ask = quote["ask"]
+    spread = max(0.0, ask - bid)
+    raw = bid + (spread * SELL_LIMIT_SPREAD_FACTOR)
+    raw = max(raw, bid)
+    return round_option_limit_price(max(raw, MIN_OPTION_BID))
+
+# =========================================================
 # CONSTITUENT ENGINE
 # =========================================================
 def load_constituent_snapshots(etf_symbol: str) -> List[ConstituentSnapshot]:
@@ -581,11 +679,8 @@ def analyze_constituent_internals(etf_symbol: str, snapshots: List[ConstituentSn
 def enrich_context_with_constituents(context: MarketContext) -> MarketContext:
     if context.symbol not in ETF_CONSTITUENTS:
         return context
-
-    snapshots = load_constituent_snapshots(context.symbol)
-    internals = analyze_constituent_internals(context.symbol, snapshots)
-    context.constituent_snapshots = snapshots
-    context.constituent_internals = internals
+    context.constituent_snapshots = load_constituent_snapshots(context.symbol)
+    context.constituent_internals = analyze_constituent_internals(context.symbol, context.constituent_snapshots)
     return context
 
 # =========================================================
@@ -714,24 +809,18 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
     if plan.action == "BUY_CALL":
         if ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score += BULLISH_CONFIRM_BONUS
-            plan.reasons.append(f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
         elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
         else:
             plan.score -= MIXED_PENALTY
-            plan.reasons.append("Call setup has mixed internal participation.")
 
     elif plan.action == "BUY_PUT":
         if ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score += BEARISH_CONFIRM_BONUS
-            plan.reasons.append(f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
         elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
         else:
             plan.score -= MIXED_PENALTY
-            plan.reasons.append("Put setup has mixed internal participation.")
 
     if plan.action == "BUY_CALL" and context.rsi >= MIN_RSI_CALL:
         plan.score += 5
@@ -862,10 +951,6 @@ def pick_option_contract(underlying: str, action: str, underlying_price: float):
 
     return None
 
-
-def estimate_option_limit_price() -> float:
-    return max(0.01, round(DEFAULT_OPTION_LIMIT_PRICE, 2))
-
 # =========================================================
 # STATE HELPERS
 # =========================================================
@@ -888,8 +973,7 @@ def increment_daily_entry_count(state: Dict) -> None:
 
 
 def set_recent_closure(state: Dict, symbol: str) -> None:
-    rc = state.setdefault("recent_closures", {})
-    rc[symbol] = now_et().isoformat()
+    state.setdefault("recent_closures", {})[symbol] = now_et().isoformat()
 
 
 def cooldown_active(state: Dict, symbol: str) -> bool:
@@ -903,22 +987,17 @@ def cooldown_active(state: Dict, symbol: str) -> bool:
         return False
 
 
-def can_open_new_trade(state: Dict, plan: TradePlan, context: MarketContext) -> Tuple[bool, str]:
+def can_open_new_trade(state: Dict, context: MarketContext) -> Tuple[bool, str]:
     if len(state.get("open_trades", [])) >= MAX_OPEN_TRADES:
         return False, "Max open trades reached."
-
     if get_open_trades_for_symbol(state, context.symbol):
         return False, f"Open trade already exists for {context.symbol}."
-
     if get_daily_entry_count(state) >= MAX_NEW_TRADES_PER_DAY:
         return False, "Max new trades per day reached."
-
     if cooldown_active(state, context.symbol):
         return False, f"Cooldown active for {context.symbol}."
-
     if entry_cutoff_reached():
         return False, "Entry cutoff reached."
-
     return True, "Entry allowed."
 
 # =========================================================
@@ -929,7 +1008,7 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
     if qty <= 0:
         return
 
-    allowed, reason = can_open_new_trade(state, plan, context)
+    allowed, reason = can_open_new_trade(state, context)
     if not allowed:
         broadcast_execution(f"⛔ ENTRY BLOCKED\nUnderlying: {context.symbol}\nReason: {reason}")
         return
@@ -958,7 +1037,18 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
             broadcast_execution(f"❌ Contract object missing symbol for {context.symbol} {plan.action}")
             return
 
-        if is_regular_market_hours_et():
+        quote = get_option_latest_quote(option_symbol)
+        ok, quote_reason = quote_is_tradeable(quote)
+        if not ok:
+            broadcast_execution(
+                f"⛔ ENTRY BLOCKED — BAD OPTION QUOTE\n"
+                f"Underlying: {context.symbol}\n"
+                f"Contract: {option_symbol}\n"
+                f"Reason: {quote_reason}"
+            )
+            return
+
+        if is_regular_market_hours_et() and ALLOW_MARKET_ORDERS_DURING_RTH:
             order_request = MarketOrderRequest(
                 symbol=option_symbol,
                 qty=qty,
@@ -968,7 +1058,7 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
             order_type_used = "MARKET"
             limit_price_used = None
         else:
-            limit_price = estimate_option_limit_price()
+            limit_price = compute_buy_limit_from_quote(quote)
             order_request = LimitOrderRequest(
                 symbol=option_symbol,
                 qty=qty,
@@ -1007,6 +1097,9 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
             f"Action: {plan.action}\n"
             f"Qty: {qty}\n"
             f"Order Type: {order_type_used}\n"
+            f"Bid: {quote['bid']:.4f}\n"
+            f"Ask: {quote['ask']:.4f}\n"
+            f"Spread: ${quote['spread_abs']:.4f} ({quote['spread_pct']:.2f}%)\n"
             f"Limit Price: {limit_price_used if limit_price_used is not None else 'N/A'}\n"
             f"Strike: {strike_price}\n"
             f"Expiry: {expiration_date}\n"
@@ -1027,7 +1120,7 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
             entry_underlying=context.current_price,
             current_underlying=context.current_price,
             underlying_move_pct=0.0,
-            reason="entry_sent",
+            reason="entry_sent_real_quote_pricing",
             order_id=str(order.id),
         )
 
@@ -1041,23 +1134,15 @@ def compute_directional_move_pct(trade: Dict, current_underlying: float) -> floa
         return 0.0
 
     raw_move = ((current_underlying - entry) / entry) * 100.0
-
-    if trade.get("action") == "BUY_CALL":
-        return raw_move
-    return -raw_move
+    return raw_move if trade.get("action") == "BUY_CALL" else -raw_move
 
 
 def should_exit_trade(trade: Dict, current_underlying: float) -> Tuple[bool, str, float]:
     move_pct = compute_directional_move_pct(trade, current_underlying)
-    be_armed = bool(trade.get("be_armed", False))
     action = trade.get("action", "BUY_CALL")
 
-    if action == "BUY_CALL":
-        tp = CALL_TP_UNDERLYING_PCT
-        sl = CALL_SL_UNDERLYING_PCT
-    else:
-        tp = PUT_TP_UNDERLYING_PCT
-        sl = PUT_SL_UNDERLYING_PCT
+    tp = CALL_TP_UNDERLYING_PCT if action == "BUY_CALL" else PUT_TP_UNDERLYING_PCT
+    sl = CALL_SL_UNDERLYING_PCT if action == "BUY_CALL" else PUT_SL_UNDERLYING_PCT
 
     try:
         entry_time = datetime.fromisoformat(trade["entry_time"])
@@ -1066,7 +1151,7 @@ def should_exit_trade(trade: Dict, current_underlying: float) -> Tuple[bool, str
 
     age_minutes = max(0, (now_et() - entry_time).total_seconds() / 60.0)
 
-    if move_pct >= BREAK_EVEN_TRIGGER_PCT and not be_armed:
+    if move_pct >= BREAK_EVEN_TRIGGER_PCT and not trade.get("be_armed", False):
         trade["be_armed"] = True
         return False, "break_even_armed", move_pct
 
@@ -1075,7 +1160,7 @@ def should_exit_trade(trade: Dict, current_underlying: float) -> Tuple[bool, str
 
     effective_stop = 0.0 if trade.get("be_armed", False) else -sl
     if move_pct <= effective_stop:
-        return True, "stop_hit" if not trade.get("be_armed", False) else "break_even_exit", move_pct
+        return True, "break_even_exit" if trade.get("be_armed", False) else "stop_hit", move_pct
 
     if age_minutes >= MAX_HOLD_MINUTES:
         return True, "max_hold_time_exit", move_pct
@@ -1095,7 +1180,18 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
     qty = int(trade["qty"])
 
     try:
-        if is_regular_market_hours_et():
+        quote = get_option_latest_quote(option_symbol)
+        ok, quote_reason = quote_is_tradeable(quote)
+        if not ok:
+            broadcast_execution(
+                f"⛔ EXIT BLOCKED — BAD OPTION QUOTE\n"
+                f"Underlying: {trade['underlying']}\n"
+                f"Contract: {option_symbol}\n"
+                f"Reason: {quote_reason}"
+            )
+            return
+
+        if is_regular_market_hours_et() and ALLOW_MARKET_ORDERS_DURING_RTH:
             order_request = MarketOrderRequest(
                 symbol=option_symbol,
                 qty=qty,
@@ -1105,7 +1201,7 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
             order_type_used = "MARKET"
             limit_price_used = None
         else:
-            limit_price = estimate_option_limit_price()
+            limit_price = compute_sell_limit_from_quote(quote)
             order_request = LimitOrderRequest(
                 symbol=option_symbol,
                 qty=qty,
@@ -1125,6 +1221,9 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
             f"Action: SELL TO CLOSE\n"
             f"Qty: {qty}\n"
             f"Order Type: {order_type_used}\n"
+            f"Bid: {quote['bid']:.4f}\n"
+            f"Ask: {quote['ask']:.4f}\n"
+            f"Spread: ${quote['spread_abs']:.4f} ({quote['spread_pct']:.2f}%)\n"
             f"Limit Price: {limit_price_used if limit_price_used is not None else 'N/A'}\n"
             f"Reason: {reason}\n"
             f"Underlying Move: {move_pct:.2f}%\n"
@@ -1154,7 +1253,13 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
         save_state(state)
 
     except Exception as e:
-        broadcast_execution(f"❌ ALPACA OPTION EXIT FAILED\nUnderlying: {trade.get('underlying')}\nContract: {option_symbol}\nReason: {reason}\nError: {e}")
+        broadcast_execution(
+            f"❌ ALPACA OPTION EXIT FAILED\n"
+            f"Underlying: {trade.get('underlying')}\n"
+            f"Contract: {option_symbol}\n"
+            f"Reason: {reason}\n"
+            f"Error: {e}"
+        )
 
 # =========================================================
 # OPEN TRADE MANAGEMENT
@@ -1237,6 +1342,7 @@ def main() -> None:
         f"ALPACA_PAPER: {ALPACA_PAPER}\n"
         f"Alpaca Connected: {alpaca_client is not None}\n"
         f"Alpaca Options Ready: {alpaca_options_ready}\n"
+        f"Option Feed: {OPTION_QUOTE_FEED}\n"
         f"Open Trades Loaded: {len(state.get('open_trades', []))}\n"
         f"RUN_ONCE: {RUN_ONCE}"
     )
