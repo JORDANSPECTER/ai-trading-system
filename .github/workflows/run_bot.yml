@@ -1,36 +1,29 @@
-name: UnBiased Bot Runner
+name: UnBiased Trading Bot
 
 on:
   workflow_dispatch:
-    inputs:
-      bot_mode:
-        description: "Choose mode (trade_alert, live_update, daily_report, weekly_report, dashboard, email_weekly, test_all)"
-        required: false
-        default: "test_all"
-
   schedule:
-    - cron: "0 1 * * *"
-    - cron: "0 23 * * 0"
+    - cron: "*/5 13-21 * * 1-5"  # Runs every 5 min during market hours (9:30–4 EST)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-      BOT_MODE: ${{ github.event.inputs.bot_mode }}
-
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      # DATA + ALERTS
+      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      DISCORD_WEBHOOK_FREE: ${{ secrets.DISCORD_WEBHOOK_FREE }}
-      DISCORD_WEBHOOK_PREMIUM: ${{ secrets.DISCORD_WEBHOOK_PREMIUM }}
-      DISCORD_WEBHOOK_PREMIUM_LEVELS: ${{ secrets.DISCORD_WEBHOOK_PREMIUM_LEVELS }}
+      # ALPACA
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
 
-      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+      # BOT SETTINGS
+      LIVE_TRADING: "true"     # 🔴 set to "false" for alerts only
+      POLL_SECONDS: "60"
 
     steps:
       - name: Checkout repo
@@ -42,24 +35,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests matplotlib
-
-      - name: Set BOT_MODE for scheduled runs
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            if [[ "$(date +%u)" == "7" ]]; then
-              echo "BOT_MODE=email_weekly" >> $GITHUB_ENV
-            else
-              echo "BOT_MODE=daily_report" >> $GITHUB_ENV
-            fi
-          fi
+          pip install requests alpaca-py
 
-      - name: Run UnBiased Bot
-        run: python main.py
-
-      - name: Upload trade logs
-        uses: actions/upload-artifact@v4
-        with:
-          name: unbiased-trade-logs
-          path: artifacts/
-          if-no-files-found: warn
+      - name: Run Trading Bot
+        run: |
+          python main.py
