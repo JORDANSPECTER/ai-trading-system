@@ -13,12 +13,12 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 
+ET = ZoneInfo("America/New_York")
+
+
 # ============================================================
 # HELPERS
 # ============================================================
-
-ET = ZoneInfo("America/New_York")
-
 
 def env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
@@ -142,6 +142,7 @@ class Config:
 
     state_file: str
     performance_state_file: str
+    control_state_file: str
     dedupe_price_rounding: int
     alert_cooldown_seconds: int
     daily_levels_cooldown_seconds: int
@@ -170,7 +171,6 @@ class Config:
     risk_warning_text: str
     debug: bool
 
-    # Execution
     execution_enabled: bool
     execution_min_grade: str
     alpaca_api_key: str
@@ -182,7 +182,6 @@ class Config:
     max_open_positions: int
     default_time_in_force: str
 
-    # Reports
     daily_reports_enabled: bool
     weekly_reports_enabled: bool
     morning_report_hour_et: int
@@ -192,14 +191,11 @@ class Config:
     weekly_report_hour_et: int
     weekly_report_minute_et: int
 
-    # Tracking
     tracking_enabled: bool
     tracking_target_pct: float
     tracking_fail_pct: float
 
-    # Risk Engine
     risk_enabled: bool
-    kill_switch_enabled: bool
     session_filter_enabled: bool
     allow_midday_entries: bool
     market_quality_enabled: bool
@@ -217,6 +213,9 @@ class Config:
     max_vwap_distance_pct: float
     probation_size_multiplier: float
 
+    control_notifications_enabled: bool
+    control_admin_name: str
+
 
 def load_config() -> Config:
     return Config(
@@ -229,6 +228,7 @@ def load_config() -> Config:
 
         state_file=env_str("STATE_FILE", "elite_state.json"),
         performance_state_file=env_str("PERFORMANCE_STATE_FILE", "performance_state.json"),
+        control_state_file=env_str("CONTROL_STATE_FILE", "control_state.json"),
         dedupe_price_rounding=env_int("DEDUPE_PRICE_ROUNDING", 2),
         alert_cooldown_seconds=env_int("ALERT_COOLDOWN_SECONDS", 900),
         daily_levels_cooldown_seconds=env_int("DAILY_LEVELS_COOLDOWN_SECONDS", 1200),
@@ -285,7 +285,6 @@ def load_config() -> Config:
         tracking_fail_pct=env_float("TRACKING_FAIL_PCT", 0.20),
 
         risk_enabled=env_bool("RISK_ENABLED", True),
-        kill_switch_enabled=env_bool("KILL_SWITCH_ENABLED", False),
         session_filter_enabled=env_bool("SESSION_FILTER_ENABLED", True),
         allow_midday_entries=env_bool("ALLOW_MIDDAY_ENTRIES", False),
         market_quality_enabled=env_bool("MARKET_QUALITY_ENABLED", True),
@@ -302,6 +301,9 @@ def load_config() -> Config:
         vix_spike_block_pct=env_float("VIX_SPIKE_BLOCK_PCT", 4.0),
         max_vwap_distance_pct=env_float("MAX_VWAP_DISTANCE_PCT", 0.35),
         probation_size_multiplier=env_float("PROBATION_SIZE_MULTIPLIER", 0.5),
+
+        control_notifications_enabled=env_bool("CONTROL_NOTIFICATIONS_ENABLED", True),
+        control_admin_name=env_str("CONTROL_ADMIN_NAME", "Jordan"),
     )
 
 
@@ -381,7 +383,7 @@ class OrderIntent:
 
 @dataclass
 class RiskDecision:
-    action: str  # ALLOW / ALLOW_REDUCED / BLOCK_TEMP / BLOCK_HARD / REDUCE_ONLY / KILL_SWITCH_ACTIVE
+    action: str
     size_multiplier: float
     reason_codes: List[str]
     state_after: str
@@ -467,8 +469,57 @@ class PerformanceState:
             json.dump(payload, f, indent=2)
 
 
+@dataclass
+class ControlState:
+    desired_state: str = "AUTO"
+    kill_switch: bool = False
+    override_minutes: int = 0
+    operator: str = ""
+    note: str = ""
+    command_id: str = ""
+    last_applied_command_id: str = ""
+    last_applied_at_utc: str = ""
+    admin_log: List[Dict[str, Any]] = field(default_factory=list)
+
+    @staticmethod
+    def load(path: str) -> "ControlState":
+        if not os.path.exists(path):
+            return ControlState()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return ControlState(
+                desired_state=raw.get("desired_state", "AUTO"),
+                kill_switch=raw.get("kill_switch", False),
+                override_minutes=raw.get("override_minutes", 0),
+                operator=raw.get("operator", ""),
+                note=raw.get("note", ""),
+                command_id=raw.get("command_id", ""),
+                last_applied_command_id=raw.get("last_applied_command_id", ""),
+                last_applied_at_utc=raw.get("last_applied_at_utc", ""),
+                admin_log=raw.get("admin_log", []),
+            )
+        except Exception:
+            return ControlState()
+
+    def save(self, path: str) -> None:
+        payload = {
+            "desired_state": self.desired_state,
+            "kill_switch": self.kill_switch,
+            "override_minutes": self.override_minutes,
+            "operator": self.operator,
+            "note": self.note,
+            "command_id": self.command_id,
+            "last_applied_command_id": self.last_applied_command_id,
+            "last_applied_at_utc": self.last_applied_at_utc,
+            "admin_log": self.admin_log[-500:],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
 # ============================================================
-# TWELVE DATA CLIENT
+# DATA CLIENT
 # ============================================================
 
 class TwelveDataClient:
@@ -491,8 +542,8 @@ class TwelveDataClient:
     def get_quote(self, symbol: str) -> Quote:
         if not symbol:
             raise RuntimeError("Symbol is blank. Check GitHub secrets.")
-
         data = self._get("quote", {"symbol": symbol})
+
         price = safe_float(data.get("close"), 0.0)
         open_price = safe_float(data.get("open"), 0.0)
         high = safe_float(data.get("high"), 0.0)
@@ -700,6 +751,7 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
         lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
     if ctx.primary_indicators.rsi is not None:
         lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
+
     lines.append("")
     lines.append("Watch for acceptance / rejection at these levels before entry.")
     lines.append(cfg.risk_warning_text)
@@ -720,6 +772,7 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
 
 def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
     emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
+
     lines = [
         f"Symbol: {ctx.primary.symbol}",
         f"Direction: {setup.direction}",
@@ -728,6 +781,7 @@ def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> Ale
         f"Price: {ctx.primary.price:.2f}",
         f"Day Change: {ctx.primary.change_pct:+.2f}%",
     ]
+
     if ctx.primary_indicators.vwap is not None:
         lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
     if ctx.primary_indicators.rsi is not None:
@@ -823,6 +877,103 @@ def format_for_discord(alert: AlertPayload) -> str:
 
 
 # ============================================================
+# CONTROL PLANE
+# ============================================================
+
+VALID_CONTROL_STATES = {"AUTO", "ACTIVE", "SOFT_BLOCK", "COOLDOWN", "BREACH", "PROBATION", "KILL_SWITCH"}
+
+
+def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
+    state.risk_audit.append(
+        {"ts_utc": now_utc_iso(), "event_type": event_type, "details": details}
+    )
+    state.risk_audit = state.risk_audit[-1000:]
+
+
+def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> None:
+    state.risk_state = new_state
+    if minutes > 0:
+        until_ts = now_utc().timestamp() + minutes * 60
+        state.risk_state_until_utc = datetime.fromtimestamp(until_ts, timezone.utc).isoformat()
+    else:
+        state.risk_state_until_utc = ""
+
+
+def normalize_risk_state(state: PersistentState) -> None:
+    if state.risk_state_until_utc:
+        try:
+            if now_utc() >= parse_iso(state.risk_state_until_utc):
+                state.risk_state = "ACTIVE"
+                state.risk_state_until_utc = ""
+        except Exception:
+            pass
+
+
+def apply_control_plane(
+    cfg: Config,
+    control: ControlState,
+    state: PersistentState,
+    discord: DiscordNotifier,
+    telegram: TelegramNotifier,
+) -> None:
+    if control.desired_state not in VALID_CONTROL_STATES:
+        control.desired_state = "AUTO"
+
+    if control.command_id and control.command_id != control.last_applied_command_id:
+        previous_state = state.risk_state
+
+        if control.kill_switch or control.desired_state == "KILL_SWITCH":
+            set_risk_state(state, "KILL_SWITCH")
+        elif control.desired_state == "AUTO":
+            # do not force a change; just let engine manage it
+            normalize_risk_state(state)
+        elif control.desired_state == "ACTIVE":
+            set_risk_state(state, "ACTIVE")
+        elif control.desired_state == "SOFT_BLOCK":
+            set_risk_state(state, "SOFT_BLOCK", control.override_minutes)
+        elif control.desired_state == "COOLDOWN":
+            set_risk_state(state, "COOLDOWN", control.override_minutes if control.override_minutes > 0 else cfg.cooldown_minutes_after_loss_cluster)
+        elif control.desired_state == "BREACH":
+            set_risk_state(state, "BREACH")
+        elif control.desired_state == "PROBATION":
+            set_risk_state(state, "PROBATION", control.override_minutes)
+
+        control.last_applied_command_id = control.command_id
+        control.last_applied_at_utc = now_utc_iso()
+
+        log_entry = {
+            "ts_utc": now_utc_iso(),
+            "operator": control.operator or cfg.control_admin_name,
+            "from_state": previous_state,
+            "to_state": state.risk_state,
+            "desired_state": control.desired_state,
+            "kill_switch": control.kill_switch,
+            "override_minutes": control.override_minutes,
+            "note": control.note,
+            "command_id": control.command_id,
+        }
+        control.admin_log.append(log_entry)
+        record_risk_audit(state, "MANUAL_OVERRIDE_APPLIED", log_entry)
+
+        if cfg.control_notifications_enabled:
+            msg = (
+                f"🛠 CONTROL PLANE UPDATE\n"
+                f"Operator: {log_entry['operator']}\n"
+                f"From: {log_entry['from_state']}\n"
+                f"To: {log_entry['to_state']}\n"
+                f"Desired: {log_entry['desired_state']}\n"
+                f"Kill Switch: {log_entry['kill_switch']}\n"
+                f"Duration (min): {log_entry['override_minutes']}\n"
+                f"Note: {log_entry['note'] or 'n/a'}\n"
+                f"Command ID: {log_entry['command_id']}"
+            )
+            if cfg.discord_premium_webhook:
+                discord.send(cfg.discord_premium_webhook, msg)
+            if cfg.telegram_enabled:
+                telegram.send(msg)
+
+
+# ============================================================
 # RISK ENGINE
 # ============================================================
 
@@ -836,37 +987,6 @@ def current_session_label() -> str:
     if 14 * 60 <= mins <= 16 * 60:
         return "POWER_HOUR"
     return "OFF_HOURS"
-
-
-def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
-    state.risk_audit.append(
-        {
-            "ts_utc": now_utc_iso(),
-            "event_type": event_type,
-            "details": details,
-        }
-    )
-    state.risk_audit = state.risk_audit[-1000:]
-
-
-def is_state_active(state: PersistentState) -> bool:
-    if state.risk_state_until_utc:
-        try:
-            if now_utc() >= parse_iso(state.risk_state_until_utc):
-                state.risk_state = "ACTIVE"
-                state.risk_state_until_utc = ""
-        except Exception:
-            pass
-    return state.risk_state == "ACTIVE"
-
-
-def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> None:
-    state.risk_state = new_state
-    if minutes > 0:
-        until_dt = now_utc().timestamp() + minutes * 60
-        state.risk_state_until_utc = datetime.fromtimestamp(until_dt, timezone.utc).isoformat()
-    else:
-        state.risk_state_until_utc = ""
 
 
 class ExposureService:
@@ -926,16 +1046,16 @@ def consecutive_losses_today(perf: PerformanceState) -> int:
     return count
 
 
-def realized_signal_pnl_estimate_today(perf: PerformanceState) -> float:
+def realized_signal_pnl_estimate_today(perf: PerformanceState, cfg: Config) -> float:
     today = today_et_str()
     tracked = [x for x in perf.history if x.get("type") == "tracked_outcome" and x.get("date_et") == today]
     pnl = 0.0
     for item in tracked:
         status = item.get("final_status")
         if status == "WIN":
-            pnl += 1.0
+            pnl += cfg.max_order_notional * (cfg.tracking_target_pct / 100.0)
         elif status == "LOSS":
-            pnl -= 1.0
+            pnl -= cfg.max_order_notional * (cfg.tracking_fail_pct / 100.0)
     return pnl
 
 
@@ -953,30 +1073,34 @@ class PreTradeRiskEngine:
             self.state.risk_peak_equity = equity
 
     def _check_state(self, reasons: List[str]) -> Optional[RiskDecision]:
-        if self.cfg.kill_switch_enabled:
-            set_risk_state(self.state, "KILL_SWITCH")
+        normalize_risk_state(self.state)
+
+        if self.state.risk_state == "KILL_SWITCH":
             reasons.append("KILL_SWITCH_ACTIVE")
             return RiskDecision("KILL_SWITCH_ACTIVE", 0.0, reasons, self.state.risk_state)
 
-        if not is_state_active(self.state):
-            if self.state.risk_state == "COOLDOWN":
-                reasons.append("COOLDOWN_ACTIVE")
-                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
-            if self.state.risk_state == "BREACH":
-                reasons.append("RISK_BREACH_ACTIVE")
-                return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
-            if self.state.risk_state == "SOFT_BLOCK":
-                reasons.append("SOFT_BLOCK_ACTIVE")
-                return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
-            if self.state.risk_state == "PROBATION":
-                reasons.append("PROBATION_ACTIVE")
-                return None
+        if self.state.risk_state == "BREACH":
+            reasons.append("RISK_BREACH_ACTIVE")
+            return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
+
+        if self.state.risk_state == "SOFT_BLOCK":
+            reasons.append("SOFT_BLOCK_ACTIVE")
+            return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        if self.state.risk_state == "COOLDOWN":
+            reasons.append("COOLDOWN_ACTIVE")
+            return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
+
+        if self.state.risk_state == "PROBATION":
+            reasons.append("PROBATION_ACTIVE")
+            return None
+
         return None
 
     def _check_daily_loss_and_drawdown(self, reasons: List[str]) -> Optional[RiskDecision]:
         self._sync_peak_equity()
 
-        pseudo_realized = realized_signal_pnl_estimate_today(self.perf) * self.cfg.max_order_notional * (self.cfg.tracking_target_pct / 100.0)
+        pseudo_realized = realized_signal_pnl_estimate_today(self.perf, self.cfg)
         if abs(min(pseudo_realized, 0.0)) >= self.cfg.max_daily_loss:
             set_risk_state(self.state, "BREACH")
             reasons.append("MAX_DAILY_LOSS_BREACH")
@@ -1049,13 +1173,12 @@ class PreTradeRiskEngine:
             return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
 
         if portfolio_exposure + intent.requested_notional > self.cfg.max_portfolio_exposure:
-            # haircut before full block
             if portfolio_exposure < self.cfg.max_portfolio_exposure:
                 remaining = self.cfg.max_portfolio_exposure - portfolio_exposure
                 if remaining > 0:
                     mult = max(0.1, min(1.0, remaining / max(intent.requested_notional, 0.01)))
                     reasons.append("PORTFOLIO_EXPOSURE_HAIRCUT")
-                    return RiskDecision("ALLOW_REDUCED", mult, reasons, "ACTIVE")
+                    return RiskDecision("ALLOW_REDUCED", mult, reasons, self.state.risk_state)
             reasons.append("MAX_PORTFOLIO_EXPOSURE_BREACH")
             return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
 
@@ -1128,7 +1251,7 @@ class PreTradeRiskEngine:
             return RiskDecision("ALLOW_REDUCED", self.cfg.probation_size_multiplier, reasons, self.state.risk_state)
 
         reasons.append("PRETRADE_RISK_OK")
-        return RiskDecision("ALLOW", 1.0, reasons, "ACTIVE")
+        return RiskDecision("ALLOW", 1.0, reasons, self.state.risk_state)
 
 
 # ============================================================
@@ -1564,33 +1687,8 @@ def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionE
 
 
 # ============================================================
-# MAIN
+# MAIN FLOW HELPERS
 # ============================================================
-
-def print_snapshot(ctx: MarketContext) -> None:
-    print(
-        f"[{now_utc_iso()}] "
-        f"{ctx.primary.symbol} {ctx.primary.price:.2f} ({ctx.primary.change_pct:+.2f}%) | "
-        f"VWAP {ctx.primary_indicators.vwap if ctx.primary_indicators.vwap is not None else 'n/a'} | "
-        f"RSI {ctx.primary_indicators.rsi if ctx.primary_indicators.rsi is not None else 'n/a'}"
-    )
-
-
-def append_risk_to_alert(alert: AlertPayload, decision: RiskDecision) -> AlertPayload:
-    extra = [
-        "",
-        "Risk Decision:",
-        f"• Action: {decision.action}",
-        f"• State: {decision.state_after}",
-        f"• Size Multiplier: {decision.size_multiplier:.2f}",
-        "• Reason Codes:",
-    ]
-    for code in decision.reason_codes[:8]:
-        extra.append(f"  - {code}")
-
-    alert.body = alert.body + "\n" + "\n".join(extra)
-    return alert
-
 
 def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
     current_ts = time.time()
@@ -1637,6 +1735,36 @@ def route_alert(alert: AlertPayload, cfg: Config, state: PersistentState, telegr
     mark_sent(state, alert.key)
 
 
+def append_risk_to_alert(alert: AlertPayload, decision: RiskDecision, control: ControlState, state: PersistentState) -> AlertPayload:
+    extra = [
+        "",
+        "Risk Decision:",
+        f"• Action: {decision.action}",
+        f"• State: {decision.state_after}",
+        f"• Size Multiplier: {decision.size_multiplier:.2f}",
+        f"• Control Desired State: {control.desired_state}",
+        f"• Kill Switch: {control.kill_switch}",
+        "• Reason Codes:",
+    ]
+    for code in decision.reason_codes[:8]:
+        extra.append(f"  - {code}")
+    alert.body = alert.body + "\n" + "\n".join(extra)
+    return alert
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def print_snapshot(ctx: MarketContext) -> None:
+    print(
+        f"[{now_utc_iso()}] "
+        f"{ctx.primary.symbol} {ctx.primary.price:.2f} ({ctx.primary.change_pct:+.2f}%) | "
+        f"VWAP {ctx.primary_indicators.vwap if ctx.primary_indicators.vwap is not None else 'n/a'} | "
+        f"RSI {ctx.primary_indicators.rsi if ctx.primary_indicators.rsi is not None else 'n/a'}"
+    )
+
+
 def run_once() -> None:
     cfg = load_config()
     if not cfg.twelve_data_api_key:
@@ -1644,22 +1772,22 @@ def run_once() -> None:
 
     state = PersistentState.load(cfg.state_file)
     perf = PerformanceState.load(cfg.performance_state_file)
+    control = ControlState.load(cfg.control_state_file)
     client = TwelveDataClient(cfg.twelve_data_api_key, cfg)
 
     telegram = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.telegram_enabled)
     discord = DiscordNotifier(cfg.discord_enabled)
     executor = ExecutionEngine(cfg, state)
 
+    apply_control_plane(cfg, control, state, discord, telegram)
     evaluate_pending_signals(client, perf, cfg)
 
     ctx = build_market_context(client, cfg)
     print_snapshot(ctx)
 
-    # daily levels
     daily_levels_alert = build_daily_levels_alert(ctx, cfg)
     route_alert(daily_levels_alert, cfg, state, telegram, discord)
 
-    # trade signal
     trade_alert = generate_trade_alert_if_valid(ctx, cfg)
     if trade_alert:
         record_signal(perf, trade_alert, ctx, cfg)
@@ -1679,7 +1807,7 @@ def run_once() -> None:
         risk_decision = risk_engine.evaluate(intent, ctx)
         record_risk_audit(state, "RISK_DECISION", {"intent": asdict(intent), "decision": asdict(risk_decision)})
 
-        trade_alert = append_risk_to_alert(trade_alert, risk_decision)
+        trade_alert = append_risk_to_alert(trade_alert, risk_decision, control, state)
         route_alert(trade_alert, cfg, state, telegram, discord)
 
         if risk_decision.action in {"ALLOW", "ALLOW_REDUCED"}:
@@ -1696,6 +1824,7 @@ def run_once() -> None:
                     f"Qty: {exec_result['qty']}\n"
                     f"Notional: {format_money(exec_result['notional'])}\n"
                     f"Risk Action: {risk_decision.action}\n"
+                    f"Risk State: {state.risk_state}\n"
                     f"Price snapshot: {ctx.primary.price:.2f}\n"
                     f"Order ID: {exec_result['alpaca_order_id']}\n"
                     f"Status: {exec_result['alpaca_status']}"
@@ -1707,11 +1836,11 @@ def run_once() -> None:
             else:
                 record_risk_audit(state, "EXECUTION_SKIPPED", exec_result)
         else:
-            print(f"Execution blocked by risk engine: {risk_decision.action}")
             block_msg = (
                 f"🛑 RISK BLOCKED {trade_alert.symbol}\n"
                 f"Action: {risk_decision.action}\n"
                 f"State: {risk_decision.state_after}\n"
+                f"Control Desired State: {control.desired_state}\n"
                 f"Reasons: {', '.join(risk_decision.reason_codes[:6])}"
             )
             if cfg.discord_premium_webhook:
@@ -1731,6 +1860,7 @@ def run_once() -> None:
 
     state.save(cfg.state_file)
     perf.save(cfg.performance_state_file)
+    control.save(cfg.control_state_file)
     print("Run complete.")
 
 
