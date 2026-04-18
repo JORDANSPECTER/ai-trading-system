@@ -1,6 +1,8 @@
 import os
 import time
+import csv
 import requests
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
@@ -29,7 +31,21 @@ BEARISH_CONFIRM_BONUS = 15
 CONFLICT_PENALTY = 20
 MIXED_PENALTY = 5
 
+# =========================================================
+# EXECUTION ENGINE SETTINGS
+# =========================================================
+A_PLUS_ONLY_MODE = os.getenv("A_PLUS_ONLY_MODE", "false").lower() == "true"
+ALLOW_B_MICRO_SIZE = os.getenv("ALLOW_B_MICRO_SIZE", "true").lower() == "true"
+
 DEFAULT_ORDER_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
+B_MICRO_QTY = int(os.getenv("B_MICRO_QTY", "1"))
+
+CHASE_DISTANCE_PCT = float(os.getenv("CHASE_DISTANCE_PCT", "0.15"))   # percent distance from VWAP
+MIN_RSI_CALL = float(os.getenv("MIN_RSI_CALL", "55"))
+MAX_RSI_PUT = float(os.getenv("MAX_RSI_PUT", "45"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))
+
+PNL_LOG_FILE = os.getenv("PNL_LOG_FILE", "trade_log.csv")
 
 # =========================================================
 # OPTIONAL ALPACA IMPORT
@@ -140,6 +156,9 @@ class TradePlan:
     score: int
     confidence: float
     reasons: List[str] = field(default_factory=list)
+    execution_qty: int = 0
+    execution_tier: str = "NONE"
+    chasing: bool = False
 
 # =========================================================
 # UTILS
@@ -181,6 +200,60 @@ def broadcast(message: str) -> None:
     print(message)
     send_discord(message)
     send_telegram(message)
+
+# =========================================================
+# TRADE LOGGING
+# =========================================================
+def ensure_trade_log_exists() -> None:
+    path = Path(PNL_LOG_FILE)
+    if path.exists():
+        return
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp",
+            "symbol",
+            "action",
+            "grade",
+            "score",
+            "confidence",
+            "execution_tier",
+            "qty",
+            "price",
+            "vwap",
+            "rsi",
+            "change_pct",
+            "volume_ratio",
+            "order_id",
+            "status",
+            "pnl"
+        ])
+
+
+def log_trade_entry(plan: TradePlan, context: MarketContext, order_id: str = "") -> None:
+    ensure_trade_log_exists()
+
+    with open(PNL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().isoformat(),
+            context.symbol,
+            plan.action,
+            plan.grade,
+            plan.score,
+            round(plan.confidence, 4),
+            plan.execution_tier,
+            plan.execution_qty,
+            round(context.current_price, 4),
+            round(context.vwap, 4),
+            round(context.rsi, 4),
+            round(context.change_pct, 4),
+            round(context.volume_ratio, 4),
+            order_id,
+            "OPEN",
+            ""
+        ])
 
 # =========================================================
 # MARKET DATA
@@ -493,6 +566,41 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
     )
 
 
+def detect_chasing(context: MarketContext) -> Tuple[bool, str]:
+    if context.vwap <= 0:
+        return False, "VWAP unavailable for chase check."
+
+    distance_pct = abs((context.current_price - context.vwap) / context.vwap) * 100.0
+
+    if distance_pct >= CHASE_DISTANCE_PCT:
+        return True, f"Price is extended {distance_pct:.2f}% from VWAP."
+    return False, f"Price extension acceptable at {distance_pct:.2f}% from VWAP."
+
+
+def assign_execution_tier(plan: TradePlan, context: MarketContext) -> TradePlan:
+    plan.execution_qty = 0
+    plan.execution_tier = "NONE"
+
+    if plan.grade == "A+":
+        plan.execution_tier = "FULL"
+        plan.execution_qty = DEFAULT_ORDER_QTY
+        return plan
+
+    if plan.grade == "A":
+        plan.execution_tier = "STANDARD"
+        plan.execution_qty = DEFAULT_ORDER_QTY
+        return plan
+
+    if plan.grade == "B" and ALLOW_B_MICRO_SIZE:
+        high_volume_exception = context.volume_ratio >= 3.0
+        if high_volume_exception:
+            plan.execution_tier = "MICRO"
+            plan.execution_qty = B_MICRO_QTY
+        return plan
+
+    return plan
+
+
 def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> TradePlan:
     ci = context.constituent_internals
     if not ci:
@@ -503,26 +611,58 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
     if plan.action == "BUY_CALL":
         if ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score += BULLISH_CONFIRM_BONUS
-            plan.reasons.append(f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
+            plan.reasons.append(
+                f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
+            )
         elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
+            plan.reasons.append(
+                f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
+            )
         else:
             plan.score -= MIXED_PENALTY
             plan.reasons.append("Call setup has mixed internal participation.")
+
     elif plan.action == "BUY_PUT":
         if ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score += BEARISH_CONFIRM_BONUS
-            plan.reasons.append(f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
+            plan.reasons.append(
+                f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
+            )
         elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
+            plan.reasons.append(
+                f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
+            )
         else:
             plan.score -= MIXED_PENALTY
             plan.reasons.append("Put setup has mixed internal participation.")
 
+    if plan.action == "BUY_CALL" and context.rsi >= MIN_RSI_CALL:
+        plan.score += 5
+        plan.reasons.append(f"Call RSI passes strong threshold ({context.rsi:.1f} >= {MIN_RSI_CALL}).")
+    elif plan.action == "BUY_CALL":
+        plan.score -= 5
+        plan.reasons.append(f"Call RSI below strong threshold ({context.rsi:.1f} < {MIN_RSI_CALL}).")
+
+    if plan.action == "BUY_PUT" and context.rsi <= MAX_RSI_PUT:
+        plan.score += 5
+        plan.reasons.append(f"Put RSI passes strong threshold ({context.rsi:.1f} <= {MAX_RSI_PUT}).")
+    elif plan.action == "BUY_PUT":
+        plan.score -= 5
+        plan.reasons.append(f"Put RSI above strong threshold ({context.rsi:.1f} > {MAX_RSI_PUT}).")
+
+    chasing, chase_note = detect_chasing(context)
+    plan.chasing = chasing
+    plan.reasons.append(chase_note)
+
+    if chasing:
+        plan.score -= 15
+        plan.reasons.append("Chase blocker penalty applied.")
+
     plan.grade = score_to_grade(plan.score)
     plan.confidence = max(0.0, min(plan.score / 100.0, 0.99))
+    plan = assign_execution_tier(plan, context)
     return plan
 
 
@@ -534,8 +674,16 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
         notes.append("Blocked: no clear directional action.")
         return "AVOID", notes
 
-    if not passes_grade_threshold(plan.grade, MIN_EXECUTION_GRADE):
-        notes.append(f"Blocked: grade {plan.grade} is below execution threshold {MIN_EXECUTION_GRADE}.")
+    if A_PLUS_ONLY_MODE and plan.grade != "A+":
+        notes.append("Blocked: A+ sniper mode active.")
+        return "AVOID", notes
+
+    if plan.chasing:
+        notes.append("Blocked: trade is chasing away from decision zone.")
+        return "AVOID", notes
+
+    if plan.confidence < MIN_CONFIDENCE and plan.grade != "B":
+        notes.append(f"Blocked: confidence {plan.confidence:.0%} below minimum {MIN_CONFIDENCE:.0%}.")
         return "AVOID", notes
 
     if ci:
@@ -554,19 +702,47 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
         notes.append("Blocked: volume too weak.")
         return "AVOID", notes
 
-    notes.append("Execution filter passed.")
+    if plan.grade == "B":
+        if not ALLOW_B_MICRO_SIZE:
+            notes.append("Blocked: B trades disabled.")
+            return "AVOID", notes
+        if plan.execution_tier != "MICRO":
+            notes.append("Blocked: B trade did not qualify for micro-size exception.")
+            return "AVOID", notes
+        notes.append("Approved: B micro-size execution enabled.")
+
+    elif not passes_grade_threshold(plan.grade, MIN_EXECUTION_GRADE):
+        notes.append(f"Blocked: grade {plan.grade} is below execution threshold {MIN_EXECUTION_GRADE}.")
+        return "AVOID", notes
+
+    if plan.execution_qty <= 0:
+        notes.append("Blocked: execution quantity resolved to zero.")
+        return "AVOID", notes
+
+    notes.append(f"Execution filter passed. Tier={plan.execution_tier}, Qty={plan.execution_qty}")
     return "EXECUTE", notes
 
 # =========================================================
 # ALPACA EXECUTION
 # =========================================================
 def execute_trade(plan: TradePlan, context: MarketContext) -> None:
+    qty = max(0, int(plan.execution_qty))
+
+    if qty <= 0:
+        print(f"[SKIP] Zero quantity for {context.symbol}")
+        return
+
     if not LIVE_TRADING:
-        print(f"[PAPER MODE LOCAL] {plan.action} {context.symbol} | Grade {plan.grade} | Score {plan.score}")
+        msg = (
+            f"[PAPER MODE LOCAL] {plan.action} {context.symbol} | "
+            f"Grade {plan.grade} | Score {plan.score} | Tier {plan.execution_tier} | Qty {qty}"
+        )
+        print(msg)
+        log_trade_entry(plan, context, "PAPER_LOCAL")
         return
 
     if alpaca_client is None:
-        msg = "❌ LIVE_TRADING is ON but Alpaca is not connected. Check ALPACA_API_KEY / ALPACA_SECRET_KEY / dependency install."
+        msg = "❌ LIVE_TRADING is ON but Alpaca is not connected."
         print(msg)
         send_telegram(msg)
         send_discord(msg)
@@ -583,7 +759,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
 
         order_request = MarketOrderRequest(
             symbol=context.symbol,
-            qty=DEFAULT_ORDER_QTY,
+            qty=qty,
             side=side,
             time_in_force=TimeInForce.DAY,
         )
@@ -595,15 +771,18 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
             f"Symbol: {context.symbol}\n"
             f"Action: {plan.action}\n"
             f"Side: {side.value}\n"
-            f"Qty: {DEFAULT_ORDER_QTY}\n"
+            f"Qty: {qty}\n"
             f"Grade: {plan.grade}\n"
             f"Score: {plan.score}\n"
+            f"Tier: {plan.execution_tier}\n"
             f"Broker Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
             f"Order ID: {order.id}"
         )
         print(msg)
         send_telegram(msg)
         send_discord(msg)
+
+        log_trade_entry(plan, context, str(order.id))
 
     except Exception as e:
         err = f"❌ ALPACA ORDER FAILED: {e}"
@@ -646,13 +825,16 @@ def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: Lis
         "Reasons:",
     ]
 
-    for reason in plan.reasons[:6]:
+    for reason in plan.reasons[:8]:
         lines.append(f"- {reason}")
 
     lines.append("Execution Filter:")
     for note in notes:
         lines.append(f"- {note}")
 
+    lines.append(f"Execution Tier: {plan.execution_tier}")
+    lines.append(f"Execution Qty: {plan.execution_qty}")
+    lines.append(f"Chasing: {plan.chasing}")
     lines.append(f"Final Status: {status}")
     lines.append(f"LIVE_TRADING: {LIVE_TRADING}")
     lines.append(f"ALPACA_PAPER: {ALPACA_PAPER}")
@@ -680,13 +862,17 @@ def run_symbol(symbol: str) -> None:
 
 
 def main() -> None:
+    ensure_trade_log_exists()
+
     startup = (
         "🚀 UnBiased Framework started\n"
         f"Watchlist: {', '.join(WATCHLIST)}\n"
         f"LIVE_TRADING: {LIVE_TRADING}\n"
         f"ALPACA_PAPER: {ALPACA_PAPER}\n"
         f"Alpaca Connected: {alpaca_client is not None}\n"
-        "Constituent engine active."
+        f"A_PLUS_ONLY_MODE: {A_PLUS_ONLY_MODE}\n"
+        f"ALLOW_B_MICRO_SIZE: {ALLOW_B_MICRO_SIZE}\n"
+        "Execution engine upgraded."
     )
     broadcast(startup)
 
