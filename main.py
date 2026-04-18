@@ -1750,9 +1750,12 @@ def run_once() -> None:
 if __name__ == "__main__":
     try:
         run_once()
-    except Exception:
+    except BaseException as e:
         import traceback
         print("\n===== FULL PYTHON ERROR =====")
-        traceback.print_exc()
+        print(f"Exception type: {type(e).__name__}")
+        print(f"Exception repr: {repr(e)}")
+        print("Traceback:")
+        print(traceback.format_exc())
         print("===== END PYTHON ERROR =====\n")
         raise
