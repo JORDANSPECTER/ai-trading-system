@@ -3,6 +3,8 @@ name: UnBiased Trading Bot
 on:
   workflow_dispatch:
   schedule:
+    # Runs every 5 minutes during market hours (Mon–Fri)
+    # 13:30–20:00 UTC = 9:30 AM – 4:00 PM EST
     - cron: "*/5 13-20 * * 1-5"
 
 jobs:
@@ -11,20 +13,33 @@ jobs:
     timeout-minutes: 360
 
     env:
+      # =========================
+      # DATA + ALERTS
+      # =========================
       TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_FREE: ${{ secrets.DISCORD_WEBHOOK_FREE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
+      # =========================
+      # ALPACA (BROKER)
+      # =========================
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
 
-      LIVE_TRADING: "false"
+      # =========================
+      # CORE BOT CONTROL
+      # =========================
+      LIVE_TRADING: "false"        # 🔴 change to "true" to enable execution
       POLL_SECONDS: "60"
 
+      # =========================
+      # EXECUTION ENGINE SETTINGS
+      # =========================
       A_PLUS_ONLY_MODE: "false"
       ALLOW_B_MICRO_SIZE: "true"
+
       DEFAULT_ORDER_QTY: "1"
       B_MICRO_QTY: "1"
 
@@ -36,7 +51,7 @@ jobs:
       PNL_LOG_FILE: "trade_log.csv"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -49,6 +64,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests alpaca-py
 
-      - name: Run bot
+      - name: Run trading bot
         run: |
           python main.py
