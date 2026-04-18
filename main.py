@@ -1335,6 +1335,103 @@ def run_bot_mode():
         run_dashboard_mode()
     else:
         run_test_all_mode()
+# =========================
+# STATE 11 - LOG BACKUP + PERSISTENCE + COMMAND ROUTER
+# =========================
+
+BOT_MODE = os.getenv("BOT_MODE", "test_all").strip().lower()
+
+
+def run_trade_alert_mode():
+    send_test_alert()
+
+
+def run_live_update_mode():
+    test_live_manager()
+
+
+def run_daily_report_mode():
+    send_daily_report()
+
+
+def run_weekly_report_mode():
+    send_weekly_report()
+
+
+def run_dashboard_mode():
+    send_performance_summary()
+
+
+def run_test_all_mode():
+    test_telegram_only()
+    send_test_alert()
+    test_live_manager()
+    test_reports()
+
+
+def run_bot_mode():
+    print(f"BOT_MODE = {BOT_MODE}")
+
+    if BOT_MODE == "trade_alert":
+        run_trade_alert_mode()
+    elif BOT_MODE == "live_update":
+        run_live_update_mode()
+    elif BOT_MODE == "daily_report":
+        run_daily_report_mode()
+    elif BOT_MODE == "weekly_report":
+        run_weekly_report_mode()
+    elif BOT_MODE == "dashboard":
+        run_dashboard_mode()
+    else:
+        run_test_all_mode()
+
+
+def save_logs_to_artifact_folder():
+    """
+    Copies logs into an artifacts folder so GitHub Actions can upload them.
+    """
+    folder = "artifacts"
+    os.makedirs(folder, exist_ok=True)
+
+    files_to_save = [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]
+
+    for f in files_to_save:
+        if os.path.exists(f):
+            try:
+                with open(f, "r", encoding="utf-8") as src:
+                    data = src.read()
+
+                with open(os.path.join(folder, f), "w", encoding="utf-8") as dst:
+                    dst.write(data)
+
+                print(f"Saved {f} to artifacts/")
+            except Exception as e:
+                print(f"Error saving {f}: {e}")
+        else:
+            print(f"{f} not found — nothing to save")
+
+
+def load_logs_if_exist():
+    """
+    Ensures CSV files exist so system doesn't break on first run.
+    """
+    for f in [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]:
+        if not os.path.exists(f):
+            with open(f, "w", encoding="utf-8") as file:
+                file.write("")
+            print(f"Created empty {f}")
+
+
+def end_of_run_cleanup():
+    """
+    Runs at end of every execution
+    """
+    print("\n=== END OF RUN CLEANUP ===")
+    save_logs_to_artifact_folder()
+    print("Logs prepared for upload")
+
 
 if __name__ == "__main__":
+    load_logs_if_exist()
     run_bot_mode()
+    end_of_run_cleanup()
