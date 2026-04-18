@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
+from zoneinfo import ZoneInfo
 
 import requests
 from alpaca.trading.client import TradingClient
@@ -15,6 +16,9 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # ============================================================
 # HELPERS
 # ============================================================
+
+ET = ZoneInfo("America/New_York")
+
 
 def env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
@@ -51,6 +55,19 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def now_et() -> datetime:
+    return datetime.now(ET)
+
+
+def today_et_str() -> str:
+    return now_et().strftime("%Y-%m-%d")
+
+
+def week_key_et() -> str:
+    year, week_num, _ = now_et().isocalendar()
+    return f"{year}-W{week_num:02d}"
+
+
 def safe_float(value, default: Optional[float] = 0.0) -> Optional[float]:
     try:
         if value is None or value == "":
@@ -84,14 +101,17 @@ def grade_from_score(score: int) -> str:
 
 
 def is_daily_levels_window() -> bool:
-    """
-    9AM to 9PM Eastern, approximated via UTC window for GitHub cron pairing:
-    - 13:00 to 23:59 UTC
-    - 00:00 to 01:59 UTC
-    """
-    now = datetime.now(timezone.utc)
-    hour = now.hour
-    return (13 <= hour <= 23) or (0 <= hour <= 1)
+    current = now_et()
+    mins = current.hour * 60 + current.minute
+    return 9 * 60 <= mins <= 21 * 60
+
+
+def format_money(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def format_pct(v: float) -> str:
+    return f"{v:+.2f}%"
 
 
 # ============================================================
@@ -108,6 +128,7 @@ class Config:
     volatility_symbol: str
 
     state_file: str
+    performance_state_file: str
     dedupe_price_rounding: int
     alert_cooldown_seconds: int
     daily_levels_cooldown_seconds: int
@@ -120,6 +141,8 @@ class Config:
     discord_free_webhook: str
     discord_premium_webhook: str
     discord_daily_levels_webhook: str
+    discord_daily_performance_webhook: str
+    discord_weekly_performance_webhook: str
 
     premium_min_grade: str
     free_min_grade: str
@@ -146,6 +169,16 @@ class Config:
     max_open_positions: int
     default_time_in_force: str
 
+    # Reports
+    daily_reports_enabled: bool
+    weekly_reports_enabled: bool
+    morning_report_hour_et: int
+    morning_report_minute_et: int
+    evening_report_hour_et: int
+    evening_report_minute_et: int
+    weekly_report_hour_et: int
+    weekly_report_minute_et: int
+
 
 def load_config() -> Config:
     return Config(
@@ -157,6 +190,7 @@ def load_config() -> Config:
         volatility_symbol=env_str("VOLATILITY_SYMBOL", "VIX"),
 
         state_file=env_str("STATE_FILE", "elite_state.json"),
+        performance_state_file=env_str("PERFORMANCE_STATE_FILE", "performance_state.json"),
         dedupe_price_rounding=env_int("DEDUPE_PRICE_ROUNDING", 2),
         alert_cooldown_seconds=env_int("ALERT_COOLDOWN_SECONDS", 900),
         daily_levels_cooldown_seconds=env_int("DAILY_LEVELS_COOLDOWN_SECONDS", 1200),
@@ -169,6 +203,8 @@ def load_config() -> Config:
         discord_free_webhook=env_str("DISCORD_FREE_WEBHOOK"),
         discord_premium_webhook=env_str("DISCORD_PREMIUM_WEBHOOK"),
         discord_daily_levels_webhook=env_str("DISCORD_DAILY_LEVELS_WEBHOOK"),
+        discord_daily_performance_webhook=env_str("DISCORD_DAILY_PERFORMANCE_WEBHOOK"),
+        discord_weekly_performance_webhook=env_str("DISCORD_WEEKLY_PERFORMANCE_WEBHOOK"),
 
         premium_min_grade=env_str("PREMIUM_MIN_GRADE", "A"),
         free_min_grade=env_str("FREE_MIN_GRADE", "B"),
@@ -196,6 +232,15 @@ def load_config() -> Config:
         max_position_notional=env_float("MAX_POSITION_NOTIONAL", 500.0),
         max_open_positions=env_int("MAX_OPEN_POSITIONS", 2),
         default_time_in_force=env_str("DEFAULT_TIME_IN_FORCE", "day"),
+
+        daily_reports_enabled=env_bool("DAILY_REPORTS_ENABLED", True),
+        weekly_reports_enabled=env_bool("WEEKLY_REPORTS_ENABLED", True),
+        morning_report_hour_et=env_int("MORNING_REPORT_HOUR_ET", 8),
+        morning_report_minute_et=env_int("MORNING_REPORT_MINUTE_ET", 30),
+        evening_report_hour_et=env_int("EVENING_REPORT_HOUR_ET", 17),
+        evening_report_minute_et=env_int("EVENING_REPORT_MINUTE_ET", 30),
+        weekly_report_hour_et=env_int("WEEKLY_REPORT_HOUR_ET", 9),
+        weekly_report_minute_et=env_int("WEEKLY_REPORT_MINUTE_ET", 0),
     )
 
 
@@ -293,6 +338,40 @@ class PersistentState:
             "last_alert_times": self.last_alert_times,
             "last_market_snapshot": self.last_market_snapshot,
             "execution_submitted_signals": self.execution_submitted_signals,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
+@dataclass
+class PerformanceState:
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    last_daily_morning_report_date: str = ""
+    last_daily_evening_report_date: str = ""
+    last_weekly_report_key: str = ""
+
+    @staticmethod
+    def load(path: str) -> "PerformanceState":
+        if not os.path.exists(path):
+            return PerformanceState()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return PerformanceState(
+                history=raw.get("history", []),
+                last_daily_morning_report_date=raw.get("last_daily_morning_report_date", ""),
+                last_daily_evening_report_date=raw.get("last_daily_evening_report_date", ""),
+                last_weekly_report_key=raw.get("last_weekly_report_key", ""),
+            )
+        except Exception:
+            return PerformanceState()
+
+    def save(self, path: str) -> None:
+        payload = {
+            "history": self.history[-1000:],
+            "last_daily_morning_report_date": self.last_daily_morning_report_date,
+            "last_daily_evening_report_date": self.last_daily_evening_report_date,
+            "last_weekly_report_key": self.last_weekly_report_key,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -872,6 +951,238 @@ class ExecutionEngine:
 
 
 # ============================================================
+# PERFORMANCE TRACKING
+# ============================================================
+
+def record_signal(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext) -> None:
+    entry = {
+        "ts_utc": now_utc_iso(),
+        "date_et": today_et_str(),
+        "week_key": week_key_et(),
+        "type": "signal",
+        "symbol": alert.symbol,
+        "grade": alert.grade,
+        "direction": alert.direction,
+        "score": alert.score,
+        "price_snapshot": ctx.primary.price,
+        "change_pct": ctx.primary.change_pct,
+    }
+    perf.history.append(entry)
+
+
+def record_execution(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, result: Dict[str, Any]) -> None:
+    entry = {
+        "ts_utc": now_utc_iso(),
+        "date_et": today_et_str(),
+        "week_key": week_key_et(),
+        "type": "execution",
+        "symbol": alert.symbol,
+        "grade": alert.grade,
+        "direction": alert.direction,
+        "score": alert.score,
+        "qty": result.get("qty", 0),
+        "side": result.get("side", ""),
+        "price_snapshot": ctx.primary.price,
+        "alpaca_order_id": result.get("alpaca_order_id", ""),
+        "alpaca_status": result.get("alpaca_status", ""),
+    }
+    perf.history.append(entry)
+
+
+def safe_get_account_equity(executor: ExecutionEngine) -> float:
+    try:
+        if executor.client is None:
+            return 0.0
+        account = executor.client.get_account()
+        return float(account.equity)
+    except Exception:
+        return 0.0
+
+
+def safe_get_account_last_equity(executor: ExecutionEngine) -> float:
+    try:
+        if executor.client is None:
+            return 0.0
+        account = executor.client.get_account()
+        return float(account.last_equity)
+    except Exception:
+        return 0.0
+
+
+def safe_get_positions(executor: ExecutionEngine) -> List[Any]:
+    try:
+        if executor.client is None:
+            return []
+        return executor.client.get_all_positions()
+    except Exception:
+        return []
+
+
+def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    signals = [x for x in history if x.get("type") == "signal"]
+    executions = [x for x in history if x.get("type") == "execution"]
+
+    grade_counts: Dict[str, int] = {}
+    symbol_counts: Dict[str, int] = {}
+
+    for item in signals:
+        grade = item.get("grade", "UNK")
+        symbol = item.get("symbol", "UNK")
+        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+        symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+
+    top_symbol = max(symbol_counts, key=symbol_counts.get) if symbol_counts else "n/a"
+
+    bullish = sum(1 for x in signals if x.get("direction") == "BULLISH")
+    bearish = sum(1 for x in signals if x.get("direction") == "BEARISH")
+    avg_score = round(sum(x.get("score", 0) for x in signals) / len(signals), 2) if signals else 0.0
+
+    return {
+        "signals": len(signals),
+        "executions": len(executions),
+        "grade_counts": grade_counts,
+        "symbol_counts": symbol_counts,
+        "top_symbol": top_symbol,
+        "bullish": bullish,
+        "bearish": bearish,
+        "avg_score": avg_score,
+    }
+
+
+def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, mode: str) -> str:
+    date_key = today_et_str()
+    day_history = [x for x in perf.history if x.get("date_et") == date_key]
+    summary = summarize_period(day_history)
+
+    equity = safe_get_account_equity(executor)
+    last_equity = safe_get_account_last_equity(executor)
+    equity_change = equity - last_equity if equity and last_equity else 0.0
+    positions = safe_get_positions(executor)
+
+    lines = [
+        f"📊 {'Morning' if mode == 'morning' else 'Evening'} Daily Performance Report",
+        f"Date (ET): {date_key}",
+        "",
+        f"Signals Today: {summary['signals']}",
+        f"Executions Today: {summary['executions']}",
+        f"Avg Signal Score: {summary['avg_score']}",
+        f"Bullish / Bearish Signals: {summary['bullish']} / {summary['bearish']}",
+        f"Most Active Symbol: {summary['top_symbol']}",
+        "",
+        f"Account Equity: {format_money(equity)}" if equity else "Account Equity: n/a",
+        f"Equity Change vs Last Equity: {format_money(equity_change)}" if equity and last_equity else "Equity Change vs Last Equity: n/a",
+        f"Open Positions: {len(positions)}",
+        "",
+        "Grade Breakdown:",
+    ]
+
+    if summary["grade_counts"]:
+        for grade, count in sorted(summary["grade_counts"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
+            lines.append(f"• {grade}: {count}")
+    else:
+        lines.append("• No signals recorded yet")
+
+    if positions:
+        lines.append("")
+        lines.append("Open Positions Snapshot:")
+        for pos in positions[:8]:
+            try:
+                symbol = str(pos.symbol)
+                qty = getattr(pos, "qty", "n/a")
+                unrealized = safe_float(getattr(pos, "unrealized_pl", 0), 0.0)
+                lines.append(f"• {symbol} | Qty: {qty} | Unrealized: {format_money(unrealized)}")
+            except Exception:
+                pass
+
+    lines.append("")
+    lines.append("Dashboard Notes:")
+    lines.append("• This report tracks signals, executions, and current account state.")
+    lines.append("• Realized / unrealized detail depends on what Alpaca returns for the account and positions.")
+
+    return "\n".join(lines)
+
+
+def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine) -> str:
+    wk = week_key_et()
+    week_history = [x for x in perf.history if x.get("week_key") == wk]
+    summary = summarize_period(week_history)
+
+    equity = safe_get_account_equity(executor)
+    positions = safe_get_positions(executor)
+
+    lines = [
+        "📈 Weekly Performance Report",
+        f"Week: {wk}",
+        "",
+        f"Signals This Week: {summary['signals']}",
+        f"Executions This Week: {summary['executions']}",
+        f"Avg Signal Score: {summary['avg_score']}",
+        f"Bullish / Bearish Signals: {summary['bullish']} / {summary['bearish']}",
+        f"Most Active Symbol: {summary['top_symbol']}",
+        "",
+        f"Current Account Equity: {format_money(equity)}" if equity else "Current Account Equity: n/a",
+        f"Open Positions Right Now: {len(positions)}",
+        "",
+        "Weekly Grade Breakdown:",
+    ]
+
+    if summary["grade_counts"]:
+        for grade, count in sorted(summary["grade_counts"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
+            lines.append(f"• {grade}: {count}")
+    else:
+        lines.append("• No weekly signals recorded yet")
+
+    lines.append("")
+    lines.append("Weekly Notes:")
+    lines.append("• Use this to compare signal quality, execution frequency, and concentration by symbol.")
+    lines.append("• As future upgrades are added, this section can expand into realized PnL, win rate, and best/worst day summaries.")
+
+    return "\n".join(lines)
+
+
+def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, discord: DiscordNotifier) -> None:
+    current = now_et()
+    date_key = current.strftime("%Y-%m-%d")
+    wk = week_key_et()
+
+    # Morning daily
+    if cfg.daily_reports_enabled:
+        if (
+            current.hour == cfg.morning_report_hour_et
+            and current.minute < 20
+            and perf.last_daily_morning_report_date != date_key
+        ):
+            text = build_daily_report_text(cfg, perf, executor, "morning")
+            if cfg.discord_daily_performance_webhook:
+                discord.send(cfg.discord_daily_performance_webhook, text)
+            perf.last_daily_morning_report_date = date_key
+
+        # Evening daily
+        if (
+            current.hour == cfg.evening_report_hour_et
+            and current.minute < 20
+            and perf.last_daily_evening_report_date != date_key
+        ):
+            text = build_daily_report_text(cfg, perf, executor, "evening")
+            if cfg.discord_daily_performance_webhook:
+                discord.send(cfg.discord_daily_performance_webhook, text)
+            perf.last_daily_evening_report_date = date_key
+
+    # Sunday weekly
+    if cfg.weekly_reports_enabled:
+        if (
+            current.weekday() == 6
+            and current.hour == cfg.weekly_report_hour_et
+            and current.minute < 20
+            and perf.last_weekly_report_key != wk
+        ):
+            text = build_weekly_report_text(cfg, perf, executor)
+            if cfg.discord_weekly_performance_webhook:
+                discord.send(cfg.discord_weekly_performance_webhook, text)
+            perf.last_weekly_report_key = wk
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -891,6 +1202,7 @@ def run_once() -> None:
         raise RuntimeError("Missing TWELVE_DATA_API_KEY")
 
     state = PersistentState.load(cfg.state_file)
+    perf = PerformanceState.load(cfg.performance_state_file)
     client = TwelveDataClient(cfg.twelve_data_api_key, cfg)
 
     telegram = TelegramNotifier(
@@ -910,12 +1222,13 @@ def run_once() -> None:
     trade_alert = generate_trade_alert_if_valid(ctx, cfg)
     if trade_alert:
         route_alert(trade_alert, cfg, state, telegram, discord)
+        record_signal(perf, trade_alert, ctx)
 
         exec_result = executor.maybe_execute(trade_alert, ctx)
         print(f"Execution result: {exec_result}")
 
-        # Optional execution notification to premium channel + telegram
         if exec_result.get("executed"):
+            record_execution(perf, trade_alert, ctx, exec_result)
             exec_msg = (
                 f"🚀 EXECUTED {trade_alert.symbol}\n"
                 f"Direction: {trade_alert.direction}\n"
@@ -933,6 +1246,8 @@ def run_once() -> None:
         else:
             print(f"Execution skipped: {exec_result.get('reason')}")
 
+    maybe_send_reports(cfg, perf, executor, discord)
+
     state.last_market_snapshot = {
         "primary_price": ctx.primary.price,
         "primary_change_pct": ctx.primary.change_pct,
@@ -942,6 +1257,7 @@ def run_once() -> None:
     }
 
     state.save(cfg.state_file)
+    perf.save(cfg.performance_state_file)
     print("Run complete.")
 
 
