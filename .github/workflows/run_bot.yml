@@ -31,7 +31,7 @@ jobs:
       # =========================
       # CORE BOT CONTROL
       # =========================
-      LIVE_TRADING: "false"        # 🔴 change to "true" to enable execution
+      LIVE_TRADING: "true"        # 🔴 change to "true" to enable execution
       POLL_SECONDS: "60"
 
       # =========================
