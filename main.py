@@ -387,6 +387,136 @@ def build_trade_management_plan(decision, context, discipline, sizing):
 
 
 # =========================
+# STATE 7 - OPTIONS CONTRACT ENGINE
+# =========================
+def build_options_contract_plan(decision, context, discipline, sizing, management):
+    direction = management["direction"]
+    symbol = str(get_attr(context, "symbol", "QQQ")).upper()
+    execution_grade = discipline["execution_grade"]
+    confidence_score = sizing["confidence_score"]
+    size_label = sizing["size_label"]
+    timing_label = discipline["timing"]["timing_label"]
+
+    dte = int(get_attr(context, "dte", 0) or 0)
+    option_spread_pct = float(get_attr(context, "option_spread_pct", 0.0) or 0.0)
+    option_volume_ok = bool(get_attr(context, "option_volume_ok", True))
+    option_open_interest_ok = bool(get_attr(context, "option_open_interest_ok", True))
+    iv_is_elevated = bool(get_attr(context, "iv_is_elevated", False))
+    fast_move_expected = bool(get_attr(context, "fast_move_expected", True))
+    contract_price = float(get_attr(context, "contract_price", 0.0) or 0.0)
+    contract_delta = get_attr(context, "contract_delta", None)
+
+    reasons = []
+    blockers = []
+
+    # Liquidity checks
+    if option_spread_pct > 12:
+        blockers.append(f"Option spread too wide at {option_spread_pct:.1f}%.")
+    if not option_volume_ok:
+        blockers.append("Option volume is weak.")
+    if not option_open_interest_ok:
+        blockers.append("Open interest is weak.")
+
+    contract_style = "BALANCED"
+    expiry_guidance = "Use nearest liquid expiry."
+    moneyness = "ATM"
+    contract_type = "CALL" if direction == "LONG" else "PUT"
+    options_execution_allowed = True
+
+    if execution_grade == "WATCHLIST" or size_label == "NO EXECUTION":
+        options_execution_allowed = False
+        blockers.append("Underlying setup is not approved for execution.")
+
+    if discipline["timing"]["is_chasing"]:
+        options_execution_allowed = False
+        blockers.append("Underlying timing is late/chasing for options execution.")
+
+    if blockers:
+        options_execution_allowed = False
+
+    # Contract style logic
+    if confidence_score >= 85 and timing_label in ["IDEAL", "RETEST"] and fast_move_expected and not iv_is_elevated:
+        contract_style = "AGGRESSIVE"
+        moneyness = "SLIGHT OTM"
+        expiry_guidance = "0DTE allowed if liquidity is strong."
+        reasons.append("High-conviction setup allows more aggressive contract selection.")
+    elif confidence_score >= 65 and timing_label in ["IDEAL", "CONFIRMED", "RETEST"]:
+        contract_style = "BALANCED"
+        moneyness = "ATM"
+        expiry_guidance = "0DTE or next expiry is acceptable if spreads are clean."
+        reasons.append("Balanced contract selection fits current setup quality.")
+    else:
+        contract_style = "SAFE"
+        moneyness = "ATM or slight ITM"
+        expiry_guidance = "Prefer next expiry over 0DTE."
+        reasons.append("Safer contract profile is preferred due to lower conviction or weaker timing.")
+
+    # Extra protection against cheap lottery behavior
+    if iv_is_elevated and contract_style == "AGGRESSIVE":
+        contract_style = "BALANCED"
+        moneyness = "ATM"
+        expiry_guidance = "Prefer ATM with cleaner pricing because IV is elevated."
+        reasons.append("Downgraded from aggressive contract due to elevated IV.")
+
+    if confidence_score < 60:
+        contract_style = "SAFE"
+        moneyness = "ATM or slight ITM"
+        expiry_guidance = "Prefer next expiry. Avoid lottery contracts."
+        reasons.append("Avoid cheap far OTM contracts on weaker setups.")
+
+    if dte == 0 and confidence_score < 70:
+        reasons.append("0DTE is only acceptable on strong alignment. Use caution here.")
+
+    if contract_price > 0:
+        if contract_price < 0.20 and contract_style != "AGGRESSIVE":
+            reasons.append("Very cheap premium often behaves like lottery pricing. Avoid forcing it.")
+        elif contract_price > 3.50 and confidence_score < 75:
+            reasons.append("Premium is already expensive relative to current conviction.")
+
+    if contract_delta is not None:
+        try:
+            delta_val = abs(float(contract_delta))
+            if contract_style == "SAFE":
+                preferred_delta = "0.55 to 0.70"
+            elif contract_style == "BALANCED":
+                preferred_delta = "0.40 to 0.60"
+            else:
+                preferred_delta = "0.25 to 0.45"
+            reasons.append(f"Current observed delta: {delta_val:.2f}. Preferred delta zone: {preferred_delta}.")
+        except Exception:
+            pass
+    else:
+        if contract_style == "SAFE":
+            preferred_delta = "0.55 to 0.70"
+        elif contract_style == "BALANCED":
+            preferred_delta = "0.40 to 0.60"
+        else:
+            preferred_delta = "0.25 to 0.45"
+
+    if symbol in ["QQQ", "SPY"]:
+        reasons.append(f"{symbol} is liquid enough for short-dated contracts when spreads are clean.")
+    else:
+        reasons.append("Use extra caution on non-index names because options can move less cleanly.")
+
+    if not options_execution_allowed:
+        contract_style = "NO EXECUTION"
+        expiry_guidance = "Do not enter options yet."
+        moneyness = "WAIT"
+        preferred_delta = "WAIT"
+
+    return {
+        "contract_type": contract_type,
+        "contract_style": contract_style,
+        "expiry_guidance": expiry_guidance,
+        "moneyness": moneyness,
+        "preferred_delta": preferred_delta,
+        "options_execution_allowed": options_execution_allowed,
+        "reasons": reasons,
+        "blockers": blockers
+    }
+
+
+# =========================
 # FORMATTERS
 # =========================
 def format_trade_management_block(plan):
@@ -406,7 +536,29 @@ def format_trade_management_block(plan):
     ])
 
 
-def format_telegram_alert(decision, context, discipline, sizing, management):
+def format_options_block(options_plan):
+    lines = [
+        f"Contract Type: {options_plan['contract_type']}",
+        f"Contract Style: {options_plan['contract_style']}",
+        f"Expiry Guidance: {options_plan['expiry_guidance']}",
+        f"Moneyness: {options_plan['moneyness']}",
+        f"Preferred Delta: {options_plan['preferred_delta']}",
+    ]
+
+    if options_plan["reasons"]:
+        lines.append("")
+        lines.append("Options Notes:")
+        lines.extend([f"- {x}" for x in options_plan["reasons"]])
+
+    if options_plan["blockers"]:
+        lines.append("")
+        lines.append("Options Blockers:")
+        lines.extend([f"- {x}" for x in options_plan["blockers"]])
+
+    return "\n".join(lines)
+
+
+def format_telegram_alert(decision, context, discipline, sizing, management, options_plan):
     timing = discipline["timing"]
     return f"""
 🚨 {context.symbol} TRADE ALERT
@@ -430,11 +582,14 @@ Size Notes:
 Trade Plan:
 {format_trade_management_block(management)}
 
+Options Plan:
+{format_options_block(options_plan)}
+
 Time: {datetime.now().strftime('%H:%M:%S')}
 """.strip()
 
 
-def format_discord_premium_alert(decision, context, discipline, sizing, management):
+def format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan):
     timing = discipline["timing"]
     return f"""
 💎 PREMIUM EXECUTION — {context.symbol}
@@ -458,11 +613,14 @@ Distance From Trigger: {timing['distance_from_trigger_pct']}%
 🎯 TRADE PLAN
 {format_trade_management_block(management)}
 
+🧠 OPTIONS PLAN
+{format_options_block(options_plan)}
+
 ⚡ Clean execution conditions are present.
 """.strip()
 
 
-def format_discord_watchlist_alert(decision, context, discipline, sizing, management):
+def format_discord_watchlist_alert(decision, context, discipline, sizing, management, options_plan):
     timing = discipline["timing"]
     chasing_block = ""
     if timing["is_chasing"]:
@@ -490,6 +648,9 @@ Distance From Trigger: {timing['distance_from_trigger_pct']}%
 🎯 MANAGEMENT VIEW
 {format_trade_management_block(management)}
 
+🧠 OPTIONS VIEW
+{format_options_block(options_plan)}
+
 Patience > forcing entries.
 Wait for reclaim, retest, or momentum confirmation.
 """.strip()
@@ -509,7 +670,7 @@ Join premium for execution access.
 """.strip()
 
 
-def format_discord_educational_alert(decision, context, discipline, sizing, management):
+def format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan):
     timing = discipline["timing"]
     return f"""
 📘 MARKET CONTEXT — {context.symbol}
@@ -529,6 +690,11 @@ Management Levels:
 • Trim 2: {fmt_price(management['trim_2'])}
 • Runner: {fmt_price(management['runner_target'])}
 
+Options View:
+• Type: {options_plan['contract_type']}
+• Style: {options_plan['contract_style']}
+• Moneyness: {options_plan['moneyness']}
+
 This is informational, not confirmed execution.
 """.strip()
 
@@ -540,22 +706,24 @@ def route_alerts(decision, context):
     discipline = apply_state_4_discipline(decision, context)
     sizing = calculate_confidence_and_size(decision, context, discipline)
     management = build_trade_management_plan(decision, context, discipline, sizing)
+    options_plan = build_options_contract_plan(decision, context, discipline, sizing, management)
 
     execution_grade = discipline["execution_grade"]
     size_label = sizing["size_label"]
+    options_allowed = options_plan["options_execution_allowed"]
 
-    if execution_grade in ["A+", "A"] and size_label in ["AGGRESSIVE", "NORMAL"]:
-        send_telegram(format_telegram_alert(decision, context, discipline, sizing, management))
-        send_discord_premium(format_discord_premium_alert(decision, context, discipline, sizing, management))
+    if execution_grade in ["A+", "A"] and size_label in ["AGGRESSIVE", "NORMAL"] and options_allowed:
+        send_telegram(format_telegram_alert(decision, context, discipline, sizing, management, options_plan))
+        send_discord_premium(format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan))
         send_discord_free(format_discord_free_teaser(decision, context, discipline, sizing))
 
-    elif execution_grade == "WATCHLIST" or size_label == "NO EXECUTION":
-        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing, management))
-        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management))
+    elif execution_grade == "WATCHLIST" or size_label == "NO EXECUTION" or not options_allowed:
+        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing, management, options_plan))
+        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan))
 
     elif execution_grade in ["B+", "B", "C"]:
-        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing, management))
-        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management))
+        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing, management, options_plan))
+        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan))
 
     elif execution_grade == "AVOID":
         print(f"[AVOID] No alert sent for {context.symbol}")
@@ -600,6 +768,16 @@ def send_test_alert():
         support_2 = 615.20
         resistance_1 = 616.60
         resistance_2 = 617.15
+
+        # options inputs
+        dte = 0
+        option_spread_pct = 4.5
+        option_volume_ok = True
+        option_open_interest_ok = True
+        iv_is_elevated = False
+        fast_move_expected = True
+        contract_price = 1.45
+        contract_delta = 0.49
 
     decision = DummyDecision()
     context = DummyContext()
