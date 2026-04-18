@@ -1,1488 +1,946 @@
 import os
-import csv
+import time
+import math
+import json
 import requests
-import smtplib
-from email.message import EmailMessage
-from datetime import datetime, timedelta
-
-import matplotlib.pyplot as plt
-
-# =========================
-# ENV VARIABLES
-# =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE")
-DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM")
-DISCORD_WEBHOOK_PREMIUM_LEVELS = os.getenv("DISCORD_WEBHOOK_PREMIUM_LEVELS")
-
-EMAIL_SENDER = os.getenv("EMAIL_SENDER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
-
-BOT_MODE = os.getenv("BOT_MODE", "test_all").strip().lower()
-
-# =========================
-# FILE PATHS
-# =========================
-TRADE_LOG_FILE = "trade_log.csv"
-CLOSED_TRADE_LOG_FILE = "closed_trade_log.csv"
-ARTIFACTS_DIR = "artifacts"
-PNL_CHART_FILE = "pnl_chart.png"
-
-# =========================
-# GLOBAL TRADE STORE
-# =========================
-OPEN_TRADES = {}
-
-# =========================
-# HELPERS
-# =========================
-def get_attr(obj, name, default=None):
-    return getattr(obj, name, default)
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
 
 
-def safe_float(x, default=0.0):
+# =========================================================
+# CONFIG
+# =========================================================
+
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_PREMIUM_WEBHOOK_URL = os.getenv("DISCORD_PREMIUM_WEBHOOK_URL", "")
+
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+
+STATE_FILE = os.getenv("STATE_FILE", "system_state.json")
+ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "30"))
+
+
+# =========================================================
+# DATA MODELS
+# =========================================================
+
+@dataclass
+class MarketBar:
+    symbol: str
+    price: float
+    open_price: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    volume: float = 0.0
+    prev_close: float = 0.0
+    timestamp: str = ""
+
+
+@dataclass
+class OpenPosition:
+    symbol: str
+    direction: str              # "LONG", "SHORT", "CALL", "PUT"
+    market_value: float
+    risk_value: float
+    cluster: str
+    beta_weighted_delta: float = 0.0
+
+
+@dataclass
+class MarketStressState:
+    vix: float = 0.0
+    vix_prev_close: float = 0.0
+    spy_move_pct: float = 0.0
+    qqq_move_pct: float = 0.0
+    gap_move_pct: float = 0.0
+
+    breadth_breaking_down: bool = False
+    liquidity_thin: bool = False
+    slippage_spike: bool = False
+    abnormal_spread: bool = False
+    trading_halt_detected: bool = False
+    data_stale: bool = False
+    execution_disconnect: bool = False
+    rejected_orders_spiking: bool = False
+    regime_break_detected: bool = False
+
+
+@dataclass
+class RiskSnapshot:
+    equity: float
+    cash: float
+    daily_pnl: float
+    weekly_pnl: float
+    unrealized_pnl: float
+    realized_pnl: float
+    open_positions: List[OpenPosition] = field(default_factory=list)
+
+
+@dataclass
+class BlackSwanConfig:
+    daily_loss_limit_pct: float = 2.5
+    weekly_loss_limit_pct: float = 5.0
+
+    max_gross_exposure_pct: float = 60.0
+    max_net_exposure_pct: float = 35.0
+    max_symbol_exposure_pct: float = 20.0
+    max_cluster_exposure_pct: float = 30.0
+
+    vix_reduce_risk: float = 22.0
+    vix_hard_stop: float = 32.0
+    gap_move_hard_stop_pct: float = 2.0
+    intraday_index_shock_pct: float = 1.75
+
+    abnormal_size_multiplier: float = 0.50
+    severe_size_multiplier: float = 0.25
+
+    max_rejected_orders_before_lock: int = 2
+    allow_new_trades_after_lock: bool = False
+
+
+@dataclass
+class BlackSwanDecision:
+    status: str                 # "ALLOW", "REDUCE_SIZE", "BLOCK_NEW", "FORCE_EXIT_ALL", "FLAT_AND_LOCK"
+    size_multiplier: float
+    reasons: List[str]
+    alert: str
+    lock_trading: bool = False
+
+
+@dataclass
+class SystemLockState:
+    trading_locked: bool = False
+    lock_reason: str = ""
+    locked_at: str = ""
+
+
+@dataclass
+class TradePlan:
+    symbol: str
+    action: str                 # "ENTER_CALL", "ENTER_PUT", "HOLD", "EXIT_ALL"
+    grade: str
+    confidence: float
+    size: int
+    entry_price: float
+    trigger_level: Optional[float]
+    stop_level: Optional[float]
+    target_level: Optional[float]
+    reasons: List[str] = field(default_factory=list)
+    alerts: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EngineState:
+    lock_state: SystemLockState = field(default_factory=SystemLockState)
+    rejected_order_count: int = 0
+    last_heartbeat_ts: float = 0.0
+    last_alert_hash: str = ""
+    last_prices: Dict[str, float] = field(default_factory=dict)
+
+
+# =========================================================
+# UTILITIES
+# =========================================================
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def safe_float(value, default=0.0) -> float:
     try:
-        return float(x)
+        return float(value)
     except Exception:
         return default
 
 
-def fmt_price(x):
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return str(x)
-
-
-def pct_change(entry, current):
-    try:
-        entry = float(entry)
-        current = float(current)
-        if entry == 0:
-            return 0.0
-        return ((current - entry) / entry) * 100
-    except Exception:
+def pct_change(current: float, reference: float) -> float:
+    if reference == 0:
         return 0.0
+    return ((current - reference) / reference) * 100.0
 
 
-def file_exists(path):
-    return os.path.exists(path)
+def pct_of_equity(value: float, equity: float) -> float:
+    if equity <= 0:
+        return 0.0
+    return (value / equity) * 100.0
 
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def infer_cluster(symbol: str) -> str:
+    s = symbol.upper()
+    if s in ["SPY", "QQQ", "SPX", "NDX", "AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA"]:
+        return "INDEX_TECH"
+    if s in ["XOM", "CVX", "USO"]:
+        return "ENERGY"
+    if s in ["JPM", "BAC", "GS"]:
+        return "FINANCIALS"
+    return "OTHER"
 
 
-def parse_dt(value):
+def hash_text(text: str) -> str:
+    return str(abs(hash(text)))
+
+
+# =========================================================
+# STATE FILE
+# =========================================================
+
+def load_engine_state() -> EngineState:
+    if not os.path.exists(STATE_FILE):
+        return EngineState()
+
     try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        lock_raw = data.get("lock_state", {})
+        return EngineState(
+            lock_state=SystemLockState(
+                trading_locked=lock_raw.get("trading_locked", False),
+                lock_reason=lock_raw.get("lock_reason", ""),
+                locked_at=lock_raw.get("locked_at", ""),
+            ),
+            rejected_order_count=data.get("rejected_order_count", 0),
+            last_heartbeat_ts=data.get("last_heartbeat_ts", 0.0),
+            last_alert_hash=data.get("last_alert_hash", ""),
+            last_prices=data.get("last_prices", {}),
+        )
     except Exception:
-        return None
+        return EngineState()
 
 
-# =========================
-# SEND FUNCTIONS
-# =========================
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
-        print("TELEGRAM_TOKEN exists:", bool(TELEGRAM_TOKEN))
-        print("TELEGRAM_CHAT_ID exists:", bool(TELEGRAM_CHAT_ID))
-        return
+def save_engine_state(state: EngineState) -> None:
+    payload = {
+        "lock_state": asdict(state.lock_state),
+        "rejected_order_count": state.rejected_order_count,
+        "last_heartbeat_ts": state.last_heartbeat_ts,
+        "last_alert_hash": state.last_alert_hash,
+        "last_prices": state.last_prices,
+    }
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+# =========================================================
+# ALERTS
+# =========================================================
+
+def send_telegram_message(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message
     }
-
     try:
         r = requests.post(url, json=payload, timeout=15)
-        print("Telegram status:", r.status_code)
-        print("Telegram response:", r.text)
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
+        return r.ok
+    except Exception:
+        return False
 
 
-def send_discord(webhook, message):
-    if not webhook:
-        print("Discord webhook missing")
-        return
+def send_discord_message(message: str, premium: bool = False) -> bool:
+    webhook_url = DISCORD_PREMIUM_WEBHOOK_URL if premium else DISCORD_WEBHOOK_URL
+    if not webhook_url:
+        return False
 
     try:
-        r = requests.post(webhook, json={"content": message}, timeout=15)
-        print("Discord status:", r.status_code)
-    except Exception as e:
-        print(f"Discord send failed: {e}")
+        r = requests.post(webhook_url, json={"content": message}, timeout=15)
+        return r.ok
+    except Exception:
+        return False
 
 
-def send_discord_free(message):
-    send_discord(DISCORD_WEBHOOK_FREE, message)
+def send_alert(message: str, premium: bool = False) -> None:
+    send_telegram_message(message)
+    send_discord_message(message, premium=premium)
 
 
-def send_discord_premium(message):
-    send_discord(DISCORD_WEBHOOK_PREMIUM, message)
+# =========================================================
+# MARKET DATA
+# =========================================================
 
-
-def send_discord_premium_levels(message):
-    webhook = DISCORD_WEBHOOK_PREMIUM_LEVELS or DISCORD_WEBHOOK_PREMIUM
-    send_discord(webhook, message)
-
-
-# =========================
-# CSV / JOURNAL LOGGING
-# =========================
-def append_csv_row(path, fieldnames, row):
-    exists = file_exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def log_open_trade(symbol, context, discipline, sizing, management, options_plan):
-    row = {
-        "timestamp": now_str(),
-        "symbol": symbol,
-        "direction": management["direction"],
-        "execution_grade": discipline["execution_grade"],
-        "original_grade": discipline["original_grade"],
-        "timing_label": discipline["timing"]["timing_label"],
-        "confidence_score": sizing["confidence_score"],
-        "size_label": sizing["size_label"],
-        "risk_multiplier": sizing["risk_multiplier"],
-        "entry_underlying": safe_float(get_attr(context, "current_price", 0.0)),
-        "trigger_level": safe_float(get_attr(context, "trigger_level", 0.0)),
-        "entry_contract_price": safe_float(get_attr(context, "contract_price", 0.0)),
-        "contract_type": options_plan["contract_type"],
-        "contract_style": options_plan["contract_style"],
-        "expiry_guidance": options_plan["expiry_guidance"],
-        "moneyness": options_plan["moneyness"],
-        "preferred_delta": options_plan["preferred_delta"],
-        "invalidation": management["invalidation"],
-        "trim_1": management["trim_1"],
-        "trim_2": management["trim_2"],
-        "runner_target": management["runner_target"],
-        "breakeven_trigger": management["breakeven_trigger"],
-        "reasons": " | ".join(discipline["reasons"]),
-        "size_notes": " | ".join(sizing["size_notes"]),
-        "options_notes": " | ".join(options_plan["reasons"]),
-        "options_blockers": " | ".join(options_plan["blockers"]),
-    }
-    append_csv_row(TRADE_LOG_FILE, list(row.keys()), row)
-
-
-def log_closed_trade(closed_row):
-    append_csv_row(CLOSED_TRADE_LOG_FILE, list(closed_row.keys()), closed_row)
-
-
-def load_closed_trades():
-    if not file_exists(CLOSED_TRADE_LOG_FILE):
-        return []
-
-    rows = []
-    with open(CLOSED_TRADE_LOG_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
-
-
-# =========================
-# STATE 4 - ENTRY DISCIPLINE
-# =========================
-def evaluate_entry_timing(decision, context):
-    current_price = safe_float(get_attr(context, "current_price", 0.0))
-    trigger_level = safe_float(get_attr(context, "trigger_level", current_price))
-
-    entry_zone_high = safe_float(get_attr(context, "entry_zone_high", trigger_level))
-    entry_zone_low = safe_float(get_attr(context, "entry_zone_low", trigger_level))
-    atr_push = safe_float(get_attr(context, "atr_push", 0.0))
-    extension_pct = safe_float(get_attr(context, "extension_pct", 0.0))
-    bars_since_breakout = int(get_attr(context, "bars_since_breakout", 0) or 0)
-    momentum_confirmed = bool(get_attr(context, "momentum_confirmed", False))
-    retest_hold = bool(get_attr(context, "retest_hold", False))
-    breakout_with_volume = bool(get_attr(context, "breakout_with_volume", False))
-    near_key_level = bool(get_attr(context, "near_key_level", True))
-    above_vwap = bool(get_attr(context, "above_vwap", False))
-    below_vwap = bool(get_attr(context, "below_vwap", False))
-
-    distance_from_trigger_pct = 0.0
-    if trigger_level != 0:
-        distance_from_trigger_pct = abs(current_price - trigger_level) / abs(trigger_level) * 100
-
-    if entry_zone_high == entry_zone_low == trigger_level:
-        within_entry_zone = distance_from_trigger_pct <= 0.20
-    else:
-        within_entry_zone = entry_zone_low <= current_price <= entry_zone_high
-
-    chasing_reasons = []
-
-    if not within_entry_zone:
-        chasing_reasons.append("Price is outside preferred entry zone.")
-    if distance_from_trigger_pct > 0.35:
-        chasing_reasons.append(f"Price is extended {distance_from_trigger_pct:.2f}% from trigger.")
-    if extension_pct > 0.40:
-        chasing_reasons.append(f"Extension is elevated at {extension_pct:.2f}%.")
-    if bars_since_breakout >= 3 and not retest_hold:
-        chasing_reasons.append(f"Entry is late: {bars_since_breakout} bars after breakout without clean retest.")
-    if atr_push > 0.35:
-        chasing_reasons.append(f"Move already expanded {atr_push:.2f} ATR from trigger.")
-    if not near_key_level:
-        chasing_reasons.append("Price is no longer near the key decision level.")
-
-    is_chasing = len(chasing_reasons) > 0
-
-    timing_label = "IDEAL"
-    if is_chasing:
-        timing_label = "LATE"
-    elif breakout_with_volume and momentum_confirmed:
-        timing_label = "CONFIRMED"
-    elif retest_hold:
-        timing_label = "RETEST"
-
-    directional_alignment = above_vwap or below_vwap
-
-    premium_execution_allowed = (
-        not is_chasing and directional_alignment and (retest_hold or (breakout_with_volume and momentum_confirmed))
-    )
-
-    b_grade_execution_allowed = (
-        not is_chasing and momentum_confirmed and directional_alignment and (retest_hold or breakout_with_volume)
-    )
-
-    return {
-        "is_chasing": is_chasing,
-        "timing_label": timing_label,
-        "premium_execution_allowed": premium_execution_allowed,
-        "b_grade_execution_allowed": b_grade_execution_allowed,
-        "distance_from_trigger_pct": round(distance_from_trigger_pct, 3),
-        "chasing_reasons": chasing_reasons,
-    }
-
-
-def apply_state_4_discipline(decision, context):
-    timing = evaluate_entry_timing(decision, context)
-
-    original_grade = get_attr(decision, "grade", "C")
-    reasons = list(get_attr(decision, "reasons", []))
-
-    if timing["is_chasing"]:
-        reasons.append("YOU ARE CHASING: entry is extended from the intended trigger zone.")
-        reasons.extend(timing["chasing_reasons"])
-
-    if original_grade in ["B+", "B"] and not timing["b_grade_execution_allowed"]:
-        reasons.append("B-grade blocked from premium execution until momentum confirms.")
-        execution_grade = "WATCHLIST"
-    elif original_grade in ["A+", "A"] and not timing["premium_execution_allowed"]:
-        reasons.append("High-grade setup downgraded to watchlist because entry timing is no longer clean.")
-        execution_grade = "WATCHLIST"
-    else:
-        execution_grade = original_grade
-
-    return {
-        "original_grade": original_grade,
-        "execution_grade": execution_grade,
-        "timing": timing,
-        "reasons": reasons
-    }
-
-
-# =========================
-# STATE 5 - SIZE ENGINE
-# =========================
-def calculate_confidence_and_size(decision, context, discipline):
-    original_grade = discipline["original_grade"]
-    execution_grade = discipline["execution_grade"]
-    timing = discipline["timing"]
-
-    breakout_with_volume = bool(get_attr(context, "breakout_with_volume", False))
-    momentum_confirmed = bool(get_attr(context, "momentum_confirmed", False))
-    retest_hold = bool(get_attr(context, "retest_hold", False))
-    above_vwap = bool(get_attr(context, "above_vwap", False))
-    below_vwap = bool(get_attr(context, "below_vwap", False))
-    near_key_level = bool(get_attr(context, "near_key_level", True))
-    oil_aligned = bool(get_attr(context, "oil_aligned", True))
-    market_breadth_aligned = bool(get_attr(context, "market_breadth_aligned", True))
-    sector_aligned = bool(get_attr(context, "sector_aligned", True))
-    big_print_aligned = bool(get_attr(context, "big_print_aligned", True))
-
-    confidence_score = 0
-
-    if original_grade == "A+":
-        confidence_score += 30
-    elif original_grade == "A":
-        confidence_score += 25
-    elif original_grade == "B+":
-        confidence_score += 18
-    elif original_grade == "B":
-        confidence_score += 14
-    elif original_grade == "C":
-        confidence_score += 8
-
-    if execution_grade == "WATCHLIST":
-        confidence_score -= 18
-
-    if timing["timing_label"] == "IDEAL":
-        confidence_score += 15
-    elif timing["timing_label"] == "CONFIRMED":
-        confidence_score += 12
-    elif timing["timing_label"] == "RETEST":
-        confidence_score += 14
-    elif timing["timing_label"] == "LATE":
-        confidence_score -= 20
-
-    if breakout_with_volume:
-        confidence_score += 8
-    if momentum_confirmed:
-        confidence_score += 10
-    if retest_hold:
-        confidence_score += 12
-    if above_vwap or below_vwap:
-        confidence_score += 8
-    if near_key_level:
-        confidence_score += 8
-    else:
-        confidence_score -= 8
-
-    confidence_score += 4 if oil_aligned else -4
-    confidence_score += 4 if market_breadth_aligned else -4
-    confidence_score += 4 if sector_aligned else -4
-    confidence_score += 5 if big_print_aligned else -5
-
-    if timing["is_chasing"]:
-        confidence_score -= 15
-
-    confidence_score = max(0, min(100, confidence_score))
-
-    if execution_grade in ["A+", "A"] and confidence_score >= 80:
-        size_label = "AGGRESSIVE"
-        risk_multiplier = 1.25
-    elif execution_grade in ["A+", "A", "B+", "B"] and confidence_score >= 60:
-        size_label = "NORMAL"
-        risk_multiplier = 1.00
-    elif execution_grade == "WATCHLIST":
-        size_label = "NO EXECUTION"
-        risk_multiplier = 0.00
-    else:
-        size_label = "SMALL"
-        risk_multiplier = 0.50
-
-    if timing["is_chasing"]:
-        size_label = "NO EXECUTION"
-        risk_multiplier = 0.00
-
-    size_notes = []
-    if size_label == "AGGRESSIVE":
-        size_notes.append("Multiple conditions are aligned.")
-        size_notes.append("Timing is clean enough for higher conviction sizing.")
-    elif size_label == "NORMAL":
-        size_notes.append("Setup is valid, but not peak conviction.")
-    elif size_label == "SMALL":
-        size_notes.append("Reduce exposure due to weaker alignment.")
-    elif size_label == "NO EXECUTION":
-        size_notes.append("Do not size into this move.")
-        size_notes.append("Wait for a reclaim, retest, or better timing.")
-
-    return {
-        "confidence_score": confidence_score,
-        "size_label": size_label,
-        "risk_multiplier": risk_multiplier,
-        "size_notes": size_notes
-    }
-
-
-# =========================
-# STATE 6 - TRADE MANAGEMENT
-# =========================
-def build_trade_management_plan(decision, context, discipline, sizing):
-    current_price = safe_float(get_attr(context, "current_price", 0.0))
-    trigger_level = safe_float(get_attr(context, "trigger_level", current_price))
-
-    direction = get_attr(context, "direction", None)
-    if not direction:
-        if bool(get_attr(context, "above_vwap", False)):
-            direction = "LONG"
-        elif bool(get_attr(context, "below_vwap", False)):
-            direction = "SHORT"
-        else:
-            direction = "LONG"
-
-    support_1 = get_attr(context, "support_1", None)
-    support_2 = get_attr(context, "support_2", None)
-    resistance_1 = get_attr(context, "resistance_1", None)
-    resistance_2 = get_attr(context, "resistance_2", None)
-    atr_push = safe_float(get_attr(context, "atr_push", 0.20), 0.20)
-
-    entry_reference = trigger_level if trigger_level else current_price
-
-    if direction == "LONG":
-        invalidation = support_1 if support_1 is not None else (entry_reference - max(0.25, atr_push * 0.8))
-        trim_1 = resistance_1 if resistance_1 is not None else (entry_reference + max(0.35, atr_push * 1.0))
-        trim_2 = resistance_2 if resistance_2 is not None else (entry_reference + max(0.60, atr_push * 1.6))
-        runner_target = trim_2 + max(0.30, atr_push * 1.0)
-        breakeven_trigger = trim_1
-    else:
-        invalidation = resistance_1 if resistance_1 is not None else (entry_reference + max(0.25, atr_push * 0.8))
-        trim_1 = support_1 if support_1 is not None else (entry_reference - max(0.35, atr_push * 1.0))
-        trim_2 = support_2 if support_2 is not None else (entry_reference - max(0.60, atr_push * 1.6))
-        runner_target = trim_2 - max(0.30, atr_push * 1.0)
-        breakeven_trigger = trim_1
-
-    size_label = sizing["size_label"]
-    execution_grade = discipline["execution_grade"]
-
-    if size_label == "AGGRESSIVE":
-        trim_plan = ["Take 25% off at Trim 1", "Take 35% off at Trim 2", "Leave 40% for runner"]
-    elif size_label == "NORMAL":
-        trim_plan = ["Take 33% off at Trim 1", "Take 33% off at Trim 2", "Leave 34% for runner"]
-    elif size_label == "SMALL":
-        trim_plan = ["Take 50% off at Trim 1", "Take 30% off at Trim 2", "Leave 20% for runner"]
-    else:
-        trim_plan = ["No execution plan active", "Wait for better location", "Do not force a position here"]
-
-    move_stop_rule = f"Move stop to breakeven once price reaches {fmt_price(breakeven_trigger)}."
-
-    management_notes = []
-    if execution_grade == "WATCHLIST":
-        management_notes.append("Execution downgraded to watchlist. Management plan is informational only.")
-    if discipline["timing"]["is_chasing"]:
-        management_notes.append("Late/chasing conditions detected. Avoid forcing entry.")
-    else:
-        management_notes.append("Entry timing is acceptable for structured trade management.")
-
-    return {
-        "direction": direction,
-        "entry_reference": round(entry_reference, 2),
-        "invalidation": round(float(invalidation), 2),
-        "trim_1": round(float(trim_1), 2),
-        "trim_2": round(float(trim_2), 2),
-        "runner_target": round(float(runner_target), 2),
-        "breakeven_trigger": round(float(breakeven_trigger), 2),
-        "trim_plan": trim_plan,
-        "move_stop_rule": move_stop_rule,
-        "management_notes": management_notes
-    }
-
-
-# =========================
-# STATE 7 - OPTIONS CONTRACT ENGINE
-# =========================
-def build_options_contract_plan(decision, context, discipline, sizing, management):
-    direction = management["direction"]
-    symbol = str(get_attr(context, "symbol", "QQQ")).upper()
-    execution_grade = discipline["execution_grade"]
-    confidence_score = sizing["confidence_score"]
-    size_label = sizing["size_label"]
-    timing_label = discipline["timing"]["timing_label"]
-
-    dte = int(get_attr(context, "dte", 0) or 0)
-    option_spread_pct = safe_float(get_attr(context, "option_spread_pct", 0.0))
-    option_volume_ok = bool(get_attr(context, "option_volume_ok", True))
-    option_open_interest_ok = bool(get_attr(context, "option_open_interest_ok", True))
-    iv_is_elevated = bool(get_attr(context, "iv_is_elevated", False))
-    fast_move_expected = bool(get_attr(context, "fast_move_expected", True))
-    contract_price = safe_float(get_attr(context, "contract_price", 0.0))
-    contract_delta = get_attr(context, "contract_delta", None)
-
-    reasons = []
-    blockers = []
-
-    if option_spread_pct > 12:
-        blockers.append(f"Option spread too wide at {option_spread_pct:.1f}%.")
-    if not option_volume_ok:
-        blockers.append("Option volume is weak.")
-    if not option_open_interest_ok:
-        blockers.append("Open interest is weak.")
-
-    contract_style = "BALANCED"
-    expiry_guidance = "Use nearest liquid expiry."
-    moneyness = "ATM"
-    contract_type = "CALL" if direction == "LONG" else "PUT"
-    options_execution_allowed = True
-
-    if execution_grade == "WATCHLIST" or size_label == "NO EXECUTION":
-        options_execution_allowed = False
-        blockers.append("Underlying setup is not approved for execution.")
-
-    if discipline["timing"]["is_chasing"]:
-        options_execution_allowed = False
-        blockers.append("Underlying timing is late/chasing for options execution.")
-
-    if blockers:
-        options_execution_allowed = False
-
-    if confidence_score >= 85 and timing_label in ["IDEAL", "RETEST"] and fast_move_expected and not iv_is_elevated:
-        contract_style = "AGGRESSIVE"
-        moneyness = "SLIGHT OTM"
-        expiry_guidance = "0DTE allowed if liquidity is strong."
-        reasons.append("High-conviction setup allows more aggressive contract selection.")
-    elif confidence_score >= 65 and timing_label in ["IDEAL", "CONFIRMED", "RETEST"]:
-        contract_style = "BALANCED"
-        moneyness = "ATM"
-        expiry_guidance = "0DTE or next expiry is acceptable if spreads are clean."
-        reasons.append("Balanced contract selection fits current setup quality.")
-    else:
-        contract_style = "SAFE"
-        moneyness = "ATM or slight ITM"
-        expiry_guidance = "Prefer next expiry over 0DTE."
-        reasons.append("Safer contract profile is preferred due to lower conviction or weaker timing.")
-
-    if iv_is_elevated and contract_style == "AGGRESSIVE":
-        contract_style = "BALANCED"
-        moneyness = "ATM"
-        expiry_guidance = "Prefer ATM with cleaner pricing because IV is elevated."
-        reasons.append("Downgraded from aggressive contract due to elevated IV.")
-
-    if confidence_score < 60:
-        contract_style = "SAFE"
-        moneyness = "ATM or slight ITM"
-        expiry_guidance = "Prefer next expiry. Avoid lottery contracts."
-        reasons.append("Avoid cheap far OTM contracts on weaker setups.")
-
-    if dte == 0 and confidence_score < 70:
-        reasons.append("0DTE is only acceptable on strong alignment. Use caution here.")
-
-    if contract_price > 0:
-        if contract_price < 0.20 and contract_style != "AGGRESSIVE":
-            reasons.append("Very cheap premium often behaves like lottery pricing. Avoid forcing it.")
-        elif contract_price > 3.50 and confidence_score < 75:
-            reasons.append("Premium is already expensive relative to current conviction.")
-
-    if contract_delta is not None:
-        try:
-            delta_val = abs(float(contract_delta))
-            if contract_style == "SAFE":
-                preferred_delta = "0.55 to 0.70"
-            elif contract_style == "BALANCED":
-                preferred_delta = "0.40 to 0.60"
-            else:
-                preferred_delta = "0.25 to 0.45"
-            reasons.append(f"Current observed delta: {delta_val:.2f}. Preferred delta zone: {preferred_delta}.")
-        except Exception:
-            preferred_delta = "0.40 to 0.60"
-    else:
-        if contract_style == "SAFE":
-            preferred_delta = "0.55 to 0.70"
-        elif contract_style == "BALANCED":
-            preferred_delta = "0.40 to 0.60"
-        else:
-            preferred_delta = "0.25 to 0.45"
-
-    if symbol in ["QQQ", "SPY"]:
-        reasons.append(f"{symbol} is liquid enough for short-dated contracts when spreads are clean.")
-    else:
-        reasons.append("Use extra caution on non-index names because options can move less cleanly.")
-
-    if not options_execution_allowed:
-        contract_style = "NO EXECUTION"
-        expiry_guidance = "Do not enter options yet."
-        moneyness = "WAIT"
-        preferred_delta = "WAIT"
-
-    return {
-        "contract_type": contract_type,
-        "contract_style": contract_style,
-        "expiry_guidance": expiry_guidance,
-        "moneyness": moneyness,
-        "preferred_delta": preferred_delta,
-        "options_execution_allowed": options_execution_allowed,
-        "reasons": reasons,
-        "blockers": blockers
-    }
-
-
-# =========================
-# STATE 8 - LIVE TRADE MANAGER
-# =========================
-def register_open_trade(symbol, context, discipline, sizing, management, options_plan):
-    OPEN_TRADES[symbol] = {
-        "symbol": symbol,
-        "opened_at": now_str(),
-        "direction": management["direction"],
-        "entry_underlying": safe_float(get_attr(context, "current_price", 0.0)),
-        "entry_contract_price": safe_float(get_attr(context, "contract_price", 0.0)),
-        "execution_grade": discipline["execution_grade"],
-        "original_grade": discipline["original_grade"],
-        "timing_label": discipline["timing"]["timing_label"],
-        "confidence_score": sizing["confidence_score"],
-        "size_label": sizing["size_label"],
-        "contract_type": options_plan["contract_type"],
-        "contract_style": options_plan["contract_style"],
-        "trim_1": management["trim_1"],
-        "trim_2": management["trim_2"],
-        "runner_target": management["runner_target"],
-        "breakeven_trigger": management["breakeven_trigger"],
-        "invalidation": management["invalidation"],
-        "trim_1_hit": False,
-        "trim_2_hit": False,
-        "runner_hit": False,
-        "breakeven_sent": False,
-        "closed": False,
-    }
-
-    log_open_trade(symbol, context, discipline, sizing, management, options_plan)
-
-
-def evaluate_open_trade(symbol, current_underlying_price, current_contract_price=None, close_trade=False):
-    if symbol not in OPEN_TRADES:
-        print(f"No open trade tracked for {symbol}")
+def fetch_twelve_quote(symbol: str) -> Optional[MarketBar]:
+    if not TWELVE_DATA_API_KEY:
         return None
 
-    trade = OPEN_TRADES[symbol]
-    if trade["closed"]:
-        print(f"Trade for {symbol} already closed")
+    url = "https://api.twelvedata.com/quote"
+    params = {
+        "symbol": symbol,
+        "apikey": TWELVE_DATA_API_KEY
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
+
+        if "code" in data and data.get("status") == "error":
+            return None
+
+        price = safe_float(data.get("close") or data.get("price"))
+        open_price = safe_float(data.get("open"))
+        high = safe_float(data.get("high"))
+        low = safe_float(data.get("low"))
+        prev_close = safe_float(data.get("previous_close"))
+        volume = safe_float(data.get("volume"))
+
+        return MarketBar(
+            symbol=symbol,
+            price=price,
+            open_price=open_price,
+            high=high,
+            low=low,
+            volume=volume,
+            prev_close=prev_close,
+            timestamp=now_iso()
+        )
+    except Exception:
         return None
 
-    direction = trade["direction"]
-    entry_underlying = trade["entry_underlying"]
-    entry_contract = trade["entry_contract_price"]
 
-    current_underlying_price = safe_float(current_underlying_price)
-    current_contract_price = safe_float(current_contract_price, entry_contract)
-
-    if direction == "LONG":
-        underlying_pnl_pct = pct_change(entry_underlying, current_underlying_price)
-    else:
-        underlying_pnl_pct = pct_change(entry_underlying, current_underlying_price) * -1
-
-    contract_pnl_pct = 0.0
-    if entry_contract > 0:
-        contract_pnl_pct = pct_change(entry_contract, current_contract_price)
-
-    alerts = []
-
-    if direction == "LONG":
-        if (not trade["trim_1_hit"]) and current_underlying_price >= trade["trim_1"]:
-            trade["trim_1_hit"] = True
-            alerts.append(f"✅ {symbol} Trim 1 hit at {fmt_price(trade['trim_1'])}")
-        if (not trade["trim_2_hit"]) and current_underlying_price >= trade["trim_2"]:
-            trade["trim_2_hit"] = True
-            alerts.append(f"✅ {symbol} Trim 2 hit at {fmt_price(trade['trim_2'])}")
-        if (not trade["runner_hit"]) and current_underlying_price >= trade["runner_target"]:
-            trade["runner_hit"] = True
-            alerts.append(f"🏁 {symbol} Runner target hit at {fmt_price(trade['runner_target'])}")
-        if (not trade["breakeven_sent"]) and current_underlying_price >= trade["breakeven_trigger"]:
-            trade["breakeven_sent"] = True
-            alerts.append(f"🛡️ {symbol} Move stop to breakeven now")
-        if current_underlying_price <= trade["invalidation"]:
-            alerts.append(f"❌ {symbol} invalidation lost at {fmt_price(trade['invalidation'])}")
-            close_trade = True
-    else:
-        if (not trade["trim_1_hit"]) and current_underlying_price <= trade["trim_1"]:
-            trade["trim_1_hit"] = True
-            alerts.append(f"✅ {symbol} Trim 1 hit at {fmt_price(trade['trim_1'])}")
-        if (not trade["trim_2_hit"]) and current_underlying_price <= trade["trim_2"]:
-            trade["trim_2_hit"] = True
-            alerts.append(f"✅ {symbol} Trim 2 hit at {fmt_price(trade['trim_2'])}")
-        if (not trade["runner_hit"]) and current_underlying_price <= trade["runner_target"]:
-            trade["runner_hit"] = True
-            alerts.append(f"🏁 {symbol} Runner target hit at {fmt_price(trade['runner_target'])}")
-        if (not trade["breakeven_sent"]) and current_underlying_price <= trade["breakeven_trigger"]:
-            trade["breakeven_sent"] = True
-            alerts.append(f"🛡️ {symbol} Move stop to breakeven now")
-        if current_underlying_price >= trade["invalidation"]:
-            alerts.append(f"❌ {symbol} invalidation lost at {fmt_price(trade['invalidation'])}")
-            close_trade = True
-
-    if close_trade:
-        trade["closed"] = True
-
-        win_loss = "WIN" if contract_pnl_pct > 0 else "LOSS"
-        closed_row = {
-            "closed_at": now_str(),
-            "symbol": symbol,
-            "direction": direction,
-            "execution_grade": trade["execution_grade"],
-            "original_grade": trade["original_grade"],
-            "timing_label": trade["timing_label"],
-            "confidence_score": trade["confidence_score"],
-            "size_label": trade["size_label"],
-            "contract_type": trade["contract_type"],
-            "contract_style": trade["contract_style"],
-            "entry_underlying": entry_underlying,
-            "exit_underlying": current_underlying_price,
-            "underlying_pnl_pct": round(underlying_pnl_pct, 2),
-            "entry_contract_price": entry_contract,
-            "exit_contract_price": current_contract_price,
-            "contract_pnl_pct": round(contract_pnl_pct, 2),
-            "result": win_loss,
-            "trim_1_hit": trade["trim_1_hit"],
-            "trim_2_hit": trade["trim_2_hit"],
-            "runner_hit": trade["runner_hit"],
-        }
-        log_closed_trade(closed_row)
-
-    summary = {
-        "symbol": symbol,
-        "direction": direction,
-        "entry_underlying": entry_underlying,
-        "current_underlying": current_underlying_price,
-        "underlying_pnl_pct": round(underlying_pnl_pct, 2),
-        "entry_contract": entry_contract,
-        "current_contract": current_contract_price,
-        "contract_pnl_pct": round(contract_pnl_pct, 2),
-        "alerts": alerts,
-        "trim_1_hit": trade["trim_1_hit"],
-        "trim_2_hit": trade["trim_2_hit"],
-        "runner_hit": trade["runner_hit"],
-        "breakeven_sent": trade["breakeven_sent"],
-        "closed": trade["closed"],
-    }
-    return summary
-
-
-# =========================
-# STATE 9/10 - REPORTING ENGINE
-# =========================
-def filter_rows_by_days(rows, days):
-    cutoff = datetime.now() - timedelta(days=days)
-    out = []
-    for row in rows:
-        dt = parse_dt(row.get("closed_at", ""))
-        if dt and dt >= cutoff:
-            out.append(row)
+def fetch_market_snapshot(symbols: List[str]) -> Dict[str, MarketBar]:
+    out = {}
+    for symbol in symbols:
+        bar = fetch_twelve_quote(symbol)
+        if bar:
+            out[symbol] = bar
     return out
 
 
-def summarize_bucket(rows, key_name):
-    bucket = {}
-    for row in rows:
-        key = row.get(key_name, "UNKNOWN")
-        pnl = safe_float(row.get("contract_pnl_pct", 0.0))
-        if key not in bucket:
-            bucket[key] = {"count": 0, "wins": 0, "losses": 0, "pnl": 0.0}
-        bucket[key]["count"] += 1
-        bucket[key]["pnl"] += pnl
-        if row.get("result") == "WIN":
-            bucket[key]["wins"] += 1
-        else:
-            bucket[key]["losses"] += 1
-    return bucket
+# =========================================================
+# BLACK SWAN HELPERS
+# =========================================================
+
+def calc_gross_exposure_pct(snapshot: RiskSnapshot) -> float:
+    gross = sum(abs(p.market_value) for p in snapshot.open_positions)
+    return pct_of_equity(gross, snapshot.equity)
 
 
-def find_best_and_worst(bucket):
-    if not bucket:
-        return None, None
-    items = list(bucket.items())
-    best = max(items, key=lambda x: x[1]["pnl"])
-    worst = min(items, key=lambda x: x[1]["pnl"])
-    return best, worst
+def calc_net_exposure_pct(snapshot: RiskSnapshot) -> float:
+    net = sum(p.market_value for p in snapshot.open_positions)
+    return pct_of_equity(abs(net), snapshot.equity)
 
 
-def build_stats(rows):
-    if not rows:
+def calc_symbol_exposures(snapshot: RiskSnapshot) -> Dict[str, float]:
+    exposures = {}
+    for p in snapshot.open_positions:
+        exposures[p.symbol] = exposures.get(p.symbol, 0.0) + abs(p.market_value)
+    return {k: pct_of_equity(v, snapshot.equity) for k, v in exposures.items()}
+
+
+def calc_cluster_exposures(snapshot: RiskSnapshot) -> Dict[str, float]:
+    exposures = {}
+    for p in snapshot.open_positions:
+        exposures[p.cluster] = exposures.get(p.cluster, 0.0) + abs(p.market_value)
+    return {k: pct_of_equity(v, snapshot.equity) for k, v in exposures.items()}
+
+
+def max_dict_item(d: Dict[str, float]) -> Optional[Tuple[str, float]]:
+    if not d:
         return None
-
-    total_trades = len(rows)
-    wins = sum(1 for r in rows if r.get("result") == "WIN")
-    losses = total_trades - wins
-    total_contract_pnl = round(sum(safe_float(r.get("contract_pnl_pct", 0.0)) for r in rows), 2)
-    avg_contract_pnl = round(total_contract_pnl / total_trades, 2) if total_trades else 0.0
-    win_rate = round((wins / total_trades) * 100, 2) if total_trades else 0.0
-
-    top_winner = max(rows, key=lambda r: safe_float(r.get("contract_pnl_pct", 0.0)))
-    top_loser = min(rows, key=lambda r: safe_float(r.get("contract_pnl_pct", 0.0)))
-
-    by_grade = summarize_bucket(rows, "execution_grade")
-    by_symbol = summarize_bucket(rows, "symbol")
-    by_style = summarize_bucket(rows, "contract_style")
-
-    best_grade, worst_grade = find_best_and_worst(by_grade)
-    best_symbol, worst_symbol = find_best_and_worst(by_symbol)
-    best_style, worst_style = find_best_and_worst(by_style)
-
-    return {
-        "total_trades": total_trades,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "total_contract_pnl": total_contract_pnl,
-        "avg_contract_pnl": avg_contract_pnl,
-        "top_winner": top_winner,
-        "top_loser": top_loser,
-        "by_grade": by_grade,
-        "by_symbol": by_symbol,
-        "by_style": by_style,
-        "best_grade": best_grade,
-        "worst_grade": worst_grade,
-        "best_symbol": best_symbol,
-        "worst_symbol": worst_symbol,
-        "best_style": best_style,
-        "worst_style": worst_style,
-    }
+    k = max(d, key=d.get)
+    return k, d[k]
 
 
-def build_dashboard_snapshot(rows, label="ALL TIME"):
-    stats = build_stats(rows)
-    if not stats:
-        return f"📊 UNBIASED BOT DASHBOARD — {label}\nNo closed trades logged yet."
+# =========================================================
+# BLACK SWAN ENGINE
+# =========================================================
 
-    return f"""
-📊 UNBIASED BOT DASHBOARD — {label}
+def evaluate_black_swan_risk(
+    snapshot: RiskSnapshot,
+    stress: MarketStressState,
+    config: BlackSwanConfig,
+    rejected_order_count: int = 0
+) -> BlackSwanDecision:
 
-Trades: {stats['total_trades']}
-Wins: {stats['wins']}
-Losses: {stats['losses']}
-Win Rate: {stats['win_rate']}%
-Total Contract PnL: {stats['total_contract_pnl']}%
-Average Contract PnL: {stats['avg_contract_pnl']}%
+    daily_loss_pct = pct_of_equity(abs(min(snapshot.daily_pnl, 0.0)), snapshot.equity)
+    weekly_loss_pct = pct_of_equity(abs(min(snapshot.weekly_pnl, 0.0)), snapshot.equity)
 
-Top Winner:
-- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('execution_grade')} | {stats['top_winner'].get('contract_pnl_pct')}%
+    gross_exposure_pct = calc_gross_exposure_pct(snapshot)
+    net_exposure_pct = calc_net_exposure_pct(snapshot)
+    symbol_exposures = calc_symbol_exposures(snapshot)
+    cluster_exposures = calc_cluster_exposures(snapshot)
 
-Top Loser:
-- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('execution_grade')} | {stats['top_loser'].get('contract_pnl_pct')}%
+    reasons = []
 
-Best Grade:
-- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
-
-Worst Grade:
-- {stats['worst_grade'][0]} | total PnL {round(stats['worst_grade'][1]['pnl'], 2)}%
-
-Best Symbol:
-- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
-
-Worst Symbol:
-- {stats['worst_symbol'][0]} | total PnL {round(stats['worst_symbol'][1]['pnl'], 2)}%
-
-Best Contract Style:
-- {stats['best_style'][0]} | total PnL {round(stats['best_style'][1]['pnl'], 2)}%
-
-Worst Contract Style:
-- {stats['worst_style'][0]} | total PnL {round(stats['worst_style'][1]['pnl'], 2)}%
-""".strip()
-
-
-def build_daily_report():
-    rows = filter_rows_by_days(load_closed_trades(), 1)
-    stats = build_stats(rows)
-    if not stats:
-        return "🗓️ DAILY REPORT\nNo closed trades in the last 24 hours."
-
-    return f"""
-🗓️ UNBIASED BOT DAILY REPORT
-
-Period: Last 24 Hours
-Closed Trades: {stats['total_trades']}
-Wins: {stats['wins']}
-Losses: {stats['losses']}
-Win Rate: {stats['win_rate']}%
-Total Contract PnL: {stats['total_contract_pnl']}%
-Average Contract PnL: {stats['avg_contract_pnl']}%
-
-Best Symbol:
-- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
-
-Best Grade:
-- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
-
-Top Winner:
-- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('contract_pnl_pct')}%
-
-Top Loser:
-- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('contract_pnl_pct')}%
-""".strip()
-
-
-def build_weekly_report():
-    rows = filter_rows_by_days(load_closed_trades(), 7)
-    stats = build_stats(rows)
-    if not stats:
-        return "📬 WEEKLY REPORT\nNo closed trades in the last 7 days."
-
-    grade_lines = []
-    for grade, data in stats["by_grade"].items():
-        grade_lines.append(
-            f"- {grade}: {data['count']} trades | W {data['wins']} / L {data['losses']} | total {round(data['pnl'], 2)}%"
+    if daily_loss_pct >= config.daily_loss_limit_pct:
+        reasons.append(f"Daily loss breached: {daily_loss_pct:.2f}%")
+        return BlackSwanDecision(
+            status="FLAT_AND_LOCK",
+            size_multiplier=0.0,
+            reasons=reasons,
+            alert="🛑 BLACK SWAN LOCK: daily loss limit breached. Flatten all positions and lock system.",
+            lock_trading=True
         )
 
-    symbol_lines = []
-    for symbol, data in stats["by_symbol"].items():
-        symbol_lines.append(
-            f"- {symbol}: {data['count']} trades | W {data['wins']} / L {data['losses']} | total {round(data['pnl'], 2)}%"
+    if weekly_loss_pct >= config.weekly_loss_limit_pct:
+        reasons.append(f"Weekly loss breached: {weekly_loss_pct:.2f}%")
+        return BlackSwanDecision(
+            status="FLAT_AND_LOCK",
+            size_multiplier=0.0,
+            reasons=reasons,
+            alert="🛑 BLACK SWAN LOCK: weekly loss limit breached. Flatten all positions and lock system.",
+            lock_trading=True
         )
 
-    return f"""
-📬 UNBIASED BOT WEEKLY REPORT
-
-Period: Last 7 Days
-Closed Trades: {stats['total_trades']}
-Wins: {stats['wins']}
-Losses: {stats['losses']}
-Win Rate: {stats['win_rate']}%
-Total Contract PnL: {stats['total_contract_pnl']}%
-Average Contract PnL: {stats['avg_contract_pnl']}%
-
-Best Grade:
-- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
-
-Worst Grade:
-- {stats['worst_grade'][0]} | total PnL {round(stats['worst_grade'][1]['pnl'], 2)}%
-
-Best Symbol:
-- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
-
-Worst Symbol:
-- {stats['worst_symbol'][0]} | total PnL {round(stats['worst_symbol'][1]['pnl'], 2)}%
-
-By Grade:
-{chr(10).join(grade_lines)}
-
-By Symbol:
-{chr(10).join(symbol_lines)}
-
-Top Winner:
-- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('execution_grade')} | {stats['top_winner'].get('contract_pnl_pct')}%
-
-Top Loser:
-- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('execution_grade')} | {stats['top_loser'].get('contract_pnl_pct')}%
-""".strip()
-
-
-def build_email_ready_weekly_body():
-    return f"""
-UNBIASED BOT WEEKLY PERFORMANCE REPORT
-
-Generated: {now_str()}
-
-{build_weekly_report()}
-
-{build_dashboard_snapshot(filter_rows_by_days(load_closed_trades(), 7), label="LAST 7 DAYS")}
-""".strip()
-
-
-# =========================
-# STATE 12 - EMAIL + PNL CHART
-# =========================
-def generate_pnl_chart():
-    rows = load_closed_trades()
-    if not rows:
-        print("No data for chart")
-        return None
-
-    pnl = []
-    cumulative = 0.0
-
-    for r in rows:
-        change = safe_float(r.get("contract_pnl_pct", 0.0))
-        cumulative += change
-        pnl.append(cumulative)
-
-    if not pnl:
-        return None
-
-    plt.figure()
-    plt.plot(pnl)
-    plt.title("UnBiased Bot PnL Curve")
-    plt.xlabel("Trades")
-    plt.ylabel("Cumulative %")
-    plt.savefig(PNL_CHART_FILE)
-    plt.close()
-
-    return PNL_CHART_FILE
-
-
-def send_email_report(subject, body):
-    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
-        print("Email not configured")
-        print("EMAIL_SENDER exists:", bool(EMAIL_SENDER))
-        print("EMAIL_PASSWORD exists:", bool(EMAIL_PASSWORD))
-        print("EMAIL_RECEIVER exists:", bool(EMAIL_RECEIVER))
-        return
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = EMAIL_RECEIVER
-    msg.set_content(body)
-
-    for file_path in [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]:
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as f:
-                msg.add_attachment(
-                    f.read(),
-                    maintype="application",
-                    subtype="octet-stream",
-                    filename=os.path.basename(file_path),
-                )
-
-    chart = generate_pnl_chart()
-    if chart and os.path.exists(chart):
-        with open(chart, "rb") as f:
-            msg.add_attachment(
-                f.read(),
-                maintype="image",
-                subtype="png",
-                filename="pnl_chart.png",
-            )
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print("Email sent successfully")
-    except Exception as e:
-        print(f"Email failed: {e}")
-
-
-def send_weekly_email_report():
-    body = build_email_ready_weekly_body()
-    send_email_report("UNBIASED BOT WEEKLY REPORT", body)
-
-
-# =========================
-# FORMATTERS
-# =========================
-def format_trade_management_block(plan):
-    return "\n".join([
-        f"Direction: {plan['direction']}",
-        f"Invalidation: {fmt_price(plan['invalidation'])}",
-        f"Trim 1: {fmt_price(plan['trim_1'])}",
-        f"Trim 2: {fmt_price(plan['trim_2'])}",
-        f"Runner Target: {fmt_price(plan['runner_target'])}",
-        f"Break-even Trigger: {fmt_price(plan['breakeven_trigger'])}",
-        "",
-        "Scale-Out Plan:",
-        *[f"- {x}" for x in plan["trim_plan"]],
-        "",
-        f"Stop Rule: {plan['move_stop_rule']}",
-        *[f"- {x}" for x in plan["management_notes"]],
-    ])
-
-
-def format_options_block(options_plan):
-    lines = [
-        f"Contract Type: {options_plan['contract_type']}",
-        f"Contract Style: {options_plan['contract_style']}",
-        f"Expiry Guidance: {options_plan['expiry_guidance']}",
-        f"Moneyness: {options_plan['moneyness']}",
-        f"Preferred Delta: {options_plan['preferred_delta']}",
-    ]
-
-    if options_plan["reasons"]:
-        lines.append("")
-        lines.append("Options Notes:")
-        lines.extend([f"- {x}" for x in options_plan["reasons"]])
-
-    if options_plan["blockers"]:
-        lines.append("")
-        lines.append("Options Blockers:")
-        lines.extend([f"- {x}" for x in options_plan["blockers"]])
-
-    return "\n".join(lines)
-
-
-def format_telegram_alert(decision, context, discipline, sizing, management, options_plan):
-    timing = discipline["timing"]
-    return f"""
-🚨 {context.symbol} TRADE ALERT
-
-Grade: {discipline['execution_grade']}
-Original Grade: {discipline['original_grade']}
-Timing: {timing['timing_label']}
-Confidence: {sizing['confidence_score']}/100
-Size: {sizing['size_label']}
-Risk Multiplier: {sizing['risk_multiplier']}x
-
-Price: {fmt_price(context.current_price)}
-Trigger: {fmt_price(context.trigger_level)}
-
-Entry Logic:
-{chr(10).join(['- ' + r for r in discipline['reasons']])}
-
-Size Notes:
-{chr(10).join(['- ' + r for r in sizing['size_notes']])}
-
-Trade Plan:
-{format_trade_management_block(management)}
-
-Options Plan:
-{format_options_block(options_plan)}
-
-Time: {now_str()}
-""".strip()
-
-
-def format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan):
-    timing = discipline["timing"]
-    return f"""
-💎 PREMIUM EXECUTION — {context.symbol}
-
-Grade: {discipline['execution_grade']}
-Original Grade: {discipline['original_grade']}
-Timing: {timing['timing_label']}
-Confidence: {sizing['confidence_score']}/100
-
-📏 Size: {sizing['size_label']}
-⚖️ Risk Multiplier: {sizing['risk_multiplier']}x
-
-Price: {fmt_price(context.current_price)}
-Trigger Level: {fmt_price(context.trigger_level)}
-Distance From Trigger: {timing['distance_from_trigger_pct']}%
-
-{chr(10).join(['• ' + r for r in discipline['reasons']])}
-
-{chr(10).join(['• ' + r for r in sizing['size_notes']])}
-
-🎯 TRADE PLAN
-{format_trade_management_block(management)}
-
-🧠 OPTIONS PLAN
-{format_options_block(options_plan)}
-""".strip()
-
-
-def format_discord_watchlist_alert(decision, context, discipline, sizing, management, options_plan):
-    timing = discipline["timing"]
-    chasing_block = ""
-    if timing["is_chasing"]:
-        chasing_block = "\n🚫 YOU ARE CHASING\nDo not force premium execution here."
-
-    return f"""
-💎 PREMIUM WATCHLIST — {context.symbol}
-
-Original Grade: {discipline['original_grade']}
-Execution Status: {discipline['execution_grade']}
-Timing: {timing['timing_label']}
-Confidence: {sizing['confidence_score']}/100
-
-📏 Size: {sizing['size_label']}
-
-Price: {fmt_price(context.current_price)}
-Trigger Level: {fmt_price(context.trigger_level)}
-Distance From Trigger: {timing['distance_from_trigger_pct']}%
-{chasing_block}
-
-{chr(10).join(['• ' + r for r in discipline['reasons']])}
-
-{chr(10).join(['• ' + r for r in sizing['size_notes']])}
-
-🎯 MANAGEMENT VIEW
-{format_trade_management_block(management)}
-
-🧠 OPTIONS VIEW
-{format_options_block(options_plan)}
-""".strip()
-
-
-def format_discord_free_teaser(decision, context, discipline, sizing):
-    timing = discipline["timing"]
-    return f"""
-📊 MARKET INSIGHT — {context.symbol}
-
-A strong setup is active.
-Timing: {timing['timing_label']}
-Confidence: {sizing['confidence_score']}/100
-Key Level: {fmt_price(context.trigger_level)}
-
-Join premium for execution access.
-""".strip()
-
-
-def format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan):
-    timing = discipline["timing"]
-    return f"""
-📘 MARKET CONTEXT — {context.symbol}
-
-Timing: {timing['timing_label']}
-Confidence: {sizing['confidence_score']}/100
-Suggested Size: {sizing['size_label']}
-
-Price: {fmt_price(context.current_price)}
-Key Level: {fmt_price(context.trigger_level)}
-
-{chr(10).join(['• ' + r for r in discipline['reasons'][:5]])}
-
-Management Levels:
-• Invalidation: {fmt_price(management['invalidation'])}
-• Trim 1: {fmt_price(management['trim_1'])}
-• Trim 2: {fmt_price(management['trim_2'])}
-• Runner: {fmt_price(management['runner_target'])}
-
-Options View:
-• Type: {options_plan['contract_type']}
-• Style: {options_plan['contract_style']}
-• Moneyness: {options_plan['moneyness']}
-""".strip()
-
-
-def format_live_management_update(summary):
-    lines = [
-        f"📈 LIVE TRADE UPDATE — {summary['symbol']}",
-        f"Direction: {summary['direction']}",
-        f"Underlying Entry: {fmt_price(summary['entry_underlying'])}",
-        f"Underlying Now: {fmt_price(summary['current_underlying'])}",
-        f"Underlying PnL: {summary['underlying_pnl_pct']}%",
-    ]
-
-    if summary["entry_contract"] > 0:
-        lines.extend([
-            f"Contract Entry: {fmt_price(summary['entry_contract'])}",
-            f"Contract Now: {fmt_price(summary['current_contract'])}",
-            f"Contract PnL: {summary['contract_pnl_pct']}%",
-        ])
-
-    lines.append("")
-    lines.append("Status:")
-    lines.append(f"- Trim 1 hit: {summary['trim_1_hit']}")
-    lines.append(f"- Trim 2 hit: {summary['trim_2_hit']}")
-    lines.append(f"- Runner hit: {summary['runner_hit']}")
-    lines.append(f"- Breakeven sent: {summary['breakeven_sent']}")
-    lines.append(f"- Closed: {summary['closed']}")
-
-    if summary["alerts"]:
-        lines.append("")
-        lines.append("Triggered Alerts:")
-        lines.extend([f"- {a}" for a in summary["alerts"]])
-
-    return "\n".join(lines)
-
-
-# =========================
-# ROUTING
-# =========================
-def route_alerts(decision, context):
-    discipline = apply_state_4_discipline(decision, context)
-    sizing = calculate_confidence_and_size(decision, context, discipline)
-    management = build_trade_management_plan(decision, context, discipline, sizing)
-    options_plan = build_options_contract_plan(decision, context, discipline, sizing, management)
-
-    execution_grade = discipline["execution_grade"]
-    size_label = sizing["size_label"]
-    options_allowed = options_plan["options_execution_allowed"]
-
-    print("=== ROUTE DEBUG ===")
-    print("execution_grade:", execution_grade)
-    print("size_label:", size_label)
-    print("options_allowed:", options_allowed)
-    print("===================")
-
-    symbol = str(get_attr(context, "symbol", "QQQ")).upper()
-
-    if execution_grade in ["A+", "A"] and size_label in ["AGGRESSIVE", "NORMAL"] and options_allowed:
-        alert_text = format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan)
-        register_open_trade(symbol, context, discipline, sizing, management, options_plan)
-        send_telegram(format_telegram_alert(decision, context, discipline, sizing, management, options_plan))
-        send_discord_premium(alert_text)
-        send_discord_premium_levels(alert_text)
-        send_discord_free(format_discord_free_teaser(decision, context, discipline, sizing))
-
-    elif execution_grade == "WATCHLIST" or size_label == "NO EXECUTION" or not options_allowed:
-        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing, management, options_plan))
-        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan))
-
-    elif execution_grade in ["B+", "B", "C"]:
-        send_discord_premium(format_discord_watchlist_alert(decision, context, discipline, sizing, management, options_plan))
-        send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan))
-
-    elif execution_grade == "AVOID":
-        print(f"[AVOID] No alert sent for {symbol}")
-
-
-# =========================
-# LIVE / REPORT ROUTES
-# =========================
-def send_live_trade_update(symbol, current_underlying_price, current_contract_price=None, close_trade=False):
-    summary = evaluate_open_trade(symbol, current_underlying_price, current_contract_price, close_trade=close_trade)
-    if not summary:
-        return
-
-    msg = format_live_management_update(summary)
-    send_telegram(msg)
-    send_discord_premium(msg)
-
-
-def send_performance_summary():
-    msg = build_dashboard_snapshot(load_closed_trades(), label="ALL TIME")
-    send_telegram(msg)
-    send_discord_premium(msg)
-
-
-def send_daily_report():
-    msg = build_daily_report()
-    send_telegram(msg)
-    send_discord_premium(msg)
-
-
-def send_weekly_report():
-    msg = build_weekly_report()
-    send_telegram(msg)
-    send_discord_premium(msg)
-
-
-def print_email_ready_weekly_body():
-    body = build_email_ready_weekly_body()
-    print("\n=== EMAIL READY WEEKLY BODY ===\n")
-    print(body)
-    print("\n===============================\n")
-
-
-# =========================
-# TEST HELPERS
-# =========================
-def test_telegram_only():
-    send_telegram("✅ UNBIASED BOT TELEGRAM TEST MESSAGE")
-
-
-def send_test_alert():
-    class DummyDecision:
-        grade = "A"
-        reasons = [
-            "VWAP reclaimed",
-            "Breakout candle printed with volume",
-            "Key level triggered"
-        ]
-
-    class DummyContext:
-        symbol = "QQQ"
-        current_price = 616.10
-        trigger_level = 616.00
-
-        entry_zone_low = 615.95
-        entry_zone_high = 616.20
-        atr_push = 0.12
-        extension_pct = 0.08
-        bars_since_breakout = 1
-        momentum_confirmed = True
-        retest_hold = True
-        breakout_with_volume = True
-        near_key_level = True
-        above_vwap = True
-        below_vwap = False
-
-        oil_aligned = True
-        market_breadth_aligned = True
-        sector_aligned = True
-        big_print_aligned = True
-
-        direction = "LONG"
-        support_1 = 615.70
-        support_2 = 615.20
-        resistance_1 = 616.60
-        resistance_2 = 617.15
-
-        dte = 0
-        option_spread_pct = 4.5
-        option_volume_ok = True
-        option_open_interest_ok = True
-        iv_is_elevated = False
-        fast_move_expected = True
-        contract_price = 1.45
-        contract_delta = 0.49
-
-    route_alerts(DummyDecision(), DummyContext())
-
-
-def test_live_manager():
-    send_live_trade_update("QQQ", 616.65, 1.92)
-    send_live_trade_update("QQQ", 617.18, 2.45)
-    send_live_trade_update("QQQ", 617.55, 2.90, close_trade=True)
-
-
-def test_reports():
-    send_performance_summary()
-    send_daily_report()
-    send_weekly_report()
-    print_email_ready_weekly_body()
-
-
-# =========================
-# STATE 11 - LOG BACKUP + ROUTER
-# =========================
-def run_trade_alert_mode():
-    send_test_alert()
-
-
-def run_live_update_mode():
-    test_live_manager()
-
-
-def run_daily_report_mode():
-    send_daily_report()
-
-
-def run_weekly_report_mode():
-    send_weekly_report()
-
-
-def run_dashboard_mode():
-    send_performance_summary()
-
-
-def run_email_weekly_mode():
-    send_weekly_email_report()
-
-
-def run_test_all_mode():
-    test_telegram_only()
-    send_test_alert()
-    test_live_manager()
-    test_reports()
-
-
-def run_bot_mode():
-    print(f"BOT_MODE = {BOT_MODE}")
-
-    if BOT_MODE == "trade_alert":
-        run_trade_alert_mode()
-    elif BOT_MODE == "live_update":
-        run_live_update_mode()
-    elif BOT_MODE == "daily_report":
-        run_daily_report_mode()
-    elif BOT_MODE == "weekly_report":
-        run_weekly_report_mode()
-    elif BOT_MODE == "dashboard":
-        run_dashboard_mode()
-    elif BOT_MODE == "email_weekly":
-        run_email_weekly_mode()
+    infra_fail_reasons = []
+
+    if stress.execution_disconnect:
+        infra_fail_reasons.append("Execution disconnect detected")
+    if stress.data_stale:
+        infra_fail_reasons.append("Data stale")
+    if stress.trading_halt_detected:
+        infra_fail_reasons.append("Trading halt detected")
+    if stress.rejected_orders_spiking:
+        infra_fail_reasons.append("Rejected orders spiking")
+    if rejected_order_count >= config.max_rejected_orders_before_lock:
+        infra_fail_reasons.append(f"Rejected orders >= {config.max_rejected_orders_before_lock}")
+    if stress.slippage_spike and stress.abnormal_spread:
+        infra_fail_reasons.append("Slippage spike with abnormal spread")
+
+    if infra_fail_reasons:
+        return BlackSwanDecision(
+            status="FLAT_AND_LOCK",
+            size_multiplier=0.0,
+            reasons=infra_fail_reasons,
+            alert="🚨 BLACK SWAN LOCK: broker/data/execution compromised. Flatten and lock trading.",
+            lock_trading=True
+        )
+
+    shock_detected = False
+    shock_reasons = []
+
+    if stress.vix >= config.vix_hard_stop:
+        shock_detected = True
+        shock_reasons.append(f"VIX hard stop triggered ({stress.vix:.2f})")
+
+    if abs(stress.gap_move_pct) >= config.gap_move_hard_stop_pct:
+        shock_detected = True
+        shock_reasons.append(f"Gap move too large ({stress.gap_move_pct:.2f}%)")
+
+    if abs(stress.spy_move_pct) >= config.intraday_index_shock_pct:
+        shock_detected = True
+        shock_reasons.append(f"SPY shock move ({stress.spy_move_pct:.2f}%)")
+
+    if abs(stress.qqq_move_pct) >= config.intraday_index_shock_pct:
+        shock_detected = True
+        shock_reasons.append(f"QQQ shock move ({stress.qqq_move_pct:.2f}%)")
+
+    if shock_detected and stress.liquidity_thin:
+        shock_reasons.append("Liquidity thin during shock")
+        return BlackSwanDecision(
+            status="FLAT_AND_LOCK",
+            size_multiplier=0.0,
+            reasons=shock_reasons,
+            alert="⚠️ BLACK SWAN LOCK: shock regime with weak liquidity. Flatten all and lock.",
+            lock_trading=True
+        )
+
+    if shock_detected:
+        return BlackSwanDecision(
+            status="BLOCK_NEW",
+            size_multiplier=0.0,
+            reasons=shock_reasons,
+            alert="⚠️ BLACK SWAN DEFENSE: shock conditions detected. Block new trades.",
+            lock_trading=False
+        )
+
+    if gross_exposure_pct >= config.max_gross_exposure_pct:
+        reasons.append(f"Gross exposure too high ({gross_exposure_pct:.2f}%)")
+        return BlackSwanDecision(
+            status="BLOCK_NEW",
+            size_multiplier=0.0,
+            reasons=reasons,
+            alert="⛔ BLOCK NEW TRADES: gross exposure cap reached.",
+            lock_trading=False
+        )
+
+    if net_exposure_pct >= config.max_net_exposure_pct:
+        reasons.append(f"Net exposure too high ({net_exposure_pct:.2f}%)")
+        return BlackSwanDecision(
+            status="BLOCK_NEW",
+            size_multiplier=0.0,
+            reasons=reasons,
+            alert="⛔ BLOCK NEW TRADES: net exposure cap reached.",
+            lock_trading=False
+        )
+
+    max_symbol = max_dict_item(symbol_exposures)
+    if max_symbol and max_symbol[1] >= config.max_symbol_exposure_pct:
+        reasons.append(f"Symbol concentration too high: {max_symbol[0]} = {max_symbol[1]:.2f}%")
+        return BlackSwanDecision(
+            status="BLOCK_NEW",
+            size_multiplier=0.0,
+            reasons=reasons,
+            alert=f"⛔ BLOCK NEW TRADES: symbol concentration cap hit on {max_symbol[0]}.",
+            lock_trading=False
+        )
+
+    max_cluster = max_dict_item(cluster_exposures)
+    if max_cluster and max_cluster[1] >= config.max_cluster_exposure_pct:
+        reasons.append(f"Cluster concentration too high: {max_cluster[0]} = {max_cluster[1]:.2f}%")
+        return BlackSwanDecision(
+            status="BLOCK_NEW",
+            size_multiplier=0.0,
+            reasons=reasons,
+            alert=f"⛔ BLOCK NEW TRADES: correlated cluster cap hit on {max_cluster[0]}.",
+            lock_trading=False
+        )
+
+    reduce_reasons = []
+
+    if stress.vix >= config.vix_reduce_risk:
+        reduce_reasons.append(f"VIX elevated ({stress.vix:.2f})")
+    if stress.regime_break_detected:
+        reduce_reasons.append("Regime break detected")
+    if stress.breadth_breaking_down:
+        reduce_reasons.append("Breadth deterioration")
+    if stress.liquidity_thin:
+        reduce_reasons.append("Liquidity thin")
+    if stress.slippage_spike:
+        reduce_reasons.append("Slippage spike")
+    if stress.abnormal_spread:
+        reduce_reasons.append("Abnormal spread")
+
+    if len(reduce_reasons) >= 3:
+        return BlackSwanDecision(
+            status="REDUCE_SIZE",
+            size_multiplier=config.severe_size_multiplier,
+            reasons=reduce_reasons,
+            alert=f"⚠️ SEVERE RISK REDUCTION: {' | '.join(reduce_reasons)}. Cut size aggressively.",
+            lock_trading=False
+        )
+
+    if len(reduce_reasons) >= 1:
+        return BlackSwanDecision(
+            status="REDUCE_SIZE",
+            size_multiplier=config.abnormal_size_multiplier,
+            reasons=reduce_reasons,
+            alert=f"⚠️ RISK REDUCTION: {' | '.join(reduce_reasons)}. Trade smaller.",
+            lock_trading=False
+        )
+
+    return BlackSwanDecision(
+        status="ALLOW",
+        size_multiplier=1.0,
+        reasons=["No black swan constraints triggered"],
+        alert="✅ Risk layer clear. Trading allowed.",
+        lock_trading=False
+    )
+
+
+# =========================================================
+# PLAN ENGINE
+# =========================================================
+
+def classify_grade(confidence: float) -> str:
+    if confidence >= 0.90:
+        return "A+"
+    if confidence >= 0.82:
+        return "A"
+    if confidence >= 0.74:
+        return "B+"
+    if confidence >= 0.65:
+        return "B"
+    if confidence >= 0.55:
+        return "C"
+    return "AVOID"
+
+
+def detect_basic_signal(bar: MarketBar) -> TradePlan:
+    move_from_open = pct_change(bar.price, bar.open_price) if bar.open_price else 0.0
+    gap_pct = pct_change(bar.open_price, bar.prev_close) if bar.prev_close and bar.open_price else 0.0
+
+    action = "HOLD"
+    confidence = 0.50
+    reasons = []
+    tags = []
+
+    if move_from_open > 0.45:
+        action = "ENTER_CALL"
+        confidence = 0.76
+        reasons.append(f"{bar.symbol} showing positive expansion from open ({move_from_open:.2f}%).")
+        tags.extend(["bullish", "expansion"])
+    elif move_from_open < -0.45:
+        action = "ENTER_PUT"
+        confidence = 0.76
+        reasons.append(f"{bar.symbol} showing negative expansion from open ({move_from_open:.2f}%).")
+        tags.extend(["bearish", "expansion"])
     else:
-        run_test_all_mode()
+        reasons.append(f"{bar.symbol} is inside neutral range from open ({move_from_open:.2f}%).")
+        tags.append("neutral")
+
+    if abs(gap_pct) >= 1.0:
+        confidence += 0.05
+        reasons.append(f"Gap context present ({gap_pct:.2f}%).")
+
+    confidence = min(confidence, 0.95)
+    grade = classify_grade(confidence)
+
+    return TradePlan(
+        symbol=bar.symbol,
+        action=action if grade != "AVOID" else "HOLD",
+        grade=grade,
+        confidence=confidence,
+        size=1,
+        entry_price=bar.price,
+        trigger_level=bar.open_price if bar.open_price else None,
+        stop_level=bar.low if action == "ENTER_CALL" else (bar.high if action == "ENTER_PUT" else None),
+        target_level=(bar.price * 1.01) if action == "ENTER_CALL" else ((bar.price * 0.99) if action == "ENTER_PUT" else None),
+        reasons=reasons,
+        alerts=[],
+        tags=tags
+    )
 
 
-def save_logs_to_artifact_folder():
-    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+def apply_black_swan_override_to_plan(plan: TradePlan, black_swan: BlackSwanDecision) -> TradePlan:
+    plan.reasons.extend(black_swan.reasons)
+    plan.alerts.append(black_swan.alert)
 
-    files_to_save = [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]
-    if os.path.exists(PNL_CHART_FILE):
-        files_to_save.append(PNL_CHART_FILE)
+    if black_swan.status == "ALLOW":
+        return plan
 
-    for f in files_to_save:
-        if os.path.exists(f):
-            try:
-                with open(f, "rb") as src:
-                    data = src.read()
+    if black_swan.status == "REDUCE_SIZE":
+        plan.size = max(1, int(round(plan.size * black_swan.size_multiplier))) if plan.size > 0 else 0
+        plan.confidence = max(0.0, plan.confidence * 0.85)
+        plan.reasons.append("Black swan defense reduced size.")
+        return plan
 
-                with open(os.path.join(ARTIFACTS_DIR, os.path.basename(f)), "wb") as dst:
-                    dst.write(data)
+    if black_swan.status == "BLOCK_NEW":
+        if plan.action in ["ENTER_CALL", "ENTER_PUT", "BUY", "SELL", "OPEN"]:
+            plan.action = "HOLD"
+        plan.size = 0
+        plan.confidence = min(plan.confidence, 0.20)
+        plan.reasons.append("Black swan defense blocked new trades.")
+        return plan
 
-                print(f"Saved {f} to {ARTIFACTS_DIR}/")
-            except Exception as e:
-                print(f"Error saving {f}: {e}")
-        else:
-            print(f"{f} not found — nothing to save")
+    if black_swan.status in ["FORCE_EXIT_ALL", "FLAT_AND_LOCK"]:
+        plan.action = "EXIT_ALL"
+        plan.size = 0
+        plan.confidence = 1.0
+        plan.reasons.append("Black swan defense forced exit / flat lock.")
+        return plan
+
+    return plan
 
 
-def load_logs_if_exist():
-    for f in [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]:
-        if not os.path.exists(f):
-            with open(f, "w", encoding="utf-8") as file:
-                file.write("")
-            print(f"Created empty {f}")
+# =========================================================
+# LOCK MANAGEMENT
+# =========================================================
+
+def update_system_lock(lock_state: SystemLockState, black_swan: BlackSwanDecision) -> SystemLockState:
+    if black_swan.lock_trading:
+        lock_state.trading_locked = True
+        lock_state.lock_reason = black_swan.alert
+        if not lock_state.locked_at:
+            lock_state.locked_at = now_iso()
+    return lock_state
 
 
-def end_of_run_cleanup():
-    print("\n=== END OF RUN CLEANUP ===")
-    generate_pnl_chart()
-    save_logs_to_artifact_folder()
-    print("Logs prepared for upload")
+def manual_unlock_if_allowed(state: EngineState, config: BlackSwanConfig) -> None:
+    if state.lock_state.trading_locked and config.allow_new_trades_after_lock:
+        state.lock_state.trading_locked = False
+        state.lock_state.lock_reason = ""
+        state.lock_state.locked_at = ""
 
+
+def can_trade(lock_state: SystemLockState) -> bool:
+    return not lock_state.trading_locked
+
+
+# =========================================================
+# EXECUTION PLACEHOLDERS
+# =========================================================
+
+def flatten_all_positions(snapshot: RiskSnapshot) -> None:
+    if snapshot.open_positions:
+        send_alert("🛑 EMERGENCY FLATTEN: flattening all positions now.", premium=True)
+
+
+def cancel_open_orders() -> None:
+    send_alert("🧹 CANCEL OPEN ORDERS: cancelling all open orders.", premium=True)
+
+
+# =========================================================
+# STRESS MODEL
+# =========================================================
+
+def build_market_stress_state(market: Dict[str, MarketBar], state: EngineState) -> MarketStressState:
+    spy = market.get("SPY")
+    qqq = market.get("QQQ")
+    vix = market.get("VIX") or market.get("^VIX")
+
+    spy_move = pct_change(spy.price, spy.prev_close) if spy and spy.prev_close else 0.0
+    qqq_move = pct_change(qqq.price, qqq.prev_close) if qqq and qqq.prev_close else 0.0
+    gap_move = pct_change(spy.open_price, spy.prev_close) if spy and spy.prev_close and spy.open_price else 0.0
+
+    vix_value = vix.price if vix else 0.0
+    vix_prev = vix.prev_close if vix else 0.0
+
+    breadth_breaking_down = (spy_move < -1.0 and qqq_move < -1.0)
+    liquidity_thin = False
+    slippage_spike = False
+    abnormal_spread = False
+    trading_halt_detected = False
+    data_stale = len(market) == 0
+    execution_disconnect = False
+    rejected_orders_spiking = state.rejected_order_count >= 2
+    regime_break_detected = abs(spy_move) > 1.0 or abs(qqq_move) > 1.0
+
+    return MarketStressState(
+        vix=vix_value,
+        vix_prev_close=vix_prev,
+        spy_move_pct=spy_move,
+        qqq_move_pct=qqq_move,
+        gap_move_pct=gap_move,
+        breadth_breaking_down=breadth_breaking_down,
+        liquidity_thin=liquidity_thin,
+        slippage_spike=slippage_spike,
+        abnormal_spread=abnormal_spread,
+        trading_halt_detected=trading_halt_detected,
+        data_stale=data_stale,
+        execution_disconnect=execution_disconnect,
+        rejected_orders_spiking=rejected_orders_spiking,
+        regime_break_detected=regime_break_detected
+    )
+
+
+# =========================================================
+# ACCOUNT SNAPSHOT PLACEHOLDER
+# =========================================================
+
+def build_risk_snapshot(state: EngineState) -> RiskSnapshot:
+    # Replace this with live broker/account values when you connect execution.
+    return RiskSnapshot(
+        equity=100000.0,
+        cash=100000.0,
+        daily_pnl=0.0,
+        weekly_pnl=0.0,
+        unrealized_pnl=0.0,
+        realized_pnl=0.0,
+        open_positions=[]
+    )
+
+
+# =========================================================
+# FORMATTERS
+# =========================================================
+
+def format_plan_alert(plan: TradePlan) -> str:
+    lines = [
+        f"📊 {plan.symbol} PLAN",
+        f"Action: {plan.action}",
+        f"Grade: {plan.grade}",
+        f"Confidence: {plan.confidence:.2f}",
+        f"Size: {plan.size}",
+        f"Entry: {plan.entry_price:.2f}",
+    ]
+
+    if plan.trigger_level is not None:
+        lines.append(f"Trigger: {plan.trigger_level:.2f}")
+    if plan.stop_level is not None:
+        lines.append(f"Stop: {plan.stop_level:.2f}")
+    if plan.target_level is not None:
+        lines.append(f"Target: {plan.target_level:.2f}")
+
+    if plan.reasons:
+        lines.append("Reasons:")
+        lines.extend([f"- {r}" for r in plan.reasons[:5]])
+
+    if plan.alerts:
+        lines.append("Risk:")
+        lines.extend([f"- {a}" for a in plan.alerts[:3]])
+
+    return "\n".join(lines)
+
+
+def format_heartbeat(state: EngineState, stress: MarketStressState) -> str:
+    status = "LOCKED" if state.lock_state.trading_locked else "ACTIVE"
+    return (
+        f"💓 HEARTBEAT\n"
+        f"Status: {status}\n"
+        f"Lock Reason: {state.lock_state.lock_reason or 'None'}\n"
+        f"Rejected Orders: {state.rejected_order_count}\n"
+        f"VIX: {stress.vix:.2f}\n"
+        f"SPY Move: {stress.spy_move_pct:.2f}%\n"
+        f"QQQ Move: {stress.qqq_move_pct:.2f}%"
+    )
+
+
+# =========================================================
+# CORE LOOP
+# =========================================================
+
+def should_send_heartbeat(state: EngineState) -> bool:
+    if not ENABLE_HEARTBEAT:
+        return False
+    elapsed = time.time() - state.last_heartbeat_ts
+    return elapsed >= HEARTBEAT_MINUTES * 60
+
+
+def analyze_symbol(
+    symbol: str,
+    market: Dict[str, MarketBar],
+    black_swan: BlackSwanDecision
+) -> Optional[TradePlan]:
+    bar = market.get(symbol)
+    if not bar:
+        return None
+
+    plan = detect_basic_signal(bar)
+    plan = apply_black_swan_override_to_plan(plan, black_swan)
+    return plan
+
+
+def maybe_send_plan_alert(state: EngineState, plan: TradePlan) -> None:
+    text = format_plan_alert(plan)
+    text_hash = hash_text(text)
+
+    if text_hash == state.last_alert_hash:
+        return
+
+    premium = plan.grade in ["A+", "A", "B+"]
+    send_alert(text, premium=premium)
+    state.last_alert_hash = text_hash
+
+
+def process_cycle(state: EngineState, config: BlackSwanConfig) -> None:
+    symbols_to_fetch = list(set(SYMBOLS + ["SPY", "QQQ", "VIX"]))
+    market = fetch_market_snapshot(symbols_to_fetch)
+
+    for sym, bar in market.items():
+        state.last_prices[sym] = bar.price
+
+    snapshot = build_risk_snapshot(state)
+    stress = build_market_stress_state(market, state)
+
+    black_swan = evaluate_black_swan_risk(
+        snapshot=snapshot,
+        stress=stress,
+        config=config,
+        rejected_order_count=state.rejected_order_count
+    )
+
+    state.lock_state = update_system_lock(state.lock_state, black_swan)
+
+    if black_swan.status in ["FORCE_EXIT_ALL", "FLAT_AND_LOCK"]:
+        cancel_open_orders()
+        flatten_all_positions(snapshot)
+        send_alert(black_swan.alert, premium=True)
+
+    if should_send_heartbeat(state):
+        send_alert(format_heartbeat(state, stress), premium=False)
+        state.last_heartbeat_ts = time.time()
+
+    for symbol in SYMBOLS:
+        plan = analyze_symbol(symbol, market, black_swan)
+        if not plan:
+            continue
+
+        if state.lock_state.trading_locked:
+            plan.action = "HOLD"
+            plan.size = 0
+            plan.reasons.append(f"System locked: {state.lock_state.lock_reason}")
+
+        maybe_send_plan_alert(state, plan)
+
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+def run_status(config: BlackSwanConfig) -> None:
+    state = load_engine_state()
+    snapshot = build_risk_snapshot(state)
+    market = fetch_market_snapshot(list(set(SYMBOLS + ["SPY", "QQQ", "VIX"])))
+    stress = build_market_stress_state(market, state)
+    black_swan = evaluate_black_swan_risk(snapshot, stress, config, state.rejected_order_count)
+
+    print("========== STATUS ==========")
+    print(f"Trading Locked: {state.lock_state.trading_locked}")
+    print(f"Lock Reason: {state.lock_state.lock_reason}")
+    print(f"Rejected Orders: {state.rejected_order_count}")
+    print(f"Black Swan Status: {black_swan.status}")
+    print(f"Black Swan Alert: {black_swan.alert}")
+    print("============================")
+
+
+def run_unlock() -> None:
+    state = load_engine_state()
+    state.lock_state = SystemLockState()
+    save_engine_state(state)
+    msg = "🔓 MANUAL RESET: trading lock cleared."
+    print(msg)
+    send_alert(msg, premium=True)
+
+
+def run_flatten() -> None:
+    state = load_engine_state()
+    snapshot = build_risk_snapshot(state)
+    cancel_open_orders()
+    flatten_all_positions(snapshot)
+    state.lock_state.trading_locked = True
+    state.lock_state.lock_reason = "Manual flatten invoked."
+    state.lock_state.locked_at = now_iso()
+    save_engine_state(state)
+    msg = "🛑 MANUAL FLATTEN: all positions should be flattened and system locked."
+    print(msg)
+    send_alert(msg, premium=True)
+
+
+def run_once(config: BlackSwanConfig) -> None:
+    state = load_engine_state()
+    process_cycle(state, config)
+    save_engine_state(state)
+
+
+def run_loop(config: BlackSwanConfig) -> None:
+    state = load_engine_state()
+    send_alert("🚀 Analyzer started.", premium=False)
+
+    while True:
+        try:
+            process_cycle(state, config)
+            save_engine_state(state)
+        except KeyboardInterrupt:
+            send_alert("🛑 Analyzer stopped manually.", premium=False)
+            save_engine_state(state)
+            break
+        except Exception as e:
+            msg = f"❌ MAIN LOOP ERROR: {type(e).__name__}: {e}"
+            print(msg)
+            send_alert(msg, premium=True)
+            save_engine_state(state)
+
+        time.sleep(POLL_SECONDS)
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
-    load_logs_if_exist()
-    run_bot_mode()
-    end_of_run_cleanup()
+    config = BlackSwanConfig()
+
+    command = os.getenv("BOT_COMMAND", "run").strip().lower()
+
+    if command == "status":
+        run_status(config)
+    elif command == "unlock":
+        run_unlock()
+    elif command == "flatten":
+        run_flatten()
+    elif command == "once":
+        run_once(config)
+    else:
+        run_loop(config)
