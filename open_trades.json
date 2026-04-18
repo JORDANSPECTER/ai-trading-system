@@ -1,1 +1,23 @@
-
+{
+  "open_trades": [
+    {
+      "underlying": "SPY",
+      "option_symbol": "SPY260420C00679000",
+      "action": "BUY_CALL",
+      "grade": "B",
+      "score": 60,
+      "execution_tier": "MICRO",
+      "qty": 1,
+      "entry_underlying": 710.049988,
+      "entry_time": "2026-04-18T08:30:58.252429-04:00",
+      "entry_order_id": "5bead424-8d8e-45fb-81fe-f6dac3aba773",
+      "be_armed": false,
+      "strike": "679.0",
+      "expiry": "2026-04-20"
+    }
+  ],
+  "recent_closures": {},
+  "daily_entries": {
+    "2026-04-18": 1
+  }
+}
