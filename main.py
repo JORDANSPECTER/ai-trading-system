@@ -13,6 +13,7 @@ from datetime import datetime, date, timedelta
 # =========================================================
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
 DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE", "")
+DISCORD_WEBHOOK_EXECUTION = os.getenv("DISCORD_WEBHOOK_EXECUTION", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -85,7 +86,7 @@ try:
         alpaca_options_ready = True
 
 except Exception as e:
-    print(f"[ALPACA IMPORT WARNING] {e}")
+    print(f"[ALPACA IMPORT WARNING] {e}", flush=True)
     alpaca_client = None
     alpaca_options_ready = False
 
@@ -211,13 +212,22 @@ def is_regular_market_hours_et() -> bool:
 # =========================================================
 # ALERTS
 # =========================================================
-def send_discord(message: str) -> None:
+def send_discord_free(message: str) -> None:
     if not DISCORD_WEBHOOK_FREE:
         return
     try:
         requests.post(DISCORD_WEBHOOK_FREE, json={"content": message}, timeout=12)
     except Exception as e:
-        print(f"[DISCORD ERROR] {e}")
+        print(f"[DISCORD FREE ERROR] {e}", flush=True)
+
+
+def send_discord_execution(message: str) -> None:
+    if not DISCORD_WEBHOOK_EXECUTION:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_EXECUTION, json={"content": message}, timeout=12)
+    except Exception as e:
+        print(f"[DISCORD EXEC ERROR] {e}", flush=True)
 
 
 def send_telegram(message: str) -> None:
@@ -228,12 +238,18 @@ def send_telegram(message: str) -> None:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
         requests.post(url, data=payload, timeout=12)
     except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
+        print(f"[TELEGRAM ERROR] {e}", flush=True)
 
 
-def broadcast(message: str) -> None:
+def broadcast_framework(message: str) -> None:
     print(message, flush=True)
-    send_discord(message)
+    send_discord_free(message)
+    send_telegram(message)
+
+
+def broadcast_execution(message: str) -> None:
+    print(message, flush=True)
+    send_discord_execution(message)
     send_telegram(message)
 
 # =========================================================
@@ -788,11 +804,7 @@ def pick_option_contract(underlying: str, action: str, underlying_price: float):
                 if strike <= 0 or not symbol:
                     continue
 
-                if action == "BUY_CALL":
-                    target = underlying_price + OPTIONS_STRIKE_STEP_BUFFER
-                else:
-                    target = underlying_price - OPTIONS_STRIKE_STEP_BUFFER
-
+                target = underlying_price + OPTIONS_STRIKE_STEP_BUFFER if action == "BUY_CALL" else underlying_price - OPTIONS_STRIKE_STEP_BUFFER
                 distance = abs(strike - target)
                 ranked.append((distance, contract))
 
@@ -829,8 +841,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
         return
 
     if alpaca_client is None:
-        msg = "❌ LIVE_TRADING is ON but Alpaca is not connected."
-        broadcast(msg)
+        broadcast_execution("❌ LIVE_TRADING is ON but Alpaca is not connected.")
         return
 
     try:
@@ -841,8 +852,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
         )
 
         if contract is None:
-            msg = f"❌ No option contract found for {context.symbol} {plan.action}"
-            broadcast(msg)
+            broadcast_execution(f"❌ No option contract found for {context.symbol} {plan.action}")
             return
 
         option_symbol = getattr(contract, "symbol", None)
@@ -850,8 +860,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
         expiration_date = getattr(contract, "expiration_date", "NA")
 
         if not option_symbol:
-            msg = f"❌ Contract object missing symbol for {context.symbol} {plan.action}"
-            broadcast(msg)
+            broadcast_execution(f"❌ Contract object missing symbol for {context.symbol} {plan.action}")
             return
 
         order_side = OrderSide.BUY
@@ -896,12 +905,11 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
             f"Broker Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
             f"Order ID: {order.id}"
         )
-        broadcast(msg)
+        broadcast_execution(msg)
         log_trade_entry(plan, context, str(order.id), option_symbol)
 
     except Exception as e:
-        err = f"❌ ALPACA OPTION ORDER FAILED: {e}"
-        broadcast(err)
+        broadcast_execution(f"❌ ALPACA OPTION ORDER FAILED: {e}")
 
 # =========================================================
 # ALERT FORMAT
@@ -967,9 +975,11 @@ def run_symbol(symbol: str) -> None:
     plan = apply_constituent_confirmation(context, plan)
     status, notes = execution_filter(plan, context)
 
-    broadcast(build_alert(plan, context, status, notes))
+    # Framework alerts go ONLY to free + telegram
+    broadcast_framework(build_alert(plan, context, status, notes))
 
     if status == "EXECUTE":
+        # Execution alerts go ONLY to execution channel + telegram
         execute_trade(plan, context)
 
 
@@ -992,21 +1002,22 @@ def main() -> None:
         f"A_PLUS_ONLY_MODE: {A_PLUS_ONLY_MODE}\n"
         f"ALLOW_B_MICRO_SIZE: {ALLOW_B_MICRO_SIZE}\n"
         f"RUN_ONCE: {RUN_ONCE}\n"
-        f"Discord Free Connected: {bool(DISCORD_WEBHOOK_FREE)}"
+        f"Discord Free Connected: {bool(DISCORD_WEBHOOK_FREE)}\n"
+        f"Discord Execution Connected: {bool(DISCORD_WEBHOOK_EXECUTION)}"
     )
-    broadcast(startup)
+    broadcast_framework(startup)
 
     if alpaca_client is not None:
         try:
             account = alpaca_client.get_account()
-            broadcast(
+            broadcast_execution(
                 "✅ ALPACA CONNECTION OK\n"
                 f"Status: {account.status}\n"
                 f"Buying Power: {account.buying_power}\n"
                 f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}"
             )
         except Exception as e:
-            broadcast(f"❌ ALPACA CONNECTION FAILED: {e}")
+            broadcast_execution(f"❌ ALPACA CONNECTION FAILED: {e}")
 
     if RUN_ONCE:
         run_cycle()
@@ -1016,7 +1027,7 @@ def main() -> None:
         try:
             run_cycle()
         except Exception as e:
-            broadcast(f"❌ MAIN LOOP ERROR: {e}")
+            broadcast_execution(f"❌ MAIN LOOP ERROR: {e}")
         time.sleep(POLL_SECONDS)
 
 
