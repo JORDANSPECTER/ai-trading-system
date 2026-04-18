@@ -1,7 +1,7 @@
 import os
 import csv
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # =========================
 # ENV VARIABLES
@@ -100,6 +100,17 @@ def pct_change(entry, current):
 def file_exists(path):
     return os.path.exists(path)
 
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_dt(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
 # =========================
 # CSV / JOURNAL LOGGING
 # =========================
@@ -114,7 +125,7 @@ def append_csv_row(path, fieldnames, row):
 
 def log_open_trade(symbol, context, discipline, sizing, management, options_plan):
     row = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": now_str(),
         "symbol": symbol,
         "direction": management["direction"],
         "execution_grade": discipline["execution_grade"],
@@ -142,13 +153,11 @@ def log_open_trade(symbol, context, discipline, sizing, management, options_plan
         "options_blockers": " | ".join(options_plan["blockers"]),
     }
 
-    fieldnames = list(row.keys())
-    append_csv_row(TRADE_LOG_FILE, fieldnames, row)
+    append_csv_row(TRADE_LOG_FILE, list(row.keys()), row)
 
 
 def log_closed_trade(closed_row):
-    fieldnames = list(closed_row.keys())
-    append_csv_row(CLOSED_TRADE_LOG_FILE, fieldnames, closed_row)
+    append_csv_row(CLOSED_TRADE_LOG_FILE, list(closed_row.keys()), closed_row)
 
 # =========================
 # STATE 4 - ENTRY DISCIPLINE
@@ -557,7 +566,7 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
 def register_open_trade(symbol, context, discipline, sizing, management, options_plan):
     OPEN_TRADES[symbol] = {
         "symbol": symbol,
-        "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "opened_at": now_str(),
         "direction": management["direction"],
         "entry_underlying": safe_float(get_attr(context, "current_price", 0.0)),
         "entry_contract_price": safe_float(get_attr(context, "contract_price", 0.0)),
@@ -649,7 +658,7 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
 
         win_loss = "WIN" if contract_pnl_pct > 0 else "LOSS"
         closed_row = {
-            "closed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "closed_at": now_str(),
             "symbol": symbol,
             "direction": direction,
             "execution_grade": trade["execution_grade"],
@@ -692,7 +701,7 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
     return summary
 
 # =========================
-# PERFORMANCE SUMMARY
+# REPORT / DASHBOARD ENGINE
 # =========================
 def load_closed_trades():
     if not file_exists(CLOSED_TRADE_LOG_FILE):
@@ -706,75 +715,221 @@ def load_closed_trades():
     return rows
 
 
-def build_performance_summary():
-    rows = load_closed_trades()
+def filter_rows_by_days(rows, days):
+    cutoff = datetime.now() - timedelta(days=days)
+    out = []
+    for row in rows:
+        dt = parse_dt(row.get("closed_at", ""))
+        if dt and dt >= cutoff:
+            out.append(row)
+    return out
+
+
+def summarize_bucket(rows, key_name):
+    bucket = {}
+    for row in rows:
+        key = row.get(key_name, "UNKNOWN")
+        pnl = safe_float(row.get("contract_pnl_pct", 0.0))
+        if key not in bucket:
+            bucket[key] = {"count": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        bucket[key]["count"] += 1
+        bucket[key]["pnl"] += pnl
+        if row.get("result") == "WIN":
+            bucket[key]["wins"] += 1
+        else:
+            bucket[key]["losses"] += 1
+    return bucket
+
+
+def find_best_and_worst(bucket):
+    if not bucket:
+        return None, None
+    items = list(bucket.items())
+    best = max(items, key=lambda x: x[1]["pnl"])
+    worst = min(items, key=lambda x: x[1]["pnl"])
+    return best, worst
+
+
+def build_stats(rows):
     if not rows:
-        return "No closed trades logged yet."
+        return None
 
     total_trades = len(rows)
-    wins = 0
-    losses = 0
-    total_contract_pnl = 0.0
+    wins = sum(1 for r in rows if r.get("result") == "WIN")
+    losses = total_trades - wins
+    total_contract_pnl = round(sum(safe_float(r.get("contract_pnl_pct", 0.0)) for r in rows), 2)
+    avg_contract_pnl = round(total_contract_pnl / total_trades, 2) if total_trades else 0.0
+    win_rate = round((wins / total_trades) * 100, 2) if total_trades else 0.0
 
-    by_grade = {}
-    by_symbol = {}
+    top_winner = max(rows, key=lambda r: safe_float(r.get("contract_pnl_pct", 0.0)))
+    top_loser = min(rows, key=lambda r: safe_float(r.get("contract_pnl_pct", 0.0)))
 
-    for row in rows:
-        result = row.get("result", "")
-        grade = row.get("execution_grade", "UNKNOWN")
-        symbol = row.get("symbol", "UNKNOWN")
-        pnl = safe_float(row.get("contract_pnl_pct", 0.0))
+    by_grade = summarize_bucket(rows, "execution_grade")
+    by_symbol = summarize_bucket(rows, "symbol")
+    by_style = summarize_bucket(rows, "contract_style")
 
-        total_contract_pnl += pnl
+    best_grade, worst_grade = find_best_and_worst(by_grade)
+    best_symbol, worst_symbol = find_best_and_worst(by_symbol)
+    best_style, worst_style = find_best_and_worst(by_style)
 
-        if result == "WIN":
-            wins += 1
-        else:
-            losses += 1
+    return {
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "total_contract_pnl": total_contract_pnl,
+        "avg_contract_pnl": avg_contract_pnl,
+        "top_winner": top_winner,
+        "top_loser": top_loser,
+        "by_grade": by_grade,
+        "by_symbol": by_symbol,
+        "by_style": by_style,
+        "best_grade": best_grade,
+        "worst_grade": worst_grade,
+        "best_symbol": best_symbol,
+        "worst_symbol": worst_symbol,
+        "best_style": best_style,
+        "worst_style": worst_style,
+    }
 
-        if grade not in by_grade:
-            by_grade[grade] = {"count": 0, "pnl": 0.0}
-        by_grade[grade]["count"] += 1
-        by_grade[grade]["pnl"] += pnl
 
-        if symbol not in by_symbol:
-            by_symbol[symbol] = {"count": 0, "pnl": 0.0}
-        by_symbol[symbol]["count"] += 1
-        by_symbol[symbol]["pnl"] += pnl
+def build_dashboard_snapshot(rows, label="ALL TIME"):
+    stats = build_stats(rows)
+    if not stats:
+        return f"📊 UNBIASED BOT DASHBOARD — {label}\nNo closed trades logged yet."
 
-    win_rate = (wins / total_trades) * 100 if total_trades else 0.0
-    avg_contract_pnl = total_contract_pnl / total_trades if total_trades else 0.0
+    return f"""
+📊 UNBIASED BOT DASHBOARD — {label}
+
+Trades: {stats['total_trades']}
+Wins: {stats['wins']}
+Losses: {stats['losses']}
+Win Rate: {stats['win_rate']}%
+Total Contract PnL: {stats['total_contract_pnl']}%
+Average Contract PnL: {stats['avg_contract_pnl']}%
+
+Top Winner:
+- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('execution_grade')} | {stats['top_winner'].get('contract_pnl_pct')}%
+
+Top Loser:
+- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('execution_grade')} | {stats['top_loser'].get('contract_pnl_pct')}%
+
+Best Grade:
+- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
+
+Worst Grade:
+- {stats['worst_grade'][0]} | total PnL {round(stats['worst_grade'][1]['pnl'], 2)}%
+
+Best Symbol:
+- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
+
+Worst Symbol:
+- {stats['worst_symbol'][0]} | total PnL {round(stats['worst_symbol'][1]['pnl'], 2)}%
+
+Best Contract Style:
+- {stats['best_style'][0]} | total PnL {round(stats['best_style'][1]['pnl'], 2)}%
+
+Worst Contract Style:
+- {stats['worst_style'][0]} | total PnL {round(stats['worst_style'][1]['pnl'], 2)}%
+""".strip()
+
+
+def build_weekly_report():
+    rows = filter_rows_by_days(load_closed_trades(), 7)
+    stats = build_stats(rows)
+    if not stats:
+        return "📬 WEEKLY REPORT\nNo closed trades in the last 7 days."
 
     grade_lines = []
-    for grade, data in by_grade.items():
+    for grade, data in stats["by_grade"].items():
         grade_lines.append(
-            f"- {grade}: {data['count']} trades, total contract PnL {round(data['pnl'], 2)}%"
+            f"- {grade}: {data['count']} trades | W {data['wins']} / L {data['losses']} | total {round(data['pnl'], 2)}%"
         )
 
     symbol_lines = []
-    for symbol, data in by_symbol.items():
+    for symbol, data in stats["by_symbol"].items():
         symbol_lines.append(
-            f"- {symbol}: {data['count']} trades, total contract PnL {round(data['pnl'], 2)}%"
+            f"- {symbol}: {data['count']} trades | W {data['wins']} / L {data['losses']} | total {round(data['pnl'], 2)}%"
         )
 
-    summary = f"""
-📊 UNBIASED BOT PERFORMANCE SUMMARY
+    return f"""
+📬 UNBIASED BOT WEEKLY REPORT
 
-Total Closed Trades: {total_trades}
-Wins: {wins}
-Losses: {losses}
-Win Rate: {round(win_rate, 2)}%
-Total Contract PnL: {round(total_contract_pnl, 2)}%
-Average Contract PnL per Trade: {round(avg_contract_pnl, 2)}%
+Period: Last 7 Days
+Closed Trades: {stats['total_trades']}
+Wins: {stats['wins']}
+Losses: {stats['losses']}
+Win Rate: {stats['win_rate']}%
+Total Contract PnL: {stats['total_contract_pnl']}%
+Average Contract PnL: {stats['avg_contract_pnl']}%
+
+Best Grade:
+- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
+
+Worst Grade:
+- {stats['worst_grade'][0]} | total PnL {round(stats['worst_grade'][1]['pnl'], 2)}%
+
+Best Symbol:
+- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
+
+Worst Symbol:
+- {stats['worst_symbol'][0]} | total PnL {round(stats['worst_symbol'][1]['pnl'], 2)}%
 
 By Grade:
 {chr(10).join(grade_lines)}
 
 By Symbol:
 {chr(10).join(symbol_lines)}
+
+Top Winner:
+- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('execution_grade')} | {stats['top_winner'].get('contract_pnl_pct')}%
+
+Top Loser:
+- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('execution_grade')} | {stats['top_loser'].get('contract_pnl_pct')}%
 """.strip()
 
-    return summary
+
+def build_daily_report():
+    rows = filter_rows_by_days(load_closed_trades(), 1)
+    stats = build_stats(rows)
+    if not stats:
+        return "🗓️ DAILY REPORT\nNo closed trades in the last 24 hours."
+
+    return f"""
+🗓️ UNBIASED BOT DAILY REPORT
+
+Period: Last 24 Hours
+Closed Trades: {stats['total_trades']}
+Wins: {stats['wins']}
+Losses: {stats['losses']}
+Win Rate: {stats['win_rate']}%
+Total Contract PnL: {stats['total_contract_pnl']}%
+Average Contract PnL: {stats['avg_contract_pnl']}%
+
+Best Symbol:
+- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
+
+Best Grade:
+- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
+
+Top Winner:
+- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('contract_pnl_pct')}%
+
+Top Loser:
+- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('contract_pnl_pct')}%
+""".strip()
+
+
+def build_email_ready_weekly_body():
+    return f"""
+UNBIASED BOT WEEKLY PERFORMANCE REPORT
+
+Generated: {now_str()}
+
+{build_weekly_report()}
+
+{build_dashboard_snapshot(filter_rows_by_days(load_closed_trades(), 7), label="LAST 7 DAYS")}
+""".strip()
 
 # =========================
 # FORMATTERS
@@ -845,7 +1000,7 @@ Trade Plan:
 Options Plan:
 {format_options_block(options_plan)}
 
-Time: {datetime.now().strftime('%H:%M:%S')}
+Time: {now_str()}
 """.strip()
 
 
@@ -1041,12 +1196,31 @@ def send_live_trade_update(symbol, current_underlying_price, current_contract_pr
     send_discord_premium(msg)
 
 # =========================
-# PERFORMANCE ROUTE
+# REPORT ROUTES
 # =========================
 def send_performance_summary():
-    summary = build_performance_summary()
-    send_telegram(summary)
-    send_discord_premium(summary)
+    msg = build_dashboard_snapshot(load_closed_trades(), label="ALL TIME")
+    send_telegram(msg)
+    send_discord_premium(msg)
+
+
+def send_daily_report():
+    msg = build_daily_report()
+    send_telegram(msg)
+    send_discord_premium(msg)
+
+
+def send_weekly_report():
+    msg = build_weekly_report()
+    send_telegram(msg)
+    send_discord_premium(msg)
+
+
+def print_email_ready_weekly_body():
+    body = build_email_ready_weekly_body()
+    print("\n=== EMAIL READY WEEKLY BODY ===\n")
+    print(body)
+    print("\n===============================\n")
 
 # =========================
 # TESTS
@@ -1101,9 +1275,7 @@ def send_test_alert():
         contract_price = 1.45
         contract_delta = 0.49
 
-    decision = DummyDecision()
-    context = DummyContext()
-    route_alerts(decision, context)
+    route_alerts(DummyDecision(), DummyContext())
 
 
 def test_live_manager():
@@ -1112,8 +1284,11 @@ def test_live_manager():
     send_live_trade_update("QQQ", 617.55, 2.90, close_trade=True)
 
 
-def test_performance_summary():
+def test_reports():
     send_performance_summary()
+    send_daily_report()
+    send_weekly_report()
+    print_email_ready_weekly_body()
 
 # =========================
 # MAIN
@@ -1122,4 +1297,4 @@ if __name__ == "__main__":
     test_telegram_only()
     send_test_alert()
     test_live_manager()
-    test_performance_summary()
+    test_reports()
