@@ -28,7 +28,7 @@ jobs:
       - name: Create fallback state file if missing
         run: |
           if [ ! -f elite_state.json ]; then
-            echo '{"last_alert_times": {}, "last_daily_levels_date": "", "last_market_snapshot": {}, "fill_history": []}' > elite_state.json
+            echo '{"last_alert_times": {}, "last_daily_levels_date": "", "last_market_snapshot": {}}' > elite_state.json
           fi
 
       - name: Install dependencies
@@ -45,29 +45,31 @@ jobs:
           OIL_SYMBOL: ${{ secrets.OIL_SYMBOL }}
           VOLATILITY_SYMBOL: ${{ secrets.VOLATILITY_SYMBOL }}
 
-          POLL_SECONDS: ${{ secrets.POLL_SECONDS }}
           STATE_FILE: elite_state.json
+          DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
+          ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
+          DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
 
           TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
           DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED }}
-          DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
-          DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
-          DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
 
-          ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
-          DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
-          DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
+          # FREE ALERTS CHANNEL (B / C trade alerts)
+          DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
+
+          # PREMIUM DAILY LEVELS CHANNEL (A / A+ trade alerts)
+          DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
+
+          # FREE DAILY LEVELS CHANNEL (plain levels post only)
+          DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
 
           PREMIUM_MIN_GRADE: ${{ secrets.PREMIUM_MIN_GRADE }}
           FREE_MIN_GRADE: ${{ secrets.FREE_MIN_GRADE }}
-          SEND_SUB_A_TO_PREMIUM: ${{ secrets.SEND_SUB_A_TO_PREMIUM }}
-
           MIN_SCORE_FOR_FREE: ${{ secrets.MIN_SCORE_FOR_FREE }}
           MIN_SCORE_FOR_PREMIUM: ${{ secrets.MIN_SCORE_FOR_PREMIUM }}
-          MIN_VOLUME_BIAS_SCORE: ${{ secrets.MIN_VOLUME_BIAS_SCORE }}
+
           OIL_IMPACT_THRESHOLD: ${{ secrets.OIL_IMPACT_THRESHOLD }}
           PRICE_CHANGE_THRESHOLD_PCT: ${{ secrets.PRICE_CHANGE_THRESHOLD_PCT }}
           VWAP_DISTANCE_THRESHOLD_PCT: ${{ secrets.VWAP_DISTANCE_THRESHOLD_PCT }}
