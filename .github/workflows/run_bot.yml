@@ -1,102 +1,88 @@
-name: UnBiased Trading Bot
+name: Elite Engine
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 13-20 * * 1-5"
-
-permissions:
-  contents: write
+    - cron: "*/5 * * * 1-5"
 
 jobs:
-  run-bot:
+  run-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      # DATA + ALERTS
-      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-      DISCORD_WEBHOOK_FREE: ${{ secrets.DISCORD_WEBHOOK_FREE }}
-      DISCORD_WEBHOOK_EXECUTION: ${{ secrets.DISCORD_WEBHOOK_EXECUTION }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-      # ALPACA
-      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
-
-      # CORE BOT CONTROL
-      LIVE_TRADING: "true"
-      RUN_ONCE: "true"
-      POLL_SECONDS: "60"
-      WATCHLIST: "QQQ,SPY"
-
-      # EXECUTION ENGINE
-      A_PLUS_ONLY_MODE: "false"
-      ALLOW_B_MICRO_SIZE: "true"
-      DEFAULT_ORDER_QTY: "1"
-      B_MICRO_QTY: "1"
-      CHASE_DISTANCE_PCT: "0.15"
-      MIN_RSI_CALL: "55"
-      MAX_RSI_PUT: "45"
-      MIN_CONFIDENCE: "0.75"
-
-      # ELITE RISK / MANAGEMENT
-      MAX_OPEN_TRADES: "2"
-      MAX_NEW_TRADES_PER_DAY: "4"
-      ENTRY_CUTOFF_HOUR_ET: "15"
-      ENTRY_CUTOFF_MINUTE_ET: "0"
-      FORCE_EXIT_HOUR_ET: "15"
-      FORCE_EXIT_MINUTE_ET: "45"
-      CALL_TP_UNDERLYING_PCT: "0.35"
-      CALL_SL_UNDERLYING_PCT: "0.20"
-      PUT_TP_UNDERLYING_PCT: "0.35"
-      PUT_SL_UNDERLYING_PCT: "0.20"
-      BREAK_EVEN_TRIGGER_PCT: "0.20"
-      MAX_HOLD_MINUTES: "120"
-      COOLDOWN_MINUTES: "20"
-
-      # FILES
-      OPEN_TRADES_FILE: "open_trades.json"
-      TRADE_LOG_FILE: "trade_log.csv"
-
-      # OPTIONS / PRICING ENGINE
-      OPTIONS_DTE_FALLBACK_DAYS: "5"
-      OPTIONS_STRIKE_STEP_BUFFER: "0.0"
-      OPTION_QUOTE_FEED: "indicative"
-      MAX_OPTION_SPREAD_ABS: "0.30"
-      MAX_OPTION_SPREAD_PCT: "20"
-      BUY_LIMIT_SPREAD_FACTOR: "0.85"
-      SELL_LIMIT_SPREAD_FACTOR: "0.15"
-      MIN_OPTION_ASK: "0.05"
-      MIN_OPTION_BID: "0.01"
-      ALLOW_MARKET_ORDERS_DURING_RTH: "false"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Restore prior state file
+        uses: actions/download-artifact@v4
+        with:
+          name: elite-state
+          path: .
+        continue-on-error: true
+
+      - name: Create fallback state file if missing
+        run: |
+          if [ ! -f elite_state.json ]; then
+            echo '{"last_alert_times": {}, "last_daily_levels_date": "", "last_market_snapshot": {}, "fill_history": []}' > elite_state.json
+          fi
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests alpaca-py
+          pip install requests
 
-      - name: Run pricing engine
+      - name: Run elite engine
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+
+          PRIMARY_SYMBOL: ${{ secrets.PRIMARY_SYMBOL }}
+          SECONDARY_SYMBOL: ${{ secrets.SECONDARY_SYMBOL }}
+          OIL_SYMBOL: ${{ secrets.OIL_SYMBOL }}
+          VOLATILITY_SYMBOL: ${{ secrets.VOLATILITY_SYMBOL }}
+
+          POLL_SECONDS: ${{ secrets.POLL_SECONDS }}
+          STATE_FILE: elite_state.json
+
+          TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED }}
+          DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
+          DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
+          DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
+
+          ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
+          DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
+          DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
+
+          PREMIUM_MIN_GRADE: ${{ secrets.PREMIUM_MIN_GRADE }}
+          FREE_MIN_GRADE: ${{ secrets.FREE_MIN_GRADE }}
+          SEND_SUB_A_TO_PREMIUM: ${{ secrets.SEND_SUB_A_TO_PREMIUM }}
+
+          MIN_SCORE_FOR_FREE: ${{ secrets.MIN_SCORE_FOR_FREE }}
+          MIN_SCORE_FOR_PREMIUM: ${{ secrets.MIN_SCORE_FOR_PREMIUM }}
+          MIN_VOLUME_BIAS_SCORE: ${{ secrets.MIN_VOLUME_BIAS_SCORE }}
+          OIL_IMPACT_THRESHOLD: ${{ secrets.OIL_IMPACT_THRESHOLD }}
+          PRICE_CHANGE_THRESHOLD_PCT: ${{ secrets.PRICE_CHANGE_THRESHOLD_PCT }}
+          VWAP_DISTANCE_THRESHOLD_PCT: ${{ secrets.VWAP_DISTANCE_THRESHOLD_PCT }}
+
+          DAILY_LEVELS_ENABLED: ${{ secrets.DAILY_LEVELS_ENABLED }}
+          DAILY_LEVELS_ONLY_ONCE_PER_DAY: ${{ secrets.DAILY_LEVELS_ONLY_ONCE_PER_DAY }}
+
+          RISK_WARNING_TEXT: ${{ secrets.RISK_WARNING_TEXT }}
+          DEBUG: ${{ secrets.DEBUG }}
         run: |
           python main.py
 
-      - name: Commit state files
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add open_trades.json trade_log.csv || true
-          git diff --cached --quiet || git commit -m "Update execution engine state"
-          git push
+      - name: Upload updated state file
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elite-state
+          path: elite_state.json
