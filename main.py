@@ -3,6 +3,7 @@ import time
 import csv
 import requests
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, date, timedelta
@@ -20,8 +21,9 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+RUN_ONCE = os.getenv("RUN_ONCE", "true").lower() == "true"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-WATCHLIST = ["QQQ", "SPY"]
+WATCHLIST = [x.strip().upper() for x in os.getenv("WATCHLIST", "QQQ,SPY").split(",") if x.strip()]
 
 MIN_EXECUTION_GRADE = "A"
 GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "A+": 4}
@@ -47,9 +49,12 @@ MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))
 
 PNL_LOG_FILE = os.getenv("PNL_LOG_FILE", "trade_log.csv")
 
-# options contract selection
+# =========================================================
+# OPTIONS SETTINGS
+# =========================================================
 OPTIONS_DTE_FALLBACK_DAYS = int(os.getenv("OPTIONS_DTE_FALLBACK_DAYS", "5"))
 OPTIONS_STRIKE_STEP_BUFFER = float(os.getenv("OPTIONS_STRIKE_STEP_BUFFER", "0.0"))
+DEFAULT_OPTION_LIMIT_PRICE = float(os.getenv("DEFAULT_OPTION_LIMIT_PRICE", "1.00"))
 
 # =========================================================
 # OPTIONAL ALPACA IMPORT
@@ -59,13 +64,16 @@ alpaca_options_ready = False
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
+    from alpaca.trading.requests import (
+        MarketOrderRequest,
+        LimitOrderRequest,
+        GetOptionContractsRequest,
+    )
     from alpaca.trading.enums import (
         OrderSide,
         TimeInForce,
         ContractType,
         AssetStatus,
-        OrderClass,
     )
 
     if ALPACA_API_KEY and ALPACA_SECRET_KEY:
@@ -188,6 +196,18 @@ def safe_float(value, default=0.0) -> float:
 def passes_grade_threshold(grade: str, threshold: str) -> bool:
     return GRADE_ORDER.get(grade, 0) >= GRADE_ORDER.get(threshold, 0)
 
+
+def now_et() -> datetime:
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def is_regular_market_hours_et() -> bool:
+    current = now_et()
+    if current.weekday() > 4:
+        return False
+    current_minutes = current.hour * 60 + current.minute
+    return (9 * 60 + 30) <= current_minutes <= (16 * 60)
+
 # =========================================================
 # ALERTS
 # =========================================================
@@ -195,7 +215,7 @@ def send_discord(message: str) -> None:
     if not DISCORD_WEBHOOK_FREE:
         return
     try:
-        requests.post(DISCORD_WEBHOOK_FREE, json={"content": message}, timeout=10)
+        requests.post(DISCORD_WEBHOOK_FREE, json={"content": message}, timeout=12)
     except Exception as e:
         print(f"[DISCORD ERROR] {e}")
 
@@ -206,13 +226,13 @@ def send_telegram(message: str) -> None:
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, data=payload, timeout=10)
+        requests.post(url, data=payload, timeout=12)
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
 
 
 def broadcast(message: str) -> None:
-    print(message)
+    print(message, flush=True)
     send_discord(message)
     send_telegram(message)
 
@@ -243,7 +263,7 @@ def ensure_trade_log_exists() -> None:
             "order_id",
             "status",
             "pnl",
-            "broker_symbol"
+            "broker_symbol",
         ])
 
 
@@ -253,7 +273,7 @@ def log_trade_entry(plan: TradePlan, context: MarketContext, order_id: str = "",
     with open(PNL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().isoformat(),
+            now_et().isoformat(),
             context.symbol,
             plan.action,
             plan.grade,
@@ -269,7 +289,7 @@ def log_trade_entry(plan: TradePlan, context: MarketContext, order_id: str = "",
             order_id,
             "OPEN",
             "",
-            broker_symbol
+            broker_symbol,
         ])
 
 # =========================================================
@@ -380,7 +400,7 @@ def get_symbol_snapshot(symbol: str) -> Optional[Dict]:
             "bars": bars,
         }
     except Exception as e:
-        print(f"[SNAPSHOT ERROR] {symbol}: {e}")
+        print(f"[SNAPSHOT ERROR] {symbol}: {e}", flush=True)
         return None
 
 # =========================================================
@@ -390,21 +410,18 @@ def load_constituent_snapshots(etf_symbol: str) -> List[ConstituentSnapshot]:
     snapshots: List[ConstituentSnapshot] = []
 
     for item in ETF_CONSTITUENTS.get(etf_symbol, []):
-        symbol = item["symbol"]
-        weight = item["weight"]
-
-        data = get_symbol_snapshot(symbol)
+        data = get_symbol_snapshot(item["symbol"])
         if not data:
             continue
 
         snapshots.append(
             ConstituentSnapshot(
-                symbol=symbol,
+                symbol=item["symbol"],
                 price=safe_float(data["price"]),
                 vwap=safe_float(data["vwap"]),
                 change_pct=safe_float(data["change_pct"]),
                 volume_ratio=safe_float(data.get("volume_ratio", 1.0)),
-                weight=safe_float(weight),
+                weight=safe_float(item["weight"]),
             )
         )
 
@@ -609,8 +626,7 @@ def assign_execution_tier(plan: TradePlan, context: MarketContext) -> TradePlan:
         return plan
 
     if plan.grade == "B" and ALLOW_B_MICRO_SIZE:
-        high_volume_exception = context.volume_ratio >= 3.0
-        if high_volume_exception:
+        if context.volume_ratio >= 3.0:
             plan.execution_tier = "MICRO"
             plan.execution_qty = B_MICRO_QTY
         return plan
@@ -628,14 +644,10 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
     if plan.action == "BUY_CALL":
         if ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score += BULLISH_CONFIRM_BONUS
-            plan.reasons.append(
-                f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Constituent confirmation bullish. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
         elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(
-                f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Call setup weakened by bearish internals. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
         else:
             plan.score -= MIXED_PENALTY
             plan.reasons.append("Call setup has mixed internal participation.")
@@ -643,14 +655,10 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
     elif plan.action == "BUY_PUT":
         if ci.confirmation_bias == "BEARISH_CONFIRMATION":
             plan.score += BEARISH_CONFIRM_BONUS
-            plan.reasons.append(
-                f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Constituent confirmation bearish. Leaders down: {', '.join(ci.leaders_down[:5]) or 'none'}.")
         elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
             plan.score -= CONFLICT_PENALTY
-            plan.reasons.append(
-                f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}."
-            )
+            plan.reasons.append(f"Put setup weakened by bullish internals. Leaders up: {', '.join(ci.leaders_up[:5]) or 'none'}.")
         else:
             plan.score -= MIXED_PENALTY
             plan.reasons.append("Put setup has mixed internal participation.")
@@ -742,8 +750,8 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
 # =========================================================
 # OPTIONS CONTRACT PICKER
 # =========================================================
-def _get_candidate_expirations() -> List[date]:
-    today = date.today()
+def candidate_expirations() -> List[date]:
+    today = now_et().date()
     return [today + timedelta(days=i) for i in range(OPTIONS_DTE_FALLBACK_DAYS + 1)]
 
 
@@ -758,9 +766,7 @@ def pick_option_contract(underlying: str, action: str, underlying_price: float):
     else:
         return None
 
-    expirations = _get_candidate_expirations()
-
-    for exp in expirations:
+    for exp in candidate_expirations():
         try:
             req = GetOptionContractsRequest(
                 underlying_symbols=[underlying],
@@ -775,30 +781,33 @@ def pick_option_contract(underlying: str, action: str, underlying_price: float):
             if not contracts:
                 continue
 
-            valid_contracts = []
-            for c in contracts:
-                strike = safe_float(getattr(c, "strike_price", 0.0))
-                if strike <= 0:
+            ranked = []
+            for contract in contracts:
+                strike = safe_float(getattr(contract, "strike_price", 0.0))
+                symbol = getattr(contract, "symbol", "")
+                if strike <= 0 or not symbol:
                     continue
 
-                # bullish: prefer near ATM / slightly OTM calls
                 if action == "BUY_CALL":
-                    distance = abs((strike - (underlying_price + OPTIONS_STRIKE_STEP_BUFFER)))
+                    target = underlying_price + OPTIONS_STRIKE_STEP_BUFFER
                 else:
-                    distance = abs((strike - (underlying_price - OPTIONS_STRIKE_STEP_BUFFER)))
+                    target = underlying_price - OPTIONS_STRIKE_STEP_BUFFER
 
-                valid_contracts.append((distance, c))
+                distance = abs(strike - target)
+                ranked.append((distance, contract))
 
-            if not valid_contracts:
-                continue
-
-            valid_contracts.sort(key=lambda x: x[0])
-            return valid_contracts[0][1]
+            if ranked:
+                ranked.sort(key=lambda x: x[0])
+                return ranked[0][1]
 
         except Exception as e:
-            print(f"[OPTION PICKER WARN] {underlying} {action} {exp}: {e}")
+            print(f"[OPTION PICKER WARN] {underlying} {action} {exp}: {e}", flush=True)
 
     return None
+
+
+def estimate_option_limit_price() -> float:
+    return max(0.01, round(DEFAULT_OPTION_LIMIT_PRICE, 2))
 
 # =========================================================
 # ALPACA EXECUTION
@@ -807,7 +816,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
     qty = max(0, int(plan.execution_qty))
 
     if qty <= 0:
-        print(f"[SKIP] Zero quantity for {context.symbol}")
+        print(f"[SKIP] Zero quantity for {context.symbol}", flush=True)
         return
 
     if not LIVE_TRADING:
@@ -815,15 +824,13 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
             f"[PAPER MODE LOCAL] {plan.action} {context.symbol} | "
             f"Grade {plan.grade} | Score {plan.score} | Tier {plan.execution_tier} | Qty {qty}"
         )
-        print(msg)
+        print(msg, flush=True)
         log_trade_entry(plan, context, "PAPER_LOCAL", context.symbol)
         return
 
     if alpaca_client is None:
         msg = "❌ LIVE_TRADING is ON but Alpaca is not connected."
-        print(msg)
-        send_telegram(msg)
-        send_discord(msg)
+        broadcast(msg)
         return
 
     try:
@@ -835,9 +842,7 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
 
         if contract is None:
             msg = f"❌ No option contract found for {context.symbol} {plan.action}"
-            print(msg)
-            send_telegram(msg)
-            send_discord(msg)
+            broadcast(msg)
             return
 
         option_symbol = getattr(contract, "symbol", None)
@@ -846,20 +851,31 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
 
         if not option_symbol:
             msg = f"❌ Contract object missing symbol for {context.symbol} {plan.action}"
-            print(msg)
-            send_telegram(msg)
-            send_discord(msg)
+            broadcast(msg)
             return
 
-        # Long call or long put = BUY the option contract
         order_side = OrderSide.BUY
 
-        order_request = MarketOrderRequest(
-            symbol=option_symbol,
-            qty=qty,
-            side=order_side,
-            time_in_force=TimeInForce.DAY,
-        )
+        if is_regular_market_hours_et():
+            order_request = MarketOrderRequest(
+                symbol=option_symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+            )
+            order_type_used = "MARKET"
+            limit_price_used = None
+        else:
+            limit_price = estimate_option_limit_price()
+            order_request = LimitOrderRequest(
+                symbol=option_symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+            )
+            order_type_used = "LIMIT"
+            limit_price_used = limit_price
 
         order = alpaca_client.submit_order(order_data=order_request)
 
@@ -870,6 +886,8 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
             f"Action: {plan.action}\n"
             f"Side: {order_side.value}\n"
             f"Qty: {qty}\n"
+            f"Order Type: {order_type_used}\n"
+            f"Limit Price: {limit_price_used if limit_price_used is not None else 'N/A'}\n"
             f"Strike: {strike_price}\n"
             f"Expiry: {expiration_date}\n"
             f"Grade: {plan.grade}\n"
@@ -878,17 +896,12 @@ def execute_trade(plan: TradePlan, context: MarketContext) -> None:
             f"Broker Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
             f"Order ID: {order.id}"
         )
-        print(msg)
-        send_telegram(msg)
-        send_discord(msg)
-
+        broadcast(msg)
         log_trade_entry(plan, context, str(order.id), option_symbol)
 
     except Exception as e:
         err = f"❌ ALPACA OPTION ORDER FAILED: {e}"
-        print(err)
-        send_telegram(err)
-        send_discord(err)
+        broadcast(err)
 
 # =========================================================
 # ALERT FORMAT
@@ -907,11 +920,11 @@ def build_constituent_summary_for_alert(context: MarketContext) -> str:
 
 def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: List[str]) -> str:
     emoji = "🟢" if plan.action == "BUY_CALL" else "🔴" if plan.action == "BUY_PUT" else "⚪"
-    now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+    timestamp = now_et().strftime("%Y-%m-%d %I:%M:%S %p ET")
 
     lines = [
         f"{emoji} {context.symbol} FRAMEWORK UPDATE",
-        f"Time: {now_str}",
+        f"Time: {timestamp}",
         f"Price: {context.current_price:.2f}",
         f"VWAP: {context.vwap:.2f}",
         f"RSI: {context.rsi:.1f}",
@@ -942,23 +955,28 @@ def build_alert(plan: TradePlan, context: MarketContext, status: str, notes: Lis
     return "\n".join(lines)
 
 # =========================================================
-# MAIN LOOP
+# MAIN
 # =========================================================
 def run_symbol(symbol: str) -> None:
     context = build_market_context(symbol)
     if not context:
-        print(f"[WARN] Could not build context for {symbol}")
+        print(f"[WARN] Could not build context for {symbol}", flush=True)
         return
 
     plan = make_hybrid_decision(context)
     plan = apply_constituent_confirmation(context, plan)
     status, notes = execution_filter(plan, context)
 
-    message = build_alert(plan, context, status, notes)
-    broadcast(message)
+    broadcast(build_alert(plan, context, status, notes))
 
     if status == "EXECUTE":
         execute_trade(plan, context)
+
+
+def run_cycle() -> None:
+    for symbol in WATCHLIST:
+        run_symbol(symbol)
+        time.sleep(2)
 
 
 def main() -> None:
@@ -973,6 +991,7 @@ def main() -> None:
         f"Alpaca Options Ready: {alpaca_options_ready}\n"
         f"A_PLUS_ONLY_MODE: {A_PLUS_ONLY_MODE}\n"
         f"ALLOW_B_MICRO_SIZE: {ALLOW_B_MICRO_SIZE}\n"
+        f"RUN_ONCE: {RUN_ONCE}\n"
         f"Discord Free Connected: {bool(DISCORD_WEBHOOK_FREE)}"
     )
     broadcast(startup)
@@ -980,32 +999,24 @@ def main() -> None:
     if alpaca_client is not None:
         try:
             account = alpaca_client.get_account()
-            msg = (
-                f"✅ ALPACA CONNECTION OK\n"
+            broadcast(
+                "✅ ALPACA CONNECTION OK\n"
                 f"Status: {account.status}\n"
                 f"Buying Power: {account.buying_power}\n"
                 f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}"
             )
-            print(msg)
-            send_telegram(msg)
-            send_discord(msg)
         except Exception as e:
-            err = f"❌ ALPACA CONNECTION FAILED: {e}"
-            print(err)
-            send_telegram(err)
-            send_discord(err)
+            broadcast(f"❌ ALPACA CONNECTION FAILED: {e}")
+
+    if RUN_ONCE:
+        run_cycle()
+        return
 
     while True:
         try:
-            for symbol in WATCHLIST:
-                run_symbol(symbol)
-                time.sleep(2)
+            run_cycle()
         except Exception as e:
-            err = f"❌ MAIN LOOP ERROR: {e}"
-            print(err)
-            send_telegram(err)
-            send_discord(err)
-
+            broadcast(f"❌ MAIN LOOP ERROR: {e}")
         time.sleep(POLL_SECONDS)
 
 
