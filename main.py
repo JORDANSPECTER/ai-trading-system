@@ -11,6 +11,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM")
 DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE")
 
+# =========================
+# GLOBAL TRADE STORE
+# =========================
+OPEN_TRADES = {}
 
 # =========================
 # SEND FUNCTIONS
@@ -18,17 +22,20 @@ DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE")
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured")
+        print("TELEGRAM_TOKEN exists:", bool(TELEGRAM_TOKEN))
+        print("TELEGRAM_CHAT_ID exists:", bool(TELEGRAM_CHAT_ID))
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
+        "text": message
     }
 
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        print("Telegram status:", r.status_code)
+        print("Telegram response:", r.text)
     except Exception as e:
         print(f"Telegram send failed: {e}")
 
@@ -37,9 +44,9 @@ def send_discord(webhook, message):
     if not webhook:
         print("Discord webhook missing")
         return
-
     try:
-        requests.post(webhook, json={"content": message}, timeout=10)
+        r = requests.post(webhook, json={"content": message}, timeout=10)
+        print("Discord status:", r.status_code)
     except Exception as e:
         print(f"Discord send failed: {e}")
 
@@ -50,7 +57,6 @@ def send_discord_premium(message):
 
 def send_discord_free(message):
     send_discord(DISCORD_WEBHOOK_FREE, message)
-
 
 # =========================
 # HELPERS
@@ -66,17 +72,34 @@ def fmt_price(x):
         return str(x)
 
 
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def pct_change(entry, current):
+    try:
+        entry = float(entry)
+        current = float(current)
+        if entry == 0:
+            return 0.0
+        return ((current - entry) / entry) * 100
+    except Exception:
+        return 0.0
+
 # =========================
 # STATE 4 - ENTRY DISCIPLINE
 # =========================
 def evaluate_entry_timing(decision, context):
-    current_price = float(get_attr(context, "current_price", 0.0) or 0.0)
-    trigger_level = float(get_attr(context, "trigger_level", current_price) or current_price)
+    current_price = safe_float(get_attr(context, "current_price", 0.0))
+    trigger_level = safe_float(get_attr(context, "trigger_level", current_price))
 
-    entry_zone_high = float(get_attr(context, "entry_zone_high", trigger_level) or trigger_level)
-    entry_zone_low = float(get_attr(context, "entry_zone_low", trigger_level) or trigger_level)
-    atr_push = float(get_attr(context, "atr_push", 0.0) or 0.0)
-    extension_pct = float(get_attr(context, "extension_pct", 0.0) or 0.0)
+    entry_zone_high = safe_float(get_attr(context, "entry_zone_high", trigger_level))
+    entry_zone_low = safe_float(get_attr(context, "entry_zone_low", trigger_level))
+    atr_push = safe_float(get_attr(context, "atr_push", 0.0))
+    extension_pct = safe_float(get_attr(context, "extension_pct", 0.0))
     bars_since_breakout = int(get_attr(context, "bars_since_breakout", 0) or 0)
     momentum_confirmed = bool(get_attr(context, "momentum_confirmed", False))
     retest_hold = bool(get_attr(context, "retest_hold", False))
@@ -85,9 +108,8 @@ def evaluate_entry_timing(decision, context):
     above_vwap = bool(get_attr(context, "above_vwap", False))
     below_vwap = bool(get_attr(context, "below_vwap", False))
 
-    if trigger_level == 0:
-        distance_from_trigger_pct = 0.0
-    else:
+    distance_from_trigger_pct = 0.0
+    if trigger_level != 0:
         distance_from_trigger_pct = abs(current_price - trigger_level) / abs(trigger_level) * 100
 
     if entry_zone_high == entry_zone_low == trigger_level:
@@ -99,19 +121,14 @@ def evaluate_entry_timing(decision, context):
 
     if not within_entry_zone:
         chasing_reasons.append("Price is outside preferred entry zone.")
-
     if distance_from_trigger_pct > 0.35:
         chasing_reasons.append(f"Price is extended {distance_from_trigger_pct:.2f}% from trigger.")
-
     if extension_pct > 0.40:
         chasing_reasons.append(f"Extension is elevated at {extension_pct:.2f}%.")
-
     if bars_since_breakout >= 3 and not retest_hold:
         chasing_reasons.append(f"Entry is late: {bars_since_breakout} bars after breakout without clean retest.")
-
     if atr_push > 0.35:
         chasing_reasons.append(f"Move already expanded {atr_push:.2f} ATR from trigger.")
-
     if not near_key_level:
         chasing_reasons.append("Price is no longer near the key decision level.")
 
@@ -128,22 +145,11 @@ def evaluate_entry_timing(decision, context):
     directional_alignment = above_vwap or below_vwap
 
     premium_execution_allowed = (
-        not is_chasing
-        and directional_alignment
-        and (
-            retest_hold
-            or (breakout_with_volume and momentum_confirmed)
-        )
+        not is_chasing and directional_alignment and (retest_hold or (breakout_with_volume and momentum_confirmed))
     )
 
     b_grade_execution_allowed = (
-        not is_chasing
-        and momentum_confirmed
-        and directional_alignment
-        and (
-            retest_hold
-            or breakout_with_volume
-        )
+        not is_chasing and momentum_confirmed and directional_alignment and (retest_hold or breakout_with_volume)
     )
 
     return {
@@ -182,7 +188,6 @@ def apply_state_4_discipline(decision, context):
         "timing": timing,
         "reasons": reasons
     }
-
 
 # =========================
 # STATE 5 - SIZE ENGINE
@@ -236,7 +241,6 @@ def calculate_confidence_and_size(decision, context, discipline):
         confidence_score += 12
     if above_vwap or below_vwap:
         confidence_score += 8
-
     if near_key_level:
         confidence_score += 8
     else:
@@ -270,7 +274,6 @@ def calculate_confidence_and_size(decision, context, discipline):
         risk_multiplier = 0.00
 
     size_notes = []
-
     if size_label == "AGGRESSIVE":
         size_notes.append("Multiple conditions are aligned.")
         size_notes.append("Timing is clean enough for higher conviction sizing.")
@@ -289,13 +292,12 @@ def calculate_confidence_and_size(decision, context, discipline):
         "size_notes": size_notes
     }
 
-
 # =========================
 # STATE 6 - STOP + SCALE OUT ENGINE
 # =========================
 def build_trade_management_plan(decision, context, discipline, sizing):
-    current_price = float(get_attr(context, "current_price", 0.0) or 0.0)
-    trigger_level = float(get_attr(context, "trigger_level", current_price) or current_price)
+    current_price = safe_float(get_attr(context, "current_price", 0.0))
+    trigger_level = safe_float(get_attr(context, "trigger_level", current_price))
 
     direction = get_attr(context, "direction", None)
     if not direction:
@@ -310,7 +312,7 @@ def build_trade_management_plan(decision, context, discipline, sizing):
     support_2 = get_attr(context, "support_2", None)
     resistance_1 = get_attr(context, "resistance_1", None)
     resistance_2 = get_attr(context, "resistance_2", None)
-    atr_push = float(get_attr(context, "atr_push", 0.20) or 0.20)
+    atr_push = safe_float(get_attr(context, "atr_push", 0.20), 0.20)
 
     entry_reference = trigger_level if trigger_level else current_price
 
@@ -331,46 +333,23 @@ def build_trade_management_plan(decision, context, discipline, sizing):
     execution_grade = discipline["execution_grade"]
 
     if size_label == "AGGRESSIVE":
-        trim_plan = [
-            "Take 25% off at Trim 1",
-            "Take 35% off at Trim 2",
-            "Leave 40% for runner"
-        ]
+        trim_plan = ["Take 25% off at Trim 1", "Take 35% off at Trim 2", "Leave 40% for runner"]
     elif size_label == "NORMAL":
-        trim_plan = [
-            "Take 33% off at Trim 1",
-            "Take 33% off at Trim 2",
-            "Leave 34% for runner"
-        ]
+        trim_plan = ["Take 33% off at Trim 1", "Take 33% off at Trim 2", "Leave 34% for runner"]
     elif size_label == "SMALL":
-        trim_plan = [
-            "Take 50% off at Trim 1",
-            "Take 30% off at Trim 2",
-            "Leave 20% for runner"
-        ]
+        trim_plan = ["Take 50% off at Trim 1", "Take 30% off at Trim 2", "Leave 20% for runner"]
     else:
-        trim_plan = [
-            "No execution plan active",
-            "Wait for better location",
-            "Do not force a position here"
-        ]
+        trim_plan = ["No execution plan active", "Wait for better location", "Do not force a position here"]
 
     move_stop_rule = f"Move stop to breakeven once price reaches {fmt_price(breakeven_trigger)}."
 
     management_notes = []
-
     if execution_grade == "WATCHLIST":
         management_notes.append("Execution downgraded to watchlist. Management plan is informational only.")
-
     if discipline["timing"]["is_chasing"]:
         management_notes.append("Late/chasing conditions detected. Avoid forcing entry.")
     else:
         management_notes.append("Entry timing is acceptable for structured trade management.")
-
-    if direction == "LONG":
-        management_notes.append("Bias remains valid while price holds above invalidation.")
-    else:
-        management_notes.append("Bias remains valid while price stays below invalidation.")
 
     return {
         "direction": direction,
@@ -385,7 +364,6 @@ def build_trade_management_plan(decision, context, discipline, sizing):
         "management_notes": management_notes
     }
 
-
 # =========================
 # STATE 7 - OPTIONS CONTRACT ENGINE
 # =========================
@@ -398,18 +376,17 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
     timing_label = discipline["timing"]["timing_label"]
 
     dte = int(get_attr(context, "dte", 0) or 0)
-    option_spread_pct = float(get_attr(context, "option_spread_pct", 0.0) or 0.0)
+    option_spread_pct = safe_float(get_attr(context, "option_spread_pct", 0.0))
     option_volume_ok = bool(get_attr(context, "option_volume_ok", True))
     option_open_interest_ok = bool(get_attr(context, "option_open_interest_ok", True))
     iv_is_elevated = bool(get_attr(context, "iv_is_elevated", False))
     fast_move_expected = bool(get_attr(context, "fast_move_expected", True))
-    contract_price = float(get_attr(context, "contract_price", 0.0) or 0.0)
+    contract_price = safe_float(get_attr(context, "contract_price", 0.0))
     contract_delta = get_attr(context, "contract_delta", None)
 
     reasons = []
     blockers = []
 
-    # Liquidity checks
     if option_spread_pct > 12:
         blockers.append(f"Option spread too wide at {option_spread_pct:.1f}%.")
     if not option_volume_ok:
@@ -434,7 +411,6 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
     if blockers:
         options_execution_allowed = False
 
-    # Contract style logic
     if confidence_score >= 85 and timing_label in ["IDEAL", "RETEST"] and fast_move_expected and not iv_is_elevated:
         contract_style = "AGGRESSIVE"
         moneyness = "SLIGHT OTM"
@@ -451,7 +427,6 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
         expiry_guidance = "Prefer next expiry over 0DTE."
         reasons.append("Safer contract profile is preferred due to lower conviction or weaker timing.")
 
-    # Extra protection against cheap lottery behavior
     if iv_is_elevated and contract_style == "AGGRESSIVE":
         contract_style = "BALANCED"
         moneyness = "ATM"
@@ -484,7 +459,7 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
                 preferred_delta = "0.25 to 0.45"
             reasons.append(f"Current observed delta: {delta_val:.2f}. Preferred delta zone: {preferred_delta}.")
         except Exception:
-            pass
+            preferred_delta = "0.40 to 0.60"
     else:
         if contract_style == "SAFE":
             preferred_delta = "0.55 to 0.70"
@@ -515,6 +490,111 @@ def build_options_contract_plan(decision, context, discipline, sizing, managemen
         "blockers": blockers
     }
 
+# =========================
+# STATE 8 - LIVE TRADE MANAGER
+# =========================
+def register_open_trade(symbol, context, discipline, sizing, management, options_plan):
+    OPEN_TRADES[symbol] = {
+        "symbol": symbol,
+        "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "direction": management["direction"],
+        "entry_underlying": safe_float(get_attr(context, "current_price", 0.0)),
+        "entry_contract_price": safe_float(get_attr(context, "contract_price", 0.0)),
+        "execution_grade": discipline["execution_grade"],
+        "confidence_score": sizing["confidence_score"],
+        "size_label": sizing["size_label"],
+        "trim_1": management["trim_1"],
+        "trim_2": management["trim_2"],
+        "runner_target": management["runner_target"],
+        "breakeven_trigger": management["breakeven_trigger"],
+        "invalidation": management["invalidation"],
+        "trim_1_hit": False,
+        "trim_2_hit": False,
+        "runner_hit": False,
+        "breakeven_sent": False,
+        "closed": False,
+    }
+
+
+def evaluate_open_trade(symbol, current_underlying_price, current_contract_price=None):
+    if symbol not in OPEN_TRADES:
+        print(f"No open trade tracked for {symbol}")
+        return None
+
+    trade = OPEN_TRADES[symbol]
+    if trade["closed"]:
+        print(f"Trade for {symbol} already closed")
+        return None
+
+    direction = trade["direction"]
+    entry_underlying = trade["entry_underlying"]
+    entry_contract = trade["entry_contract_price"]
+
+    current_underlying_price = safe_float(current_underlying_price)
+    current_contract_price = safe_float(current_contract_price, entry_contract)
+
+    if direction == "LONG":
+        underlying_pnl_pct = pct_change(entry_underlying, current_underlying_price)
+    else:
+        underlying_pnl_pct = pct_change(entry_underlying, current_underlying_price) * -1
+
+    contract_pnl_pct = 0.0
+    if entry_contract > 0:
+        contract_pnl_pct = pct_change(entry_contract, current_contract_price)
+
+    alerts = []
+
+    if direction == "LONG":
+        if (not trade["trim_1_hit"]) and current_underlying_price >= trade["trim_1"]:
+            trade["trim_1_hit"] = True
+            alerts.append(f"✅ {symbol} Trim 1 hit at {fmt_price(trade['trim_1'])}")
+        if (not trade["trim_2_hit"]) and current_underlying_price >= trade["trim_2"]:
+            trade["trim_2_hit"] = True
+            alerts.append(f"✅ {symbol} Trim 2 hit at {fmt_price(trade['trim_2'])}")
+        if (not trade["runner_hit"]) and current_underlying_price >= trade["runner_target"]:
+            trade["runner_hit"] = True
+            alerts.append(f"🏁 {symbol} Runner target hit at {fmt_price(trade['runner_target'])}")
+        if (not trade["breakeven_sent"]) and current_underlying_price >= trade["breakeven_trigger"]:
+            trade["breakeven_sent"] = True
+            alerts.append(f"🛡️ {symbol} Move stop to breakeven now")
+        if current_underlying_price <= trade["invalidation"]:
+            alerts.append(f"❌ {symbol} invalidation lost at {fmt_price(trade['invalidation'])}")
+            trade["closed"] = True
+    else:
+        if (not trade["trim_1_hit"]) and current_underlying_price <= trade["trim_1"]:
+            trade["trim_1_hit"] = True
+            alerts.append(f"✅ {symbol} Trim 1 hit at {fmt_price(trade['trim_1'])}")
+        if (not trade["trim_2_hit"]) and current_underlying_price <= trade["trim_2"]:
+            trade["trim_2_hit"] = True
+            alerts.append(f"✅ {symbol} Trim 2 hit at {fmt_price(trade['trim_2'])}")
+        if (not trade["runner_hit"]) and current_underlying_price <= trade["runner_target"]:
+            trade["runner_hit"] = True
+            alerts.append(f"🏁 {symbol} Runner target hit at {fmt_price(trade['runner_target'])}")
+        if (not trade["breakeven_sent"]) and current_underlying_price <= trade["breakeven_trigger"]:
+            trade["breakeven_sent"] = True
+            alerts.append(f"🛡️ {symbol} Move stop to breakeven now")
+        if current_underlying_price >= trade["invalidation"]:
+            alerts.append(f"❌ {symbol} invalidation lost at {fmt_price(trade['invalidation'])}")
+            trade["closed"] = True
+
+    summary = {
+        "symbol": symbol,
+        "direction": direction,
+        "entry_underlying": entry_underlying,
+        "current_underlying": current_underlying_price,
+        "underlying_pnl_pct": round(underlying_pnl_pct, 2),
+        "entry_contract": entry_contract,
+        "current_contract": current_contract_price,
+        "contract_pnl_pct": round(contract_pnl_pct, 2),
+        "alerts": alerts,
+        "trim_1_hit": trade["trim_1_hit"],
+        "trim_2_hit": trade["trim_2_hit"],
+        "runner_hit": trade["runner_hit"],
+        "breakeven_sent": trade["breakeven_sent"],
+        "closed": trade["closed"],
+    }
+
+    return summary
 
 # =========================
 # FORMATTERS
@@ -699,6 +779,37 @@ This is informational, not confirmed execution.
 """.strip()
 
 
+def format_live_management_update(summary):
+    lines = [
+        f"📈 LIVE TRADE UPDATE — {summary['symbol']}",
+        f"Direction: {summary['direction']}",
+        f"Underlying Entry: {fmt_price(summary['entry_underlying'])}",
+        f"Underlying Now: {fmt_price(summary['current_underlying'])}",
+        f"Underlying PnL: {summary['underlying_pnl_pct']}%",
+    ]
+
+    if summary["entry_contract"] > 0:
+        lines.extend([
+            f"Contract Entry: {fmt_price(summary['entry_contract'])}",
+            f"Contract Now: {fmt_price(summary['current_contract'])}",
+            f"Contract PnL: {summary['contract_pnl_pct']}%",
+        ])
+
+    lines.append("")
+    lines.append("Status:")
+    lines.append(f"- Trim 1 hit: {summary['trim_1_hit']}")
+    lines.append(f"- Trim 2 hit: {summary['trim_2_hit']}")
+    lines.append(f"- Runner hit: {summary['runner_hit']}")
+    lines.append(f"- Breakeven sent: {summary['breakeven_sent']}")
+    lines.append(f"- Closed: {summary['closed']}")
+
+    if summary["alerts"]:
+        lines.append("")
+        lines.append("Triggered Alerts:")
+        lines.extend([f"- {a}" for a in summary["alerts"]])
+
+    return "\n".join(lines)
+
 # =========================
 # ROUTING LOGIC
 # =========================
@@ -712,7 +823,16 @@ def route_alerts(decision, context):
     size_label = sizing["size_label"]
     options_allowed = options_plan["options_execution_allowed"]
 
+    print("=== ROUTE DEBUG ===")
+    print("execution_grade:", execution_grade)
+    print("size_label:", size_label)
+    print("options_allowed:", options_allowed)
+    print("===================")
+
+    symbol = str(get_attr(context, "symbol", "QQQ")).upper()
+
     if execution_grade in ["A+", "A"] and size_label in ["AGGRESSIVE", "NORMAL"] and options_allowed:
+        register_open_trade(symbol, context, discipline, sizing, management, options_plan)
         send_telegram(format_telegram_alert(decision, context, discipline, sizing, management, options_plan))
         send_discord_premium(format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan))
         send_discord_free(format_discord_free_teaser(decision, context, discipline, sizing))
@@ -726,12 +846,27 @@ def route_alerts(decision, context):
         send_discord_free(format_discord_educational_alert(decision, context, discipline, sizing, management, options_plan))
 
     elif execution_grade == "AVOID":
-        print(f"[AVOID] No alert sent for {context.symbol}")
-
+        print(f"[AVOID] No alert sent for {symbol}")
 
 # =========================
-# TEST FUNCTION
+# LIVE MANAGER ROUTE
 # =========================
+def send_live_trade_update(symbol, current_underlying_price, current_contract_price=None):
+    summary = evaluate_open_trade(symbol, current_underlying_price, current_contract_price)
+    if not summary:
+        return
+
+    msg = format_live_management_update(summary)
+    send_telegram(msg)
+    send_discord_premium(msg)
+
+# =========================
+# TESTS
+# =========================
+def test_telegram_only():
+    send_telegram("✅ UNBIASED BOT TELEGRAM TEST MESSAGE")
+
+
 def send_test_alert():
     class DummyDecision:
         grade = "A"
@@ -769,7 +904,6 @@ def send_test_alert():
         resistance_1 = 616.60
         resistance_2 = 617.15
 
-        # options inputs
         dte = 0
         option_spread_pct = 4.5
         option_volume_ok = True
@@ -784,8 +918,19 @@ def send_test_alert():
     route_alerts(decision, context)
 
 
+def test_live_manager():
+    send_live_trade_update("QQQ", 616.65, 1.92)
+    send_live_trade_update("QQQ", 617.18, 2.45)
+
 # =========================
 # MAIN
 # =========================
 if __name__ == "__main__":
+    # 1) direct telegram test
+    test_telegram_only()
+
+    # 2) entry alert test
     send_test_alert()
+
+    # 3) live management test
+    test_live_manager()
