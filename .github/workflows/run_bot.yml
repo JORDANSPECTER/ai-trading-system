@@ -3,58 +3,46 @@ name: UnBiased Trading Bot
 on:
   workflow_dispatch:
   schedule:
-    # Every 5 minutes during regular market hours, Monday-Friday
-    # 13:30-20:00 UTC = 9:30 AM - 4:00 PM Eastern during daylight savings
     - cron: "*/5 13-20 * * 1-5"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
 
     env:
-      # =========================
       # DATA + ALERTS
-      # =========================
       TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
       DISCORD_WEBHOOK_FREE: ${{ secrets.DISCORD_WEBHOOK_FREE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # =========================
       # ALPACA
-      # =========================
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
 
-      # =========================
       # CORE BOT CONTROL
-      # =========================
       LIVE_TRADING: "true"
+      RUN_ONCE: "true"
       POLL_SECONDS: "60"
+      WATCHLIST: "QQQ,SPY"
 
-      # =========================
       # EXECUTION ENGINE
-      # =========================
       A_PLUS_ONLY_MODE: "false"
       ALLOW_B_MICRO_SIZE: "true"
-
       DEFAULT_ORDER_QTY: "1"
       B_MICRO_QTY: "1"
-
       CHASE_DISTANCE_PCT: "0.15"
       MIN_RSI_CALL: "55"
       MAX_RSI_PUT: "45"
       MIN_CONFIDENCE: "0.75"
-
       PNL_LOG_FILE: "trade_log.csv"
 
-      # =========================
-      # OPTIONS CONTRACT PICKER
-      # =========================
+      # OPTIONS
       OPTIONS_DTE_FALLBACK_DAYS: "5"
       OPTIONS_STRIKE_STEP_BUFFER: "0.0"
+      DEFAULT_OPTION_LIMIT_PRICE: "1.00"
 
     steps:
       - name: Checkout repository
