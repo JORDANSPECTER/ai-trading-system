@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       bot_mode:
-        description: "Choose mode (trade_alert, live_update, daily_report, weekly_report, dashboard, test_all)"
+        description: "Choose mode (trade_alert, live_update, daily_report, weekly_report, dashboard, email_weekly, test_all)"
         required: false
         default: "test_all"
 
@@ -28,6 +28,10 @@ jobs:
       DISCORD_WEBHOOK_PREMIUM: ${{ secrets.DISCORD_WEBHOOK_PREMIUM }}
       DISCORD_WEBHOOK_PREMIUM_LEVELS: ${{ secrets.DISCORD_WEBHOOK_PREMIUM_LEVELS }}
 
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -38,16 +42,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests matplotlib
 
       - name: Set BOT_MODE for scheduled runs
         run: |
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            if [[ "$(date +%u)" != "7" ]]; then
-              echo "BOT_MODE=daily_report" >> $GITHUB_ENV
-            fi
             if [[ "$(date +%u)" == "7" ]]; then
-              echo "BOT_MODE=weekly_report" >> $GITHUB_ENV
+              echo "BOT_MODE=email_weekly" >> $GITHUB_ENV
+            else
+              echo "BOT_MODE=daily_report" >> $GITHUB_ENV
             fi
           fi
 
