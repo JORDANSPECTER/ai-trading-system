@@ -11,7 +11,7 @@ from datetime import datetime
 # CONFIG
 # =========================================================
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -40,7 +40,7 @@ ALLOW_B_MICRO_SIZE = os.getenv("ALLOW_B_MICRO_SIZE", "true").lower() == "true"
 DEFAULT_ORDER_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
 B_MICRO_QTY = int(os.getenv("B_MICRO_QTY", "1"))
 
-CHASE_DISTANCE_PCT = float(os.getenv("CHASE_DISTANCE_PCT", "0.15"))   # percent distance from VWAP
+CHASE_DISTANCE_PCT = float(os.getenv("CHASE_DISTANCE_PCT", "0.15"))
 MIN_RSI_CALL = float(os.getenv("MIN_RSI_CALL", "55"))
 MAX_RSI_PUT = float(os.getenv("MAX_RSI_PUT", "45"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))
@@ -177,10 +177,10 @@ def passes_grade_threshold(grade: str, threshold: str) -> bool:
 # ALERTS
 # =========================================================
 def send_discord(message: str) -> None:
-    if not DISCORD_WEBHOOK_URL:
+    if not DISCORD_WEBHOOK_FREE:
         return
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        requests.post(DISCORD_WEBHOOK_FREE, json={"content": message}, timeout=10)
     except Exception as e:
         print(f"[DISCORD ERROR] {e}")
 
@@ -277,7 +277,7 @@ def fetch_twelve_time_series(symbol: str, interval: str = "1min", outputsize: in
     if "values" not in data:
         raise RuntimeError(f"Twelve Data error for {symbol}: {data}")
 
-    return list(reversed(data["values"]))  # oldest -> newest
+    return list(reversed(data["values"]))
 
 
 def compute_vwap_from_bars(bars: List[Dict]) -> float:
@@ -872,9 +872,28 @@ def main() -> None:
         f"Alpaca Connected: {alpaca_client is not None}\n"
         f"A_PLUS_ONLY_MODE: {A_PLUS_ONLY_MODE}\n"
         f"ALLOW_B_MICRO_SIZE: {ALLOW_B_MICRO_SIZE}\n"
-        "Execution engine upgraded."
+        "Execution engine upgraded.\n"
+        f"Discord Free Connected: {bool(DISCORD_WEBHOOK_FREE)}"
     )
     broadcast(startup)
+
+    if alpaca_client is not None:
+        try:
+            account = alpaca_client.get_account()
+            msg = (
+                f"✅ ALPACA CONNECTION OK\n"
+                f"Status: {account.status}\n"
+                f"Buying Power: {account.buying_power}\n"
+                f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}"
+            )
+            print(msg)
+            send_telegram(msg)
+            send_discord(msg)
+        except Exception as e:
+            err = f"❌ ALPACA CONNECTION FAILED: {e}"
+            print(err)
+            send_telegram(err)
+            send_discord(err)
 
     while True:
         try:
