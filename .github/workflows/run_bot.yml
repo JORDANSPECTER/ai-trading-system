@@ -1,116 +1,58 @@
-name: Elite Engine
+env:
+  TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
 
-on:
-  workflow_dispatch:
-  schedule:
-    # Every 20 minutes during 9:00 AM -> 11:59 PM UTC-4 window portion
-    - cron: "*/20 13-23 * * 1-5"
-    # Every 20 minutes during the 12:00 AM -> 1:59 AM UTC portion, which is 8:00 PM -> 9:59 PM ET in DST
-    - cron: "*/20 0-1 * * 2-6"
-    # Sunday weekly report window
-    - cron: "*/20 13-14 * * 0"
+  PRIMARY_SYMBOL: ${{ secrets.PRIMARY_SYMBOL }}
+  SECONDARY_SYMBOL: ${{ secrets.SECONDARY_SYMBOL }}
+  OIL_SYMBOL: ${{ secrets.OIL_SYMBOL }}
+  VOLATILITY_SYMBOL: ${{ secrets.VOLATILITY_SYMBOL }}
 
-jobs:
-  run-engine:
-    runs-on: ubuntu-latest
+  STATE_FILE: elite_state.json
+  PERFORMANCE_STATE_FILE: performance_state.json
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+  DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
+  ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
+  DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+  TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      - name: Restore prior state files
-        uses: actions/download-artifact@v4
-        with:
-          name: elite-state-bundle
-          path: .
-        continue-on-error: true
+  DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED }}
+  DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
+  DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
+  DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
+  DISCORD_DAILY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_DAILY_PERFORMANCE_WEBHOOK }}
+  DISCORD_WEEKLY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_WEEKLY_PERFORMANCE_WEBHOOK }}
 
-      - name: Create fallback state files if missing
-        run: |
-          if [ ! -f elite_state.json ]; then
-            echo '{"last_alert_times": {}, "last_market_snapshot": {}, "execution_submitted_signals": {}}' > elite_state.json
-          fi
-          if [ ! -f performance_state.json ]; then
-            echo '{"history": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
-          fi
+  PREMIUM_MIN_GRADE: ${{ secrets.PREMIUM_MIN_GRADE }}
+  FREE_MIN_GRADE: ${{ secrets.FREE_MIN_GRADE }}
+  MIN_SCORE_FOR_FREE: ${{ secrets.MIN_SCORE_FOR_FREE }}
+  MIN_SCORE_FOR_PREMIUM: ${{ secrets.MIN_SCORE_FOR_PREMIUM }}
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests alpaca-py
+  OIL_IMPACT_THRESHOLD: ${{ secrets.OIL_IMPACT_THRESHOLD }}
+  PRICE_CHANGE_THRESHOLD_PCT: ${{ secrets.PRICE_CHANGE_THRESHOLD_PCT }}
+  VWAP_DISTANCE_THRESHOLD_PCT: ${{ secrets.VWAP_DISTANCE_THRESHOLD_PCT }}
 
-      - name: Run elite engine
-        env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+  DAILY_LEVELS_ENABLED: ${{ secrets.DAILY_LEVELS_ENABLED }}
+  RISK_WARNING_TEXT: ${{ secrets.RISK_WARNING_TEXT }}
+  DEBUG: ${{ secrets.DEBUG }}
 
-          PRIMARY_SYMBOL: ${{ secrets.PRIMARY_SYMBOL }}
-          SECONDARY_SYMBOL: ${{ secrets.SECONDARY_SYMBOL }}
-          OIL_SYMBOL: ${{ secrets.OIL_SYMBOL }}
-          VOLATILITY_SYMBOL: ${{ secrets.VOLATILITY_SYMBOL }}
+  EXECUTION_ENABLED: ${{ secrets.EXECUTION_ENABLED }}
+  EXECUTION_MIN_GRADE: ${{ secrets.EXECUTION_MIN_GRADE }}
+  ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+  ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+  ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
+  ALLOW_SHORTS: ${{ secrets.ALLOW_SHORTS }}
+  ALLOW_FRACTIONAL: ${{ secrets.ALLOW_FRACTIONAL }}
+  MAX_POSITION_NOTIONAL: ${{ secrets.MAX_POSITION_NOTIONAL }}
+  MAX_OPEN_POSITIONS: ${{ secrets.MAX_OPEN_POSITIONS }}
+  DEFAULT_TIME_IN_FORCE: ${{ secrets.DEFAULT_TIME_IN_FORCE }}
 
-          STATE_FILE: ${{ secrets.STATE_FILE }}
-          PERFORMANCE_STATE_FILE: ${{ secrets.PERFORMANCE_STATE_FILE }}
-
-          DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
-          ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
-          DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
-
-          TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED }}
-          DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
-          DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
-          DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
-          DISCORD_DAILY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_DAILY_PERFORMANCE_WEBHOOK }}
-          DISCORD_WEEKLY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_WEEKLY_PERFORMANCE_WEBHOOK }}
-
-          PREMIUM_MIN_GRADE: ${{ secrets.PREMIUM_MIN_GRADE }}
-          FREE_MIN_GRADE: ${{ secrets.FREE_MIN_GRADE }}
-          MIN_SCORE_FOR_FREE: ${{ secrets.MIN_SCORE_FOR_FREE }}
-          MIN_SCORE_FOR_PREMIUM: ${{ secrets.MIN_SCORE_FOR_PREMIUM }}
-
-          OIL_IMPACT_THRESHOLD: ${{ secrets.OIL_IMPACT_THRESHOLD }}
-          PRICE_CHANGE_THRESHOLD_PCT: ${{ secrets.PRICE_CHANGE_THRESHOLD_PCT }}
-          VWAP_DISTANCE_THRESHOLD_PCT: ${{ secrets.VWAP_DISTANCE_THRESHOLD_PCT }}
-
-          DAILY_LEVELS_ENABLED: ${{ secrets.DAILY_LEVELS_ENABLED }}
-          RISK_WARNING_TEXT: ${{ secrets.RISK_WARNING_TEXT }}
-          DEBUG: ${{ secrets.DEBUG }}
-
-          EXECUTION_ENABLED: ${{ secrets.EXECUTION_ENABLED }}
-          EXECUTION_MIN_GRADE: ${{ secrets.EXECUTION_MIN_GRADE }}
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
-          ALLOW_SHORTS: ${{ secrets.ALLOW_SHORTS }}
-          ALLOW_FRACTIONAL: ${{ secrets.ALLOW_FRACTIONAL }}
-          MAX_POSITION_NOTIONAL: ${{ secrets.MAX_POSITION_NOTIONAL }}
-          MAX_OPEN_POSITIONS: ${{ secrets.MAX_OPEN_POSITIONS }}
-          DEFAULT_TIME_IN_FORCE: ${{ secrets.DEFAULT_TIME_IN_FORCE }}
-
-          DAILY_REPORTS_ENABLED: ${{ secrets.DAILY_REPORTS_ENABLED }}
-          WEEKLY_REPORTS_ENABLED: ${{ secrets.WEEKLY_REPORTS_ENABLED }}
-          MORNING_REPORT_HOUR_ET: ${{ secrets.MORNING_REPORT_HOUR_ET }}
-          MORNING_REPORT_MINUTE_ET: ${{ secrets.MORNING_REPORT_MINUTE_ET }}
-          EVENING_REPORT_HOUR_ET: ${{ secrets.EVENING_REPORT_HOUR_ET }}
-          EVENING_REPORT_MINUTE_ET: ${{ secrets.EVENING_REPORT_MINUTE_ET }}
-          WEEKLY_REPORT_HOUR_ET: ${{ secrets.WEEKLY_REPORT_HOUR_ET }}
-          WEEKLY_REPORT_MINUTE_ET: ${{ secrets.WEEKLY_REPORT_MINUTE_ET }}
-        run: |
-          python main.py
-
-      - name: Upload updated state bundle
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: elite-state-bundle
-          path: |
-            elite_state.json
-            performance_state.json
+  DAILY_REPORTS_ENABLED: ${{ secrets.DAILY_REPORTS_ENABLED }}
+  WEEKLY_REPORTS_ENABLED: ${{ secrets.WEEKLY_REPORTS_ENABLED }}
+  MORNING_REPORT_HOUR_ET: ${{ secrets.MORNING_REPORT_HOUR_ET }}
+  MORNING_REPORT_MINUTE_ET: ${{ secrets.MORNING_REPORT_MINUTE_ET }}
+  EVENING_REPORT_HOUR_ET: ${{ secrets.EVENING_REPORT_HOUR_ET }}
+  EVENING_REPORT_MINUTE_ET: ${{ secrets.EVENING_REPORT_MINUTE_ET }}
+  WEEKLY_REPORT_HOUR_ET: ${{ secrets.WEEKLY_REPORT_HOUR_ET }}
+  WEEKLY_REPORT_MINUTE_ET: ${{ secrets.WEEKLY_REPORT_MINUTE_ET }}
