@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/5 13-20 * * 1-5"
 
+permissions:
+  contents: write
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -38,7 +41,25 @@ jobs:
       MIN_RSI_CALL: "55"
       MAX_RSI_PUT: "45"
       MIN_CONFIDENCE: "0.75"
-      PNL_LOG_FILE: "trade_log.csv"
+
+      # ELITE RISK / MANAGEMENT
+      MAX_OPEN_TRADES: "2"
+      MAX_NEW_TRADES_PER_DAY: "4"
+      ENTRY_CUTOFF_HOUR_ET: "15"
+      ENTRY_CUTOFF_MINUTE_ET: "0"
+      FORCE_EXIT_HOUR_ET: "15"
+      FORCE_EXIT_MINUTE_ET: "45"
+      CALL_TP_UNDERLYING_PCT: "0.35"
+      CALL_SL_UNDERLYING_PCT: "0.20"
+      PUT_TP_UNDERLYING_PCT: "0.35"
+      PUT_SL_UNDERLYING_PCT: "0.20"
+      BREAK_EVEN_TRIGGER_PCT: "0.20"
+      MAX_HOLD_MINUTES: "120"
+      COOLDOWN_MINUTES: "20"
+
+      # FILES
+      OPEN_TRADES_FILE: "open_trades.json"
+      TRADE_LOG_FILE: "trade_log.csv"
 
       # OPTIONS
       OPTIONS_DTE_FALLBACK_DAYS: "5"
@@ -48,6 +69,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,6 +82,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests alpaca-py
 
-      - name: Run trading bot
+      - name: Run elite execution engine
         run: |
           python main.py
+
+      - name: Commit state files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add open_trades.json trade_log.csv || true
+          git diff --cached --quiet || git commit -m "Update elite execution state"
+          git push
