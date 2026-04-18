@@ -379,6 +379,41 @@ def load_state() -> Dict:
         return {"open_trades": [], "recent_closures": {}, "daily_entries": {}}
 
 
+def normalize_state(state: Dict) -> Dict:
+    state.setdefault("open_trades", [])
+    state.setdefault("recent_closures", {})
+    state.setdefault("daily_entries", {})
+
+    for trade in state["open_trades"]:
+        trade.setdefault("underlying", "")
+        trade.setdefault("option_symbol", "")
+        trade.setdefault("action", "")
+        trade.setdefault("grade", "B")
+        trade.setdefault("score", 0)
+        trade.setdefault("execution_tier", "NONE")
+        trade.setdefault("qty", 0)
+        trade.setdefault("entry_underlying", 0.0)
+        trade.setdefault("entry_time", now_et().isoformat())
+        trade.setdefault("entry_order_id", None)
+
+        trade.setdefault("entry_order_status", "submitted")
+        trade.setdefault("entry_fill_price", None)
+        trade.setdefault("entry_filled_qty", 0)
+        trade.setdefault("entry_fill_alert_sent", False)
+
+        trade.setdefault("exit_order_id", None)
+        trade.setdefault("exit_order_status", None)
+        trade.setdefault("exit_fill_price", None)
+        trade.setdefault("exit_filled_qty", 0)
+        trade.setdefault("exit_fill_alert_sent", False)
+
+        trade.setdefault("be_armed", False)
+        trade.setdefault("strike", "NA")
+        trade.setdefault("expiry", "NA")
+
+    return state
+
+
 def save_state(state: Dict) -> None:
     with open(OPEN_TRADES_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -607,6 +642,8 @@ def analyze_constituent_internals(etf_symbol: str, snapshots: List[ConstituentSn
             leadership_score=0.0,
             confirmation_bias="NEUTRAL",
             summary=f"{etf_symbol} internals unavailable.",
+            leaders_up=[],
+            leaders_down=[],
             conflicts=["No constituent data available."],
         )
 
@@ -731,6 +768,7 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
 
     if context.volume_ratio >= 1.20:
         score += 8
+
     if context.above_vwap and context.change_pct > 0:
         score += 8
     elif context.below_vwap and context.change_pct < 0:
@@ -817,9 +855,6 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
 
 
 def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List[str]]:
-    notes = []
-    ci = context.constituent_internals
-
     if plan.action == "NO_TRADE":
         return "AVOID", ["Blocked: no clear directional action."]
     if A_PLUS_ONLY_MODE and plan.grade != "A+":
@@ -828,7 +863,8 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
         return "AVOID", ["Blocked: trade is chasing away from decision zone."]
     if plan.confidence < MIN_CONFIDENCE and plan.grade != "B":
         return "AVOID", ["Blocked: confidence too low."]
-    if ci:
+    if context.constituent_internals:
+        ci = context.constituent_internals
         if plan.action == "BUY_CALL" and ci.confirmation_bias == "BEARISH_CONFIRMATION":
             return "AVOID", ["Blocked: bearish internals against call."]
         if plan.action == "BUY_PUT" and ci.confirmation_bias == "BULLISH_CONFIRMATION":
@@ -845,8 +881,7 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
     if plan.execution_qty <= 0:
         return "AVOID", ["Blocked: zero quantity."]
 
-    notes.append(f"Execution filter passed. Tier={plan.execution_tier}, Qty={plan.execution_qty}")
-    return "EXECUTE", notes
+    return "EXECUTE", [f"Execution filter passed. Tier={plan.execution_tier}, Qty={plan.execution_qty}"]
 
 # =========================================================
 # FREE ALERT
@@ -1279,6 +1314,7 @@ def update_entry_fills(state: Dict) -> None:
 
         trade["entry_order_status"] = status
         trade["entry_filled_qty"] = order_filled_qty(order_obj)
+
         fill_price = order_fill_price(order_obj)
         if fill_price > 0:
             trade["entry_fill_price"] = fill_price
@@ -1286,35 +1322,35 @@ def update_entry_fills(state: Dict) -> None:
         if status != prev_status:
             broadcast_execution(
                 f"📥 ENTRY ORDER STATUS UPDATE\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {trade['option_symbol']}\n"
+                f"Underlying: {trade.get('underlying', 'N/A')}\n"
+                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
                 f"Order ID: {order_id}\n"
                 f"Status: {status}\n"
-                f"Filled Qty: {trade['entry_filled_qty']}\n"
-                f"Avg Fill Price: {trade['entry_fill_price'] if trade['entry_fill_price'] else 'N/A'}"
+                f"Filled Qty: {trade.get('entry_filled_qty', 0)}\n"
+                f"Avg Fill Price: {trade.get('entry_fill_price') if trade.get('entry_fill_price') else 'N/A'}"
             )
             changed = True
 
         if order_is_fill_like(status) and not trade.get("entry_fill_alert_sent", False):
             broadcast_execution(
                 f"✅ ENTRY FILL CONFIRMED\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {trade['option_symbol']}\n"
+                f"Underlying: {trade.get('underlying', 'N/A')}\n"
+                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
                 f"Status: {status}\n"
-                f"Filled Qty: {trade['entry_filled_qty']}\n"
-                f"Avg Fill Price: {trade['entry_fill_price'] if trade['entry_fill_price'] else 'N/A'}"
+                f"Filled Qty: {trade.get('entry_filled_qty', 0)}\n"
+                f"Avg Fill Price: {trade.get('entry_fill_price') if trade.get('entry_fill_price') else 'N/A'}"
             )
 
             log_trade_event(
                 event="ENTRY_FILL",
-                underlying=trade["underlying"],
-                option_symbol=trade["option_symbol"],
-                action=trade["action"],
-                grade=trade["grade"],
-                execution_tier=trade["execution_tier"],
-                qty=int(trade["qty"]),
-                entry_underlying=safe_float(trade["entry_underlying"]),
-                current_underlying=safe_float(trade["entry_underlying"]),
+                underlying=trade.get("underlying", ""),
+                option_symbol=trade.get("option_symbol", ""),
+                action=trade.get("action", ""),
+                grade=trade.get("grade", "B"),
+                execution_tier=trade.get("execution_tier", "NONE"),
+                qty=int(trade.get("qty", 0)),
+                entry_underlying=safe_float(trade.get("entry_underlying"), 0.0),
+                current_underlying=safe_float(trade.get("entry_underlying"), 0.0),
                 underlying_move_pct=0.0,
                 reason=status,
                 order_id=order_id,
@@ -1341,6 +1377,7 @@ def update_exit_fills(state: Dict) -> None:
 
         trade["exit_order_status"] = status
         trade["exit_filled_qty"] = order_filled_qty(order_obj)
+
         fill_price = order_fill_price(order_obj)
         if fill_price > 0:
             trade["exit_fill_price"] = fill_price
@@ -1348,12 +1385,12 @@ def update_exit_fills(state: Dict) -> None:
         if status != prev_status:
             broadcast_execution(
                 f"📤 EXIT ORDER STATUS UPDATE\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {trade['option_symbol']}\n"
+                f"Underlying: {trade.get('underlying', 'N/A')}\n"
+                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
                 f"Order ID: {exit_order_id}\n"
                 f"Status: {status}\n"
-                f"Filled Qty: {trade['exit_filled_qty']}\n"
-                f"Avg Fill Price: {trade['exit_fill_price'] if trade['exit_fill_price'] else 'N/A'}"
+                f"Filled Qty: {trade.get('exit_filled_qty', 0)}\n"
+                f"Avg Fill Price: {trade.get('exit_fill_price') if trade.get('exit_fill_price') else 'N/A'}"
             )
             changed = True
 
@@ -1364,25 +1401,25 @@ def update_exit_fills(state: Dict) -> None:
 
             broadcast_execution(
                 f"🏁 TRADE CLOSED\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {trade['option_symbol']}\n"
+                f"Underlying: {trade.get('underlying', 'N/A')}\n"
+                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
                 f"Entry Fill: {entry_fill if entry_fill > 0 else 'N/A'}\n"
                 f"Exit Fill: {exit_fill if exit_fill > 0 else 'N/A'}\n"
                 f"PnL: {pnl_pct:.2f}%\n"
-                f"Grade: {trade['grade']}\n"
-                f"Tier: {trade['execution_tier']}"
+                f"Grade: {trade.get('grade', 'B')}\n"
+                f"Tier: {trade.get('execution_tier', 'NONE')}"
             )
 
             log_trade_event(
                 event="EXIT_FILL",
-                underlying=trade["underlying"],
-                option_symbol=trade["option_symbol"],
-                action=trade["action"],
-                grade=trade["grade"],
-                execution_tier=trade["execution_tier"],
-                qty=int(trade["qty"]),
-                entry_underlying=safe_float(trade["entry_underlying"]),
-                current_underlying=safe_float(trade["entry_underlying"]),
+                underlying=trade.get("underlying", ""),
+                option_symbol=trade.get("option_symbol", ""),
+                action=trade.get("action", ""),
+                grade=trade.get("grade", "B"),
+                execution_tier=trade.get("execution_tier", "NONE"),
+                qty=int(trade.get("qty", 0)),
+                entry_underlying=safe_float(trade.get("entry_underlying"), 0.0),
+                current_underlying=safe_float(trade.get("entry_underlying"), 0.0),
                 underlying_move_pct=0.0,
                 reason=f"pnl_pct={pnl_pct:.2f}",
                 order_id=exit_order_id,
@@ -1401,7 +1438,7 @@ def purge_filled_exits(state: Dict) -> None:
 
     for trade in state.get("open_trades", []):
         if trade.get("exit_order_status") == "filled":
-            set_recent_closure(state, trade["underlying"])
+            set_recent_closure(state, trade.get("underlying", ""))
             changed = True
             continue
         remaining.append(trade)
@@ -1426,7 +1463,7 @@ def manage_open_trades(state: Dict) -> None:
         if trade.get("exit_order_id"):
             continue
 
-        snapshot = get_symbol_snapshot(trade["underlying"])
+        snapshot = get_symbol_snapshot(trade.get("underlying", ""))
         if not snapshot:
             continue
 
@@ -1437,8 +1474,8 @@ def manage_open_trades(state: Dict) -> None:
             save_state(state)
             broadcast_execution(
                 f"🛡 BREAK-EVEN ARMED\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {trade['option_symbol']}\n"
+                f"Underlying: {trade.get('underlying', 'N/A')}\n"
+                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
                 f"Underlying Move: {move_pct:.2f}%"
             )
             continue
@@ -1448,11 +1485,11 @@ def manage_open_trades(state: Dict) -> None:
         else:
             broadcast_execution(
                 f"📡 OPEN TRADE CHECK\n"
-                f"Underlying: {trade['underlying']}\n"
-                f"Contract: {trade['option_symbol']}\n"
-                f"Action: {trade['action']}\n"
-                f"Grade: {trade['grade']}\n"
-                f"Underlying Entry: {safe_float(trade['entry_underlying']):.2f}\n"
+                f"Underlying: {trade.get('underlying', 'N/A')}\n"
+                f"Contract: {trade.get('option_symbol', 'N/A')}\n"
+                f"Action: {trade.get('action', 'N/A')}\n"
+                f"Grade: {trade.get('grade', 'N/A')}\n"
+                f"Underlying Entry: {safe_float(trade.get('entry_underlying'), 0.0):.2f}\n"
                 f"Underlying Now: {current_underlying:.2f}\n"
                 f"Underlying Move: {move_pct:.2f}%\n"
                 f"Break-Even Armed: {trade.get('be_armed', False)}"
@@ -1489,7 +1526,8 @@ def run_cycle(state: Dict) -> None:
 
 def main() -> None:
     ensure_trade_log_exists()
-    state = load_state()
+    state = normalize_state(load_state())
+    save_state(state)
 
     broadcast_execution(
         "🚀 ELITE EXECUTION ENGINE STARTED\n"
