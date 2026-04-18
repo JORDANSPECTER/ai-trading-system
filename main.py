@@ -3,9 +3,18 @@ import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import requests
+
+# Optional Alpaca imports
+ALPACA_AVAILABLE = True
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+except Exception:
+    ALPACA_AVAILABLE = False
 
 
 # ============================================================
@@ -47,10 +56,6 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def today_utc_date() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
 def safe_float(value, default: Optional[float] = 0.0) -> Optional[float]:
     try:
         if value is None or value == "":
@@ -85,11 +90,8 @@ def grade_from_score(score: int) -> str:
 
 def is_daily_levels_window() -> bool:
     """
-    Send Daily Levels only from 9AM to 9PM Eastern.
-    Approximated using UTC hours:
-    - 13:00 to 23:59 UTC
-    - 00:00 to 01:59 UTC
-    This matches the workflow cron windows.
+    9AM to 9PM Eastern approximated by UTC windows used in workflow:
+    13:00-23:59 UTC and 00:00-01:59 UTC
     """
     now = datetime.now(timezone.utc)
     hour = now.hour
@@ -102,8 +104,8 @@ def is_daily_levels_window() -> bool:
 
 @dataclass
 class Config:
+    # Market / alerts
     twelve_data_api_key: str
-
     primary_symbol: str
     secondary_symbol: str
     oil_symbol: str
@@ -135,6 +137,16 @@ class Config:
     daily_levels_enabled: bool
     risk_warning_text: str
     debug: bool
+
+    # Execution / Alpaca
+    execution_enabled: bool
+    execution_min_grade: str
+    alpaca_api_key: str
+    alpaca_secret_key: str
+    alpaca_paper: bool
+    max_position_notional: float
+    max_open_positions: int
+    default_time_in_force: str
 
 
 def load_config() -> Config:
@@ -175,6 +187,15 @@ def load_config() -> Config:
             "Educational alert only. Not financial advice. Wait for confirmation at key levels."
         ),
         debug=env_bool("DEBUG", False),
+
+        execution_enabled=env_bool("EXECUTION_ENABLED", False),
+        execution_min_grade=env_str("EXECUTION_MIN_GRADE", "A"),
+        alpaca_api_key=env_str("ALPACA_API_KEY"),
+        alpaca_secret_key=env_str("ALPACA_SECRET_KEY"),
+        alpaca_paper=env_bool("ALPACA_PAPER", True),
+        max_position_notional=env_float("MAX_POSITION_NOTIONAL", 500.0),
+        max_open_positions=env_int("MAX_OPEN_POSITIONS", 2),
+        default_time_in_force=env_str("DEFAULT_TIME_IN_FORCE", "day"),
     )
 
 
@@ -250,6 +271,7 @@ class AlertPayload:
 class PersistentState:
     last_alert_times: Dict[str, float] = field(default_factory=dict)
     last_market_snapshot: Dict[str, float] = field(default_factory=dict)
+    executed_signal_keys: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @staticmethod
     def load(path: str) -> "PersistentState":
@@ -261,6 +283,7 @@ class PersistentState:
             return PersistentState(
                 last_alert_times=raw.get("last_alert_times", {}),
                 last_market_snapshot=raw.get("last_market_snapshot", {}),
+                executed_signal_keys=raw.get("executed_signal_keys", {}),
             )
         except Exception:
             return PersistentState()
@@ -269,6 +292,7 @@ class PersistentState:
         payload = {
             "last_alert_times": self.last_alert_times,
             "last_market_snapshot": self.last_market_snapshot,
+            "executed_signal_keys": self.executed_signal_keys,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -511,276 +535,4 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
 # ALERT BUILDERS
 # ============================================================
 
-def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
-    lines = [
-        f"Symbol: {ctx.primary.symbol}",
-        f"Current Price: {ctx.primary.price:.2f}",
-        f"Previous Day High: {ctx.previous_day_high:.2f}" if ctx.previous_day_high is not None else "Previous Day High: n/a",
-        f"Previous Day Low: {ctx.previous_day_low:.2f}" if ctx.previous_day_low is not None else "Previous Day Low: n/a",
-        f"Premarket High: {ctx.premarket_high:.2f}" if ctx.premarket_high is not None else "Premarket High: n/a",
-        f"Premarket Low: {ctx.premarket_low:.2f}" if ctx.premarket_low is not None else "Premarket Low: n/a",
-    ]
-
-    if ctx.primary_indicators.vwap is not None:
-        lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
-    if ctx.primary_indicators.rsi is not None:
-        lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
-
-    lines.append("")
-    lines.append("Watch for acceptance / rejection at these levels before entry.")
-    lines.append(cfg.risk_warning_text)
-
-    # key does NOT include date anymore so cooldown can govern repeated sends all day
-    return AlertPayload(
-        alert_type="DAILY_LEVELS",
-        symbol=ctx.primary.symbol,
-        title=f"📍 {ctx.primary.symbol} Daily Levels",
-        body="\n".join(lines),
-        grade="INFO",
-        direction="LEVELS",
-        score=0,
-        tags=["daily-levels", ctx.primary.symbol.lower()],
-        key=f"DAILY_LEVELS::{ctx.primary.symbol}",
-        timestamp_utc=now_utc_iso(),
-    )
-
-
-def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
-    emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
-
-    lines = [
-        f"Symbol: {ctx.primary.symbol}",
-        f"Direction: {setup.direction}",
-        f"Grade: {setup.grade}",
-        f"Score: {setup.score}",
-        f"Price: {ctx.primary.price:.2f}",
-        f"Day Change: {ctx.primary.change_pct:+.2f}%",
-    ]
-
-    if ctx.primary_indicators.vwap is not None:
-        lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
-    if ctx.primary_indicators.rsi is not None:
-        lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
-    if ctx.oil:
-        lines.append(f"{ctx.oil.symbol}: {ctx.oil.change_pct:+.2f}%")
-    if ctx.volatility:
-        lines.append(f"{ctx.volatility.symbol}: {ctx.volatility.change_pct:+.2f}%")
-
-    if setup.reasons:
-        lines.append("")
-        lines.append("Core reasons:")
-        for item in setup.reasons[:5]:
-            lines.append(f"• {item}")
-
-    if setup.premium_reasons:
-        lines.append("")
-        lines.append("Institutional / premium context:")
-        for item in setup.premium_reasons[:4]:
-            lines.append(f"• {item}")
-
-    if setup.risk_flags:
-        lines.append("")
-        lines.append("Risk flags:")
-        for item in setup.risk_flags[:4]:
-            lines.append(f"• {item}")
-
-    lines.append("")
-    lines.append(cfg.risk_warning_text)
-
-    rounded_price = round(ctx.primary.price, cfg.dedupe_price_rounding)
-
-    return AlertPayload(
-        alert_type="TRADE_ALERT",
-        symbol=ctx.primary.symbol,
-        title=f"{emoji} {ctx.primary.symbol} {setup.direction} Setup | Grade {setup.grade} | Score {setup.score}",
-        body="\n".join(lines),
-        grade=setup.grade,
-        direction=setup.direction,
-        score=setup.score,
-        tags=[
-            ctx.primary.symbol.lower(),
-            setup.direction.lower(),
-            f"grade-{setup.grade.lower().replace('+', 'plus')}",
-            "trade-alert",
-        ],
-        key=f"TRADE::{ctx.primary.symbol}::{setup.direction}::{setup.grade}::{rounded_price}",
-        timestamp_utc=now_utc_iso(),
-    )
-
-
-def generate_trade_alert_if_valid(ctx: MarketContext, cfg: Config) -> Optional[AlertPayload]:
-    setup = score_setup(ctx, cfg)
-    if setup.direction == "NEUTRAL":
-        return None
-    if setup.score < cfg.min_score_for_free:
-        return None
-    return build_trade_alert(ctx, setup, cfg)
-
-
-# ============================================================
-# NOTIFIERS
-# ============================================================
-
-class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str, enabled: bool):
-        self.token = token
-        self.chat_id = chat_id
-        self.enabled = enabled
-
-    def send(self, text: str) -> None:
-        if not self.enabled or not self.token or not self.chat_id:
-            return
-        response = requests.post(
-            f"https://api.telegram.org/bot{self.token}/sendMessage",
-            json={"chat_id": self.chat_id, "text": text},
-            timeout=20,
-        )
-        response.raise_for_status()
-
-
-class DiscordNotifier:
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
-
-    def send(self, webhook_url: str, content: str) -> None:
-        if not self.enabled or not webhook_url:
-            return
-        response = requests.post(webhook_url, json={"content": content}, timeout=20)
-        response.raise_for_status()
-
-
-def format_for_telegram(alert: AlertPayload) -> str:
-    return f"{alert.title}\n\n{alert.body}\n\nUTC: {alert.timestamp_utc}"
-
-
-def format_for_discord(alert: AlertPayload) -> str:
-    hashtags = " ".join(f"#{tag}" for tag in alert.tags[:6])
-    return f"**{alert.title}**\n```{alert.body}```\n{hashtags}\nUTC: {alert.timestamp_utc}"
-
-
-# ============================================================
-# ROUTING
-# ============================================================
-
-def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
-    current_ts = time.time()
-    last_ts = state.last_alert_times.get(key, 0)
-    return (current_ts - last_ts) >= cooldown_seconds
-
-
-def mark_sent(state: PersistentState, key: str) -> None:
-    state.last_alert_times[key] = time.time()
-
-
-def route_alert(
-    alert: AlertPayload,
-    cfg: Config,
-    state: PersistentState,
-    telegram: TelegramNotifier,
-    discord: DiscordNotifier
-) -> None:
-    msg_discord = format_for_discord(alert)
-    msg_telegram = format_for_telegram(alert)
-
-    # DAILY LEVELS -> FREE DAILY LEVELS CHANNEL ONLY
-    if alert.alert_type == "DAILY_LEVELS":
-        if not cfg.daily_levels_enabled:
-            return
-
-        if not is_daily_levels_window():
-            return
-
-        if not should_send_by_cooldown(state, alert.key, cfg.daily_levels_cooldown_seconds):
-            return
-
-        if cfg.discord_daily_levels_webhook:
-            discord.send(cfg.discord_daily_levels_webhook, msg_discord)
-
-        if cfg.telegram_enabled:
-            telegram.send(msg_telegram)
-
-        mark_sent(state, alert.key)
-        return
-
-    # TRADE ALERTS
-    if alert.alert_type != "TRADE_ALERT":
-        return
-
-    if not should_send_by_cooldown(state, alert.key, cfg.alert_cooldown_seconds):
-        return
-
-    if cfg.telegram_enabled:
-        telegram.send(msg_telegram)
-
-    # A / A+ -> PREMIUM DAILY LEVELS CHANNEL
-    if (
-        grade_rank(alert.grade) >= grade_rank(cfg.premium_min_grade)
-        and alert.score >= cfg.min_score_for_premium
-    ):
-        if cfg.discord_premium_webhook:
-            discord.send(cfg.discord_premium_webhook, msg_discord)
-
-    # B / C -> FREE ALERTS CHANNEL
-    elif (
-        grade_rank(alert.grade) >= grade_rank(cfg.free_min_grade)
-        and alert.score >= cfg.min_score_for_free
-    ):
-        if cfg.discord_free_webhook:
-            discord.send(cfg.discord_free_webhook, msg_discord)
-
-    mark_sent(state, alert.key)
-
-
-# ============================================================
-# ONE-RUN ENGINE
-# ============================================================
-
-def print_snapshot(ctx: MarketContext) -> None:
-    print(
-        f"[{now_utc_iso()}] "
-        f"{ctx.primary.symbol} {ctx.primary.price:.2f} ({ctx.primary.change_pct:+.2f}%) | "
-        f"VWAP {ctx.primary_indicators.vwap if ctx.primary_indicators.vwap is not None else 'n/a'} | "
-        f"RSI {ctx.primary_indicators.rsi if ctx.primary_indicators.rsi is not None else 'n/a'}"
-    )
-
-
-def run_once() -> None:
-    cfg = load_config()
-
-    if not cfg.twelve_data_api_key:
-        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
-
-    state = PersistentState.load(cfg.state_file)
-    client = TwelveDataClient(cfg.twelve_data_api_key, cfg)
-
-    telegram = TelegramNotifier(
-        token=cfg.telegram_bot_token,
-        chat_id=cfg.telegram_chat_id,
-        enabled=cfg.telegram_enabled,
-    )
-    discord = DiscordNotifier(enabled=cfg.discord_enabled)
-
-    ctx = build_market_context(client, cfg)
-    print_snapshot(ctx)
-
-    daily_levels_alert = build_daily_levels_alert(ctx, cfg)
-    route_alert(daily_levels_alert, cfg, state, telegram, discord)
-
-    trade_alert = generate_trade_alert_if_valid(ctx, cfg)
-    if trade_alert:
-        route_alert(trade_alert, cfg, state, telegram, discord)
-
-    state.last_market_snapshot = {
-        "primary_price": ctx.primary.price,
-        "primary_change_pct": ctx.primary.change_pct,
-        "oil_change_pct": ctx.oil.change_pct if ctx.oil else 0.0,
-        "vol_change_pct": ctx.volatility.change_pct if ctx.volatility else 0.0,
-        "updated_at": time.time(),
-    }
-
-    state.save(cfg.state_file)
-    print("Run complete.")
-
-
-if __name__ == "__main__":
-    run_once()
+def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> Alert
