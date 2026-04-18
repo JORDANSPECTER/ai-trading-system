@@ -18,6 +18,10 @@ TRACK_WINDOWS_MIN = [5, 15, 30, 60]
 VALID_CONTROL_STATES = {"AUTO", "ACTIVE", "SOFT_BLOCK", "COOLDOWN", "BREACH", "PROBATION", "KILL_SWITCH"}
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -125,6 +129,10 @@ def debug_log(cfg: "Config", msg: str) -> None:
         print(f"[DEBUG] {msg}")
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 @dataclass
 class Config:
     twelve_data_api_key: str
@@ -220,6 +228,7 @@ def load_config() -> Config:
         secondary_symbol=env_str("SECONDARY_SYMBOL", "SPY"),
         oil_symbol=env_str("OIL_SYMBOL", "USO"),
         volatility_symbol=env_str("VOLATILITY_SYMBOL", "VIX"),
+
         state_file=env_str("STATE_FILE", "elite_state.json"),
         performance_state_file=env_str("PERFORMANCE_STATE_FILE", "performance_state.json"),
         control_state_file=env_str("CONTROL_STATE_FILE", "control_state.json"),
@@ -302,6 +311,10 @@ def load_config() -> Config:
         control_admin_name=env_str("CONTROL_ADMIN_NAME", "Jordan"),
     )
 
+
+# ============================================================
+# DATA MODELS
+# ============================================================
 
 @dataclass
 class Quote:
@@ -522,6 +535,10 @@ class ControlState:
             )
 
 
+# ============================================================
+# CLIENTS
+# ============================================================
+
 class TwelveDataClient:
     BASE_URL = "https://api.twelvedata.com"
 
@@ -546,6 +563,7 @@ class TwelveDataClient:
         change_pct_val = safe_float(data.get("percent_change"), 0.0)
         if change_pct_val == 0 and prev:
             change_pct_val = pct_change(price, prev)
+
         return Quote(
             symbol=symbol,
             price=price,
@@ -583,214 +601,6 @@ class TwelveDataClient:
             ema9=self.get_indicator(symbol, "ema", "5min"),
             ema20=self.get_indicator(symbol, "ema", "15min"),
         )
-
-
-def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext:
-    primary = client.get_quote(cfg.primary_symbol)
-    secondary = client.get_quote(cfg.secondary_symbol)
-    oil = None
-    volatility = None
-    try:
-        oil = client.get_quote(cfg.oil_symbol)
-    except Exception as e:
-        debug_log(cfg, f"oil quote failed: {e}")
-    try:
-        volatility = client.get_quote(cfg.volatility_symbol)
-    except Exception as e:
-        debug_log(cfg, f"vol quote failed: {e}")
-
-    return MarketContext(
-        primary=primary,
-        secondary=secondary,
-        oil=oil,
-        volatility=volatility,
-        primary_indicators=client.get_indicator_pack(cfg.primary_symbol),
-        secondary_indicators=client.get_indicator_pack(cfg.secondary_symbol),
-        previous_day_high=primary.high,
-        previous_day_low=primary.low,
-        premarket_high=primary.high,
-        premarket_low=primary.low,
-    )
-
-
-def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
-    score = 50
-    reasons: List[str] = []
-    premium_reasons: List[str] = []
-    risk_flags: List[str] = []
-    bullish_points = 0
-    bearish_points = 0
-
-    price = ctx.primary.price
-    vwap = ctx.primary_indicators.vwap
-    rsi = ctx.primary_indicators.rsi
-    ema9 = ctx.primary_indicators.ema9
-    ema20 = ctx.primary_indicators.ema20
-
-    if vwap is not None:
-        if price > vwap:
-            score += 10
-            bullish_points += 1
-            reasons.append(f"{ctx.primary.symbol} is above VWAP ({vwap:.2f}).")
-        elif price < vwap:
-            score += 10
-            bearish_points += 1
-            reasons.append(f"{ctx.primary.symbol} is below VWAP ({vwap:.2f}).")
-
-        if abs(pct_change(price, vwap)) <= cfg.vwap_distance_threshold_pct:
-            score += 5
-            premium_reasons.append("Price is trading tight around VWAP.")
-        else:
-            risk_flags.append("Price is extended away from VWAP.")
-
-    if rsi is not None:
-        if 48 <= rsi <= 62:
-            score += 8
-            reasons.append(f"RSI is healthy at {rsi:.1f}.")
-        elif rsi > 70:
-            score -= 6
-            risk_flags.append(f"RSI is hot at {rsi:.1f}.")
-        elif rsi < 30:
-            score -= 6
-            risk_flags.append(f"RSI is weak at {rsi:.1f}.")
-
-    if ema9 is not None and ema20 is not None:
-        if ema9 > ema20:
-            score += 7
-            bullish_points += 1
-            reasons.append("Short-term momentum is bullish (EMA9 > EMA20).")
-        elif ema9 < ema20:
-            score += 7
-            bearish_points += 1
-            reasons.append("Short-term momentum is bearish (EMA9 < EMA20).")
-
-    if abs(ctx.primary.change_pct) >= cfg.price_change_threshold_pct:
-        score += 8
-        reasons.append(f"Price is moving with intent ({ctx.primary.change_pct:+.2f}%).")
-
-    if ctx.oil and abs(ctx.oil.change_pct) >= cfg.oil_impact_threshold:
-        premium_reasons.append(f"Oil is making a meaningful move ({ctx.oil.symbol} {ctx.oil.change_pct:+.2f}%).")
-        if ctx.oil.change_pct > 0:
-            bearish_points += 1
-            reasons.append("Oil pressure favors caution on long-side index continuation.")
-        else:
-            bullish_points += 1
-            reasons.append("Oil relief supports index stabilization or upside continuation.")
-
-    if ctx.volatility:
-        if ctx.volatility.change_pct > 2.0:
-            bearish_points += 1
-            risk_flags.append(f"{ctx.volatility.symbol} is elevated ({ctx.volatility.change_pct:+.2f}%).")
-        elif ctx.volatility.change_pct < -2.0:
-            bullish_points += 1
-            premium_reasons.append(f"{ctx.volatility.symbol} is easing ({ctx.volatility.change_pct:+.2f}%).")
-
-    if bullish_points > bearish_points:
-        direction = "BULLISH"
-        score += 5
-    elif bearish_points > bullish_points:
-        direction = "BEARISH"
-        score += 5
-    else:
-        direction = "NEUTRAL"
-        score -= 5
-        risk_flags.append("Bullish and bearish evidence is mixed.")
-
-    score = max(0, min(score, 100))
-    return SetupScore(score, grade_from_score(score), direction, reasons, premium_reasons, risk_flags)
-
-
-def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
-    lines = [
-        f"Symbol: {ctx.primary.symbol}",
-        f"Current Price: {ctx.primary.price:.2f}",
-        f"Previous Day High: {ctx.previous_day_high:.2f}",
-        f"Previous Day Low: {ctx.previous_day_low:.2f}",
-        f"Premarket High: {ctx.premarket_high:.2f}",
-        f"Premarket Low: {ctx.premarket_low:.2f}",
-    ]
-    if ctx.primary_indicators.vwap is not None:
-        lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
-    if ctx.primary_indicators.rsi is not None:
-        lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
-    lines.append("")
-    lines.append("Watch for acceptance / rejection at these levels before entry.")
-    lines.append(cfg.risk_warning_text)
-    return AlertPayload(
-        alert_type="DAILY_LEVELS",
-        symbol=ctx.primary.symbol,
-        title=f"📍 {ctx.primary.symbol} Daily Levels",
-        body="\n".join(lines),
-        grade="INFO",
-        direction="LEVELS",
-        score=0,
-        tags=["daily-levels", ctx.primary.symbol.lower()],
-        key=f"DAILY_LEVELS::{ctx.primary.symbol}",
-        timestamp_utc=now_utc_iso(),
-    )
-
-
-def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
-    emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
-    lines = [
-        f"Symbol: {ctx.primary.symbol}",
-        f"Direction: {setup.direction}",
-        f"Grade: {setup.grade}",
-        f"Score: {setup.score}",
-        f"Price: {ctx.primary.price:.2f}",
-        f"Day Change: {ctx.primary.change_pct:+.2f}%",
-    ]
-    if ctx.primary_indicators.vwap is not None:
-        lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
-    if ctx.primary_indicators.rsi is not None:
-        lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
-    if ctx.oil:
-        lines.append(f"{ctx.oil.symbol}: {ctx.oil.change_pct:+.2f}%")
-    if ctx.volatility:
-        lines.append(f"{ctx.volatility.symbol}: {ctx.volatility.change_pct:+.2f}%")
-
-    if setup.reasons:
-        lines.append("")
-        lines.append("Core reasons:")
-        for item in setup.reasons[:5]:
-            lines.append(f"• {item}")
-
-    if setup.premium_reasons:
-        lines.append("")
-        lines.append("Institutional / premium context:")
-        for item in setup.premium_reasons[:4]:
-            lines.append(f"• {item}")
-
-    if setup.risk_flags:
-        lines.append("")
-        lines.append("Risk flags:")
-        for item in setup.risk_flags[:4]:
-            lines.append(f"• {item}")
-
-    lines.append("")
-    lines.append(cfg.risk_warning_text)
-
-    return AlertPayload(
-        alert_type="TRADE_ALERT",
-        symbol=ctx.primary.symbol,
-        title=f"{emoji} {ctx.primary.symbol} {setup.direction} Setup | Grade {setup.grade} | Score {setup.score}",
-        body="\n".join(lines),
-        grade=setup.grade,
-        direction=setup.direction,
-        score=setup.score,
-        tags=[ctx.primary.symbol.lower(), setup.direction.lower(), f"grade-{setup.grade.lower().replace('+', 'plus')}", "trade-alert"],
-        key=f"TRADE::{ctx.primary.symbol}::{setup.direction}::{setup.grade}::{round(ctx.primary.price, cfg.dedupe_price_rounding)}",
-        timestamp_utc=now_utc_iso(),
-    )
-
-
-def generate_trade_alert_if_valid(ctx: MarketContext, cfg: Config) -> Optional[AlertPayload]:
-    setup = score_setup(ctx, cfg)
-    if setup.direction == "NEUTRAL":
-        return None
-    if setup.score < cfg.min_score_for_free:
-        return None
-    return build_trade_alert(ctx, setup, cfg)
 
 
 class TelegramNotifier:
@@ -834,13 +644,22 @@ class DiscordNotifier:
         requests.post(webhook_url, json={"content": content}, timeout=20).raise_for_status()
 
 
-def format_for_telegram(alert: AlertPayload) -> str:
-    return f"{alert.title}\n\n{alert.body}\n\nUTC: {alert.timestamp_utc}"
+# ============================================================
+# CONTROL PLANE + TELEGRAM DEBUG
+# ============================================================
+
+def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
+    state.risk_audit.append({"ts_utc": now_utc_iso(), "event_type": event_type, "details": details})
+    state.risk_audit = state.risk_audit[-1000:]
 
 
-def format_for_discord(alert: AlertPayload) -> str:
-    hashtags = " ".join(f"#{tag}" for tag in alert.tags[:6])
-    return f"**{alert.title}**\n```{alert.body}```\n{hashtags}\nUTC: {alert.timestamp_utc}"
+def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> None:
+    state.risk_state = new_state
+    if minutes > 0:
+        until_ts = now_utc().timestamp() + minutes * 60
+        state.risk_state_until_utc = datetime.fromtimestamp(until_ts, timezone.utc).isoformat()
+    else:
+        state.risk_state_until_utc = ""
 
 
 def normalize_risk_state(state: PersistentState) -> None:
@@ -853,37 +672,23 @@ def normalize_risk_state(state: PersistentState) -> None:
             pass
 
 
-def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> None:
-    state.risk_state = new_state
-    if minutes > 0:
-        until_ts = now_utc().timestamp() + minutes * 60
-        state.risk_state_until_utc = datetime.fromtimestamp(until_ts, timezone.utc).isoformat()
-    else:
-        state.risk_state_until_utc = ""
-
-
-def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
-    state.risk_audit.append({"ts_utc": now_utc_iso(), "event_type": event_type, "details": details})
-    state.risk_audit = state.risk_audit[-1000:]
-
-
-def current_session_label() -> str:
-    current = now_et()
-    mins = current.hour * 60 + current.minute
-    if 9 * 60 + 30 <= mins < 10 * 60 + 30:
-        return "OPEN"
-    if 10 * 60 + 30 <= mins < 14 * 60:
-        return "MIDDAY"
-    if 14 * 60 <= mins <= 16 * 60:
-        return "POWER_HOUR"
-    return "OFF_HOURS"
-
-
 def process_telegram_control_commands(cfg: Config, control: ControlState, state: PersistentState, telegram: TelegramNotifier) -> None:
     if not cfg.telegram_enabled or not cfg.telegram_control_enabled or not cfg.telegram_admin_chat_id:
+        print("[TG DEBUG] Telegram control disabled or TELEGRAM_ADMIN_CHAT_ID missing.")
         return
 
-    updates = telegram.get_updates(offset=control.telegram_update_offset + 1)
+    print(f"[TG DEBUG] Starting Telegram control check.")
+    print(f"[TG DEBUG] Admin chat expected: {cfg.telegram_admin_chat_id}")
+    print(f"[TG DEBUG] Current update offset: {control.telegram_update_offset}")
+
+    try:
+        updates = telegram.get_updates(offset=control.telegram_update_offset + 1)
+    except Exception as e:
+        print(f"[TG DEBUG] get_updates failed: {e}")
+        return
+
+    print(f"[TG DEBUG] Updates found: {len(updates)}")
+
     if not updates:
         return
 
@@ -891,26 +696,38 @@ def process_telegram_control_commands(cfg: Config, control: ControlState, state:
         update_id = upd.get("update_id", 0)
         control.telegram_update_offset = max(control.telegram_update_offset, update_id)
 
+        print(f"[TG DEBUG] Processing update_id: {update_id}")
+
         msg = upd.get("message") or upd.get("edited_message")
         if not msg:
+            print("[TG DEBUG] No message payload in update.")
             continue
 
         chat = msg.get("chat", {})
         chat_id = str(chat.get("id", ""))
         text = (msg.get("text") or "").strip()
+
+        print(f"[TG DEBUG] Incoming chat_id: {chat_id}")
+        print(f"[TG DEBUG] Incoming text: {text}")
+
         if not text:
+            print("[TG DEBUG] Empty text, skipping.")
             continue
 
-        if chat_id != cfg.telegram_admin_chat_id:
+        if chat_id != str(cfg.telegram_admin_chat_id):
+            print(f"[TG DEBUG] Unauthorized chat. Expected {cfg.telegram_admin_chat_id}, got {chat_id}")
             try:
                 telegram.send("Unauthorized control attempt blocked.", chat_id=chat_id)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[TG DEBUG] Failed to send unauthorized reply: {e}")
             continue
 
         parts = text.split()
         cmd = parts[0].lower()
         args = parts[1:]
+
+        print(f"[TG DEBUG] Command parsed: {cmd}")
+        print(f"[TG DEBUG] Args parsed: {args}")
 
         changed = False
         reply = ""
@@ -949,7 +766,10 @@ def process_telegram_control_commands(cfg: Config, control: ControlState, state:
             reply = "Set to AUTO."
 
         elif cmd == "/softblock":
-            mins = int(args[0]) if args else 60
+            try:
+                mins = int(args[0]) if args else 60
+            except Exception:
+                mins = 60
             control.desired_state = "SOFT_BLOCK"
             control.kill_switch = False
             control.override_minutes = mins
@@ -960,7 +780,10 @@ def process_telegram_control_commands(cfg: Config, control: ControlState, state:
             reply = f"Set SOFT_BLOCK for {mins} minutes."
 
         elif cmd == "/cooldown":
-            mins = int(args[0]) if args else cfg.cooldown_minutes_after_loss_cluster
+            try:
+                mins = int(args[0]) if args else cfg.cooldown_minutes_after_loss_cluster
+            except Exception:
+                mins = cfg.cooldown_minutes_after_loss_cluster
             control.desired_state = "COOLDOWN"
             control.kill_switch = False
             control.override_minutes = mins
@@ -971,7 +794,10 @@ def process_telegram_control_commands(cfg: Config, control: ControlState, state:
             reply = f"Set COOLDOWN for {mins} minutes."
 
         elif cmd == "/probation":
-            mins = int(args[0]) if args else 120
+            try:
+                mins = int(args[0]) if args else 120
+            except Exception:
+                mins = 120
             control.desired_state = "PROBATION"
             control.kill_switch = False
             control.override_minutes = mins
@@ -1048,6 +874,9 @@ def process_telegram_control_commands(cfg: Config, control: ControlState, state:
                 "/note text"
             )
 
+        print(f"[TG DEBUG] Command changed state: {changed}")
+        print(f"[TG DEBUG] Reply prepared: {reply}")
+
         if changed:
             record_risk_audit(
                 state,
@@ -1059,11 +888,15 @@ def process_telegram_control_commands(cfg: Config, control: ControlState, state:
                     "operator": control.operator,
                 },
             )
+            print(f"[TG DEBUG] Recorded control command with command_id: {control.command_id}")
 
         try:
             telegram.send(reply, chat_id=chat_id)
-        except Exception:
-            pass
+            print("[TG DEBUG] Reply sent successfully.")
+        except Exception as e:
+            print(f"[TG DEBUG] Failed to send reply: {e}")
+
+    print(f"[TG DEBUG] Final update offset: {control.telegram_update_offset}")
 
 
 def apply_control_plane(
@@ -1127,6 +960,22 @@ def apply_control_plane(
                 discord.send(cfg.discord_premium_webhook, msg)
             if cfg.telegram_enabled:
                 telegram.send(msg, chat_id=cfg.telegram_admin_chat_id or cfg.telegram_chat_id)
+
+
+# ============================================================
+# RISK / EXECUTION / TRACKING / REPORTS
+# ============================================================
+
+def current_session_label() -> str:
+    current = now_et()
+    mins = current.hour * 60 + current.minute
+    if 9 * 60 + 30 <= mins < 10 * 60 + 30:
+        return "OPEN"
+    if 10 * 60 + 30 <= mins < 14 * 60:
+        return "MIDDAY"
+    if 14 * 60 <= mins <= 16 * 60:
+        return "POWER_HOUR"
+    return "OFF_HOURS"
 
 
 class ExposureService:
@@ -1477,167 +1326,6 @@ def safe_get_positions(executor: ExecutionEngine) -> List[Any]:
         return []
 
 
-def record_signal(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, cfg: Config) -> None:
-    perf.history.append(
-        {
-            "ts_utc": now_utc_iso(),
-            "date_et": today_et_str(),
-            "week_key": week_key_et(),
-            "type": "signal",
-            "symbol": alert.symbol,
-            "grade": alert.grade,
-            "direction": alert.direction,
-            "score": alert.score,
-            "price_snapshot": ctx.primary.price,
-            "signal_key": alert.key,
-        }
-    )
-
-    if cfg.tracking_enabled:
-        perf.pending_signals.append(
-            {
-                "signal_key": alert.key,
-                "symbol": alert.symbol,
-                "grade": alert.grade,
-                "direction": alert.direction,
-                "score": alert.score,
-                "entry_price": ctx.primary.price,
-                "created_at_utc": now_utc_iso(),
-                "date_et": today_et_str(),
-                "week_key": week_key_et(),
-                "checkpoints": {},
-                "final_status": "PENDING",
-                "target_pct": cfg.tracking_target_pct,
-                "fail_pct": cfg.tracking_fail_pct,
-            }
-        )
-
-
-def record_execution(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, result: Dict[str, Any]) -> None:
-    perf.history.append(
-        {
-            "ts_utc": now_utc_iso(),
-            "date_et": today_et_str(),
-            "week_key": week_key_et(),
-            "type": "execution",
-            "symbol": alert.symbol,
-            "grade": alert.grade,
-            "direction": alert.direction,
-            "score": alert.score,
-            "qty": result.get("qty", 0),
-            "side": result.get("side", ""),
-            "price_snapshot": ctx.primary.price,
-            "alpaca_order_id": result.get("alpaca_order_id", ""),
-            "alpaca_status": result.get("alpaca_status", ""),
-            "signal_key": alert.key,
-        }
-    )
-
-
-def compute_signal_status(direction: str, move_pct: float, target_pct: float, fail_pct: float) -> str:
-    if direction == "BULLISH":
-        if move_pct >= target_pct:
-            return "WIN"
-        if move_pct <= -fail_pct:
-            return "LOSS"
-        return "PENDING"
-    if direction == "BEARISH":
-        if move_pct <= -target_pct:
-            return "WIN"
-        if move_pct >= fail_pct:
-            return "LOSS"
-        return "PENDING"
-    return "PENDING"
-
-
-def update_pending_signal_from_quote(pending: Dict[str, Any], quote_price: float) -> None:
-    age_min = minutes_since(pending["created_at_utc"])
-    entry_price = float(pending["entry_price"])
-    move_pct = pct_change(quote_price, entry_price)
-
-    for window in TRACK_WINDOWS_MIN:
-        key = str(window)
-        if age_min >= window and key not in pending["checkpoints"]:
-            status = compute_signal_status(
-                pending["direction"],
-                move_pct,
-                float(pending["target_pct"]),
-                float(pending["fail_pct"]),
-            )
-            pending["checkpoints"][key] = {
-                "minutes": window,
-                "price": quote_price,
-                "move_pct": round(move_pct, 4),
-                "status": status,
-                "evaluated_at_utc": now_utc_iso(),
-            }
-
-    if age_min >= 60:
-        final_cp = pending["checkpoints"].get("60")
-        if final_cp:
-            pending["final_status"] = final_cp["status"]
-
-
-def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, cfg: Config) -> None:
-    if not cfg.tracking_enabled:
-        return
-
-    still_pending: List[Dict[str, Any]] = []
-    cache: Dict[str, float] = {}
-
-    for pending in perf.pending_signals:
-        symbol = pending["symbol"]
-        try:
-            if symbol not in cache:
-                cache[symbol] = client.get_quote(symbol).price
-            current_price = cache[symbol]
-            update_pending_signal_from_quote(pending, current_price)
-        except Exception as e:
-            debug_log(cfg, f"tracking quote failed for {symbol}: {e}")
-
-        age_min = minutes_since(pending["created_at_utc"])
-
-        if age_min >= 60 and pending["final_status"] != "PENDING":
-            perf.history.append(
-                {
-                    "ts_utc": now_utc_iso(),
-                    "date_et": pending["date_et"],
-                    "week_key": pending["week_key"],
-                    "type": "tracked_outcome",
-                    "signal_key": pending["signal_key"],
-                    "symbol": pending["symbol"],
-                    "grade": pending["grade"],
-                    "direction": pending["direction"],
-                    "score": pending["score"],
-                    "entry_price": pending["entry_price"],
-                    "final_status": pending["final_status"],
-                    "checkpoints": pending["checkpoints"],
-                }
-            )
-        elif age_min >= 120:
-            pending["final_status"] = "NEUTRAL"
-            perf.history.append(
-                {
-                    "ts_utc": now_utc_iso(),
-                    "date_et": pending["date_et"],
-                    "week_key": pending["week_key"],
-                    "type": "tracked_outcome",
-                    "signal_key": pending["signal_key"],
-                    "symbol": pending["symbol"],
-                    "grade": pending["grade"],
-                    "direction": pending["direction"],
-                    "score": pending["score"],
-                    "entry_price": pending["entry_price"],
-                    "final_status": pending["final_status"],
-                    "checkpoints": pending["checkpoints"],
-                }
-            )
-        else:
-            still_pending.append(pending)
-
-    perf.pending_signals = still_pending
-
-
 def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     signals = [x for x in history if x.get("type") == "signal"]
     executions = [x for x in history if x.get("type") == "execution"]
@@ -1780,6 +1468,34 @@ def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionE
             perf.last_weekly_report_key = wk
 
 
+def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext:
+    primary = client.get_quote(cfg.primary_symbol)
+    secondary = client.get_quote(cfg.secondary_symbol)
+    oil = None
+    volatility = None
+    try:
+        oil = client.get_quote(cfg.oil_symbol)
+    except Exception as e:
+        debug_log(cfg, f"oil quote failed: {e}")
+    try:
+        volatility = client.get_quote(cfg.volatility_symbol)
+    except Exception as e:
+        debug_log(cfg, f"vol quote failed: {e}")
+
+    return MarketContext(
+        primary=primary,
+        secondary=secondary,
+        oil=oil,
+        volatility=volatility,
+        primary_indicators=client.get_indicator_pack(cfg.primary_symbol),
+        secondary_indicators=client.get_indicator_pack(cfg.secondary_symbol),
+        previous_day_high=primary.high,
+        previous_day_low=primary.low,
+        premarket_high=primary.high,
+        premarket_low=primary.low,
+    )
+
+
 def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
     current_ts = time.time()
     last_ts = state.last_alert_times.get(key, 0)
@@ -1788,6 +1504,15 @@ def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: 
 
 def mark_sent(state: PersistentState, key: str) -> None:
     state.last_alert_times[key] = time.time()
+
+
+def format_for_telegram(alert: AlertPayload) -> str:
+    return f"{alert.title}\n\n{alert.body}\n\nUTC: {alert.timestamp_utc}"
+
+
+def format_for_discord(alert: AlertPayload) -> str:
+    hashtags = " ".join(f"#{tag}" for tag in alert.tags[:6])
+    return f"**{alert.title}**\n```{alert.body}```\n{hashtags}\nUTC: {alert.timestamp_utc}"
 
 
 def route_alert(alert: AlertPayload, cfg: Config, state: PersistentState, telegram: TelegramNotifier, discord: DiscordNotifier) -> None:
@@ -1840,6 +1565,90 @@ def append_risk_to_alert(alert: AlertPayload, decision: RiskDecision, control: C
         extra.append(f"  - {code}")
     alert.body = alert.body + "\n" + "\n".join(extra)
     return alert
+
+
+def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, cfg: Config) -> None:
+    if not cfg.tracking_enabled:
+        return
+
+    still_pending: List[Dict[str, Any]] = []
+    cache: Dict[str, float] = {}
+
+    for pending in perf.pending_signals:
+        symbol = pending["symbol"]
+        try:
+            if symbol not in cache:
+                cache[symbol] = client.get_quote(symbol).price
+            current_price = cache[symbol]
+            age_min = minutes_since(pending["created_at_utc"])
+            entry_price = float(pending["entry_price"])
+            move_pct = pct_change(current_price, entry_price)
+
+            for window in TRACK_WINDOWS_MIN:
+                key = str(window)
+                if age_min >= window and key not in pending["checkpoints"]:
+                    status = compute_signal_status(
+                        pending["direction"],
+                        move_pct,
+                        float(pending["target_pct"]),
+                        float(pending["fail_pct"]),
+                    )
+                    pending["checkpoints"][key] = {
+                        "minutes": window,
+                        "price": current_price,
+                        "move_pct": round(move_pct, 4),
+                        "status": status,
+                        "evaluated_at_utc": now_utc_iso(),
+                    }
+
+            if age_min >= 60:
+                final_cp = pending["checkpoints"].get("60")
+                if final_cp:
+                    pending["final_status"] = final_cp["status"]
+
+            if age_min >= 60 and pending["final_status"] != "PENDING":
+                perf.history.append(
+                    {
+                        "ts_utc": now_utc_iso(),
+                        "date_et": pending["date_et"],
+                        "week_key": pending["week_key"],
+                        "type": "tracked_outcome",
+                        "signal_key": pending["signal_key"],
+                        "symbol": pending["symbol"],
+                        "grade": pending["grade"],
+                        "direction": pending["direction"],
+                        "score": pending["score"],
+                        "entry_price": pending["entry_price"],
+                        "final_status": pending["final_status"],
+                        "checkpoints": pending["checkpoints"],
+                    }
+                )
+            elif age_min >= 120:
+                pending["final_status"] = "NEUTRAL"
+                perf.history.append(
+                    {
+                        "ts_utc": now_utc_iso(),
+                        "date_et": pending["date_et"],
+                        "week_key": pending["week_key"],
+                        "type": "tracked_outcome",
+                        "signal_key": pending["signal_key"],
+                        "symbol": pending["symbol"],
+                        "grade": pending["grade"],
+                        "direction": pending["direction"],
+                        "score": pending["score"],
+                        "entry_price": pending["entry_price"],
+                        "final_status": pending["final_status"],
+                        "checkpoints": pending["checkpoints"],
+                    }
+                )
+            else:
+                still_pending.append(pending)
+
+        except Exception as e:
+            debug_log(cfg, f"tracking quote failed for {symbol}: {e}")
+            still_pending.append(pending)
+
+    perf.pending_signals = still_pending
 
 
 def run_once() -> None:
