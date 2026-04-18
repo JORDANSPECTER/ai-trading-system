@@ -1,4 +1,5 @@
 import os
+import csv
 import requests
 from datetime import datetime
 
@@ -10,6 +11,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM")
 DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE")
+
+# =========================
+# FILE PATHS
+# =========================
+TRADE_LOG_FILE = "trade_log.csv"
+CLOSED_TRADE_LOG_FILE = "closed_trade_log.csv"
 
 # =========================
 # GLOBAL TRADE STORE
@@ -88,6 +95,60 @@ def pct_change(entry, current):
         return ((current - entry) / entry) * 100
     except Exception:
         return 0.0
+
+
+def file_exists(path):
+    return os.path.exists(path)
+
+# =========================
+# CSV / JOURNAL LOGGING
+# =========================
+def append_csv_row(path, fieldnames, row):
+    file_already_exists = file_exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_already_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def log_open_trade(symbol, context, discipline, sizing, management, options_plan):
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": symbol,
+        "direction": management["direction"],
+        "execution_grade": discipline["execution_grade"],
+        "original_grade": discipline["original_grade"],
+        "timing_label": discipline["timing"]["timing_label"],
+        "confidence_score": sizing["confidence_score"],
+        "size_label": sizing["size_label"],
+        "risk_multiplier": sizing["risk_multiplier"],
+        "entry_underlying": safe_float(get_attr(context, "current_price", 0.0)),
+        "trigger_level": safe_float(get_attr(context, "trigger_level", 0.0)),
+        "entry_contract_price": safe_float(get_attr(context, "contract_price", 0.0)),
+        "contract_type": options_plan["contract_type"],
+        "contract_style": options_plan["contract_style"],
+        "expiry_guidance": options_plan["expiry_guidance"],
+        "moneyness": options_plan["moneyness"],
+        "preferred_delta": options_plan["preferred_delta"],
+        "invalidation": management["invalidation"],
+        "trim_1": management["trim_1"],
+        "trim_2": management["trim_2"],
+        "runner_target": management["runner_target"],
+        "breakeven_trigger": management["breakeven_trigger"],
+        "reasons": " | ".join(discipline["reasons"]),
+        "size_notes": " | ".join(sizing["size_notes"]),
+        "options_notes": " | ".join(options_plan["reasons"]),
+        "options_blockers": " | ".join(options_plan["blockers"]),
+    }
+
+    fieldnames = list(row.keys())
+    append_csv_row(TRADE_LOG_FILE, fieldnames, row)
+
+
+def log_closed_trade(closed_row):
+    fieldnames = list(closed_row.keys())
+    append_csv_row(CLOSED_TRADE_LOG_FILE, fieldnames, closed_row)
 
 # =========================
 # STATE 4 - ENTRY DISCIPLINE
@@ -501,8 +562,12 @@ def register_open_trade(symbol, context, discipline, sizing, management, options
         "entry_underlying": safe_float(get_attr(context, "current_price", 0.0)),
         "entry_contract_price": safe_float(get_attr(context, "contract_price", 0.0)),
         "execution_grade": discipline["execution_grade"],
+        "original_grade": discipline["original_grade"],
+        "timing_label": discipline["timing"]["timing_label"],
         "confidence_score": sizing["confidence_score"],
         "size_label": sizing["size_label"],
+        "contract_type": options_plan["contract_type"],
+        "contract_style": options_plan["contract_style"],
         "trim_1": management["trim_1"],
         "trim_2": management["trim_2"],
         "runner_target": management["runner_target"],
@@ -515,8 +580,10 @@ def register_open_trade(symbol, context, discipline, sizing, management, options
         "closed": False,
     }
 
+    log_open_trade(symbol, context, discipline, sizing, management, options_plan)
 
-def evaluate_open_trade(symbol, current_underlying_price, current_contract_price=None):
+
+def evaluate_open_trade(symbol, current_underlying_price, current_contract_price=None, close_trade=False):
     if symbol not in OPEN_TRADES:
         print(f"No open trade tracked for {symbol}")
         return None
@@ -559,7 +626,7 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
             alerts.append(f"🛡️ {symbol} Move stop to breakeven now")
         if current_underlying_price <= trade["invalidation"]:
             alerts.append(f"❌ {symbol} invalidation lost at {fmt_price(trade['invalidation'])}")
-            trade["closed"] = True
+            close_trade = True
     else:
         if (not trade["trim_1_hit"]) and current_underlying_price <= trade["trim_1"]:
             trade["trim_1_hit"] = True
@@ -575,7 +642,35 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
             alerts.append(f"🛡️ {symbol} Move stop to breakeven now")
         if current_underlying_price >= trade["invalidation"]:
             alerts.append(f"❌ {symbol} invalidation lost at {fmt_price(trade['invalidation'])}")
-            trade["closed"] = True
+            close_trade = True
+
+    if close_trade:
+        trade["closed"] = True
+
+        win_loss = "WIN" if contract_pnl_pct > 0 else "LOSS"
+        closed_row = {
+            "closed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "direction": direction,
+            "execution_grade": trade["execution_grade"],
+            "original_grade": trade["original_grade"],
+            "timing_label": trade["timing_label"],
+            "confidence_score": trade["confidence_score"],
+            "size_label": trade["size_label"],
+            "contract_type": trade["contract_type"],
+            "contract_style": trade["contract_style"],
+            "entry_underlying": entry_underlying,
+            "exit_underlying": current_underlying_price,
+            "underlying_pnl_pct": round(underlying_pnl_pct, 2),
+            "entry_contract_price": entry_contract,
+            "exit_contract_price": current_contract_price,
+            "contract_pnl_pct": round(contract_pnl_pct, 2),
+            "result": win_loss,
+            "trim_1_hit": trade["trim_1_hit"],
+            "trim_2_hit": trade["trim_2_hit"],
+            "runner_hit": trade["runner_hit"],
+        }
+        log_closed_trade(closed_row)
 
     summary = {
         "symbol": symbol,
@@ -593,6 +688,91 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
         "breakeven_sent": trade["breakeven_sent"],
         "closed": trade["closed"],
     }
+
+    return summary
+
+# =========================
+# PERFORMANCE SUMMARY
+# =========================
+def load_closed_trades():
+    if not file_exists(CLOSED_TRADE_LOG_FILE):
+        return []
+
+    rows = []
+    with open(CLOSED_TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows
+
+
+def build_performance_summary():
+    rows = load_closed_trades()
+    if not rows:
+        return "No closed trades logged yet."
+
+    total_trades = len(rows)
+    wins = 0
+    losses = 0
+    total_contract_pnl = 0.0
+
+    by_grade = {}
+    by_symbol = {}
+
+    for row in rows:
+        result = row.get("result", "")
+        grade = row.get("execution_grade", "UNKNOWN")
+        symbol = row.get("symbol", "UNKNOWN")
+        pnl = safe_float(row.get("contract_pnl_pct", 0.0))
+
+        total_contract_pnl += pnl
+
+        if result == "WIN":
+            wins += 1
+        else:
+            losses += 1
+
+        if grade not in by_grade:
+            by_grade[grade] = {"count": 0, "pnl": 0.0}
+        by_grade[grade]["count"] += 1
+        by_grade[grade]["pnl"] += pnl
+
+        if symbol not in by_symbol:
+            by_symbol[symbol] = {"count": 0, "pnl": 0.0}
+        by_symbol[symbol]["count"] += 1
+        by_symbol[symbol]["pnl"] += pnl
+
+    win_rate = (wins / total_trades) * 100 if total_trades else 0.0
+    avg_contract_pnl = total_contract_pnl / total_trades if total_trades else 0.0
+
+    grade_lines = []
+    for grade, data in by_grade.items():
+        grade_lines.append(
+            f"- {grade}: {data['count']} trades, total contract PnL {round(data['pnl'], 2)}%"
+        )
+
+    symbol_lines = []
+    for symbol, data in by_symbol.items():
+        symbol_lines.append(
+            f"- {symbol}: {data['count']} trades, total contract PnL {round(data['pnl'], 2)}%"
+        )
+
+    summary = f"""
+📊 UNBIASED BOT PERFORMANCE SUMMARY
+
+Total Closed Trades: {total_trades}
+Wins: {wins}
+Losses: {losses}
+Win Rate: {round(win_rate, 2)}%
+Total Contract PnL: {round(total_contract_pnl, 2)}%
+Average Contract PnL per Trade: {round(avg_contract_pnl, 2)}%
+
+By Grade:
+{chr(10).join(grade_lines)}
+
+By Symbol:
+{chr(10).join(symbol_lines)}
+""".strip()
 
     return summary
 
@@ -851,14 +1031,22 @@ def route_alerts(decision, context):
 # =========================
 # LIVE MANAGER ROUTE
 # =========================
-def send_live_trade_update(symbol, current_underlying_price, current_contract_price=None):
-    summary = evaluate_open_trade(symbol, current_underlying_price, current_contract_price)
+def send_live_trade_update(symbol, current_underlying_price, current_contract_price=None, close_trade=False):
+    summary = evaluate_open_trade(symbol, current_underlying_price, current_contract_price, close_trade=close_trade)
     if not summary:
         return
 
     msg = format_live_management_update(summary)
     send_telegram(msg)
     send_discord_premium(msg)
+
+# =========================
+# PERFORMANCE ROUTE
+# =========================
+def send_performance_summary():
+    summary = build_performance_summary()
+    send_telegram(summary)
+    send_discord_premium(summary)
 
 # =========================
 # TESTS
@@ -921,16 +1109,17 @@ def send_test_alert():
 def test_live_manager():
     send_live_trade_update("QQQ", 616.65, 1.92)
     send_live_trade_update("QQQ", 617.18, 2.45)
+    send_live_trade_update("QQQ", 617.55, 2.90, close_trade=True)
+
+
+def test_performance_summary():
+    send_performance_summary()
 
 # =========================
 # MAIN
 # =========================
 if __name__ == "__main__":
-    # 1) direct telegram test
     test_telegram_only()
-
-    # 2) entry alert test
     send_test_alert()
-
-    # 3) live management test
     test_live_manager()
+    test_performance_summary()
