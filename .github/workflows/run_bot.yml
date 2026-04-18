@@ -30,7 +30,7 @@ jobs:
       - name: Create fallback state files if missing
         run: |
           if [ ! -f elite_state.json ]; then
-            echo '{"last_alert_times": {}, "last_market_snapshot": {}, "execution_submitted_signals": {}}' > elite_state.json
+            echo '{"last_alert_times": {}, "last_market_snapshot": {}, "execution_submitted_signals": {}, "risk_state": "ACTIVE", "risk_state_until_utc": "", "risk_peak_equity": 0.0, "risk_audit": []}' > elite_state.json
           fi
           if [ ! -f performance_state.json ]; then
             echo '{"history": [], "pending_signals": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
@@ -104,6 +104,25 @@ jobs:
           TRACKING_ENABLED: ${{ secrets.TRACKING_ENABLED }}
           TRACKING_TARGET_PCT: ${{ secrets.TRACKING_TARGET_PCT }}
           TRACKING_FAIL_PCT: ${{ secrets.TRACKING_FAIL_PCT }}
+
+          RISK_ENABLED: ${{ secrets.RISK_ENABLED }}
+          KILL_SWITCH_ENABLED: ${{ secrets.KILL_SWITCH_ENABLED }}
+          SESSION_FILTER_ENABLED: ${{ secrets.SESSION_FILTER_ENABLED }}
+          ALLOW_MIDDAY_ENTRIES: ${{ secrets.ALLOW_MIDDAY_ENTRIES }}
+          MARKET_QUALITY_ENABLED: ${{ secrets.MARKET_QUALITY_ENABLED }}
+          MAX_DAILY_LOSS: ${{ secrets.MAX_DAILY_LOSS }}
+          MAX_DRAWDOWN_PCT: ${{ secrets.MAX_DRAWDOWN_PCT }}
+          MAX_TRADES_PER_DAY: ${{ secrets.MAX_TRADES_PER_DAY }}
+          ONE_TRADE_PER_SYMBOL: ${{ secrets.ONE_TRADE_PER_SYMBOL }}
+          COOLDOWN_MINUTES_AFTER_LOSS_CLUSTER: ${{ secrets.COOLDOWN_MINUTES_AFTER_LOSS_CLUSTER }}
+          MAX_CONSECUTIVE_LOSSES: ${{ secrets.MAX_CONSECUTIVE_LOSSES }}
+          MAX_ORDER_NOTIONAL: ${{ secrets.MAX_ORDER_NOTIONAL }}
+          MAX_SYMBOL_EXPOSURE: ${{ secrets.MAX_SYMBOL_EXPOSURE }}
+          MAX_PORTFOLIO_EXPOSURE: ${{ secrets.MAX_PORTFOLIO_EXPOSURE }}
+          DUPLICATE_SIGNAL_WINDOW_MINUTES: ${{ secrets.DUPLICATE_SIGNAL_WINDOW_MINUTES }}
+          VIX_SPIKE_BLOCK_PCT: ${{ secrets.VIX_SPIKE_BLOCK_PCT }}
+          MAX_VWAP_DISTANCE_PCT: ${{ secrets.MAX_VWAP_DISTANCE_PCT }}
+          PROBATION_SIZE_MULTIPLIER: ${{ secrets.PROBATION_SIZE_MULTIPLIER }}
         run: |
           python main.py
 
