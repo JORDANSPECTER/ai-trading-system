@@ -83,6 +83,19 @@ def grade_from_score(score: int) -> str:
     return "D"
 
 
+def is_daily_levels_window() -> bool:
+    """
+    Send Daily Levels only from 9AM to 9PM Eastern.
+    Approximated using UTC hours:
+    - 13:00 to 23:59 UTC
+    - 00:00 to 01:59 UTC
+    This matches the workflow cron windows.
+    """
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    return (13 <= hour <= 23) or (0 <= hour <= 1)
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -120,7 +133,6 @@ class Config:
     vwap_distance_threshold_pct: float
 
     daily_levels_enabled: bool
-    daily_levels_only_once_per_day: bool
     risk_warning_text: str
     debug: bool
 
@@ -137,7 +149,7 @@ def load_config() -> Config:
         state_file=env_str("STATE_FILE", "elite_state.json"),
         dedupe_price_rounding=env_int("DEDUPE_PRICE_ROUNDING", 2),
         alert_cooldown_seconds=env_int("ALERT_COOLDOWN_SECONDS", 900),
-        daily_levels_cooldown_seconds=env_int("DAILY_LEVELS_COOLDOWN_SECONDS", 21600),
+        daily_levels_cooldown_seconds=env_int("DAILY_LEVELS_COOLDOWN_SECONDS", 1200),
 
         telegram_enabled=env_bool("TELEGRAM_ENABLED", True),
         telegram_bot_token=env_str("TELEGRAM_BOT_TOKEN"),
@@ -158,7 +170,6 @@ def load_config() -> Config:
         vwap_distance_threshold_pct=env_float("VWAP_DISTANCE_THRESHOLD_PCT", 0.15),
 
         daily_levels_enabled=env_bool("DAILY_LEVELS_ENABLED", True),
-        daily_levels_only_once_per_day=env_bool("DAILY_LEVELS_ONLY_ONCE_PER_DAY", True),
         risk_warning_text=env_str(
             "RISK_WARNING_TEXT",
             "Educational alert only. Not financial advice. Wait for confirmation at key levels."
@@ -238,7 +249,6 @@ class AlertPayload:
 @dataclass
 class PersistentState:
     last_alert_times: Dict[str, float] = field(default_factory=dict)
-    last_daily_levels_date: str = ""
     last_market_snapshot: Dict[str, float] = field(default_factory=dict)
 
     @staticmethod
@@ -250,7 +260,6 @@ class PersistentState:
                 raw = json.load(f)
             return PersistentState(
                 last_alert_times=raw.get("last_alert_times", {}),
-                last_daily_levels_date=raw.get("last_daily_levels_date", ""),
                 last_market_snapshot=raw.get("last_market_snapshot", {}),
             )
         except Exception:
@@ -259,7 +268,6 @@ class PersistentState:
     def save(self, path: str) -> None:
         payload = {
             "last_alert_times": self.last_alert_times,
-            "last_daily_levels_date": self.last_daily_levels_date,
             "last_market_snapshot": self.last_market_snapshot,
         }
         with open(path, "w", encoding="utf-8") as f:
@@ -522,6 +530,7 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
     lines.append("Watch for acceptance / rejection at these levels before entry.")
     lines.append(cfg.risk_warning_text)
 
+    # key does NOT include date anymore so cooldown can govern repeated sends all day
     return AlertPayload(
         alert_type="DAILY_LEVELS",
         symbol=ctx.primary.symbol,
@@ -531,7 +540,7 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
         direction="LEVELS",
         score=0,
         tags=["daily-levels", ctx.primary.symbol.lower()],
-        key=f"DAILY_LEVELS::{ctx.primary.symbol}::{today_utc_date()}",
+        key=f"DAILY_LEVELS::{ctx.primary.symbol}",
         timestamp_utc=now_utc_iso(),
     )
 
@@ -677,8 +686,10 @@ def route_alert(
     if alert.alert_type == "DAILY_LEVELS":
         if not cfg.daily_levels_enabled:
             return
-        if cfg.daily_levels_only_once_per_day and state.last_daily_levels_date == today_utc_date():
+
+        if not is_daily_levels_window():
             return
+
         if not should_send_by_cooldown(state, alert.key, cfg.daily_levels_cooldown_seconds):
             return
 
@@ -689,7 +700,6 @@ def route_alert(
             telegram.send(msg_telegram)
 
         mark_sent(state, alert.key)
-        state.last_daily_levels_date = today_utc_date()
         return
 
     # TRADE ALERTS
