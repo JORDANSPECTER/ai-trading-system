@@ -15,11 +15,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 STATE_FILE = "control_state.json"
 OFFSET_FILE = "telegram_offset.txt"
 
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-# Optional runtime flags
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").strip().lower() == "true"
-BOT_NAME = os.getenv("BOT_NAME", "Heartbeat Command Center").strip()
+BOT_NAME = os.getenv("BOT_NAME", "Heartbeat Live Control Center").strip()
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
+
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # =========================================================
 # DEFAULT STATE
@@ -29,7 +29,7 @@ DEFAULT_STATE = {
     "kill_switch": False,
     "flatten_requested": False,
     "armed": True,
-    "mode": "paper",  # paper or live
+    "mode": "paper",
     "last_command": "none",
     "last_command_time_utc": None,
     "last_command_from": None,
@@ -44,8 +44,8 @@ def load_json_file(path, default_value):
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
-        print(f"[WARN] Failed loading JSON file: {path}")
+    except Exception as e:
+        print(f"[WARN] Failed loading JSON from {path}: {e}")
     return default_value.copy() if isinstance(default_value, dict) else default_value
 
 def save_json_file(path, data):
@@ -57,54 +57,14 @@ def load_offset():
         if os.path.exists(OFFSET_FILE):
             with open(OFFSET_FILE, "r", encoding="utf-8") as f:
                 return int(f.read().strip())
-    except Exception:
-        print("[WARN] Failed loading telegram offset")
+    except Exception as e:
+        print(f"[WARN] Failed loading offset: {e}")
     return 0
 
 def save_offset(offset_value):
     with open(OFFSET_FILE, "w", encoding="utf-8") as f:
         f.write(str(offset_value))
 
-# =========================================================
-# TELEGRAM HELPERS
-# =========================================================
-def telegram_request(method, payload=None, timeout=30):
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN")
-
-    url = f"{TELEGRAM_API_BASE}/{method}"
-    response = requests.post(url, json=payload or {}, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("ok", False):
-        raise RuntimeError(f"Telegram API error on {method}: {data}")
-
-    return data
-
-def send_telegram_message(text, chat_id=None):
-    target_chat_id = chat_id or TELEGRAM_CHAT_ID
-    if not target_chat_id:
-        print("[WARN] TELEGRAM_CHAT_ID missing, cannot send message")
-        return None
-
-    payload = {
-        "chat_id": str(target_chat_id),
-        "text": text
-    }
-    return telegram_request("sendMessage", payload=payload)
-
-def get_telegram_updates(offset=0, timeout=10):
-    payload = {
-        "offset": offset,
-        "timeout": timeout,
-        "allowed_updates": ["message"]
-    }
-    return telegram_request("getUpdates", payload=payload, timeout=timeout + 10)
-
-# =========================================================
-# CONTROL STATE HELPERS
-# =========================================================
 def load_state():
     state = load_json_file(STATE_FILE, DEFAULT_STATE)
     for key, value in DEFAULT_STATE.items():
@@ -115,6 +75,9 @@ def load_state():
 def save_state(state):
     save_json_file(STATE_FILE, state)
 
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
 def utc_now_string():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -139,9 +102,6 @@ def update_state_command(state, command_name, user_label, note):
     state["notes"] = note
     save_state(state)
 
-# =========================================================
-# COMMAND PARSER
-# =========================================================
 def normalize_text(text):
     return (text or "").strip()
 
@@ -169,25 +129,65 @@ def is_authorized_chat(message):
     incoming_chat_id = str(message.get("chat", {}).get("id", ""))
     return incoming_chat_id == str(TELEGRAM_CHAT_ID)
 
+# =========================================================
+# TELEGRAM API
+# =========================================================
+def telegram_request(method, payload=None, timeout=30):
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN")
+
+    url = f"{TELEGRAM_API_BASE}/{method}"
+    response = requests.post(url, json=payload or {}, timeout=timeout)
+    response.raise_for_status()
+
+    data = response.json()
+    if not data.get("ok", False):
+        raise RuntimeError(f"Telegram API error on {method}: {data}")
+
+    return data
+
+def send_telegram_message(text, chat_id=None):
+    target_chat_id = str(chat_id or TELEGRAM_CHAT_ID).strip()
+    if not target_chat_id:
+        print("[WARN] TELEGRAM_CHAT_ID missing, cannot send message")
+        return None
+
+    payload = {
+        "chat_id": target_chat_id,
+        "text": text
+    }
+    return telegram_request("sendMessage", payload=payload, timeout=30)
+
+def get_telegram_updates(offset=0, timeout=20):
+    payload = {
+        "offset": offset,
+        "timeout": timeout,
+        "allowed_updates": ["message"]
+    }
+    return telegram_request("getUpdates", payload=payload, timeout=timeout + 10)
+
+# =========================================================
+# COMMANDS
+# =========================================================
 def command_menu_text():
     return (
         f"🤖 {BOT_NAME}\n\n"
         "Available commands:\n"
         "/start - Open command center\n"
         "/help - Show commands\n"
+        "/ping - Quick connectivity test\n"
         "/status - Current bot state\n"
         "/pause - Pause bot actions\n"
         "/resume - Resume bot actions\n"
         "/kill - Turn ON kill switch\n"
+        "/unkill - Turn OFF kill switch\n"
         "/flatten - Request flatten\n"
+        "/clearflatten - Clear flatten request\n"
         "/arm - Allow engine to operate\n"
         "/disarm - Disarm execution engine\n"
         "/mode paper - Set paper mode\n"
         "/mode live - Set live mode\n"
-        "/clearflatten - Clear flatten request\n"
-        "/unkill - Turn OFF kill switch\n"
-        "/debugstate - Dump raw state\n"
-        "/ping - Quick connectivity test"
+        "/debugstate - Dump raw state"
     )
 
 def process_command(text, state, user_label):
@@ -262,43 +262,34 @@ def process_command(text, state, user_label):
 
     if cmd_lower == "/debugstate":
         update_state_command(state, "/debugstate", user_label, "raw state requested")
-        return "```json\n" + json.dumps(state, indent=2) + "\n```"
+        return "Raw state:\n" + json.dumps(state, indent=2)
 
     update_state_command(state, cmd, user_label, "unknown command received")
-    return (
-        f"❓ Unknown command: {cmd}\n\n"
-        "Use /help to see available commands."
-    )
+    return f"❓ Unknown command: {cmd}\n\nUse /help to see available commands."
 
 # =========================================================
-# MAIN TELEGRAM LOOP
+# TELEGRAM UPDATE PROCESSOR
 # =========================================================
 def process_updates_once():
     state = load_state()
     last_offset = load_offset()
 
     if DEBUG_MODE:
-        print(f"[DEBUG] Starting update check with offset={last_offset}")
+        print(f"[DEBUG] Polling Telegram with offset={last_offset}")
 
-    updates_data = get_telegram_updates(offset=last_offset, timeout=5)
+    updates_data = get_telegram_updates(offset=last_offset, timeout=20)
     results = updates_data.get("result", [])
 
-    if DEBUG_MODE:
-        print(f"[DEBUG] Updates received: {len(results)}")
-
-    if not results:
-        return
+    if DEBUG_MODE and results:
+        print(f"[DEBUG] Received {len(results)} update(s)")
 
     for item in results:
         update_id = item.get("update_id")
         message = item.get("message", {})
         text = normalize_text(message.get("text", ""))
 
-        new_offset = update_id + 1
-        save_offset(new_offset)
-
-        if DEBUG_MODE:
-            print(f"[DEBUG] Processing update_id={update_id} text={text!r}")
+        if update_id is not None:
+            save_offset(update_id + 1)
 
         if not message:
             continue
@@ -306,28 +297,30 @@ def process_updates_once():
         incoming_chat_id = str(message.get("chat", {}).get("id", ""))
         user_label = extract_user_label(message)
 
+        if DEBUG_MODE:
+            print(f"[DEBUG] update_id={update_id} chat_id={incoming_chat_id} text={text!r}")
+
         if not is_authorized_chat(message):
-            if DEBUG_MODE:
-                print(f"[DEBUG] Unauthorized chat attempted access: {incoming_chat_id}")
             try:
                 send_telegram_message(
                     "⛔ This chat is not authorized for command control.",
                     chat_id=incoming_chat_id
                 )
             except Exception as e:
-                print(f"[WARN] Failed sending unauthorized notice: {e}")
+                print(f"[WARN] Failed unauthorized notice: {e}")
+            continue
+
+        if not text:
             continue
 
         if not text.startswith("/"):
-            if DEBUG_MODE:
-                print(f"[DEBUG] Non-command message ignored from {user_label}")
             try:
                 send_telegram_message(
                     f"📝 Received: {text}\n\nSend /help for available commands.",
                     chat_id=incoming_chat_id
                 )
             except Exception as e:
-                print(f"[WARN] Failed replying to non-command text: {e}")
+                print(f"[WARN] Failed replying to text: {e}")
             continue
 
         try:
@@ -339,33 +332,35 @@ def process_updates_once():
 
             state = load_state()
             reply = process_command(text, state, user_label)
-
-            if reply.startswith("```json"):
-                # Telegram sendMessage doesn't consistently honor code fences without parse mode,
-                # so send as normal text.
-                reply = "Raw state:\n" + json.dumps(state, indent=2)
-
             send_telegram_message(reply, chat_id=incoming_chat_id)
 
             if DEBUG_MODE:
-                print(f"[DEBUG] Command processed successfully: {text}")
+                print(f"[DEBUG] Command handled successfully: {text}")
 
         except Exception as command_error:
-            err_text = (
-                f"❌ Command failed: {text}\n"
-                f"Error: {str(command_error)}"
-            )
             print("[ERROR] Command processing failed")
             print(traceback.format_exc())
             try:
-                send_telegram_message(err_text, chat_id=incoming_chat_id)
+                send_telegram_message(
+                    f"❌ Command failed: {text}\nError: {str(command_error)}",
+                    chat_id=incoming_chat_id
+                )
             except Exception:
-                print("[ERROR] Also failed to send Telegram error message")
+                print("[ERROR] Failed to send Telegram error message")
+
+# =========================================================
+# BOOTSTRAP
+# =========================================================
+def ensure_files_exist():
+    if not os.path.exists(STATE_FILE):
+        save_state(DEFAULT_STATE)
+    if not os.path.exists(OFFSET_FILE):
+        save_offset(0)
 
 def startup_message():
     state = load_state()
     return (
-        f"🚀 {BOT_NAME} check-in\n"
+        f"🚀 {BOT_NAME} ONLINE\n"
         f"Time: {utc_now_string()}\n"
         f"Mode: {state.get('mode')}\n"
         f"Armed: {state.get('armed')}\n"
@@ -375,39 +370,46 @@ def startup_message():
     )
 
 # =========================================================
-# ENTRYPOINT
+# MAIN LIVE LOOP
 # =========================================================
 if __name__ == "__main__":
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN is missing.")
+
+    ensure_files_exist()
+
+    print("[BOOT] Starting live Telegram listener...")
+    print(f"[BOOT] Poll interval: {POLL_INTERVAL_SECONDS}s")
+    print(f"[BOOT] Debug mode: {DEBUG_MODE}")
+
     try:
-        if not TELEGRAM_BOT_TOKEN:
-            raise ValueError("TELEGRAM_BOT_TOKEN is missing.")
-        if not TELEGRAM_CHAT_ID:
-            print("[WARN] TELEGRAM_CHAT_ID is missing. Authorization filter will be open.")
-
-        # Make sure files exist
-        if not os.path.exists(STATE_FILE):
-            save_state(DEFAULT_STATE)
-        if not os.path.exists(OFFSET_FILE):
-            save_offset(0)
-
-        if DEBUG_MODE:
-            print("[DEBUG] main.py started")
-            print(startup_message())
-
-        process_updates_once()
-
-        if DEBUG_MODE:
-            print("[DEBUG] main.py finished cleanly")
-
+        send_telegram_message(startup_message())
     except Exception as e:
-        print("[FATAL ERROR]")
-        print(str(e))
-        print(traceback.format_exc())
+        print(f"[WARN] Could not send startup message: {e}")
 
-        # Try to notify Telegram if possible
+    while True:
         try:
-            send_telegram_message(
-                f"🚨 Fatal error in {BOT_NAME}\n{str(e)}"
-            )
-        except Exception:
-            print("[FATAL] Failed to send Telegram fatal error alert")
+            process_updates_once()
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            print("[STOP] Listener stopped by user.")
+            try:
+                send_telegram_message(f"🛑 {BOT_NAME} stopped manually.\n{utc_now_string()}")
+            except Exception:
+                pass
+            break
+
+        except Exception as e:
+            print("[FATAL LOOP ERROR]")
+            print(str(e))
+            print(traceback.format_exc())
+
+            try:
+                send_telegram_message(
+                    f"🚨 {BOT_NAME} loop error\n{str(e)}\nRetrying in 5 seconds."
+                )
+            except Exception:
+                print("[WARN] Failed to send loop error alert")
+
+            time.sleep(5)
