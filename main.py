@@ -2,7 +2,6 @@ import os
 import time
 import csv
 import json
-import math
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -67,12 +66,11 @@ OPEN_TRADES_FILE = os.getenv("OPEN_TRADES_FILE", "open_trades.json")
 TRADE_LOG_FILE = os.getenv("TRADE_LOG_FILE", "trade_log.csv")
 
 # =========================================================
-# OPTIONS SETTINGS
+# OPTIONS SETTINGS / PRICING ENGINE
 # =========================================================
 OPTIONS_DTE_FALLBACK_DAYS = int(os.getenv("OPTIONS_DTE_FALLBACK_DAYS", "5"))
 OPTIONS_STRIKE_STEP_BUFFER = float(os.getenv("OPTIONS_STRIKE_STEP_BUFFER", "0.0"))
 
-# Real pricing engine
 OPTION_QUOTE_FEED = os.getenv("OPTION_QUOTE_FEED", "indicative")
 MAX_OPTION_SPREAD_ABS = float(os.getenv("MAX_OPTION_SPREAD_ABS", "0.30"))
 MAX_OPTION_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "20"))
@@ -82,6 +80,9 @@ MIN_OPTION_ASK = float(os.getenv("MIN_OPTION_ASK", "0.05"))
 MIN_OPTION_BID = float(os.getenv("MIN_OPTION_BID", "0.01"))
 ALLOW_MARKET_ORDERS_DURING_RTH = os.getenv("ALLOW_MARKET_ORDERS_DURING_RTH", "false").lower() == "true"
 
+# =========================================================
+# CONSTANTS
+# =========================================================
 GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "A+": 4}
 BULLISH_CONFIRM_BONUS = 15
 BEARISH_CONFIRM_BONUS = 15
@@ -244,15 +245,13 @@ def is_regular_market_hours_et() -> bool:
 def entry_cutoff_reached() -> bool:
     current = now_et()
     cutoff_minutes = ENTRY_CUTOFF_HOUR_ET * 60 + ENTRY_CUTOFF_MINUTE_ET
-    current_minutes = current.hour * 60 + current.minute
-    return current_minutes >= cutoff_minutes
+    return (current.hour * 60 + current.minute) >= cutoff_minutes
 
 
 def force_exit_reached() -> bool:
     current = now_et()
     cutoff_minutes = FORCE_EXIT_HOUR_ET * 60 + FORCE_EXIT_MINUTE_ET
-    current_minutes = current.hour * 60 + current.minute
-    return current_minutes >= cutoff_minutes
+    return (current.hour * 60 + current.minute) >= cutoff_minutes
 
 
 def round_option_limit_price(price: float) -> float:
@@ -412,7 +411,6 @@ def fetch_twelve_time_series(symbol: str, interval: str = "1min", outputsize: in
 def compute_vwap_from_bars(bars: List[Dict]) -> float:
     cumulative_pv = 0.0
     cumulative_vol = 0.0
-
     for bar in bars:
         high = safe_float(bar.get("high"))
         low = safe_float(bar.get("low"))
@@ -424,7 +422,6 @@ def compute_vwap_from_bars(bars: List[Dict]) -> float:
 
     if cumulative_vol <= 0:
         return safe_float(bars[-1].get("close"))
-
     return cumulative_pv / cumulative_vol
 
 
@@ -434,7 +431,6 @@ def compute_rsi_from_closes(closes: List[float], period: int = 14) -> float:
 
     gains = []
     losses = []
-
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i - 1]
         gains.append(max(diff, 0))
@@ -596,7 +592,6 @@ def load_constituent_snapshots(etf_symbol: str) -> List[ConstituentSnapshot]:
                 weight=safe_float(item["weight"]),
             )
         )
-
     return snapshots
 
 
@@ -627,7 +622,6 @@ def analyze_constituent_internals(etf_symbol: str, snapshots: List[ConstituentSn
 
     for snap in snapshots:
         weighted_push = snap.weight * abs(snap.change_pct)
-
         if snap.above_vwap and snap.change_pct > 0:
             bullish_weight += snap.weight
             bullish_names += 1
@@ -652,13 +646,13 @@ def analyze_constituent_internals(etf_symbol: str, snapshots: List[ConstituentSn
 
     if aligned_bullish_weight >= 0.55 and bullish_participation >= 0.50:
         bias = "BULLISH_CONFIRMATION"
-        summary = f"{etf_symbol} internals bullish: {bullish_names}/{len(snapshots)} aligned, {aligned_bullish_weight:.0%} weighted support."
+        summary = f"{etf_symbol} internals bullish."
     elif aligned_bearish_weight >= 0.55 and bearish_participation >= 0.50:
         bias = "BEARISH_CONFIRMATION"
-        summary = f"{etf_symbol} internals bearish: {bearish_names}/{len(snapshots)} aligned, {aligned_bearish_weight:.0%} weighted pressure."
+        summary = f"{etf_symbol} internals bearish."
     else:
         bias = "MIXED"
-        summary = f"{etf_symbol} internals mixed: {bullish_names} bullish vs {bearish_names} bearish aligned names."
+        summary = f"{etf_symbol} internals mixed."
 
     return ConstituentInternals(
         etf_symbol=etf_symbol,
@@ -737,25 +731,15 @@ def make_hybrid_decision(context: MarketContext) -> TradePlan:
 
     if context.volume_ratio >= 1.20:
         score += 8
-        reasons.append(f"Volume expansion present ({context.volume_ratio:.2f}x).")
-    else:
-        reasons.append(f"Volume not expanding strongly ({context.volume_ratio:.2f}x).")
-
     if context.above_vwap and context.change_pct > 0:
         score += 8
-        reasons.append("Price change supports bullish continuation.")
     elif context.below_vwap and context.change_pct < 0:
         score += 8
-        reasons.append("Price change supports bearish continuation.")
-    else:
-        reasons.append("Price change is not cleanly aligned.")
 
     if context.above_vwap and context.rsi >= 52:
         action = "BUY_CALL"
     elif context.below_vwap and context.rsi <= 48:
         action = "BUY_PUT"
-    else:
-        action = "NO_TRADE"
 
     return TradePlan(
         symbol=context.symbol,
@@ -784,43 +768,33 @@ def assign_execution_tier(plan: TradePlan, context: MarketContext) -> TradePlan:
     if plan.grade == "A+":
         plan.execution_tier = "FULL"
         plan.execution_qty = DEFAULT_ORDER_QTY
-        return plan
-
-    if plan.grade == "A":
+    elif plan.grade == "A":
         plan.execution_tier = "STANDARD"
         plan.execution_qty = DEFAULT_ORDER_QTY
-        return plan
-
-    if plan.grade == "B" and ALLOW_B_MICRO_SIZE and context.volume_ratio >= 3.0:
+    elif plan.grade == "B" and ALLOW_B_MICRO_SIZE and context.volume_ratio >= 3.0:
         plan.execution_tier = "MICRO"
         plan.execution_qty = B_MICRO_QTY
-        return plan
 
     return plan
 
 
 def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> TradePlan:
     ci = context.constituent_internals
-    if not ci:
-        return plan
-
-    plan.reasons.append(ci.summary)
-
-    if plan.action == "BUY_CALL":
-        if ci.confirmation_bias == "BULLISH_CONFIRMATION":
-            plan.score += BULLISH_CONFIRM_BONUS
-        elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
-            plan.score -= CONFLICT_PENALTY
-        else:
-            plan.score -= MIXED_PENALTY
-
-    elif plan.action == "BUY_PUT":
-        if ci.confirmation_bias == "BEARISH_CONFIRMATION":
-            plan.score += BEARISH_CONFIRM_BONUS
-        elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
-            plan.score -= CONFLICT_PENALTY
-        else:
-            plan.score -= MIXED_PENALTY
+    if ci:
+        if plan.action == "BUY_CALL":
+            if ci.confirmation_bias == "BULLISH_CONFIRMATION":
+                plan.score += BULLISH_CONFIRM_BONUS
+            elif ci.confirmation_bias == "BEARISH_CONFIRMATION":
+                plan.score -= CONFLICT_PENALTY
+            else:
+                plan.score -= MIXED_PENALTY
+        elif plan.action == "BUY_PUT":
+            if ci.confirmation_bias == "BEARISH_CONFIRMATION":
+                plan.score += BEARISH_CONFIRM_BONUS
+            elif ci.confirmation_bias == "BULLISH_CONFIRMATION":
+                plan.score -= CONFLICT_PENALTY
+            else:
+                plan.score -= MIXED_PENALTY
 
     if plan.action == "BUY_CALL" and context.rsi >= MIN_RSI_CALL:
         plan.score += 5
@@ -839,8 +813,7 @@ def apply_constituent_confirmation(context: MarketContext, plan: TradePlan) -> T
 
     plan.grade = score_to_grade(plan.score)
     plan.confidence = max(0.0, min(plan.score / 100.0, 0.99))
-    plan = assign_execution_tier(plan, context)
-    return plan
+    return assign_execution_tier(plan, context)
 
 
 def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List[str]]:
@@ -848,45 +821,29 @@ def execution_filter(plan: TradePlan, context: MarketContext) -> Tuple[str, List
     ci = context.constituent_internals
 
     if plan.action == "NO_TRADE":
-        notes.append("Blocked: no clear directional action.")
-        return "AVOID", notes
-
+        return "AVOID", ["Blocked: no clear directional action."]
     if A_PLUS_ONLY_MODE and plan.grade != "A+":
-        notes.append("Blocked: A+ sniper mode active.")
-        return "AVOID", notes
-
+        return "AVOID", ["Blocked: A+ sniper mode active."]
     if plan.chasing:
-        notes.append("Blocked: trade is chasing away from decision zone.")
-        return "AVOID", notes
-
+        return "AVOID", ["Blocked: trade is chasing away from decision zone."]
     if plan.confidence < MIN_CONFIDENCE and plan.grade != "B":
-        notes.append("Blocked: confidence too low.")
-        return "AVOID", notes
-
+        return "AVOID", ["Blocked: confidence too low."]
     if ci:
         if plan.action == "BUY_CALL" and ci.confirmation_bias == "BEARISH_CONFIRMATION":
-            notes.append("Blocked: bearish internals against call.")
-            return "AVOID", notes
+            return "AVOID", ["Blocked: bearish internals against call."]
         if plan.action == "BUY_PUT" and ci.confirmation_bias == "BULLISH_CONFIRMATION":
-            notes.append("Blocked: bullish internals against put.")
-            return "AVOID", notes
-
+            return "AVOID", ["Blocked: bullish internals against put."]
     if context.volume_ratio < 0.85:
-        notes.append("Blocked: volume too weak.")
-        return "AVOID", notes
+        return "AVOID", ["Blocked: volume too weak."]
 
     if plan.grade == "B":
         if not ALLOW_B_MICRO_SIZE or plan.execution_tier != "MICRO":
-            notes.append("Blocked: B trade not approved.")
-            return "AVOID", notes
-
+            return "AVOID", ["Blocked: B trade not approved."]
     elif not passes_grade_threshold(plan.grade, "A"):
-        notes.append("Blocked: below A.")
-        return "AVOID", notes
+        return "AVOID", ["Blocked: below A."]
 
     if plan.execution_qty <= 0:
-        notes.append("Blocked: zero quantity.")
-        return "AVOID", notes
+        return "AVOID", ["Blocked: zero quantity."]
 
     notes.append(f"Execution filter passed. Tier={plan.execution_tier}, Qty={plan.execution_qty}")
     return "EXECUTE", notes
@@ -940,6 +897,7 @@ def pick_option_contract(underlying: str, action: str, underlying_price: float):
                 symbol = getattr(contract, "symbol", "")
                 if strike <= 0 or not symbol:
                     continue
+
                 target = underlying_price + OPTIONS_STRIKE_STEP_BUFFER if action == "BUY_CALL" else underlying_price - OPTIONS_STRIKE_STEP_BUFFER
                 ranked.append((abs(strike - target), contract))
 
@@ -950,6 +908,42 @@ def pick_option_contract(underlying: str, action: str, underlying_price: float):
             print(f"[OPTION PICKER WARN] {underlying} {action} {exp}: {e}", flush=True)
 
     return None
+
+# =========================================================
+# ALPACA ORDER STATUS / FILL TRACKING
+# =========================================================
+def get_order_status(order_id: str):
+    if not alpaca_client or not order_id:
+        return None
+    try:
+        return alpaca_client.get_order_by_id(order_id)
+    except Exception as e:
+        print(f"[ORDER STATUS ERROR] {order_id}: {e}", flush=True)
+        return None
+
+
+def normalize_order_status(order_obj) -> str:
+    if order_obj is None:
+        return "unknown"
+    status = getattr(order_obj, "status", None)
+    if status is None:
+        return "unknown"
+    try:
+        return str(status).split(".")[-1].lower()
+    except Exception:
+        return str(status).lower()
+
+
+def order_is_fill_like(status: str) -> bool:
+    return status in {"filled", "partially_filled"}
+
+
+def order_fill_price(order_obj) -> float:
+    return safe_float(getattr(order_obj, "filled_avg_price", None), 0.0)
+
+
+def order_filled_qty(order_obj) -> float:
+    return safe_float(getattr(order_obj, "filled_qty", None), 0.0)
 
 # =========================================================
 # STATE HELPERS
@@ -1058,16 +1052,15 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
             order_type_used = "MARKET"
             limit_price_used = None
         else:
-            limit_price = compute_buy_limit_from_quote(quote)
+            limit_price_used = compute_buy_limit_from_quote(quote)
             order_request = LimitOrderRequest(
                 symbol=option_symbol,
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
-                limit_price=limit_price,
+                limit_price=limit_price_used,
             )
             order_type_used = "LIMIT"
-            limit_price_used = limit_price
 
         order = alpaca_client.submit_order(order_data=order_request)
 
@@ -1082,6 +1075,15 @@ def submit_option_entry(plan: TradePlan, context: MarketContext, state: Dict) ->
             "entry_underlying": context.current_price,
             "entry_time": now_et().isoformat(),
             "entry_order_id": str(order.id),
+            "entry_order_status": "submitted",
+            "entry_fill_price": None,
+            "entry_filled_qty": 0,
+            "entry_fill_alert_sent": False,
+            "exit_order_id": None,
+            "exit_order_status": None,
+            "exit_fill_price": None,
+            "exit_filled_qty": 0,
+            "exit_fill_alert_sent": False,
             "be_armed": False,
             "strike": str(strike_price),
             "expiry": str(expiration_date),
@@ -1201,16 +1203,15 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
             order_type_used = "MARKET"
             limit_price_used = None
         else:
-            limit_price = compute_sell_limit_from_quote(quote)
+            limit_price_used = compute_sell_limit_from_quote(quote)
             order_request = LimitOrderRequest(
                 symbol=option_symbol,
                 qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
-                limit_price=limit_price,
+                limit_price=limit_price_used,
             )
             order_type_used = "LIMIT"
-            limit_price_used = limit_price
 
         order = alpaca_client.submit_order(order_data=order_request)
 
@@ -1245,11 +1246,11 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
             order_id=str(order.id),
         )
 
-        state["open_trades"] = [
-            t for t in state.get("open_trades", [])
-            if t.get("option_symbol") != option_symbol
-        ]
-        set_recent_closure(state, trade["underlying"])
+        trade["exit_order_id"] = str(order.id)
+        trade["exit_order_status"] = "submitted"
+        trade["exit_fill_price"] = None
+        trade["exit_filled_qty"] = 0
+        trade["exit_fill_alert_sent"] = False
         save_state(state)
 
     except Exception as e:
@@ -1262,14 +1263,169 @@ def submit_option_exit(trade: Dict, current_underlying: float, reason: str, move
         )
 
 # =========================================================
+# FILL TRACKING
+# =========================================================
+def update_entry_fills(state: Dict) -> None:
+    changed = False
+
+    for trade in state.get("open_trades", []):
+        order_id = trade.get("entry_order_id")
+        if not order_id:
+            continue
+
+        order_obj = get_order_status(order_id)
+        status = normalize_order_status(order_obj)
+        prev_status = trade.get("entry_order_status")
+
+        trade["entry_order_status"] = status
+        trade["entry_filled_qty"] = order_filled_qty(order_obj)
+        fill_price = order_fill_price(order_obj)
+        if fill_price > 0:
+            trade["entry_fill_price"] = fill_price
+
+        if status != prev_status:
+            broadcast_execution(
+                f"📥 ENTRY ORDER STATUS UPDATE\n"
+                f"Underlying: {trade['underlying']}\n"
+                f"Contract: {trade['option_symbol']}\n"
+                f"Order ID: {order_id}\n"
+                f"Status: {status}\n"
+                f"Filled Qty: {trade['entry_filled_qty']}\n"
+                f"Avg Fill Price: {trade['entry_fill_price'] if trade['entry_fill_price'] else 'N/A'}"
+            )
+            changed = True
+
+        if order_is_fill_like(status) and not trade.get("entry_fill_alert_sent", False):
+            broadcast_execution(
+                f"✅ ENTRY FILL CONFIRMED\n"
+                f"Underlying: {trade['underlying']}\n"
+                f"Contract: {trade['option_symbol']}\n"
+                f"Status: {status}\n"
+                f"Filled Qty: {trade['entry_filled_qty']}\n"
+                f"Avg Fill Price: {trade['entry_fill_price'] if trade['entry_fill_price'] else 'N/A'}"
+            )
+
+            log_trade_event(
+                event="ENTRY_FILL",
+                underlying=trade["underlying"],
+                option_symbol=trade["option_symbol"],
+                action=trade["action"],
+                grade=trade["grade"],
+                execution_tier=trade["execution_tier"],
+                qty=int(trade["qty"]),
+                entry_underlying=safe_float(trade["entry_underlying"]),
+                current_underlying=safe_float(trade["entry_underlying"]),
+                underlying_move_pct=0.0,
+                reason=status,
+                order_id=order_id,
+            )
+
+            trade["entry_fill_alert_sent"] = True
+            changed = True
+
+    if changed:
+        save_state(state)
+
+
+def update_exit_fills(state: Dict) -> None:
+    changed = False
+
+    for trade in state.get("open_trades", []):
+        exit_order_id = trade.get("exit_order_id")
+        if not exit_order_id:
+            continue
+
+        order_obj = get_order_status(exit_order_id)
+        status = normalize_order_status(order_obj)
+        prev_status = trade.get("exit_order_status")
+
+        trade["exit_order_status"] = status
+        trade["exit_filled_qty"] = order_filled_qty(order_obj)
+        fill_price = order_fill_price(order_obj)
+        if fill_price > 0:
+            trade["exit_fill_price"] = fill_price
+
+        if status != prev_status:
+            broadcast_execution(
+                f"📤 EXIT ORDER STATUS UPDATE\n"
+                f"Underlying: {trade['underlying']}\n"
+                f"Contract: {trade['option_symbol']}\n"
+                f"Order ID: {exit_order_id}\n"
+                f"Status: {status}\n"
+                f"Filled Qty: {trade['exit_filled_qty']}\n"
+                f"Avg Fill Price: {trade['exit_fill_price'] if trade['exit_fill_price'] else 'N/A'}"
+            )
+            changed = True
+
+        if status == "filled" and not trade.get("exit_fill_alert_sent", False):
+            entry_fill = safe_float(trade.get("entry_fill_price"), 0.0)
+            exit_fill = safe_float(trade.get("exit_fill_price"), 0.0)
+            pnl_pct = ((exit_fill - entry_fill) / entry_fill * 100.0) if entry_fill > 0 else 0.0
+
+            broadcast_execution(
+                f"🏁 TRADE CLOSED\n"
+                f"Underlying: {trade['underlying']}\n"
+                f"Contract: {trade['option_symbol']}\n"
+                f"Entry Fill: {entry_fill if entry_fill > 0 else 'N/A'}\n"
+                f"Exit Fill: {exit_fill if exit_fill > 0 else 'N/A'}\n"
+                f"PnL: {pnl_pct:.2f}%\n"
+                f"Grade: {trade['grade']}\n"
+                f"Tier: {trade['execution_tier']}"
+            )
+
+            log_trade_event(
+                event="EXIT_FILL",
+                underlying=trade["underlying"],
+                option_symbol=trade["option_symbol"],
+                action=trade["action"],
+                grade=trade["grade"],
+                execution_tier=trade["execution_tier"],
+                qty=int(trade["qty"]),
+                entry_underlying=safe_float(trade["entry_underlying"]),
+                current_underlying=safe_float(trade["entry_underlying"]),
+                underlying_move_pct=0.0,
+                reason=f"pnl_pct={pnl_pct:.2f}",
+                order_id=exit_order_id,
+            )
+
+            trade["exit_fill_alert_sent"] = True
+            changed = True
+
+    if changed:
+        save_state(state)
+
+
+def purge_filled_exits(state: Dict) -> None:
+    remaining = []
+    changed = False
+
+    for trade in state.get("open_trades", []):
+        if trade.get("exit_order_status") == "filled":
+            set_recent_closure(state, trade["underlying"])
+            changed = True
+            continue
+        remaining.append(trade)
+
+    if changed:
+        state["open_trades"] = remaining
+        save_state(state)
+
+# =========================================================
 # OPEN TRADE MANAGEMENT
 # =========================================================
 def manage_open_trades(state: Dict) -> None:
+    update_entry_fills(state)
+    update_exit_fills(state)
+    purge_filled_exits(state)
+
     open_trades = list(state.get("open_trades", []))
     if not open_trades:
         return
 
     for trade in open_trades:
+        if trade.get("exit_order_id"):
+            continue
+
         snapshot = get_symbol_snapshot(trade["underlying"])
         if not snapshot:
             continue
