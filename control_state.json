@@ -12,8 +12,8 @@
   "flatten_requested": false,
   "armed": true,
   "mode": "paper",
-  "last_command": "/status",
-  "last_command_time_utc": "2026-04-18 20:16:38 UTC",
+  "last_command": "/ping",
+  "last_command_time_utc": "2026-04-18 20:19:41 UTC",
   "last_command_from": "Jordan Bias (8661143355)",
-  "notes": "status checked"
+  "notes": "ping ok"
 }
