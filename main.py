@@ -9,8 +9,9 @@ from datetime import datetime, timedelta
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM")
 DISCORD_WEBHOOK_FREE = os.getenv("DISCORD_WEBHOOK_FREE")
+DISCORD_WEBHOOK_PREMIUM = os.getenv("DISCORD_WEBHOOK_PREMIUM")
+DISCORD_WEBHOOK_PREMIUM_LEVELS = os.getenv("DISCORD_WEBHOOK_PREMIUM_LEVELS")
 
 # =========================
 # FILE PATHS
@@ -24,59 +25,10 @@ CLOSED_TRADE_LOG_FILE = "closed_trade_log.csv"
 OPEN_TRADES = {}
 
 # =========================
-# SEND FUNCTIONS
-# =========================
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
-        print("TELEGRAM_TOKEN exists:", bool(TELEGRAM_TOKEN))
-        print("TELEGRAM_CHAT_ID exists:", bool(TELEGRAM_CHAT_ID))
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        print("Telegram status:", r.status_code)
-        print("Telegram response:", r.text)
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
-
-
-def send_discord(webhook, message):
-    if not webhook:
-        print("Discord webhook missing")
-        return
-    try:
-        r = requests.post(webhook, json={"content": message}, timeout=10)
-        print("Discord status:", r.status_code)
-    except Exception as e:
-        print(f"Discord send failed: {e}")
-
-
-def send_discord_premium(message):
-    send_discord(DISCORD_WEBHOOK_PREMIUM, message)
-
-
-def send_discord_free(message):
-    send_discord(DISCORD_WEBHOOK_FREE, message)
-
-# =========================
 # HELPERS
 # =========================
 def get_attr(obj, name, default=None):
     return getattr(obj, name, default)
-
-
-def fmt_price(x):
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return str(x)
 
 
 def safe_float(x, default=0.0):
@@ -84,6 +36,13 @@ def safe_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+
+def fmt_price(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
 
 
 def pct_change(entry, current):
@@ -112,13 +71,61 @@ def parse_dt(value):
         return None
 
 # =========================
+# SEND FUNCTIONS
+# =========================
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured")
+        print("TELEGRAM_TOKEN exists:", bool(TELEGRAM_TOKEN))
+        print("TELEGRAM_CHAT_ID exists:", bool(TELEGRAM_CHAT_ID))
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        print("Telegram status:", r.status_code)
+        print("Telegram response:", r.text)
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
+
+
+def send_discord(webhook, message):
+    if not webhook:
+        print("Discord webhook missing")
+        return
+
+    try:
+        r = requests.post(webhook, json={"content": message}, timeout=15)
+        print("Discord status:", r.status_code)
+    except Exception as e:
+        print(f"Discord send failed: {e}")
+
+
+def send_discord_free(message):
+    send_discord(DISCORD_WEBHOOK_FREE, message)
+
+
+def send_discord_premium(message):
+    send_discord(DISCORD_WEBHOOK_PREMIUM, message)
+
+
+def send_discord_premium_levels(message):
+    webhook = DISCORD_WEBHOOK_PREMIUM_LEVELS or DISCORD_WEBHOOK_PREMIUM
+    send_discord(webhook, message)
+
+# =========================
 # CSV / JOURNAL LOGGING
 # =========================
 def append_csv_row(path, fieldnames, row):
-    file_already_exists = file_exists(path)
+    exists = file_exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_already_exists:
+        if not exists:
             writer.writeheader()
         writer.writerow(row)
 
@@ -152,12 +159,23 @@ def log_open_trade(symbol, context, discipline, sizing, management, options_plan
         "options_notes": " | ".join(options_plan["reasons"]),
         "options_blockers": " | ".join(options_plan["blockers"]),
     }
-
     append_csv_row(TRADE_LOG_FILE, list(row.keys()), row)
 
 
 def log_closed_trade(closed_row):
     append_csv_row(CLOSED_TRADE_LOG_FILE, list(closed_row.keys()), closed_row)
+
+
+def load_closed_trades():
+    if not file_exists(CLOSED_TRADE_LOG_FILE):
+        return []
+
+    rows = []
+    with open(CLOSED_TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows
 
 # =========================
 # STATE 4 - ENTRY DISCIPLINE
@@ -240,8 +258,7 @@ def apply_state_4_discipline(decision, context):
 
     if timing["is_chasing"]:
         reasons.append("YOU ARE CHASING: entry is extended from the intended trigger zone.")
-        for r in timing["chasing_reasons"]:
-            reasons.append(r)
+        reasons.extend(timing["chasing_reasons"])
 
     if original_grade in ["B+", "B"] and not timing["b_grade_execution_allowed"]:
         reasons.append("B-grade blocked from premium execution until momentum confirms.")
@@ -363,7 +380,7 @@ def calculate_confidence_and_size(decision, context, discipline):
     }
 
 # =========================
-# STATE 6 - STOP + SCALE OUT ENGINE
+# STATE 6 - TRADE MANAGEMENT
 # =========================
 def build_trade_management_plan(decision, context, discipline, sizing):
     current_price = safe_float(get_attr(context, "current_price", 0.0))
@@ -697,24 +714,11 @@ def evaluate_open_trade(symbol, current_underlying_price, current_contract_price
         "breakeven_sent": trade["breakeven_sent"],
         "closed": trade["closed"],
     }
-
     return summary
 
 # =========================
-# REPORT / DASHBOARD ENGINE
+# STATE 9/10 - REPORTING ENGINE
 # =========================
-def load_closed_trades():
-    if not file_exists(CLOSED_TRADE_LOG_FILE):
-        return []
-
-    rows = []
-    with open(CLOSED_TRADE_LOG_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
-
-
 def filter_rows_by_days(rows, days):
     cutoff = datetime.now() - timedelta(days=days)
     out = []
@@ -834,6 +838,37 @@ Worst Contract Style:
 """.strip()
 
 
+def build_daily_report():
+    rows = filter_rows_by_days(load_closed_trades(), 1)
+    stats = build_stats(rows)
+    if not stats:
+        return "🗓️ DAILY REPORT\nNo closed trades in the last 24 hours."
+
+    return f"""
+🗓️ UNBIASED BOT DAILY REPORT
+
+Period: Last 24 Hours
+Closed Trades: {stats['total_trades']}
+Wins: {stats['wins']}
+Losses: {stats['losses']}
+Win Rate: {stats['win_rate']}%
+Total Contract PnL: {stats['total_contract_pnl']}%
+Average Contract PnL: {stats['avg_contract_pnl']}%
+
+Best Symbol:
+- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
+
+Best Grade:
+- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
+
+Top Winner:
+- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('contract_pnl_pct')}%
+
+Top Loser:
+- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('contract_pnl_pct')}%
+""".strip()
+
+
 def build_weekly_report():
     rows = filter_rows_by_days(load_closed_trades(), 7)
     stats = build_stats(rows)
@@ -886,37 +921,6 @@ Top Winner:
 
 Top Loser:
 - {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('execution_grade')} | {stats['top_loser'].get('contract_pnl_pct')}%
-""".strip()
-
-
-def build_daily_report():
-    rows = filter_rows_by_days(load_closed_trades(), 1)
-    stats = build_stats(rows)
-    if not stats:
-        return "🗓️ DAILY REPORT\nNo closed trades in the last 24 hours."
-
-    return f"""
-🗓️ UNBIASED BOT DAILY REPORT
-
-Period: Last 24 Hours
-Closed Trades: {stats['total_trades']}
-Wins: {stats['wins']}
-Losses: {stats['losses']}
-Win Rate: {stats['win_rate']}%
-Total Contract PnL: {stats['total_contract_pnl']}%
-Average Contract PnL: {stats['avg_contract_pnl']}%
-
-Best Symbol:
-- {stats['best_symbol'][0]} | total PnL {round(stats['best_symbol'][1]['pnl'], 2)}%
-
-Best Grade:
-- {stats['best_grade'][0]} | total PnL {round(stats['best_grade'][1]['pnl'], 2)}%
-
-Top Winner:
-- {stats['top_winner'].get('symbol')} | {stats['top_winner'].get('contract_pnl_pct')}%
-
-Top Loser:
-- {stats['top_loser'].get('symbol')} | {stats['top_loser'].get('contract_pnl_pct')}%
 """.strip()
 
 
@@ -1030,8 +1034,6 @@ Distance From Trigger: {timing['distance_from_trigger_pct']}%
 
 🧠 OPTIONS PLAN
 {format_options_block(options_plan)}
-
-⚡ Clean execution conditions are present.
 """.strip()
 
 
@@ -1065,9 +1067,6 @@ Distance From Trigger: {timing['distance_from_trigger_pct']}%
 
 🧠 OPTIONS VIEW
 {format_options_block(options_plan)}
-
-Patience > forcing entries.
-Wait for reclaim, retest, or momentum confirmation.
 """.strip()
 
 
@@ -1109,8 +1108,6 @@ Options View:
 • Type: {options_plan['contract_type']}
 • Style: {options_plan['contract_style']}
 • Moneyness: {options_plan['moneyness']}
-
-This is informational, not confirmed execution.
 """.strip()
 
 
@@ -1146,7 +1143,7 @@ def format_live_management_update(summary):
     return "\n".join(lines)
 
 # =========================
-# ROUTING LOGIC
+# ROUTING
 # =========================
 def route_alerts(decision, context):
     discipline = apply_state_4_discipline(decision, context)
@@ -1170,6 +1167,7 @@ def route_alerts(decision, context):
         register_open_trade(symbol, context, discipline, sizing, management, options_plan)
         send_telegram(format_telegram_alert(decision, context, discipline, sizing, management, options_plan))
         send_discord_premium(format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan))
+        send_discord_premium_levels(format_discord_premium_alert(decision, context, discipline, sizing, management, options_plan))
         send_discord_free(format_discord_free_teaser(decision, context, discipline, sizing))
 
     elif execution_grade == "WATCHLIST" or size_label == "NO EXECUTION" or not options_allowed:
@@ -1184,7 +1182,7 @@ def route_alerts(decision, context):
         print(f"[AVOID] No alert sent for {symbol}")
 
 # =========================
-# LIVE MANAGER ROUTE
+# LIVE / REPORT ROUTES
 # =========================
 def send_live_trade_update(symbol, current_underlying_price, current_contract_price=None, close_trade=False):
     summary = evaluate_open_trade(symbol, current_underlying_price, current_contract_price, close_trade=close_trade)
@@ -1195,9 +1193,7 @@ def send_live_trade_update(symbol, current_underlying_price, current_contract_pr
     send_telegram(msg)
     send_discord_premium(msg)
 
-# =========================
-# REPORT ROUTES
-# =========================
+
 def send_performance_summary():
     msg = build_dashboard_snapshot(load_closed_trades(), label="ALL TIME")
     send_telegram(msg)
@@ -1223,7 +1219,7 @@ def print_email_ready_weekly_body():
     print("\n===============================\n")
 
 # =========================
-# TESTS
+# TEST HELPERS
 # =========================
 def test_telegram_only():
     send_telegram("✅ UNBIASED BOT TELEGRAM TEST MESSAGE")
@@ -1291,54 +1287,8 @@ def test_reports():
     print_email_ready_weekly_body()
 
 # =========================
-# MAIN
+# STATE 11 - LOG BACKUP + ROUTER
 # =========================
-# =========================
-# STATE 10.1 - COMMAND ROUTER
-# =========================
-
-BOT_MODE = os.getenv("BOT_MODE", "test_all").strip().lower()
-
-def run_trade_alert_mode():
-    send_test_alert()
-
-def run_live_update_mode():
-    test_live_manager()
-
-def run_daily_report_mode():
-    send_daily_report()
-
-def run_weekly_report_mode():
-    send_weekly_report()
-
-def run_dashboard_mode():
-    send_performance_summary()
-
-def run_test_all_mode():
-    test_telegram_only()
-    send_test_alert()
-    test_live_manager()
-    test_reports()
-
-def run_bot_mode():
-    print(f"BOT_MODE = {BOT_MODE}")
-
-    if BOT_MODE == "trade_alert":
-        run_trade_alert_mode()
-    elif BOT_MODE == "live_update":
-        run_live_update_mode()
-    elif BOT_MODE == "daily_report":
-        run_daily_report_mode()
-    elif BOT_MODE == "weekly_report":
-        run_weekly_report_mode()
-    elif BOT_MODE == "dashboard":
-        run_dashboard_mode()
-    else:
-        run_test_all_mode()
-# =========================
-# STATE 11 - LOG BACKUP + PERSISTENCE + COMMAND ROUTER
-# =========================
-
 BOT_MODE = os.getenv("BOT_MODE", "test_all").strip().lower()
 
 
@@ -1387,9 +1337,6 @@ def run_bot_mode():
 
 
 def save_logs_to_artifact_folder():
-    """
-    Copies logs into an artifacts folder so GitHub Actions can upload them.
-    """
     folder = "artifacts"
     os.makedirs(folder, exist_ok=True)
 
@@ -1412,9 +1359,6 @@ def save_logs_to_artifact_folder():
 
 
 def load_logs_if_exist():
-    """
-    Ensures CSV files exist so system doesn't break on first run.
-    """
     for f in [TRADE_LOG_FILE, CLOSED_TRADE_LOG_FILE]:
         if not os.path.exists(f):
             with open(f, "w", encoding="utf-8") as file:
@@ -1423,9 +1367,6 @@ def load_logs_if_exist():
 
 
 def end_of_run_cleanup():
-    """
-    Runs at end of every execution
-    """
     print("\n=== END OF RUN CLEANUP ===")
     save_logs_to_artifact_folder()
     print("Logs prepared for upload")
