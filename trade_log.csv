@@ -1,0 +1,3 @@
+timestamp,event,underlying,option_symbol,action,grade,execution_tier,qty,entry_underlying,current_underlying,underlying_move_pct,reason,order_id
+2026-04-18T08:14:32.085345-04:00,ENTRY,QQQ,QQQ260420C00630000,BUY_CALL,A,STANDARD,1,648.78,648.78,0.0,entry_sent,9fcc1f43-6fd4-455f-8b51-957f470567ed
+2026-04-18T08:14:35.337521-04:00,ENTRY,SPY,SPY260420C00679000,BUY_CALL,B,MICRO,1,710.05,710.05,0.0,entry_sent,a6ce5eef-370f-4d66-85b4-5ae1a58cef4a
