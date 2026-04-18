@@ -51,8 +51,12 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc().isoformat()
 
 
 def now_et() -> datetime:
@@ -100,18 +104,31 @@ def grade_from_score(score: int) -> str:
     return "D"
 
 
-def is_daily_levels_window() -> bool:
-    current = now_et()
-    mins = current.hour * 60 + current.minute
-    return 9 * 60 <= mins <= 21 * 60
-
-
 def format_money(v: float) -> str:
     return f"${v:,.2f}"
 
 
 def format_pct(v: float) -> str:
     return f"{v:+.2f}%"
+
+
+def parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def minutes_since(ts: str) -> int:
+    return int((now_utc() - parse_iso(ts)).total_seconds() // 60)
+
+
+def is_daily_levels_window() -> bool:
+    current = now_et()
+    mins = current.hour * 60 + current.minute
+    return 9 * 60 <= mins <= 21 * 60
+
+
+def debug_log(cfg: "Config", msg: str) -> None:
+    if cfg.debug:
+        print(f"[DEBUG] {msg}")
 
 
 # ============================================================
@@ -157,7 +174,6 @@ class Config:
     risk_warning_text: str
     debug: bool
 
-    # Execution
     execution_enabled: bool
     execution_min_grade: str
     alpaca_api_key: str
@@ -169,7 +185,6 @@ class Config:
     max_open_positions: int
     default_time_in_force: str
 
-    # Reports
     daily_reports_enabled: bool
     weekly_reports_enabled: bool
     morning_report_hour_et: int
@@ -178,6 +193,10 @@ class Config:
     evening_report_minute_et: int
     weekly_report_hour_et: int
     weekly_report_minute_et: int
+
+    tracking_enabled: bool
+    tracking_target_pct: float
+    tracking_fail_pct: float
 
 
 def load_config() -> Config:
@@ -241,12 +260,11 @@ def load_config() -> Config:
         evening_report_minute_et=env_int("EVENING_REPORT_MINUTE_ET", 30),
         weekly_report_hour_et=env_int("WEEKLY_REPORT_HOUR_ET", 9),
         weekly_report_minute_et=env_int("WEEKLY_REPORT_MINUTE_ET", 0),
+
+        tracking_enabled=env_bool("TRACKING_ENABLED", True),
+        tracking_target_pct=env_float("TRACKING_TARGET_PCT", 0.30),
+        tracking_fail_pct=env_float("TRACKING_FAIL_PCT", 0.20),
     )
-
-
-def debug_log(cfg: Config, msg: str) -> None:
-    if cfg.debug:
-        print(f"[DEBUG] {msg}")
 
 
 # ============================================================
@@ -346,6 +364,7 @@ class PersistentState:
 @dataclass
 class PerformanceState:
     history: List[Dict[str, Any]] = field(default_factory=list)
+    pending_signals: List[Dict[str, Any]] = field(default_factory=list)
     last_daily_morning_report_date: str = ""
     last_daily_evening_report_date: str = ""
     last_weekly_report_key: str = ""
@@ -359,6 +378,7 @@ class PerformanceState:
                 raw = json.load(f)
             return PerformanceState(
                 history=raw.get("history", []),
+                pending_signals=raw.get("pending_signals", []),
                 last_daily_morning_report_date=raw.get("last_daily_morning_report_date", ""),
                 last_daily_evening_report_date=raw.get("last_daily_evening_report_date", ""),
                 last_weekly_report_key=raw.get("last_weekly_report_key", ""),
@@ -368,7 +388,8 @@ class PerformanceState:
 
     def save(self, path: str) -> None:
         payload = {
-            "history": self.history[-1000:],
+            "history": self.history[-3000:],
+            "pending_signals": self.pending_signals[-500:],
             "last_daily_morning_report_date": self.last_daily_morning_report_date,
             "last_daily_evening_report_date": self.last_daily_evening_report_date,
             "last_weekly_report_key": self.last_weekly_report_key,
@@ -827,7 +848,7 @@ def route_alert(
 
 
 # ============================================================
-# ALPACA EXECUTION
+# EXECUTION
 # ============================================================
 
 class ExecutionEngine:
@@ -950,45 +971,6 @@ class ExecutionEngine:
             return {"executed": False, "reason": f"Execution failed: {e}"}
 
 
-# ============================================================
-# PERFORMANCE TRACKING
-# ============================================================
-
-def record_signal(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext) -> None:
-    entry = {
-        "ts_utc": now_utc_iso(),
-        "date_et": today_et_str(),
-        "week_key": week_key_et(),
-        "type": "signal",
-        "symbol": alert.symbol,
-        "grade": alert.grade,
-        "direction": alert.direction,
-        "score": alert.score,
-        "price_snapshot": ctx.primary.price,
-        "change_pct": ctx.primary.change_pct,
-    }
-    perf.history.append(entry)
-
-
-def record_execution(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, result: Dict[str, Any]) -> None:
-    entry = {
-        "ts_utc": now_utc_iso(),
-        "date_et": today_et_str(),
-        "week_key": week_key_et(),
-        "type": "execution",
-        "symbol": alert.symbol,
-        "grade": alert.grade,
-        "direction": alert.direction,
-        "score": alert.score,
-        "qty": result.get("qty", 0),
-        "side": result.get("side", ""),
-        "price_snapshot": ctx.primary.price,
-        "alpaca_order_id": result.get("alpaca_order_id", ""),
-        "alpaca_status": result.get("alpaca_status", ""),
-    }
-    perf.history.append(entry)
-
-
 def safe_get_account_equity(executor: ExecutionEngine) -> float:
     try:
         if executor.client is None:
@@ -1018,12 +1000,188 @@ def safe_get_positions(executor: ExecutionEngine) -> List[Any]:
         return []
 
 
+# ============================================================
+# WIN RATE + TRACKING ENGINE
+# ============================================================
+
+TRACK_WINDOWS_MIN = [5, 15, 30, 60]
+
+
+def record_signal(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, cfg: Config) -> None:
+    signal_entry = {
+        "ts_utc": now_utc_iso(),
+        "date_et": today_et_str(),
+        "week_key": week_key_et(),
+        "type": "signal",
+        "symbol": alert.symbol,
+        "grade": alert.grade,
+        "direction": alert.direction,
+        "score": alert.score,
+        "price_snapshot": ctx.primary.price,
+        "change_pct": ctx.primary.change_pct,
+        "signal_key": alert.key,
+    }
+    perf.history.append(signal_entry)
+
+    if cfg.tracking_enabled:
+        pending = {
+            "signal_key": alert.key,
+            "symbol": alert.symbol,
+            "grade": alert.grade,
+            "direction": alert.direction,
+            "score": alert.score,
+            "entry_price": ctx.primary.price,
+            "created_at_utc": now_utc_iso(),
+            "date_et": today_et_str(),
+            "week_key": week_key_et(),
+            "checkpoints": {},  # "5","15","30","60"
+            "final_status": "PENDING",
+            "target_pct": cfg.tracking_target_pct,
+            "fail_pct": cfg.tracking_fail_pct,
+        }
+        perf.pending_signals.append(pending)
+
+
+def record_execution(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, result: Dict[str, Any]) -> None:
+    entry = {
+        "ts_utc": now_utc_iso(),
+        "date_et": today_et_str(),
+        "week_key": week_key_et(),
+        "type": "execution",
+        "symbol": alert.symbol,
+        "grade": alert.grade,
+        "direction": alert.direction,
+        "score": alert.score,
+        "qty": result.get("qty", 0),
+        "side": result.get("side", ""),
+        "price_snapshot": ctx.primary.price,
+        "alpaca_order_id": result.get("alpaca_order_id", ""),
+        "alpaca_status": result.get("alpaca_status", ""),
+        "signal_key": alert.key,
+    }
+    perf.history.append(entry)
+
+
+def compute_signal_status(direction: str, move_pct: float, target_pct: float, fail_pct: float) -> str:
+    if direction == "BULLISH":
+        if move_pct >= target_pct:
+            return "WIN"
+        if move_pct <= -fail_pct:
+            return "LOSS"
+        return "PENDING"
+
+    if direction == "BEARISH":
+        if move_pct <= -target_pct:
+            return "WIN"
+        if move_pct >= fail_pct:
+            return "LOSS"
+        return "PENDING"
+
+    return "PENDING"
+
+
+def update_pending_signal_from_quote(pending: Dict[str, Any], quote_price: float) -> None:
+    age_min = minutes_since(pending["created_at_utc"])
+    entry_price = float(pending["entry_price"])
+    direction = pending["direction"]
+    target_pct = float(pending["target_pct"])
+    fail_pct = float(pending["fail_pct"])
+
+    move_pct = pct_change(quote_price, entry_price)
+
+    for window in TRACK_WINDOWS_MIN:
+        key = str(window)
+        if age_min >= window and key not in pending["checkpoints"]:
+            status = compute_signal_status(direction, move_pct, target_pct, fail_pct)
+            pending["checkpoints"][key] = {
+                "minutes": window,
+                "price": quote_price,
+                "move_pct": round(move_pct, 4),
+                "status": status,
+                "evaluated_at_utc": now_utc_iso(),
+            }
+
+    if age_min >= 60:
+        final_cp = pending["checkpoints"].get("60")
+        if final_cp:
+            pending["final_status"] = final_cp["status"]
+
+
+def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, cfg: Config) -> None:
+    if not cfg.tracking_enabled:
+        return
+
+    still_pending: List[Dict[str, Any]] = []
+    symbol_quote_cache: Dict[str, float] = {}
+
+    for pending in perf.pending_signals:
+        symbol = pending["symbol"]
+
+        try:
+            if symbol not in symbol_quote_cache:
+                symbol_quote_cache[symbol] = client.get_quote(symbol).price
+            current_price = symbol_quote_cache[symbol]
+            update_pending_signal_from_quote(pending, current_price)
+        except Exception as e:
+            debug_log(cfg, f"tracking quote failed for {symbol}: {e}")
+
+        age_min = minutes_since(pending["created_at_utc"])
+
+        if age_min >= 60 and pending["final_status"] != "PENDING":
+            perf.history.append(
+                {
+                    "ts_utc": now_utc_iso(),
+                    "date_et": pending["date_et"],
+                    "week_key": pending["week_key"],
+                    "type": "tracked_outcome",
+                    "signal_key": pending["signal_key"],
+                    "symbol": pending["symbol"],
+                    "grade": pending["grade"],
+                    "direction": pending["direction"],
+                    "score": pending["score"],
+                    "entry_price": pending["entry_price"],
+                    "final_status": pending["final_status"],
+                    "checkpoints": pending["checkpoints"],
+                }
+            )
+        elif age_min >= 120:
+            # Force-close old signals that never hit win/loss thresholds by 2h mark
+            pending["final_status"] = "NEUTRAL"
+            perf.history.append(
+                {
+                    "ts_utc": now_utc_iso(),
+                    "date_et": pending["date_et"],
+                    "week_key": pending["week_key"],
+                    "type": "tracked_outcome",
+                    "signal_key": pending["signal_key"],
+                    "symbol": pending["symbol"],
+                    "grade": pending["grade"],
+                    "direction": pending["direction"],
+                    "score": pending["score"],
+                    "entry_price": pending["entry_price"],
+                    "final_status": pending["final_status"],
+                    "checkpoints": pending["checkpoints"],
+                }
+            )
+        else:
+            still_pending.append(pending)
+
+    perf.pending_signals = still_pending
+
+
+# ============================================================
+# REPORTING
+# ============================================================
+
 def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     signals = [x for x in history if x.get("type") == "signal"]
     executions = [x for x in history if x.get("type") == "execution"]
+    tracked = [x for x in history if x.get("type") == "tracked_outcome"]
 
     grade_counts: Dict[str, int] = {}
     symbol_counts: Dict[str, int] = {}
+    grade_outcomes: Dict[str, Dict[str, int]] = {}
+    symbol_outcomes: Dict[str, Dict[str, int]] = {}
 
     for item in signals:
         grade = item.get("grade", "UNK")
@@ -1031,22 +1189,70 @@ def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         grade_counts[grade] = grade_counts.get(grade, 0) + 1
         symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
 
-    top_symbol = max(symbol_counts, key=symbol_counts.get) if symbol_counts else "n/a"
+    for item in tracked:
+        grade = item.get("grade", "UNK")
+        symbol = item.get("symbol", "UNK")
+        status = item.get("final_status", "PENDING")
 
+        if grade not in grade_outcomes:
+            grade_outcomes[grade] = {"WIN": 0, "LOSS": 0, "NEUTRAL": 0}
+        if symbol not in symbol_outcomes:
+            symbol_outcomes[symbol] = {"WIN": 0, "LOSS": 0, "NEUTRAL": 0}
+
+        if status not in grade_outcomes[grade]:
+            grade_outcomes[grade][status] = 0
+        if status not in symbol_outcomes[symbol]:
+            symbol_outcomes[symbol][status] = 0
+
+        grade_outcomes[grade][status] += 1
+        symbol_outcomes[symbol][status] += 1
+
+    top_symbol = max(symbol_counts, key=symbol_counts.get) if symbol_counts else "n/a"
     bullish = sum(1 for x in signals if x.get("direction") == "BULLISH")
     bearish = sum(1 for x in signals if x.get("direction") == "BEARISH")
     avg_score = round(sum(x.get("score", 0) for x in signals) / len(signals), 2) if signals else 0.0
 
+    wins = sum(1 for x in tracked if x.get("final_status") == "WIN")
+    losses = sum(1 for x in tracked if x.get("final_status") == "LOSS")
+    neutrals = sum(1 for x in tracked if x.get("final_status") == "NEUTRAL")
+    decided = wins + losses
+    win_rate = round((wins / decided) * 100.0, 2) if decided else 0.0
+
     return {
         "signals": len(signals),
         "executions": len(executions),
+        "tracked": len(tracked),
+        "wins": wins,
+        "losses": losses,
+        "neutrals": neutrals,
+        "win_rate": win_rate,
         "grade_counts": grade_counts,
         "symbol_counts": symbol_counts,
+        "grade_outcomes": grade_outcomes,
+        "symbol_outcomes": symbol_outcomes,
         "top_symbol": top_symbol,
         "bullish": bullish,
         "bearish": bearish,
         "avg_score": avg_score,
     }
+
+
+def best_rate_bucket(outcomes: Dict[str, Dict[str, int]]) -> str:
+    best_name = "n/a"
+    best_rate = -1.0
+
+    for name, bucket in outcomes.items():
+        wins = bucket.get("WIN", 0)
+        losses = bucket.get("LOSS", 0)
+        decided = wins + losses
+        if decided == 0:
+            continue
+        rate = (wins / decided) * 100.0
+        if rate > best_rate:
+            best_rate = rate
+            best_name = f"{name} ({rate:.1f}%)"
+
+    return best_name
 
 
 def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, mode: str) -> str:
@@ -1065,9 +1271,14 @@ def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: Execu
         "",
         f"Signals Today: {summary['signals']}",
         f"Executions Today: {summary['executions']}",
+        f"Tracked Outcomes Today: {summary['tracked']}",
+        f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
+        f"Win Rate: {summary['win_rate']:.2f}%",
         f"Avg Signal Score: {summary['avg_score']}",
         f"Bullish / Bearish Signals: {summary['bullish']} / {summary['bearish']}",
         f"Most Active Symbol: {summary['top_symbol']}",
+        f"Best Grade So Far: {best_rate_bucket(summary['grade_outcomes'])}",
+        f"Best Symbol So Far: {best_rate_bucket(summary['symbol_outcomes'])}",
         "",
         f"Account Equity: {format_money(equity)}" if equity else "Account Equity: n/a",
         f"Equity Change vs Last Equity: {format_money(equity_change)}" if equity and last_equity else "Equity Change vs Last Equity: n/a",
@@ -1082,6 +1293,16 @@ def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: Execu
     else:
         lines.append("• No signals recorded yet")
 
+    if summary["grade_outcomes"]:
+        lines.append("")
+        lines.append("Grade Win Rates:")
+        for grade, bucket in sorted(summary["grade_outcomes"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
+            wins = bucket.get("WIN", 0)
+            losses = bucket.get("LOSS", 0)
+            decided = wins + losses
+            rate = (wins / decided) * 100.0 if decided else 0.0
+            lines.append(f"• {grade}: {wins}W / {losses}L | {rate:.1f}%")
+
     if positions:
         lines.append("")
         lines.append("Open Positions Snapshot:")
@@ -1093,11 +1314,6 @@ def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: Execu
                 lines.append(f"• {symbol} | Qty: {qty} | Unrealized: {format_money(unrealized)}")
             except Exception:
                 pass
-
-    lines.append("")
-    lines.append("Dashboard Notes:")
-    lines.append("• This report tracks signals, executions, and current account state.")
-    lines.append("• Realized / unrealized detail depends on what Alpaca returns for the account and positions.")
 
     return "\n".join(lines)
 
@@ -1116,9 +1332,13 @@ def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: Exec
         "",
         f"Signals This Week: {summary['signals']}",
         f"Executions This Week: {summary['executions']}",
+        f"Tracked Outcomes This Week: {summary['tracked']}",
+        f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
+        f"Weekly Win Rate: {summary['win_rate']:.2f}%",
         f"Avg Signal Score: {summary['avg_score']}",
-        f"Bullish / Bearish Signals: {summary['bullish']} / {summary['bearish']}",
         f"Most Active Symbol: {summary['top_symbol']}",
+        f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
+        f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
         "",
         f"Current Account Equity: {format_money(equity)}" if equity else "Current Account Equity: n/a",
         f"Open Positions Right Now: {len(positions)}",
@@ -1132,10 +1352,25 @@ def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: Exec
     else:
         lines.append("• No weekly signals recorded yet")
 
-    lines.append("")
-    lines.append("Weekly Notes:")
-    lines.append("• Use this to compare signal quality, execution frequency, and concentration by symbol.")
-    lines.append("• As future upgrades are added, this section can expand into realized PnL, win rate, and best/worst day summaries.")
+    if summary["grade_outcomes"]:
+        lines.append("")
+        lines.append("Weekly Grade Win Rates:")
+        for grade, bucket in sorted(summary["grade_outcomes"].items(), key=lambda x: grade_rank(x[0]), reverse=True):
+            wins = bucket.get("WIN", 0)
+            losses = bucket.get("LOSS", 0)
+            decided = wins + losses
+            rate = (wins / decided) * 100.0 if decided else 0.0
+            lines.append(f"• {grade}: {wins}W / {losses}L | {rate:.1f}%")
+
+    if summary["symbol_outcomes"]:
+        lines.append("")
+        lines.append("Weekly Symbol Win Rates:")
+        for symbol, bucket in sorted(summary["symbol_outcomes"].items(), key=lambda x: x[0]):
+            wins = bucket.get("WIN", 0)
+            losses = bucket.get("LOSS", 0)
+            decided = wins + losses
+            rate = (wins / decided) * 100.0 if decided else 0.0
+            lines.append(f"• {symbol}: {wins}W / {losses}L | {rate:.1f}%")
 
     return "\n".join(lines)
 
@@ -1145,7 +1380,6 @@ def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionE
     date_key = current.strftime("%Y-%m-%d")
     wk = week_key_et()
 
-    # Morning daily
     if cfg.daily_reports_enabled:
         if (
             current.hour == cfg.morning_report_hour_et
@@ -1157,7 +1391,6 @@ def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionE
                 discord.send(cfg.discord_daily_performance_webhook, text)
             perf.last_daily_morning_report_date = date_key
 
-        # Evening daily
         if (
             current.hour == cfg.evening_report_hour_et
             and current.minute < 20
@@ -1168,7 +1401,6 @@ def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionE
                 discord.send(cfg.discord_daily_performance_webhook, text)
             perf.last_daily_evening_report_date = date_key
 
-    # Sunday weekly
     if cfg.weekly_reports_enabled:
         if (
             current.weekday() == 6
@@ -1213,6 +1445,9 @@ def run_once() -> None:
     discord = DiscordNotifier(enabled=cfg.discord_enabled)
     executor = ExecutionEngine(cfg, state)
 
+    # update older pending signals before creating new one
+    evaluate_pending_signals(client, perf, cfg)
+
     ctx = build_market_context(client, cfg)
     print_snapshot(ctx)
 
@@ -1222,7 +1457,7 @@ def run_once() -> None:
     trade_alert = generate_trade_alert_if_valid(ctx, cfg)
     if trade_alert:
         route_alert(trade_alert, cfg, state, telegram, discord)
-        record_signal(perf, trade_alert, ctx)
+        record_signal(perf, trade_alert, ctx, cfg)
 
         exec_result = executor.maybe_execute(trade_alert, ctx)
         print(f"Execution result: {exec_result}")
