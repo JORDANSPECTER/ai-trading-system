@@ -1748,4 +1748,11 @@ def run_once() -> None:
 
 
 if __name__ == "__main__":
-    run_once()
+    try:
+        run_once()
+    except Exception:
+        import traceback
+        print("\n===== FULL PYTHON ERROR =====")
+        traceback.print_exc()
+        print("===== END PYTHON ERROR =====\n")
+        raise
