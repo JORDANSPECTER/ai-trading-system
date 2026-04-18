@@ -14,11 +14,9 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 
 
 ET = ZoneInfo("America/New_York")
+TRACK_WINDOWS_MIN = [5, 15, 30, 60]
+VALID_CONTROL_STATES = {"AUTO", "ACTIVE", "SOFT_BLOCK", "COOLDOWN", "BREACH", "PROBATION", "KILL_SWITCH"}
 
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
@@ -127,10 +125,6 @@ def debug_log(cfg: "Config", msg: str) -> None:
         print(f"[DEBUG] {msg}")
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 @dataclass
 class Config:
     twelve_data_api_key: str
@@ -148,8 +142,10 @@ class Config:
     daily_levels_cooldown_seconds: int
 
     telegram_enabled: bool
+    telegram_control_enabled: bool
     telegram_bot_token: str
     telegram_chat_id: str
+    telegram_admin_chat_id: str
 
     discord_enabled: bool
     discord_free_webhook: str
@@ -220,12 +216,10 @@ class Config:
 def load_config() -> Config:
     return Config(
         twelve_data_api_key=env_str("TWELVE_DATA_API_KEY"),
-
         primary_symbol=env_str("PRIMARY_SYMBOL", "QQQ"),
         secondary_symbol=env_str("SECONDARY_SYMBOL", "SPY"),
         oil_symbol=env_str("OIL_SYMBOL", "USO"),
         volatility_symbol=env_str("VOLATILITY_SYMBOL", "VIX"),
-
         state_file=env_str("STATE_FILE", "elite_state.json"),
         performance_state_file=env_str("PERFORMANCE_STATE_FILE", "performance_state.json"),
         control_state_file=env_str("CONTROL_STATE_FILE", "control_state.json"),
@@ -234,8 +228,10 @@ def load_config() -> Config:
         daily_levels_cooldown_seconds=env_int("DAILY_LEVELS_COOLDOWN_SECONDS", 1200),
 
         telegram_enabled=env_bool("TELEGRAM_ENABLED", True),
+        telegram_control_enabled=env_bool("TELEGRAM_CONTROL_ENABLED", True),
         telegram_bot_token=env_str("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=env_str("TELEGRAM_CHAT_ID"),
+        telegram_admin_chat_id=env_str("TELEGRAM_ADMIN_CHAT_ID"),
 
         discord_enabled=env_bool("DISCORD_ENABLED", True),
         discord_free_webhook=env_str("DISCORD_FREE_WEBHOOK"),
@@ -306,10 +302,6 @@ def load_config() -> Config:
         control_admin_name=env_str("CONTROL_ADMIN_NAME", "Jordan"),
     )
 
-
-# ============================================================
-# DATA MODELS
-# ============================================================
 
 @dataclass
 class Quote:
@@ -419,17 +411,20 @@ class PersistentState:
             return PersistentState()
 
     def save(self, path: str) -> None:
-        payload = {
-            "last_alert_times": self.last_alert_times,
-            "last_market_snapshot": self.last_market_snapshot,
-            "execution_submitted_signals": self.execution_submitted_signals,
-            "risk_state": self.risk_state,
-            "risk_state_until_utc": self.risk_state_until_utc,
-            "risk_peak_equity": self.risk_peak_equity,
-            "risk_audit": self.risk_audit[-1000:],
-        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(
+                {
+                    "last_alert_times": self.last_alert_times,
+                    "last_market_snapshot": self.last_market_snapshot,
+                    "execution_submitted_signals": self.execution_submitted_signals,
+                    "risk_state": self.risk_state,
+                    "risk_state_until_utc": self.risk_state_until_utc,
+                    "risk_peak_equity": self.risk_peak_equity,
+                    "risk_audit": self.risk_audit[-1000:],
+                },
+                f,
+                indent=2,
+            )
 
 
 @dataclass
@@ -458,15 +453,18 @@ class PerformanceState:
             return PerformanceState()
 
     def save(self, path: str) -> None:
-        payload = {
-            "history": self.history[-3000:],
-            "pending_signals": self.pending_signals[-500:],
-            "last_daily_morning_report_date": self.last_daily_morning_report_date,
-            "last_daily_evening_report_date": self.last_daily_evening_report_date,
-            "last_weekly_report_key": self.last_weekly_report_key,
-        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(
+                {
+                    "history": self.history[-3000:],
+                    "pending_signals": self.pending_signals[-500:],
+                    "last_daily_morning_report_date": self.last_daily_morning_report_date,
+                    "last_daily_evening_report_date": self.last_daily_evening_report_date,
+                    "last_weekly_report_key": self.last_weekly_report_key,
+                },
+                f,
+                indent=2,
+            )
 
 
 @dataclass
@@ -479,6 +477,7 @@ class ControlState:
     command_id: str = ""
     last_applied_command_id: str = ""
     last_applied_at_utc: str = ""
+    telegram_update_offset: int = 0
     admin_log: List[Dict[str, Any]] = field(default_factory=list)
 
     @staticmethod
@@ -497,30 +496,31 @@ class ControlState:
                 command_id=raw.get("command_id", ""),
                 last_applied_command_id=raw.get("last_applied_command_id", ""),
                 last_applied_at_utc=raw.get("last_applied_at_utc", ""),
+                telegram_update_offset=raw.get("telegram_update_offset", 0),
                 admin_log=raw.get("admin_log", []),
             )
         except Exception:
             return ControlState()
 
     def save(self, path: str) -> None:
-        payload = {
-            "desired_state": self.desired_state,
-            "kill_switch": self.kill_switch,
-            "override_minutes": self.override_minutes,
-            "operator": self.operator,
-            "note": self.note,
-            "command_id": self.command_id,
-            "last_applied_command_id": self.last_applied_command_id,
-            "last_applied_at_utc": self.last_applied_at_utc,
-            "admin_log": self.admin_log[-500:],
-        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(
+                {
+                    "desired_state": self.desired_state,
+                    "kill_switch": self.kill_switch,
+                    "override_minutes": self.override_minutes,
+                    "operator": self.operator,
+                    "note": self.note,
+                    "command_id": self.command_id,
+                    "last_applied_command_id": self.last_applied_command_id,
+                    "last_applied_at_utc": self.last_applied_at_utc,
+                    "telegram_update_offset": self.telegram_update_offset,
+                    "admin_log": self.admin_log[-500:],
+                },
+                f,
+                indent=2,
+            )
 
-
-# ============================================================
-# DATA CLIENT
-# ============================================================
 
 class TwelveDataClient:
     BASE_URL = "https://api.twelvedata.com"
@@ -540,27 +540,19 @@ class TwelveDataClient:
         return data
 
     def get_quote(self, symbol: str) -> Quote:
-        if not symbol:
-            raise RuntimeError("Symbol is blank. Check GitHub secrets.")
         data = self._get("quote", {"symbol": symbol})
-
         price = safe_float(data.get("close"), 0.0)
-        open_price = safe_float(data.get("open"), 0.0)
-        high = safe_float(data.get("high"), 0.0)
-        low = safe_float(data.get("low"), 0.0)
-        previous_close = safe_float(data.get("previous_close"), 0.0)
-
+        prev = safe_float(data.get("previous_close"), 0.0)
         change_pct_val = safe_float(data.get("percent_change"), 0.0)
-        if change_pct_val == 0 and previous_close:
-            change_pct_val = pct_change(price, previous_close)
-
+        if change_pct_val == 0 and prev:
+            change_pct_val = pct_change(price, prev)
         return Quote(
             symbol=symbol,
             price=price,
-            open_price=open_price,
-            high=high,
-            low=low,
-            previous_close=previous_close,
+            open_price=safe_float(data.get("open"), 0.0),
+            high=safe_float(data.get("high"), 0.0),
+            low=safe_float(data.get("low"), 0.0),
+            previous_close=prev,
             change_pct=change_pct_val,
             timestamp=now_utc_iso(),
         )
@@ -593,37 +585,27 @@ class TwelveDataClient:
         )
 
 
-# ============================================================
-# BUILD CONTEXT
-# ============================================================
-
 def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext:
     primary = client.get_quote(cfg.primary_symbol)
     secondary = client.get_quote(cfg.secondary_symbol)
-
     oil = None
     volatility = None
-
     try:
         oil = client.get_quote(cfg.oil_symbol)
     except Exception as e:
         debug_log(cfg, f"oil quote failed: {e}")
-
     try:
         volatility = client.get_quote(cfg.volatility_symbol)
     except Exception as e:
-        debug_log(cfg, f"volatility quote failed: {e}")
-
-    primary_indicators = client.get_indicator_pack(cfg.primary_symbol)
-    secondary_indicators = client.get_indicator_pack(cfg.secondary_symbol)
+        debug_log(cfg, f"vol quote failed: {e}")
 
     return MarketContext(
         primary=primary,
         secondary=secondary,
         oil=oil,
         volatility=volatility,
-        primary_indicators=primary_indicators,
-        secondary_indicators=secondary_indicators,
+        primary_indicators=client.get_indicator_pack(cfg.primary_symbol),
+        secondary_indicators=client.get_indicator_pack(cfg.secondary_symbol),
         previous_day_high=primary.high,
         previous_day_low=primary.low,
         premarket_high=primary.high,
@@ -631,24 +613,19 @@ def build_market_context(client: TwelveDataClient, cfg: Config) -> MarketContext
     )
 
 
-# ============================================================
-# SCORING
-# ============================================================
-
 def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
     score = 50
     reasons: List[str] = []
     premium_reasons: List[str] = []
     risk_flags: List[str] = []
+    bullish_points = 0
+    bearish_points = 0
 
     price = ctx.primary.price
     vwap = ctx.primary_indicators.vwap
     rsi = ctx.primary_indicators.rsi
     ema9 = ctx.primary_indicators.ema9
     ema20 = ctx.primary_indicators.ema20
-
-    bullish_points = 0
-    bearish_points = 0
 
     if vwap is not None:
         if price > vwap:
@@ -660,14 +637,11 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
             bearish_points += 1
             reasons.append(f"{ctx.primary.symbol} is below VWAP ({vwap:.2f}).")
 
-        distance_pct = abs(pct_change(price, vwap))
-        if distance_pct <= cfg.vwap_distance_threshold_pct:
+        if abs(pct_change(price, vwap)) <= cfg.vwap_distance_threshold_pct:
             score += 5
             premium_reasons.append("Price is trading tight around VWAP.")
         else:
             risk_flags.append("Price is extended away from VWAP.")
-    else:
-        risk_flags.append("VWAP unavailable.")
 
     if rsi is not None:
         if 48 <= rsi <= 62:
@@ -679,8 +653,6 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
         elif rsi < 30:
             score -= 6
             risk_flags.append(f"RSI is weak at {rsi:.1f}.")
-    else:
-        risk_flags.append("RSI unavailable.")
 
     if ema9 is not None and ema20 is not None:
         if ema9 > ema20:
@@ -691,14 +663,10 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
             score += 7
             bearish_points += 1
             reasons.append("Short-term momentum is bearish (EMA9 < EMA20).")
-    else:
-        risk_flags.append("EMA trend data unavailable.")
 
     if abs(ctx.primary.change_pct) >= cfg.price_change_threshold_pct:
         score += 8
         reasons.append(f"Price is moving with intent ({ctx.primary.change_pct:+.2f}%).")
-    else:
-        risk_flags.append("Move is still small; chop risk is higher.")
 
     if ctx.oil and abs(ctx.oil.change_pct) >= cfg.oil_impact_threshold:
         premium_reasons.append(f"Oil is making a meaningful move ({ctx.oil.symbol} {ctx.oil.change_pct:+.2f}%).")
@@ -729,33 +697,25 @@ def score_setup(ctx: MarketContext, cfg: Config) -> SetupScore:
         risk_flags.append("Bullish and bearish evidence is mixed.")
 
     score = max(0, min(score, 100))
-    grade = grade_from_score(score)
+    return SetupScore(score, grade_from_score(score), direction, reasons, premium_reasons, risk_flags)
 
-    return SetupScore(score, grade, direction, reasons, premium_reasons, risk_flags)
-
-
-# ============================================================
-# ALERT BUILDERS
-# ============================================================
 
 def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
     lines = [
         f"Symbol: {ctx.primary.symbol}",
         f"Current Price: {ctx.primary.price:.2f}",
-        f"Previous Day High: {ctx.previous_day_high:.2f}" if ctx.previous_day_high is not None else "Previous Day High: n/a",
-        f"Previous Day Low: {ctx.previous_day_low:.2f}" if ctx.previous_day_low is not None else "Previous Day Low: n/a",
-        f"Premarket High: {ctx.premarket_high:.2f}" if ctx.premarket_high is not None else "Premarket High: n/a",
-        f"Premarket Low: {ctx.premarket_low:.2f}" if ctx.premarket_low is not None else "Premarket Low: n/a",
+        f"Previous Day High: {ctx.previous_day_high:.2f}",
+        f"Previous Day Low: {ctx.previous_day_low:.2f}",
+        f"Premarket High: {ctx.premarket_high:.2f}",
+        f"Premarket Low: {ctx.premarket_low:.2f}",
     ]
     if ctx.primary_indicators.vwap is not None:
         lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
     if ctx.primary_indicators.rsi is not None:
         lines.append(f"RSI: {ctx.primary_indicators.rsi:.1f}")
-
     lines.append("")
     lines.append("Watch for acceptance / rejection at these levels before entry.")
     lines.append(cfg.risk_warning_text)
-
     return AlertPayload(
         alert_type="DAILY_LEVELS",
         symbol=ctx.primary.symbol,
@@ -772,7 +732,6 @@ def build_daily_levels_alert(ctx: MarketContext, cfg: Config) -> AlertPayload:
 
 def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> AlertPayload:
     emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
-
     lines = [
         f"Symbol: {ctx.primary.symbol}",
         f"Direction: {setup.direction}",
@@ -781,7 +740,6 @@ def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> Ale
         f"Price: {ctx.primary.price:.2f}",
         f"Day Change: {ctx.primary.change_pct:+.2f}%",
     ]
-
     if ctx.primary_indicators.vwap is not None:
         lines.append(f"VWAP: {ctx.primary_indicators.vwap:.2f}")
     if ctx.primary_indicators.rsi is not None:
@@ -812,8 +770,6 @@ def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> Ale
     lines.append("")
     lines.append(cfg.risk_warning_text)
 
-    rounded_price = round(ctx.primary.price, cfg.dedupe_price_rounding)
-
     return AlertPayload(
         alert_type="TRADE_ALERT",
         symbol=ctx.primary.symbol,
@@ -823,7 +779,7 @@ def build_trade_alert(ctx: MarketContext, setup: SetupScore, cfg: Config) -> Ale
         direction=setup.direction,
         score=setup.score,
         tags=[ctx.primary.symbol.lower(), setup.direction.lower(), f"grade-{setup.grade.lower().replace('+', 'plus')}", "trade-alert"],
-        key=f"TRADE::{ctx.primary.symbol}::{setup.direction}::{setup.grade}::{rounded_price}",
+        key=f"TRADE::{ctx.primary.symbol}::{setup.direction}::{setup.grade}::{round(ctx.primary.price, cfg.dedupe_price_rounding)}",
         timestamp_utc=now_utc_iso(),
     )
 
@@ -837,24 +793,35 @@ def generate_trade_alert_if_valid(ctx: MarketContext, cfg: Config) -> Optional[A
     return build_trade_alert(ctx, setup, cfg)
 
 
-# ============================================================
-# NOTIFIERS
-# ============================================================
-
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str, enabled: bool):
         self.token = token
         self.chat_id = chat_id
         self.enabled = enabled
 
-    def send(self, text: str) -> None:
-        if not self.enabled or not self.token or not self.chat_id:
+    def send(self, text: str, chat_id: Optional[str] = None) -> None:
+        target_chat = chat_id or self.chat_id
+        if not self.enabled or not self.token or not target_chat:
             return
         requests.post(
             f"https://api.telegram.org/bot{self.token}/sendMessage",
-            json={"chat_id": self.chat_id, "text": text},
+            json={"chat_id": target_chat, "text": text},
             timeout=20,
         ).raise_for_status()
+
+    def get_updates(self, offset: int = 0, limit: int = 20) -> List[Dict[str, Any]]:
+        if not self.enabled or not self.token:
+            return []
+        response = requests.get(
+            f"https://api.telegram.org/bot{self.token}/getUpdates",
+            params={"offset": offset, "limit": limit, "timeout": 0},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            return []
+        return data.get("result", [])
 
 
 class DiscordNotifier:
@@ -876,18 +843,14 @@ def format_for_discord(alert: AlertPayload) -> str:
     return f"**{alert.title}**\n```{alert.body}```\n{hashtags}\nUTC: {alert.timestamp_utc}"
 
 
-# ============================================================
-# CONTROL PLANE
-# ============================================================
-
-VALID_CONTROL_STATES = {"AUTO", "ACTIVE", "SOFT_BLOCK", "COOLDOWN", "BREACH", "PROBATION", "KILL_SWITCH"}
-
-
-def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
-    state.risk_audit.append(
-        {"ts_utc": now_utc_iso(), "event_type": event_type, "details": details}
-    )
-    state.risk_audit = state.risk_audit[-1000:]
+def normalize_risk_state(state: PersistentState) -> None:
+    if state.risk_state_until_utc:
+        try:
+            if now_utc() >= parse_iso(state.risk_state_until_utc):
+                state.risk_state = "ACTIVE"
+                state.risk_state_until_utc = ""
+        except Exception:
+            pass
 
 
 def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> None:
@@ -899,12 +862,206 @@ def set_risk_state(state: PersistentState, new_state: str, minutes: int = 0) -> 
         state.risk_state_until_utc = ""
 
 
-def normalize_risk_state(state: PersistentState) -> None:
-    if state.risk_state_until_utc:
+def record_risk_audit(state: PersistentState, event_type: str, details: Dict[str, Any]) -> None:
+    state.risk_audit.append({"ts_utc": now_utc_iso(), "event_type": event_type, "details": details})
+    state.risk_audit = state.risk_audit[-1000:]
+
+
+def current_session_label() -> str:
+    current = now_et()
+    mins = current.hour * 60 + current.minute
+    if 9 * 60 + 30 <= mins < 10 * 60 + 30:
+        return "OPEN"
+    if 10 * 60 + 30 <= mins < 14 * 60:
+        return "MIDDAY"
+    if 14 * 60 <= mins <= 16 * 60:
+        return "POWER_HOUR"
+    return "OFF_HOURS"
+
+
+def process_telegram_control_commands(cfg: Config, control: ControlState, state: PersistentState, telegram: TelegramNotifier) -> None:
+    if not cfg.telegram_enabled or not cfg.telegram_control_enabled or not cfg.telegram_admin_chat_id:
+        return
+
+    updates = telegram.get_updates(offset=control.telegram_update_offset + 1)
+    if not updates:
+        return
+
+    for upd in updates:
+        update_id = upd.get("update_id", 0)
+        control.telegram_update_offset = max(control.telegram_update_offset, update_id)
+
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+
+        if chat_id != cfg.telegram_admin_chat_id:
+            try:
+                telegram.send("Unauthorized control attempt blocked.", chat_id=chat_id)
+            except Exception:
+                pass
+            continue
+
+        parts = text.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        changed = False
+        reply = ""
+
+        if cmd == "/status":
+            normalize_risk_state(state)
+            reply = (
+                f"Control Status\n"
+                f"Risk State: {state.risk_state}\n"
+                f"State Until: {state.risk_state_until_utc or 'n/a'}\n"
+                f"Desired State: {control.desired_state}\n"
+                f"Kill Switch: {control.kill_switch}\n"
+                f"Last Command ID: {control.last_applied_command_id or 'n/a'}\n"
+                f"Last Applied At: {control.last_applied_at_utc or 'n/a'}\n"
+                f"Note: {control.note or 'n/a'}"
+            )
+
+        elif cmd == "/active":
+            control.desired_state = "ACTIVE"
+            control.kill_switch = False
+            control.override_minutes = 0
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = "Activated from Telegram"
+            changed = True
+            reply = "Set to ACTIVE."
+
+        elif cmd == "/auto":
+            control.desired_state = "AUTO"
+            control.kill_switch = False
+            control.override_minutes = 0
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = "Auto mode from Telegram"
+            changed = True
+            reply = "Set to AUTO."
+
+        elif cmd == "/softblock":
+            mins = int(args[0]) if args else 60
+            control.desired_state = "SOFT_BLOCK"
+            control.kill_switch = False
+            control.override_minutes = mins
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = f"Soft block from Telegram for {mins}m"
+            changed = True
+            reply = f"Set SOFT_BLOCK for {mins} minutes."
+
+        elif cmd == "/cooldown":
+            mins = int(args[0]) if args else cfg.cooldown_minutes_after_loss_cluster
+            control.desired_state = "COOLDOWN"
+            control.kill_switch = False
+            control.override_minutes = mins
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = f"Cooldown from Telegram for {mins}m"
+            changed = True
+            reply = f"Set COOLDOWN for {mins} minutes."
+
+        elif cmd == "/probation":
+            mins = int(args[0]) if args else 120
+            control.desired_state = "PROBATION"
+            control.kill_switch = False
+            control.override_minutes = mins
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = f"Probation from Telegram for {mins}m"
+            changed = True
+            reply = f"Set PROBATION for {mins} minutes."
+
+        elif cmd == "/breach":
+            control.desired_state = "BREACH"
+            control.kill_switch = False
+            control.override_minutes = 0
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = "Manual breach from Telegram"
+            changed = True
+            reply = "Set BREACH."
+
+        elif cmd == "/killswitch_on":
+            control.desired_state = "KILL_SWITCH"
+            control.kill_switch = True
+            control.override_minutes = 0
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = "Kill switch ON from Telegram"
+            changed = True
+            reply = "Kill switch enabled."
+
+        elif cmd == "/killswitch_off":
+            control.desired_state = "ACTIVE"
+            control.kill_switch = False
+            control.override_minutes = 0
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = "Kill switch OFF from Telegram"
+            changed = True
+            reply = "Kill switch disabled. Set ACTIVE."
+
+        elif cmd == "/resume":
+            control.desired_state = "ACTIVE"
+            control.kill_switch = False
+            control.override_minutes = 0
+            control.command_id = f"tg-{update_id}"
+            control.operator = cfg.control_admin_name
+            control.note = "Resume from Telegram"
+            changed = True
+            reply = "Resumed ACTIVE state."
+
+        elif cmd == "/note":
+            note_text = " ".join(args).strip()
+            if note_text:
+                control.note = note_text
+                control.command_id = f"tg-{update_id}"
+                control.operator = cfg.control_admin_name
+                changed = True
+                reply = f"Updated note: {note_text}"
+            else:
+                reply = "Usage: /note your message"
+
+        else:
+            reply = (
+                "Commands:\n"
+                "/status\n"
+                "/active\n"
+                "/auto\n"
+                "/softblock 60\n"
+                "/cooldown 45\n"
+                "/probation 120\n"
+                "/breach\n"
+                "/killswitch_on\n"
+                "/killswitch_off\n"
+                "/resume\n"
+                "/note text"
+            )
+
+        if changed:
+            record_risk_audit(
+                state,
+                "TELEGRAM_CONTROL_COMMAND",
+                {
+                    "chat_id": chat_id,
+                    "command": text,
+                    "command_id": control.command_id,
+                    "operator": control.operator,
+                },
+            )
+
         try:
-            if now_utc() >= parse_iso(state.risk_state_until_utc):
-                state.risk_state = "ACTIVE"
-                state.risk_state_until_utc = ""
+            telegram.send(reply, chat_id=chat_id)
         except Exception:
             pass
 
@@ -925,7 +1082,6 @@ def apply_control_plane(
         if control.kill_switch or control.desired_state == "KILL_SWITCH":
             set_risk_state(state, "KILL_SWITCH")
         elif control.desired_state == "AUTO":
-            # do not force a change; just let engine manage it
             normalize_risk_state(state)
         elif control.desired_state == "ACTIVE":
             set_risk_state(state, "ACTIVE")
@@ -970,23 +1126,7 @@ def apply_control_plane(
             if cfg.discord_premium_webhook:
                 discord.send(cfg.discord_premium_webhook, msg)
             if cfg.telegram_enabled:
-                telegram.send(msg)
-
-
-# ============================================================
-# RISK ENGINE
-# ============================================================
-
-def current_session_label() -> str:
-    current = now_et()
-    mins = current.hour * 60 + current.minute
-    if 9 * 60 + 30 <= mins < 10 * 60 + 30:
-        return "OPEN"
-    if 10 * 60 + 30 <= mins < 14 * 60:
-        return "MIDDAY"
-    if 14 * 60 <= mins <= 16 * 60:
-        return "POWER_HOUR"
-    return "OFF_HOURS"
+                telegram.send(msg, chat_id=cfg.telegram_admin_chat_id or cfg.telegram_chat_id)
 
 
 class ExposureService:
@@ -1074,32 +1214,25 @@ class PreTradeRiskEngine:
 
     def _check_state(self, reasons: List[str]) -> Optional[RiskDecision]:
         normalize_risk_state(self.state)
-
         if self.state.risk_state == "KILL_SWITCH":
             reasons.append("KILL_SWITCH_ACTIVE")
             return RiskDecision("KILL_SWITCH_ACTIVE", 0.0, reasons, self.state.risk_state)
-
         if self.state.risk_state == "BREACH":
             reasons.append("RISK_BREACH_ACTIVE")
             return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
-
         if self.state.risk_state == "SOFT_BLOCK":
             reasons.append("SOFT_BLOCK_ACTIVE")
             return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
-
         if self.state.risk_state == "COOLDOWN":
             reasons.append("COOLDOWN_ACTIVE")
             return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
-
         if self.state.risk_state == "PROBATION":
             reasons.append("PROBATION_ACTIVE")
             return None
-
         return None
 
     def _check_daily_loss_and_drawdown(self, reasons: List[str]) -> Optional[RiskDecision]:
         self._sync_peak_equity()
-
         pseudo_realized = realized_signal_pnl_estimate_today(self.perf, self.cfg)
         if abs(min(pseudo_realized, 0.0)) >= self.cfg.max_daily_loss:
             set_risk_state(self.state, "BREACH")
@@ -1114,17 +1247,14 @@ class PreTradeRiskEngine:
                 reasons.append("MAX_DRAWDOWN_BREACH")
                 return RiskDecision("BLOCK_HARD", 0.0, reasons, self.state.risk_state)
 
-        reasons.append("DAILY_LOSS_OK")
-        reasons.append("DRAWDOWN_OK")
+        reasons.extend(["DAILY_LOSS_OK", "DRAWDOWN_OK"])
         return None
 
     def _check_strategy_health(self, reasons: List[str]) -> Optional[RiskDecision]:
-        losses = consecutive_losses_today(self.perf)
-        if losses >= self.cfg.max_consecutive_losses:
+        if consecutive_losses_today(self.perf) >= self.cfg.max_consecutive_losses:
             set_risk_state(self.state, "COOLDOWN", self.cfg.cooldown_minutes_after_loss_cluster)
             reasons.append("LOSS_CLUSTER_COOLDOWN")
             return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
-
         reasons.append("LOSS_CLUSTER_OK")
         return None
 
@@ -1133,7 +1263,6 @@ class PreTradeRiskEngine:
             set_risk_state(self.state, "SOFT_BLOCK", 60)
             reasons.append("MAX_TRADES_PER_DAY_REACHED")
             return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
-
         reasons.append("TRADE_COUNT_OK")
         return None
 
@@ -1208,7 +1337,6 @@ class PreTradeRiskEngine:
                     return RiskDecision("BLOCK_TEMP", 0.0, reasons, self.state.risk_state)
 
             reasons.append("MARKET_QUALITY_OK")
-
         return None
 
     def evaluate(self, intent: OrderIntent, ctx: MarketContext) -> RiskDecision:
@@ -1218,33 +1346,18 @@ class PreTradeRiskEngine:
             reasons.append("RISK_ENGINE_DISABLED")
             return RiskDecision("ALLOW", 1.0, reasons, self.state.risk_state)
 
-        decision = self._check_state(reasons)
-        if decision:
-            return decision
-
-        decision = self._check_daily_loss_and_drawdown(reasons)
-        if decision:
-            return decision
-
-        decision = self._check_strategy_health(reasons)
-        if decision:
-            return decision
-
-        decision = self._check_trade_count(reasons)
-        if decision:
-            return decision
-
-        decision = self._check_duplicate(intent, reasons)
-        if decision:
-            return decision
-
-        decision = self._check_exposure(intent, reasons)
-        if decision:
-            return decision
-
-        decision = self._check_session_and_market_quality(ctx, reasons)
-        if decision:
-            return decision
+        for check in [
+            self._check_state,
+            self._check_daily_loss_and_drawdown,
+            self._check_strategy_health,
+            self._check_trade_count,
+            lambda r: self._check_duplicate(intent, r),
+            lambda r: self._check_exposure(intent, r),
+            lambda r: self._check_session_and_market_quality(ctx, r),
+        ]:
+            decision = check(reasons)
+            if decision:
+                return decision
 
         if self.state.risk_state == "PROBATION":
             reasons.append("PROBATION_SIZE_REDUCTION")
@@ -1254,16 +1367,11 @@ class PreTradeRiskEngine:
         return RiskDecision("ALLOW", 1.0, reasons, self.state.risk_state)
 
 
-# ============================================================
-# EXECUTION
-# ============================================================
-
 class ExecutionEngine:
     def __init__(self, cfg: Config, state: PersistentState):
         self.cfg = cfg
         self.state = state
         self.client = None
-
         if cfg.alpaca_api_key and cfg.alpaca_secret_key:
             self.client = TradingClient(
                 api_key=cfg.alpaca_api_key,
@@ -1346,8 +1454,7 @@ def safe_get_account_equity(executor: ExecutionEngine) -> float:
     try:
         if executor.client is None:
             return 0.0
-        account = executor.client.get_account()
-        return float(account.equity)
+        return float(executor.client.get_account().equity)
     except Exception:
         return 0.0
 
@@ -1356,8 +1463,7 @@ def safe_get_account_last_equity(executor: ExecutionEngine) -> float:
     try:
         if executor.client is None:
             return 0.0
-        account = executor.client.get_account()
-        return float(account.last_equity)
+        return float(executor.client.get_account().last_equity)
     except Exception:
         return 0.0
 
@@ -1369,13 +1475,6 @@ def safe_get_positions(executor: ExecutionEngine) -> List[Any]:
         return executor.client.get_all_positions()
     except Exception:
         return []
-
-
-# ============================================================
-# TRACKING
-# ============================================================
-
-TRACK_WINDOWS_MIN = [5, 15, 30, 60]
 
 
 def record_signal(perf: PerformanceState, alert: AlertPayload, ctx: MarketContext, cfg: Config) -> None:
@@ -1488,7 +1587,6 @@ def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, c
 
     for pending in perf.pending_signals:
         symbol = pending["symbol"]
-
         try:
             if symbol not in cache:
                 cache[symbol] = client.get_quote(symbol).price
@@ -1540,10 +1638,6 @@ def evaluate_pending_signals(client: TwelveDataClient, perf: PerformanceState, c
     perf.pending_signals = still_pending
 
 
-# ============================================================
-# REPORTS
-# ============================================================
-
 def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     signals = [x for x in history if x.get("type") == "signal"]
     executions = [x for x in history if x.get("type") == "execution"]
@@ -1562,10 +1656,8 @@ def summarize_period(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         grade = item["grade"]
         symbol = item["symbol"]
         status = item["final_status"]
-
         grade_outcomes.setdefault(grade, {"WIN": 0, "LOSS": 0, "NEUTRAL": 0})
         symbol_outcomes.setdefault(symbol, {"WIN": 0, "LOSS": 0, "NEUTRAL": 0})
-
         grade_outcomes[grade][status] = grade_outcomes[grade].get(status, 0) + 1
         symbol_outcomes[symbol][status] = symbol_outcomes[symbol].get(status, 0) + 1
 
@@ -1617,27 +1709,28 @@ def build_daily_report_text(cfg: Config, perf: PerformanceState, executor: Execu
     equity_change = equity - last_equity if equity and last_equity else 0.0
     positions = safe_get_positions(executor)
 
-    lines = [
-        f"📊 {'Morning' if mode == 'morning' else 'Evening'} Daily Performance Report",
-        f"Date (ET): {date_key}",
-        "",
-        f"Signals Today: {summary['signals']}",
-        f"Executions Today: {summary['executions']}",
-        f"Tracked Outcomes: {summary['tracked']}",
-        f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
-        f"Win Rate: {summary['win_rate']:.2f}%",
-        f"Avg Signal Score: {summary['avg_score']}",
-        f"Most Active Symbol: {summary['top_symbol']}",
-        f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
-        f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
-        "",
-        f"Risk State: {state.risk_state}",
-        f"Peak Equity: {format_money(state.risk_peak_equity)}" if state.risk_peak_equity else "Peak Equity: n/a",
-        f"Account Equity: {format_money(equity)}" if equity else "Account Equity: n/a",
-        f"Equity Change vs Last Equity: {format_money(equity_change)}" if equity and last_equity else "Equity Change vs Last Equity: n/a",
-        f"Open Positions: {len(positions)}",
-    ]
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            f"📊 {'Morning' if mode == 'morning' else 'Evening'} Daily Performance Report",
+            f"Date (ET): {date_key}",
+            "",
+            f"Signals Today: {summary['signals']}",
+            f"Executions Today: {summary['executions']}",
+            f"Tracked Outcomes: {summary['tracked']}",
+            f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
+            f"Win Rate: {summary['win_rate']:.2f}%",
+            f"Avg Signal Score: {summary['avg_score']}",
+            f"Most Active Symbol: {summary['top_symbol']}",
+            f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
+            f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
+            "",
+            f"Risk State: {state.risk_state}",
+            f"Peak Equity: {format_money(state.risk_peak_equity)}" if state.risk_peak_equity else "Peak Equity: n/a",
+            f"Account Equity: {format_money(equity)}" if equity else "Account Equity: n/a",
+            f"Equity Change vs Last Equity: {format_money(equity_change)}" if equity and last_equity else "Equity Change vs Last Equity: n/a",
+            f"Open Positions: {len(positions)}",
+        ]
+    )
 
 
 def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, state: PersistentState) -> str:
@@ -1645,22 +1738,23 @@ def build_weekly_report_text(cfg: Config, perf: PerformanceState, executor: Exec
     summary = summarize_period([x for x in perf.history if x.get("week_key") == wk])
     equity = safe_get_account_equity(executor)
 
-    lines = [
-        "📈 Weekly Performance Report",
-        f"Week: {wk}",
-        "",
-        f"Signals: {summary['signals']}",
-        f"Executions: {summary['executions']}",
-        f"Tracked Outcomes: {summary['tracked']}",
-        f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
-        f"Weekly Win Rate: {summary['win_rate']:.2f}%",
-        f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
-        f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
-        "",
-        f"Risk State: {state.risk_state}",
-        f"Current Equity: {format_money(equity)}" if equity else "Current Equity: n/a",
-    ]
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "📈 Weekly Performance Report",
+            f"Week: {wk}",
+            "",
+            f"Signals: {summary['signals']}",
+            f"Executions: {summary['executions']}",
+            f"Tracked Outcomes: {summary['tracked']}",
+            f"Win / Loss / Neutral: {summary['wins']} / {summary['losses']} / {summary['neutrals']}",
+            f"Weekly Win Rate: {summary['win_rate']:.2f}%",
+            f"Best Grade: {best_rate_bucket(summary['grade_outcomes'])}",
+            f"Best Symbol: {best_rate_bucket(summary['symbol_outcomes'])}",
+            "",
+            f"Risk State: {state.risk_state}",
+            f"Current Equity: {format_money(equity)}" if equity else "Current Equity: n/a",
+        ]
+    )
 
 
 def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionEngine, state: PersistentState, discord: DiscordNotifier) -> None:
@@ -1685,10 +1779,6 @@ def maybe_send_reports(cfg: Config, perf: PerformanceState, executor: ExecutionE
                 discord.send(cfg.discord_weekly_performance_webhook, build_weekly_report_text(cfg, perf, executor, state))
             perf.last_weekly_report_key = wk
 
-
-# ============================================================
-# MAIN FLOW HELPERS
-# ============================================================
 
 def should_send_by_cooldown(state: PersistentState, key: str, cooldown_seconds: int) -> bool:
     current_ts = time.time()
@@ -1752,19 +1842,6 @@ def append_risk_to_alert(alert: AlertPayload, decision: RiskDecision, control: C
     return alert
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
-def print_snapshot(ctx: MarketContext) -> None:
-    print(
-        f"[{now_utc_iso()}] "
-        f"{ctx.primary.symbol} {ctx.primary.price:.2f} ({ctx.primary.change_pct:+.2f}%) | "
-        f"VWAP {ctx.primary_indicators.vwap if ctx.primary_indicators.vwap is not None else 'n/a'} | "
-        f"RSI {ctx.primary_indicators.rsi if ctx.primary_indicators.rsi is not None else 'n/a'}"
-    )
-
-
 def run_once() -> None:
     cfg = load_config()
     if not cfg.twelve_data_api_key:
@@ -1779,11 +1856,11 @@ def run_once() -> None:
     discord = DiscordNotifier(cfg.discord_enabled)
     executor = ExecutionEngine(cfg, state)
 
+    process_telegram_control_commands(cfg, control, state, telegram)
     apply_control_plane(cfg, control, state, discord, telegram)
     evaluate_pending_signals(client, perf, cfg)
 
     ctx = build_market_context(client, cfg)
-    print_snapshot(ctx)
 
     daily_levels_alert = build_daily_levels_alert(ctx, cfg)
     route_alert(daily_levels_alert, cfg, state, telegram, discord)
@@ -1813,7 +1890,6 @@ def run_once() -> None:
         if risk_decision.action in {"ALLOW", "ALLOW_REDUCED"}:
             exec_notional = intent.requested_notional * risk_decision.size_multiplier
             exec_result = executor.execute(trade_alert, ctx, exec_notional)
-            print(f"Execution result: {exec_result}")
 
             if exec_result.get("executed"):
                 record_execution(perf, trade_alert, ctx, exec_result)
@@ -1825,7 +1901,6 @@ def run_once() -> None:
                     f"Notional: {format_money(exec_result['notional'])}\n"
                     f"Risk Action: {risk_decision.action}\n"
                     f"Risk State: {state.risk_state}\n"
-                    f"Price snapshot: {ctx.primary.price:.2f}\n"
                     f"Order ID: {exec_result['alpaca_order_id']}\n"
                     f"Status: {exec_result['alpaca_status']}"
                 )
@@ -1861,7 +1936,6 @@ def run_once() -> None:
     state.save(cfg.state_file)
     perf.save(cfg.performance_state_file)
     control.save(cfg.control_state_file)
-    print("Run complete.")
 
 
 if __name__ == "__main__":
