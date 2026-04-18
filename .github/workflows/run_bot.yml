@@ -53,3 +53,10 @@ jobs:
 
       - name: Run UnBiased Bot
         run: python main.py
+
+      - name: Upload trade logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: unbiased-trade-logs
+          path: artifacts/
+          if-no-files-found: warn
