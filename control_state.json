@@ -7,5 +7,13 @@
   "command_id": "cmd-001",
   "last_applied_command_id": "",
   "last_applied_at_utc": "",
-  "admin_log": []
+  "admin_log": [],
+  "bot_paused": false,
+  "flatten_requested": false,
+  "armed": true,
+  "mode": "paper",
+  "last_command": "/status",
+  "last_command_time_utc": "2026-04-18 20:16:38 UTC",
+  "last_command_from": "Jordan Bias (8661143355)",
+  "notes": "status checked"
 }
