@@ -9,10 +9,7 @@ on:
         default: "test_all"
 
   schedule:
-    # Daily report → 9:00 PM EST (adjust if needed)
     - cron: "0 1 * * *"
-
-    # Weekly report → Sunday 7:00 PM EST
     - cron: "0 23 * * 0"
 
 jobs:
@@ -20,14 +17,13 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ===== BOT MODE LOGIC =====
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
       BOT_MODE: ${{ github.event.inputs.bot_mode }}
 
-      # ===== TELEGRAM =====
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # ===== DISCORD =====
       DISCORD_WEBHOOK_FREE: ${{ secrets.DISCORD_WEBHOOK_FREE }}
       DISCORD_WEBHOOK_PREMIUM: ${{ secrets.DISCORD_WEBHOOK_PREMIUM }}
       DISCORD_WEBHOOK_PREMIUM_LEVELS: ${{ secrets.DISCORD_WEBHOOK_PREMIUM_LEVELS }}
@@ -44,16 +40,12 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      # ===== AUTO MODE SWITCHING =====
       - name: Set BOT_MODE for scheduled runs
         run: |
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            # Daily run
             if [[ "$(date +%u)" != "7" ]]; then
               echo "BOT_MODE=daily_report" >> $GITHUB_ENV
             fi
-
-            # Sunday = weekly report
             if [[ "$(date +%u)" == "7" ]]; then
               echo "BOT_MODE=weekly_report" >> $GITHUB_ENV
             fi
