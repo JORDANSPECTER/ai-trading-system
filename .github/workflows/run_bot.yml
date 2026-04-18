@@ -35,6 +35,9 @@ jobs:
           if [ ! -f performance_state.json ]; then
             echo '{"history": [], "pending_signals": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
           fi
+          if [ ! -f control_state.json ]; then
+            echo '{"desired_state": "AUTO", "kill_switch": false, "override_minutes": 0, "operator": "", "note": "", "command_id": "", "last_applied_command_id": "", "last_applied_at_utc": "", "admin_log": []}' > control_state.json
+          fi
 
       - name: Install dependencies
         run: |
@@ -52,6 +55,7 @@ jobs:
 
           STATE_FILE: elite_state.json
           PERFORMANCE_STATE_FILE: performance_state.json
+          CONTROL_STATE_FILE: control_state.json
 
           DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
           ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
@@ -106,7 +110,6 @@ jobs:
           TRACKING_FAIL_PCT: ${{ secrets.TRACKING_FAIL_PCT }}
 
           RISK_ENABLED: ${{ secrets.RISK_ENABLED }}
-          KILL_SWITCH_ENABLED: ${{ secrets.KILL_SWITCH_ENABLED }}
           SESSION_FILTER_ENABLED: ${{ secrets.SESSION_FILTER_ENABLED }}
           ALLOW_MIDDAY_ENTRIES: ${{ secrets.ALLOW_MIDDAY_ENTRIES }}
           MARKET_QUALITY_ENABLED: ${{ secrets.MARKET_QUALITY_ENABLED }}
@@ -123,6 +126,9 @@ jobs:
           VIX_SPIKE_BLOCK_PCT: ${{ secrets.VIX_SPIKE_BLOCK_PCT }}
           MAX_VWAP_DISTANCE_PCT: ${{ secrets.MAX_VWAP_DISTANCE_PCT }}
           PROBATION_SIZE_MULTIPLIER: ${{ secrets.PROBATION_SIZE_MULTIPLIER }}
+
+          CONTROL_NOTIFICATIONS_ENABLED: ${{ secrets.CONTROL_NOTIFICATIONS_ENABLED }}
+          CONTROL_ADMIN_NAME: ${{ secrets.CONTROL_ADMIN_NAME }}
         run: |
           python main.py
 
@@ -134,3 +140,4 @@ jobs:
           path: |
             elite_state.json
             performance_state.json
+            control_state.json
