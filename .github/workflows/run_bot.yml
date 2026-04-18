@@ -3,8 +3,8 @@ name: UnBiased Trading Bot
 on:
   workflow_dispatch:
   schedule:
-    # Runs every 5 minutes during market hours (Mon–Fri)
-    # 13:30–20:00 UTC = 9:30 AM – 4:00 PM EST
+    # Every 5 minutes during regular market hours, Monday-Friday
+    # 13:30-20:00 UTC = 9:30 AM - 4:00 PM Eastern during daylight savings
     - cron: "*/5 13-20 * * 1-5"
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       # =========================
-      # ALPACA (BROKER)
+      # ALPACA
       # =========================
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
@@ -31,11 +31,11 @@ jobs:
       # =========================
       # CORE BOT CONTROL
       # =========================
-      LIVE_TRADING: "true"        # 🔴 change to "true" to enable execution
+      LIVE_TRADING: "true"
       POLL_SECONDS: "60"
 
       # =========================
-      # EXECUTION ENGINE SETTINGS
+      # EXECUTION ENGINE
       # =========================
       A_PLUS_ONLY_MODE: "false"
       ALLOW_B_MICRO_SIZE: "true"
@@ -49,6 +49,12 @@ jobs:
       MIN_CONFIDENCE: "0.75"
 
       PNL_LOG_FILE: "trade_log.csv"
+
+      # =========================
+      # OPTIONS CONTRACT PICKER
+      # =========================
+      OPTIONS_DTE_FALLBACK_DAYS: "5"
+      OPTIONS_STRIKE_STEP_BUFFER: "0.0"
 
     steps:
       - name: Checkout repository
