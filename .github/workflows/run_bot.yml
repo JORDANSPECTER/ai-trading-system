@@ -3,8 +3,12 @@ name: Elite Engine
 on:
   workflow_dispatch:
   schedule:
+    # Every 20 minutes during 9:00 AM -> 11:59 PM UTC-4 window portion
     - cron: "*/20 13-23 * * 1-5"
+    # Every 20 minutes during the 12:00 AM -> 1:59 AM UTC portion, which is 8:00 PM -> 9:59 PM ET in DST
     - cron: "*/20 0-1 * * 2-6"
+    # Sunday weekly report window
+    - cron: "*/20 13-14 * * 0"
 
 jobs:
   run-engine:
@@ -19,17 +23,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restore prior state file
+      - name: Restore prior state files
         uses: actions/download-artifact@v4
         with:
-          name: elite-state
+          name: elite-state-bundle
           path: .
         continue-on-error: true
 
-      - name: Create fallback state file if missing
+      - name: Create fallback state files if missing
         run: |
           if [ ! -f elite_state.json ]; then
             echo '{"last_alert_times": {}, "last_market_snapshot": {}, "execution_submitted_signals": {}}' > elite_state.json
+          fi
+          if [ ! -f performance_state.json ]; then
+            echo '{"history": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
           fi
 
       - name: Install dependencies
@@ -46,7 +53,9 @@ jobs:
           OIL_SYMBOL: ${{ secrets.OIL_SYMBOL }}
           VOLATILITY_SYMBOL: ${{ secrets.VOLATILITY_SYMBOL }}
 
-          STATE_FILE: elite_state.json
+          STATE_FILE: ${{ secrets.STATE_FILE }}
+          PERFORMANCE_STATE_FILE: ${{ secrets.PERFORMANCE_STATE_FILE }}
+
           DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
           ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
           DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
@@ -59,6 +68,8 @@ jobs:
           DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
           DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
           DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
+          DISCORD_DAILY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_DAILY_PERFORMANCE_WEBHOOK }}
+          DISCORD_WEEKLY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_WEEKLY_PERFORMANCE_WEBHOOK }}
 
           PREMIUM_MIN_GRADE: ${{ secrets.PREMIUM_MIN_GRADE }}
           FREE_MIN_GRADE: ${{ secrets.FREE_MIN_GRADE }}
@@ -83,12 +94,23 @@ jobs:
           MAX_POSITION_NOTIONAL: ${{ secrets.MAX_POSITION_NOTIONAL }}
           MAX_OPEN_POSITIONS: ${{ secrets.MAX_OPEN_POSITIONS }}
           DEFAULT_TIME_IN_FORCE: ${{ secrets.DEFAULT_TIME_IN_FORCE }}
+
+          DAILY_REPORTS_ENABLED: ${{ secrets.DAILY_REPORTS_ENABLED }}
+          WEEKLY_REPORTS_ENABLED: ${{ secrets.WEEKLY_REPORTS_ENABLED }}
+          MORNING_REPORT_HOUR_ET: ${{ secrets.MORNING_REPORT_HOUR_ET }}
+          MORNING_REPORT_MINUTE_ET: ${{ secrets.MORNING_REPORT_MINUTE_ET }}
+          EVENING_REPORT_HOUR_ET: ${{ secrets.EVENING_REPORT_HOUR_ET }}
+          EVENING_REPORT_MINUTE_ET: ${{ secrets.EVENING_REPORT_MINUTE_ET }}
+          WEEKLY_REPORT_HOUR_ET: ${{ secrets.WEEKLY_REPORT_HOUR_ET }}
+          WEEKLY_REPORT_MINUTE_ET: ${{ secrets.WEEKLY_REPORT_MINUTE_ET }}
         run: |
           python main.py
 
-      - name: Upload updated state file
+      - name: Upload updated state bundle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: elite-state
-          path: elite_state.json
+          name: elite-state-bundle
+          path: |
+            elite_state.json
+            performance_state.json
