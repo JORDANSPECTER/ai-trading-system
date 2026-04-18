@@ -61,10 +61,17 @@ jobs:
       OPEN_TRADES_FILE: "open_trades.json"
       TRADE_LOG_FILE: "trade_log.csv"
 
-      # OPTIONS
+      # OPTIONS / PRICING ENGINE
       OPTIONS_DTE_FALLBACK_DAYS: "5"
       OPTIONS_STRIKE_STEP_BUFFER: "0.0"
-      DEFAULT_OPTION_LIMIT_PRICE: "1.00"
+      OPTION_QUOTE_FEED: "indicative"
+      MAX_OPTION_SPREAD_ABS: "0.30"
+      MAX_OPTION_SPREAD_PCT: "20"
+      BUY_LIMIT_SPREAD_FACTOR: "0.85"
+      SELL_LIMIT_SPREAD_FACTOR: "0.15"
+      MIN_OPTION_ASK: "0.05"
+      MIN_OPTION_BID: "0.01"
+      ALLOW_MARKET_ORDERS_DURING_RTH: "false"
 
     steps:
       - name: Checkout repository
@@ -82,7 +89,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests alpaca-py
 
-      - name: Run elite execution engine
+      - name: Run pricing engine
         run: |
           python main.py
 
@@ -91,5 +98,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add open_trades.json trade_log.csv || true
-          git diff --cached --quiet || git commit -m "Update elite execution state"
+          git diff --cached --quiet || git commit -m "Update execution engine state"
           git push
