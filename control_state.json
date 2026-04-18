@@ -1,0 +1,11 @@
+{
+  "desired_state": "AUTO",
+  "kill_switch": false,
+  "override_minutes": 0,
+  "operator": "Jordan",
+  "note": "Normal automatic mode",
+  "command_id": "cmd-001",
+  "last_applied_command_id": "",
+  "last_applied_at_utc": "",
+  "admin_log": []
+}
