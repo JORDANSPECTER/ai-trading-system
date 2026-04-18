@@ -1,145 +1,60 @@
-name: Run Bot
+name: Telegram Control Center
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 13-23 * * 1-5"
-    - cron: "*/20 0-1 * * 2-6"
-    - cron: "*/20 13-14 * * 0"
+    - cron: "* * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-control-center
+  cancel-in-progress: false
 
 jobs:
-  run-engine:
+  telegram-control:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Restore prior state files
-        uses: actions/download-artifact@v4
-        with:
-          name: elite-state-bundle
-          path: .
-        continue-on-error: true
-
-      - name: Create fallback state files if missing
-        run: |
-          if [ ! -f elite_state.json ]; then
-            echo '{"last_alert_times": {}, "last_market_snapshot": {}, "execution_submitted_signals": {}, "risk_state": "ACTIVE", "risk_state_until_utc": "", "risk_peak_equity": 0.0, "risk_audit": []}' > elite_state.json
-          fi
-          if [ ! -f performance_state.json ]; then
-            echo '{"history": [], "pending_signals": [], "last_daily_morning_report_date": "", "last_daily_evening_report_date": "", "last_weekly_report_key": ""}' > performance_state.json
-          fi
-          if [ ! -f control_state.json ]; then
-            echo '{"desired_state": "AUTO", "kill_switch": false, "override_minutes": 0, "operator": "", "note": "", "command_id": "", "last_applied_command_id": "", "last_applied_at_utc": "", "telegram_update_offset": 0, "admin_log": []}' > control_state.json
-          fi
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests alpaca-py
+          pip install requests
 
-      - name: Run elite engine
+      - name: Ensure state files exist
+        run: |
+          [ -f control_state.json ] || echo '{"bot_paused": false, "kill_switch": false, "flatten_requested": false, "armed": true, "mode": "paper", "last_command": "none", "last_command_time_utc": null, "last_command_from": null, "notes": "initialized"}' > control_state.json
+          [ -f telegram_offset.txt ] || echo "0" > telegram_offset.txt
+
+      - name: Run Telegram control center
         env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-
-          PRIMARY_SYMBOL: ${{ secrets.PRIMARY_SYMBOL }}
-          SECONDARY_SYMBOL: ${{ secrets.SECONDARY_SYMBOL }}
-          OIL_SYMBOL: ${{ secrets.OIL_SYMBOL }}
-          VOLATILITY_SYMBOL: ${{ secrets.VOLATILITY_SYMBOL }}
-
-          STATE_FILE: elite_state.json
-          PERFORMANCE_STATE_FILE: performance_state.json
-          CONTROL_STATE_FILE: control_state.json
-
-          DEDUPE_PRICE_ROUNDING: ${{ secrets.DEDUPE_PRICE_ROUNDING }}
-          ALERT_COOLDOWN_SECONDS: ${{ secrets.ALERT_COOLDOWN_SECONDS }}
-          DAILY_LEVELS_COOLDOWN_SECONDS: ${{ secrets.DAILY_LEVELS_COOLDOWN_SECONDS }}
-
-          TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
-          TELEGRAM_CONTROL_ENABLED: ${{ secrets.TELEGRAM_CONTROL_ENABLED }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          DEBUG_MODE: "true"
+          BOT_NAME: "Heartbeat Command Center"
+        run: python main.py
 
-          DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED }}
-          DISCORD_FREE_WEBHOOK: ${{ secrets.DISCORD_FREE_WEBHOOK }}
-          DISCORD_PREMIUM_WEBHOOK: ${{ secrets.DISCORD_PREMIUM_WEBHOOK }}
-          DISCORD_DAILY_LEVELS_WEBHOOK: ${{ secrets.DISCORD_DAILY_LEVELS_WEBHOOK }}
-          DISCORD_DAILY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_DAILY_PERFORMANCE_WEBHOOK }}
-          DISCORD_WEEKLY_PERFORMANCE_WEBHOOK: ${{ secrets.DISCORD_WEEKLY_PERFORMANCE_WEBHOOK }}
-
-          PREMIUM_MIN_GRADE: ${{ secrets.PREMIUM_MIN_GRADE }}
-          FREE_MIN_GRADE: ${{ secrets.FREE_MIN_GRADE }}
-          MIN_SCORE_FOR_FREE: ${{ secrets.MIN_SCORE_FOR_FREE }}
-          MIN_SCORE_FOR_PREMIUM: ${{ secrets.MIN_SCORE_FOR_PREMIUM }}
-
-          OIL_IMPACT_THRESHOLD: ${{ secrets.OIL_IMPACT_THRESHOLD }}
-          PRICE_CHANGE_THRESHOLD_PCT: ${{ secrets.PRICE_CHANGE_THRESHOLD_PCT }}
-          VWAP_DISTANCE_THRESHOLD_PCT: ${{ secrets.VWAP_DISTANCE_THRESHOLD_PCT }}
-
-          DAILY_LEVELS_ENABLED: ${{ secrets.DAILY_LEVELS_ENABLED }}
-          RISK_WARNING_TEXT: ${{ secrets.RISK_WARNING_TEXT }}
-          DEBUG: ${{ secrets.DEBUG }}
-
-          EXECUTION_ENABLED: ${{ secrets.EXECUTION_ENABLED }}
-          EXECUTION_MIN_GRADE: ${{ secrets.EXECUTION_MIN_GRADE }}
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
-          ALLOW_SHORTS: ${{ secrets.ALLOW_SHORTS }}
-          ALLOW_FRACTIONAL: ${{ secrets.ALLOW_FRACTIONAL }}
-          MAX_POSITION_NOTIONAL: ${{ secrets.MAX_POSITION_NOTIONAL }}
-          MAX_OPEN_POSITIONS: ${{ secrets.MAX_OPEN_POSITIONS }}
-          DEFAULT_TIME_IN_FORCE: ${{ secrets.DEFAULT_TIME_IN_FORCE }}
-
-          DAILY_REPORTS_ENABLED: ${{ secrets.DAILY_REPORTS_ENABLED }}
-          WEEKLY_REPORTS_ENABLED: ${{ secrets.WEEKLY_REPORTS_ENABLED }}
-          MORNING_REPORT_HOUR_ET: ${{ secrets.MORNING_REPORT_HOUR_ET }}
-          MORNING_REPORT_MINUTE_ET: ${{ secrets.MORNING_REPORT_MINUTE_ET }}
-          EVENING_REPORT_HOUR_ET: ${{ secrets.EVENING_REPORT_HOUR_ET }}
-          EVENING_REPORT_MINUTE_ET: ${{ secrets.EVENING_REPORT_MINUTE_ET }}
-          WEEKLY_REPORT_HOUR_ET: ${{ secrets.WEEKLY_REPORT_HOUR_ET }}
-          WEEKLY_REPORT_MINUTE_ET: ${{ secrets.WEEKLY_REPORT_MINUTE_ET }}
-
-          TRACKING_ENABLED: ${{ secrets.TRACKING_ENABLED }}
-          TRACKING_TARGET_PCT: ${{ secrets.TRACKING_TARGET_PCT }}
-          TRACKING_FAIL_PCT: ${{ secrets.TRACKING_FAIL_PCT }}
-
-          RISK_ENABLED: ${{ secrets.RISK_ENABLED }}
-          SESSION_FILTER_ENABLED: ${{ secrets.SESSION_FILTER_ENABLED }}
-          ALLOW_MIDDAY_ENTRIES: ${{ secrets.ALLOW_MIDDAY_ENTRIES }}
-          MARKET_QUALITY_ENABLED: ${{ secrets.MARKET_QUALITY_ENABLED }}
-          MAX_DAILY_LOSS: ${{ secrets.MAX_DAILY_LOSS }}
-          MAX_DRAWDOWN_PCT: ${{ secrets.MAX_DRAWDOWN_PCT }}
-          MAX_TRADES_PER_DAY: ${{ secrets.MAX_TRADES_PER_DAY }}
-          ONE_TRADE_PER_SYMBOL: ${{ secrets.ONE_TRADE_PER_SYMBOL }}
-          COOLDOWN_MINUTES_AFTER_LOSS_CLUSTER: ${{ secrets.COOLDOWN_MINUTES_AFTER_LOSS_CLUSTER }}
-          MAX_CONSECUTIVE_LOSSES: ${{ secrets.MAX_CONSECUTIVE_LOSSES }}
-          MAX_ORDER_NOTIONAL: ${{ secrets.MAX_ORDER_NOTIONAL }}
-          MAX_SYMBOL_EXPOSURE: ${{ secrets.MAX_SYMBOL_EXPOSURE }}
-          MAX_PORTFOLIO_EXPOSURE: ${{ secrets.MAX_PORTFOLIO_EXPOSURE }}
-          DUPLICATE_SIGNAL_WINDOW_MINUTES: ${{ secrets.DUPLICATE_SIGNAL_WINDOW_MINUTES }}
-          VIX_SPIKE_BLOCK_PCT: ${{ secrets.VIX_SPIKE_BLOCK_PCT }}
-          MAX_VWAP_DISTANCE_PCT: ${{ secrets.MAX_VWAP_DISTANCE_PCT }}
-          PROBATION_SIZE_MULTIPLIER: ${{ secrets.PROBATION_SIZE_MULTIPLIER }}
-
-          CONTROL_NOTIFICATIONS_ENABLED: ${{ secrets.CONTROL_NOTIFICATIONS_ENABLED }}
-          CONTROL_ADMIN_NAME: ${{ secrets.CONTROL_ADMIN_NAME }}
+      - name: Commit updated state files
         run: |
-          python main.py
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Upload updated state bundle
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: elite-state-bundle
-          path: |
-            elite_state.json
-            performance_state.json
-            control_state.json
+          git add control_state.json telegram_offset.txt
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "Update Telegram control state"
+            git push
+          fi
