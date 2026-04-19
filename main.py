@@ -24,10 +24,11 @@ except Exception:
 # CONFIG
 # ============================================================
 APP_NAME = os.getenv("APP_NAME", "UB-ENGINE")
-APP_VERSION = os.getenv("APP_VERSION", "2.3.0")
+APP_VERSION = os.getenv("APP_VERSION", "2.4.0")
 
 MODE = os.getenv("MODE", "paper").lower()  # paper | live | alerts_only
 LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
+COMMAND_POLL_SECONDS = int(os.getenv("COMMAND_POLL_SECONDS", "1"))
 
 PRIMARY_SYMBOL = os.getenv("PRIMARY_SYMBOL", "QQQ").upper()
 SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").upper()
@@ -181,6 +182,7 @@ class EngineState:
             "last_plan_signature": "",
             "last_exec_signature": "",
             "last_heartbeat_ts": 0,
+            "next_market_cycle_ts": 0,
         }
         self.load()
 
@@ -573,6 +575,25 @@ def parse_command(text: str) -> Tuple[str, List[str]]:
     return parts[0].lower(), parts[1:]
 
 
+def command_menu_text() -> str:
+    return (
+        "✅ UB Command Center Online\n\n"
+        "Commands:\n"
+        "/start\n"
+        "/help\n"
+        "/status\n"
+        "/kill\n"
+        "/resume\n"
+        "/flatten\n"
+        "/mode paper\n"
+        "/mode live\n"
+        "/mode alerts_only\n"
+        "/exec on\n"
+        "/exec off\n"
+        "/test"
+    )
+
+
 def handle_telegram_commands(
     tg: TelegramNotifier,
     state: EngineState,
@@ -601,21 +622,8 @@ def handle_telegram_commands(
 
         cmd, args = parse_command(text)
 
-        if cmd in ("/start", "start"):
-            tg.send(
-                "✅ UB Command Center Online\n\n"
-                "Commands:\n"
-                "/status\n"
-                "/kill\n"
-                "/resume\n"
-                "/flatten\n"
-                "/mode paper\n"
-                "/mode live\n"
-                "/mode alerts_only\n"
-                "/exec on\n"
-                "/exec off\n"
-                "/test"
-            )
+        if cmd in ("/start", "start", "/help", "help"):
+            tg.send(command_menu_text())
 
         elif cmd == "/status":
             tg.send(render_status(state, last_plan))
@@ -886,7 +894,13 @@ class UBEngine:
             self.safe_debug_send(f"❌ {fail_msg}")
             self.log(f"[EXEC] fail | {msg}")
 
-    def cycle(self):
+    def run_market_cycle_if_due(self):
+        now = now_ts()
+        next_cycle_ts = self.state.get("next_market_cycle_ts", 0)
+
+        if now < next_cycle_ts:
+            return
+
         ctx = self.gather_context()
         plan = build_trade_plan(ctx)
         self.last_plan = plan
@@ -895,6 +909,8 @@ class UBEngine:
         self.send_alerts(plan, ctx)
         self.maybe_execute(plan, ctx)
         self.log_heartbeat_if_due()
+
+        self.state.set("next_market_cycle_ts", now + LOOP_SECONDS)
 
     def loop(self):
         boot_msg = (
@@ -905,7 +921,9 @@ class UBEngine:
             f"Kill Switch: {self.state.get('kill_switch')}\n"
             f"Alpaca Ready: {self.broker.enabled}\n"
             f"Telegram Ready: {self.tg.enabled}\n"
-            f"Paper Account: {ALPACA_PAPER}"
+            f"Paper Account: {ALPACA_PAPER}\n"
+            f"Market Loop: {LOOP_SECONDS}s\n"
+            f"Command Poll: {COMMAND_POLL_SECONDS}s"
         )
 
         self.log("[BOOT] UB-ENGINE CLEAN START")
@@ -914,10 +932,9 @@ class UBEngine:
         self.safe_debug_send(boot_msg)
 
         consecutive_errors = 0
+        self.state.set("next_market_cycle_ts", 0)
 
         while True:
-            cycle_started = now_ts()
-
             try:
                 handle_telegram_commands(
                     tg=self.tg,
@@ -926,7 +943,7 @@ class UBEngine:
                     last_plan=self.last_plan,
                 )
 
-                self.cycle()
+                self.run_market_cycle_if_due()
                 consecutive_errors = 0
 
             except Exception as e:
@@ -945,9 +962,7 @@ class UBEngine:
                 time.sleep(sleep_on_error)
                 continue
 
-            elapsed = now_ts() - cycle_started
-            sleep_for = max(1, LOOP_SECONDS - elapsed)
-            time.sleep(sleep_for)
+            time.sleep(max(1, COMMAND_POLL_SECONDS))
 
 
 # ============================================================
