@@ -24,7 +24,7 @@ except Exception:
 # CONFIG
 # ============================================================
 APP_NAME = os.getenv("APP_NAME", "UB-ENGINE")
-APP_VERSION = os.getenv("APP_VERSION", "2.2.0")
+APP_VERSION = os.getenv("APP_VERSION", "2.3.0")
 
 MODE = os.getenv("MODE", "paper").lower()  # paper | live | alerts_only
 LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
@@ -178,6 +178,9 @@ class EngineState:
             "last_telegram_update_id": 0,
             "last_alert_fingerprint": "",
             "mode_override": None,
+            "last_plan_signature": "",
+            "last_exec_signature": "",
+            "last_heartbeat_ts": 0,
         }
         self.load()
 
@@ -764,6 +767,42 @@ class UBEngine:
     def make_fingerprint(self, plan: TradePlan) -> str:
         return f"{plan.symbol}|{plan.direction}|{plan.grade}|{round(plan.price or 0, 2)}"
 
+    def make_plan_signature(self, plan: TradePlan) -> str:
+        rounded_price = round(plan.price or 0, 2)
+        return f"{plan.symbol}|{plan.direction}|{plan.grade}|{plan.entry_bias}|{rounded_price}"
+
+    def should_log_plan(self, plan: TradePlan) -> bool:
+        sig = self.make_plan_signature(plan)
+        last_sig = self.state.get("last_plan_signature", "")
+        if sig != last_sig:
+            self.state.set("last_plan_signature", sig)
+            return True
+        return False
+
+    def log_plan_if_changed(self, plan: TradePlan):
+        if self.should_log_plan(plan):
+            self.log(
+                f"[PLAN] {plan.symbol} | direction={plan.direction} | grade={plan.grade} "
+                f"| confidence={plan.confidence:.2f} | price={fmt_price(plan.price)}"
+            )
+
+    def log_exec_if_changed(self, message: str):
+        last_sig = self.state.get("last_exec_signature", "")
+        if message != last_sig:
+            self.state.set("last_exec_signature", message)
+            self.log(message)
+
+    def log_heartbeat_if_due(self):
+        last_ts = self.state.get("last_heartbeat_ts", 0)
+        now = now_ts()
+        if now - last_ts >= 300:
+            self.log(
+                f"[HEARTBEAT] alive | mode={self.resolve_mode()} "
+                f"| exec_enabled={self.state.get('execution_enabled')} "
+                f"| trades_today={self.state.get('trades_today')}"
+            )
+            self.state.set("last_heartbeat_ts", now)
+
     def should_send_alert(self, plan: TradePlan) -> bool:
         if not grade_meets_threshold(plan.grade, MIN_GRADE_TO_ALERT):
             return False
@@ -771,7 +810,6 @@ class UBEngine:
 
     def send_alerts(self, plan: TradePlan, ctx: EngineContext):
         if not self.should_send_alert(plan):
-            self.log(f"[ALERT] skipped | duplicate | {plan.symbol} | {plan.direction} | {plan.grade}")
             return
 
         free_sent = False
@@ -798,25 +836,26 @@ class UBEngine:
 
     def maybe_execute(self, plan: TradePlan, ctx: EngineContext):
         if ctx.mode == "alerts_only":
-            self.log("[EXEC] skipped | alerts_only mode")
+            self.log_exec_if_changed("[EXEC] skipped | alerts_only mode")
             return
 
         allowed, notes = execution_filter(self.state, plan)
         if not allowed:
             msg = f"[EXEC] blocked | {' | '.join(notes)}"
-            self.log(msg)
+            self.log_exec_if_changed(msg)
             self.safe_debug_send(f"⚠️ EXEC BLOCKED | {plan.symbol} | {' | '.join(notes)}")
             return
 
         side = direction_to_side(plan.direction)
         if side is None:
-            self.log("[EXEC] blocked | side unresolved")
+            self.log_exec_if_changed("[EXEC] blocked | side unresolved")
             return
 
-        self.log(
-            f"[EXEC] approved | mode={ctx.mode} | symbol={plan.symbol} | side={side} "
-            f"| qty={plan.qty} | grade={plan.grade}"
+        approved_msg = (
+            f"[EXEC] approved | mode={ctx.mode} | symbol={plan.symbol} "
+            f"| side={side} | qty={plan.qty} | grade={plan.grade}"
         )
+        self.log_exec_if_changed(approved_msg)
 
         ok, msg = self.broker.submit_market_order(plan.symbol, plan.qty, side)
         if ok:
@@ -852,14 +891,10 @@ class UBEngine:
         plan = build_trade_plan(ctx)
         self.last_plan = plan
 
-        self.log(
-            f"[PLAN] {plan.symbol} | direction={plan.direction} | grade={plan.grade} "
-            f"| confidence={plan.confidence:.2f} | price={fmt_price(plan.price)}"
-        )
-
+        self.log_plan_if_changed(plan)
         self.send_alerts(plan, ctx)
         self.maybe_execute(plan, ctx)
-        self.log(f"[HEARTBEAT] next cycle in {LOOP_SECONDS}s")
+        self.log_heartbeat_if_due()
 
     def loop(self):
         boot_msg = (
