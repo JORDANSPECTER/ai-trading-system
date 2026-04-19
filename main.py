@@ -24,7 +24,7 @@ except Exception:
 # CONFIG
 # ============================================================
 APP_NAME = os.getenv("APP_NAME", "UB-ENGINE")
-APP_VERSION = os.getenv("APP_VERSION", "2.0.0")
+APP_VERSION = os.getenv("APP_VERSION", "2.1.0")
 
 MODE = os.getenv("MODE", "paper").lower()  # paper | live | alerts_only
 LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
@@ -70,7 +70,6 @@ MANUAL_LEVELS_QQQ = os.getenv("MANUAL_LEVELS_QQQ", "")
 MANUAL_LEVELS_SPY = os.getenv("MANUAL_LEVELS_SPY", "")
 
 REQUEST_TIMEOUT = 15
-
 GRADE_RANK = {"C": 1, "B": 2, "A": 3}
 
 
@@ -608,6 +607,7 @@ def handle_telegram_commands(
                 "/flatten\n"
                 "/mode paper\n"
                 "/mode live\n"
+                "/mode alerts_only\n"
                 "/exec on\n"
                 "/exec off\n"
                 "/test"
@@ -723,6 +723,18 @@ class UBEngine:
     def log(self, msg: str):
         print(msg, flush=True)
 
+    def safe_tg_send(self, text: str):
+        try:
+            self.tg.send(text)
+        except Exception:
+            pass
+
+    def safe_debug_send(self, text: str):
+        try:
+            self.discord.send_debug(text)
+        except Exception:
+            pass
+
     def resolve_mode(self) -> str:
         return self.state.get("mode_override") or MODE
 
@@ -756,37 +768,51 @@ class UBEngine:
         if not self.should_send_alert(plan):
             return
 
-        self.tg.send(plan.alert_text)
-        self.discord.send_free(plan.alert_text)
-        self.discord.send_premium(plan.premium_text)
+        self.safe_tg_send(plan.alert_text)
+
+        try:
+            self.discord.send_free(plan.alert_text)
+        except Exception:
+            pass
+
+        try:
+            self.discord.send_premium(plan.premium_text)
+        except Exception:
+            pass
 
         self.state.set("last_alert_fingerprint", self.make_fingerprint(plan))
         self.log(f"[ALERT] sent | {plan.symbol} | {plan.direction} | {plan.grade}")
 
     def maybe_execute(self, plan: TradePlan, ctx: EngineContext):
         if ctx.mode == "alerts_only":
+            self.log("[EXEC] skipped | alerts_only mode")
             return
 
         allowed, notes = execution_filter(self.state, plan)
         if not allowed:
-            self.discord.send_debug(f"⚠️ EXEC BLOCKED | {plan.symbol} | {' | '.join(notes)}")
-            self.log(f"[EXEC] blocked | {' | '.join(notes)}")
+            msg = f"[EXEC] blocked | {' | '.join(notes)}"
+            self.log(msg)
+            self.safe_debug_send(f"⚠️ EXEC BLOCKED | {plan.symbol} | {' | '.join(notes)}")
             return
 
         side = direction_to_side(plan.direction)
         if side is None:
+            self.log("[EXEC] blocked | side unresolved")
             return
 
         ok, msg = self.broker.submit_market_order(plan.symbol, plan.qty, side)
         if ok:
             self.state.set("last_trade_ts", now_ts())
             self.state.set("trades_today", self.state.get("trades_today", 0) + 1)
-            self.tg.send(f"✅ {msg}")
-            self.discord.send_premium(f"✅ EXECUTED | {msg}")
+            self.safe_tg_send(f"✅ {msg}")
+            try:
+                self.discord.send_premium(f"✅ EXECUTED | {msg}")
+            except Exception:
+                pass
             self.log(f"[EXEC] success | {msg}")
         else:
-            self.tg.send(f"❌ {msg}")
-            self.discord.send_debug(f"❌ {msg}")
+            self.safe_tg_send(f"❌ {msg}")
+            self.safe_debug_send(f"❌ {msg}")
             self.log(f"[EXEC] fail | {msg}")
 
     def cycle(self):
@@ -801,6 +827,7 @@ class UBEngine:
 
         self.send_alerts(plan, ctx)
         self.maybe_execute(plan, ctx)
+        self.log(f"[HEARTBEAT] next cycle in {LOOP_SECONDS}s")
 
     def loop(self):
         boot_msg = (
@@ -812,12 +839,17 @@ class UBEngine:
             f"Alpaca Ready: {self.broker.enabled}\n"
             f"Telegram Ready: {self.tg.enabled}"
         )
+
         self.log("[BOOT] UB-ENGINE CLEAN START")
         self.log(boot_msg)
-        self.tg.send(boot_msg)
-        self.discord.send_debug(boot_msg)
+        self.safe_tg_send(boot_msg)
+        self.safe_debug_send(boot_msg)
+
+        consecutive_errors = 0
 
         while True:
+            cycle_started = now_ts()
+
             try:
                 handle_telegram_commands(
                     tg=self.tg,
@@ -825,13 +857,29 @@ class UBEngine:
                     broker=self.broker,
                     last_plan=self.last_plan,
                 )
+
                 self.cycle()
+                consecutive_errors = 0
+
             except Exception as e:
-                err = f"❌ ENGINE ERROR\n{e}\n\n```{traceback.format_exc()[:1500]}```"
+                consecutive_errors += 1
+                err = (
+                    f"❌ ENGINE ERROR\n"
+                    f"{e}\n\n"
+                    f"```{traceback.format_exc()[:1500]}```"
+                )
                 self.log(err)
-                self.tg.send(err)
-                self.discord.send_debug(err)
-            time.sleep(LOOP_SECONDS)
+                self.safe_tg_send(err)
+                self.safe_debug_send(err)
+
+                sleep_on_error = min(60, 5 * consecutive_errors)
+                self.log(f"[RECOVERY] sleeping {sleep_on_error}s after error")
+                time.sleep(sleep_on_error)
+                continue
+
+            elapsed = now_ts() - cycle_started
+            sleep_for = max(1, LOOP_SECONDS - elapsed)
+            time.sleep(sleep_for)
 
 
 # ============================================================
