@@ -24,7 +24,7 @@ except Exception:
 # CONFIG
 # ============================================================
 APP_NAME = os.getenv("APP_NAME", "UB-ENGINE")
-APP_VERSION = os.getenv("APP_VERSION", "2.1.0")
+APP_VERSION = os.getenv("APP_VERSION", "2.2.0")
 
 MODE = os.getenv("MODE", "paper").lower()  # paper | live | alerts_only
 LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
@@ -545,6 +545,7 @@ def render_status(state: EngineState, plan: Optional[TradePlan]) -> str:
         f"Execution Enabled: `{state.get('execution_enabled')}`",
         f"Trades Today: `{state.get('trades_today')}`",
         f"Daily PnL: `{state.get('daily_realized_pnl')}`",
+        f"Paper Account: `{ALPACA_PAPER}`",
     ]
     if plan:
         lines.extend(
@@ -679,6 +680,10 @@ def execution_filter(state: EngineState, plan: TradePlan) -> Tuple[bool, List[st
         notes.append(f"Grade below execute threshold ({MIN_GRADE_TO_EXECUTE})")
         return False, notes
 
+    if not plan.execution_ok:
+        notes.append("Plan not marked execution_ok")
+        return False, notes
+
     if plan.qty <= 0:
         notes.append("Qty is zero")
         return False, notes
@@ -766,22 +771,30 @@ class UBEngine:
 
     def send_alerts(self, plan: TradePlan, ctx: EngineContext):
         if not self.should_send_alert(plan):
+            self.log(f"[ALERT] skipped | duplicate | {plan.symbol} | {plan.direction} | {plan.grade}")
             return
+
+        free_sent = False
+        premium_sent = False
 
         self.safe_tg_send(plan.alert_text)
 
         try:
-            self.discord.send_free(plan.alert_text)
+            free_sent = self.discord.send_free(plan.alert_text)
         except Exception:
-            pass
+            free_sent = False
 
-        try:
-            self.discord.send_premium(plan.premium_text)
-        except Exception:
-            pass
+        if plan.grade in ("A", "B"):
+            try:
+                premium_sent = self.discord.send_premium(plan.premium_text)
+            except Exception:
+                premium_sent = False
 
         self.state.set("last_alert_fingerprint", self.make_fingerprint(plan))
-        self.log(f"[ALERT] sent | {plan.symbol} | {plan.direction} | {plan.grade}")
+        self.log(
+            f"[ALERT] sent | {plan.symbol} | {plan.direction} | {plan.grade} "
+            f"| free={free_sent} | premium={premium_sent}"
+        )
 
     def maybe_execute(self, plan: TradePlan, ctx: EngineContext):
         if ctx.mode == "alerts_only":
@@ -800,19 +813,38 @@ class UBEngine:
             self.log("[EXEC] blocked | side unresolved")
             return
 
+        self.log(
+            f"[EXEC] approved | mode={ctx.mode} | symbol={plan.symbol} | side={side} "
+            f"| qty={plan.qty} | grade={plan.grade}"
+        )
+
         ok, msg = self.broker.submit_market_order(plan.symbol, plan.qty, side)
         if ok:
             self.state.set("last_trade_ts", now_ts())
             self.state.set("trades_today", self.state.get("trades_today", 0) + 1)
-            self.safe_tg_send(f"✅ {msg}")
+
+            exec_msg = (
+                f"✅ PAPER EXECUTION\n{msg}"
+                if ctx.mode == "paper"
+                else f"✅ LIVE EXECUTION\n{msg}"
+            )
+
+            self.safe_tg_send(exec_msg)
+
             try:
-                self.discord.send_premium(f"✅ EXECUTED | {msg}")
+                self.discord.send_premium(exec_msg)
             except Exception:
                 pass
+
             self.log(f"[EXEC] success | {msg}")
         else:
-            self.safe_tg_send(f"❌ {msg}")
-            self.safe_debug_send(f"❌ {msg}")
+            fail_msg = (
+                f"❌ PAPER EXECUTION FAILED\n{msg}"
+                if ctx.mode == "paper"
+                else f"❌ LIVE EXECUTION FAILED\n{msg}"
+            )
+            self.safe_tg_send(fail_msg)
+            self.safe_debug_send(f"❌ {fail_msg}")
             self.log(f"[EXEC] fail | {msg}")
 
     def cycle(self):
@@ -837,7 +869,8 @@ class UBEngine:
             f"Execution Enabled: {self.state.get('execution_enabled')}\n"
             f"Kill Switch: {self.state.get('kill_switch')}\n"
             f"Alpaca Ready: {self.broker.enabled}\n"
-            f"Telegram Ready: {self.tg.enabled}"
+            f"Telegram Ready: {self.tg.enabled}\n"
+            f"Paper Account: {ALPACA_PAPER}"
         )
 
         self.log("[BOOT] UB-ENGINE CLEAN START")
