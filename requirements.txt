@@ -1,1 +1,5 @@
-requests
+requests==2.32.3
+pandas==2.2.2
+matplotlib==3.9.0
+python-dotenv==1.0.1
+alpaca-py==0.42.0
