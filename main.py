@@ -17,11 +17,22 @@ POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 FILLS_FILE = os.getenv("FILLS_FILE", "fills.json")
 
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "300"))
 
-# execution controls
-MIN_ALERT_GRADE = os.getenv("MIN_ALERT_GRADE", "A")   # A, B, C
+MIN_ALERT_GRADE = os.getenv("MIN_ALERT_GRADE", "A")
 DEFAULT_POSITION_SIZE = int(os.getenv("DEFAULT_POSITION_SIZE", "1"))
+
+# -------------------------
+# ALPACA
+# -------------------------
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+# Example:
+# paper: https://paper-api.alpaca.markets
+# live:  https://api.alpaca.markets
 
 # =========================================================
 # HELPERS
@@ -83,10 +94,7 @@ def send_telegram_message(message: str) -> bool:
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message[:4000]
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message[:4000]}
         r = requests.post(url, json=payload, timeout=15)
         if 200 <= r.status_code < 300:
             return True
@@ -100,6 +108,78 @@ def send_alert(message: str) -> None:
     print(message)
     send_to_discord(message)
     send_telegram_message(message)
+
+# =========================================================
+# ALPACA CLIENT
+# =========================================================
+class AlpacaClient:
+    def __init__(self, api_key: str, secret_key: str, base_url: str):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.base_url = base_url.rstrip("/")
+
+    def enabled(self) -> bool:
+        return bool(self.api_key and self.secret_key)
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.secret_key,
+            "Content-Type": "application/json"
+        }
+
+    def submit_market_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        time_in_force: str = "day"
+    ) -> Dict[str, Any]:
+        if not self.enabled():
+            raise ValueError("Alpaca keys not configured")
+
+        url = f"{self.base_url}/v2/orders"
+        payload = {
+            "symbol": symbol.upper(),
+            "qty": str(qty),
+            "side": side.lower(),
+            "type": "market",
+            "time_in_force": time_in_force
+        }
+
+        r = requests.post(url, headers=self._headers(), json=payload, timeout=20)
+        if not (200 <= r.status_code < 300):
+            raise ValueError(f"Alpaca order failed: {r.status_code} | {r.text}")
+        return r.json()
+
+    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled():
+            return None
+
+        url = f"{self.base_url}/v2/positions/{symbol.upper()}"
+        r = requests.get(url, headers=self._headers(), timeout=20)
+
+        if r.status_code == 404:
+            return None
+        if not (200 <= r.status_code < 300):
+            raise ValueError(f"Alpaca get_position failed: {r.status_code} | {r.text}")
+        return r.json()
+
+    def close_position(self, symbol: str) -> Dict[str, Any]:
+        if not self.enabled():
+            raise ValueError("Alpaca keys not configured")
+
+        url = f"{self.base_url}/v2/positions/{symbol.upper()}"
+        r = requests.delete(url, headers=self._headers(), timeout=20)
+        if not (200 <= r.status_code < 300):
+            raise ValueError(f"Alpaca close_position failed: {r.status_code} | {r.text}")
+        return r.json()
+
+alpaca_client = AlpacaClient(
+    api_key=ALPACA_API_KEY,
+    secret_key=ALPACA_SECRET_KEY,
+    base_url=ALPACA_BASE_URL
+)
 
 # =========================================================
 # PAPER EXECUTION ENGINE
@@ -124,7 +204,9 @@ class PaperExecutionEngine:
         strategy: str = "",
         reason: str = "",
         position_id: Optional[str] = None,
-        status: str = "filled"
+        status: str = "filled",
+        broker_order_id: Optional[str] = None,
+        mode: str = "paper"
     ) -> Dict[str, Any]:
         return {
             "fill_id": str(uuid.uuid4()),
@@ -136,7 +218,9 @@ class PaperExecutionEngine:
             "price": round(safe_float(price), 4),
             "strategy": strategy,
             "reason": reason,
-            "status": status
+            "status": status,
+            "broker_order_id": broker_order_id,
+            "mode": mode
         }
 
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -158,7 +242,9 @@ class PaperExecutionEngine:
         take_profit: Optional[float] = None,
         alert_grade: str = "",
         note: str = "",
-        entry_reason: str = "new_position"
+        entry_reason: str = "new_position",
+        broker_order_id: Optional[str] = None,
+        mode: str = "paper"
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
         qty = safe_int(qty)
@@ -187,6 +273,7 @@ class PaperExecutionEngine:
             existing["alert_grade"] = alert_grade or existing.get("alert_grade", "")
             existing["note"] = note or existing.get("note", "")
             existing["entry_count"] = safe_int(existing.get("entry_count", 1)) + 1
+            existing["mode"] = mode
 
             fill = self._make_fill(
                 symbol=symbol,
@@ -195,7 +282,9 @@ class PaperExecutionEngine:
                 price=price,
                 strategy=strategy,
                 reason="add_to_position",
-                position_id=existing["position_id"]
+                position_id=existing["position_id"],
+                broker_order_id=broker_order_id,
+                mode=mode
             )
             self.fills.append(fill)
             self.save()
@@ -219,7 +308,9 @@ class PaperExecutionEngine:
             "entry_reason": entry_reason,
             "opened_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
-            "entry_count": 1
+            "entry_count": 1,
+            "mode": mode,
+            "broker_order_id": broker_order_id
         }
 
         self.positions[symbol] = position
@@ -231,7 +322,9 @@ class PaperExecutionEngine:
             price=price,
             strategy=strategy,
             reason=entry_reason,
-            position_id=position["position_id"]
+            position_id=position["position_id"],
+            broker_order_id=broker_order_id,
+            mode=mode
         )
         self.fills.append(fill)
         self.save()
@@ -243,7 +336,9 @@ class PaperExecutionEngine:
         qty: int,
         price: float,
         reason: str = "close",
-        strategy: str = ""
+        strategy: str = "",
+        broker_order_id: Optional[str] = None,
+        mode: str = "paper"
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
         qty = safe_int(qty)
@@ -274,7 +369,9 @@ class PaperExecutionEngine:
             price=price,
             strategy=strategy or pos.get("strategy", ""),
             reason=reason,
-            position_id=pos["position_id"]
+            position_id=pos["position_id"],
+            broker_order_id=broker_order_id,
+            mode=mode
         )
         self.fills.append(fill)
 
@@ -288,7 +385,8 @@ class PaperExecutionEngine:
                 "closed_qty": qty,
                 "final_realized_pnl": round(pos["realized_pnl"], 4),
                 "status": "closed",
-                "close_reason": reason
+                "close_reason": reason,
+                "broker_close_order_id": broker_order_id
             }
             del self.positions[symbol]
             self.save()
@@ -319,14 +417,6 @@ class PaperExecutionEngine:
         self.save()
         return pos
 
-    def mark_all_to_market(self, price_map: Dict[str, float]) -> Dict[str, Dict[str, Any]]:
-        updated = {}
-        for symbol, px in price_map.items():
-            pos = self.update_market_price(symbol, px)
-            if pos:
-                updated[symbol] = pos
-        return updated
-
     def portfolio_snapshot(self) -> Dict[str, Any]:
         total_market_value = 0.0
         total_unrealized = 0.0
@@ -348,11 +438,12 @@ class PaperExecutionEngine:
 paper_engine = PaperExecutionEngine()
 
 # =========================================================
-# MESSAGE FORMATTERS
+# FORMATTERS
 # =========================================================
 def format_position_message(pos: Dict[str, Any]) -> str:
     return (
-        f"📌 PAPER POSITION UPDATE\n"
+        f"📌 POSITION UPDATE\n"
+        f"Mode: {pos.get('mode', 'paper')}\n"
         f"Symbol: {pos.get('symbol')}\n"
         f"Qty: {pos.get('qty')}\n"
         f"Avg: {pos.get('avg_price')}\n"
@@ -371,7 +462,8 @@ def format_position_message(pos: Dict[str, Any]) -> str:
 
 def format_close_message(closed: Dict[str, Any]) -> str:
     return (
-        f"✅ PAPER POSITION CLOSED\n"
+        f"✅ POSITION CLOSED\n"
+        f"Mode: {closed.get('mode', 'paper')}\n"
         f"Symbol: {closed.get('symbol')}\n"
         f"Closed Qty: {closed.get('closed_qty', closed.get('qty'))}\n"
         f"Entry Avg: {closed.get('avg_price')}\n"
@@ -397,7 +489,7 @@ def format_alert_payload(alert: Dict[str, Any]) -> str:
 
 def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
     return (
-        f"📊 PAPER PORTFOLIO SNAPSHOT\n"
+        f"📊 PORTFOLIO SNAPSHOT\n"
         f"Open Positions: {snapshot['open_positions']}\n"
         f"Market Value: {snapshot['total_market_value']}\n"
         f"Unrealized P&L: {snapshot['total_unrealized_pnl']}\n"
@@ -406,7 +498,7 @@ def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
     )
 
 # =========================================================
-# ALERT ENGINE LOGIC
+# ALERT ENGINE
 # =========================================================
 GRADE_RANK = {
     "A+": 5,
@@ -417,7 +509,7 @@ GRADE_RANK = {
 }
 
 def grade_passes(grade: str, minimum: str = MIN_ALERT_GRADE) -> bool:
-    return GRADE_RANK.get(grade.upper(), 0) >= GRADE_RANK.get(minimum.upper(), 0)
+    return GRADE_RANK.get(str(grade).upper(), 0) >= GRADE_RANK.get(str(minimum).upper(), 0)
 
 def build_alert_payload(
     symbol: str,
@@ -434,8 +526,8 @@ def build_alert_payload(
         "symbol": symbol.upper(),
         "price": round(safe_float(price), 4),
         "setup": setup,
-        "bias": bias.lower(),   # bullish or bearish
-        "grade": grade.upper(),
+        "bias": str(bias).lower(),
+        "grade": str(grade).upper(),
         "confidence": round(safe_float(confidence), 2),
         "stop_loss": safe_float(stop_loss) if stop_loss is not None else None,
         "take_profit": safe_float(take_profit) if take_profit is not None else None,
@@ -444,7 +536,7 @@ def build_alert_payload(
     }
 
 def default_position_size_from_grade(grade: str) -> int:
-    grade = grade.upper()
+    grade = str(grade).upper()
     if grade == "A+":
         return max(DEFAULT_POSITION_SIZE + 2, 3)
     if grade == "A":
@@ -453,7 +545,64 @@ def default_position_size_from_grade(grade: str) -> int:
         return DEFAULT_POSITION_SIZE
     return 1
 
-def execute_paper_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+# =========================================================
+# EXECUTION ROUTING
+# =========================================================
+def route_entry_order(symbol: str, qty: int, price_hint: float) -> Dict[str, Any]:
+    """
+    Routes order either to Alpaca or paper mode.
+    Returns normalized execution result.
+    """
+    if LIVE_TRADING:
+        if not alpaca_client.enabled():
+            raise ValueError("LIVE_TRADING is true but Alpaca keys are missing")
+
+        broker_order = alpaca_client.submit_market_order(
+            symbol=symbol,
+            qty=qty,
+            side="buy"
+        )
+
+        return {
+            "mode": "live",
+            "broker_order_id": broker_order.get("id"),
+            "filled_price": safe_float(price_hint),
+            "raw": broker_order
+        }
+
+    return {
+        "mode": "paper",
+        "broker_order_id": None,
+        "filled_price": safe_float(price_hint),
+        "raw": None
+    }
+
+def route_exit_order(symbol: str, qty: int, price_hint: float) -> Dict[str, Any]:
+    if LIVE_TRADING:
+        if not alpaca_client.enabled():
+            raise ValueError("LIVE_TRADING is true but Alpaca keys are missing")
+
+        broker_order = alpaca_client.submit_market_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell"
+        )
+
+        return {
+            "mode": "live",
+            "broker_order_id": broker_order.get("id"),
+            "filled_price": safe_float(price_hint),
+            "raw": broker_order
+        }
+
+    return {
+        "mode": "paper",
+        "broker_order_id": None,
+        "filled_price": safe_float(price_hint),
+        "raw": None
+    }
+
+def execute_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     symbol = alert["symbol"]
     price = safe_float(alert["price"])
     grade = alert["grade"]
@@ -468,26 +617,30 @@ def execute_paper_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, 
             f"⚠️ ALERT QUALIFIED BUT NOT EXECUTED\n"
             f"Symbol: {symbol}\n"
             f"Bias: {bias}\n"
-            f"Reason: current paper engine is long-only in this phase"
+            f"Reason: this phase is long-only"
         )
         return None
 
     qty = default_position_size_from_grade(grade)
+    routing = route_entry_order(symbol=symbol, qty=qty, price_hint=price)
 
     pos = paper_engine.open_or_add_position(
         symbol=symbol,
         qty=qty,
-        price=price,
+        price=routing["filled_price"],
         strategy=setup,
         stop_loss=stop_loss,
         take_profit=take_profit,
         alert_grade=grade,
         note=reason,
-        entry_reason="alert_engine_entry"
+        entry_reason="alert_engine_entry",
+        broker_order_id=routing["broker_order_id"],
+        mode=routing["mode"]
     )
 
     send_alert(
         f"🎯 ALERT EXECUTED\n"
+        f"Execution Mode: {routing['mode']}\n\n"
         f"{format_alert_payload(alert)}\n\n"
         f"{format_position_message(pos)}"
     )
@@ -515,24 +668,25 @@ def process_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             f"Engine will add to position."
         )
 
-    return execute_paper_entry_from_alert(alert)
+    return execute_entry_from_alert(alert)
 
-# =========================================================
-# POSITION MANAGEMENT
-# =========================================================
-def execute_paper_exit(
+def execute_exit(
     symbol: str,
     qty: int,
     exit_price: float,
     reason: str = "take_profit",
     strategy: str = ""
 ) -> Dict[str, Any]:
+    routing = route_exit_order(symbol=symbol, qty=qty, price_hint=exit_price)
+
     result = paper_engine.close_position(
         symbol=symbol,
         qty=qty,
-        price=exit_price,
+        price=routing["filled_price"],
         reason=reason,
-        strategy=strategy
+        strategy=strategy,
+        broker_order_id=routing["broker_order_id"],
+        mode=routing["mode"]
     )
 
     if result.get("status") == "closed":
@@ -570,7 +724,7 @@ def update_open_position_prices(latest_prices: Dict[str, float]) -> Dict[str, Di
         exit_reason = check_position_exit_rules(symbol, safe_float(current_price))
         if exit_reason:
             qty = safe_int(pos.get("qty", 0))
-            execute_paper_exit(
+            execute_exit(
                 symbol=symbol,
                 qty=qty,
                 exit_price=safe_float(current_price),
@@ -579,8 +733,7 @@ def update_open_position_prices(latest_prices: Dict[str, float]) -> Dict[str, Di
             )
 
     if updated_positions:
-        snapshot = paper_engine.portfolio_snapshot()
-        send_alert(format_portfolio_snapshot(snapshot))
+        send_alert(format_portfolio_snapshot(paper_engine.portfolio_snapshot()))
 
     return updated_positions
 
@@ -588,14 +741,10 @@ def send_portfolio_snapshot() -> None:
     send_alert(format_portfolio_snapshot(paper_engine.portfolio_snapshot()))
 
 # =========================================================
-# SAMPLE ALERT SOURCE
-# Replace this with your real analyzer / scanner / API output
+# TEST / MOCK FEED
+# Replace these with your real engine later
 # =========================================================
 def get_mock_alerts() -> List[Dict[str, Any]]:
-    """
-    This simulates your real alert engine.
-    Replace this later with your real scanner logic.
-    """
     return [
         build_alert_payload(
             symbol="QQQ",
@@ -611,22 +760,20 @@ def get_mock_alerts() -> List[Dict[str, Any]]:
     ]
 
 def get_mock_market_prices() -> Dict[str, float]:
-    """
-    This simulates market price updates.
-    Replace this later with Twelve Data / broker / market feed.
-    """
     return {
         "QQQ": 521.90
     }
 
 # =========================================================
-# MAIN LOOP
+# MAIN
 # =========================================================
 def send_heartbeat() -> None:
     snapshot = paper_engine.portfolio_snapshot()
     send_alert(
         f"💓 ENGINE HEARTBEAT\n"
         f"PAPER_MODE: {PAPER_MODE}\n"
+        f"LIVE_TRADING: {LIVE_TRADING}\n"
+        f"ALPACA_ENABLED: {alpaca_client.enabled()}\n"
         f"MIN_ALERT_GRADE: {MIN_ALERT_GRADE}\n"
         f"Open Positions: {snapshot['open_positions']}\n"
         f"Market Value: {snapshot['total_market_value']}\n"
@@ -635,31 +782,67 @@ def send_heartbeat() -> None:
     )
 
 def main():
-    send_alert("🚀 ELITE EXECUTION PHASE 2 ONLINE\nAlert engine connected to paper execution")
+    print(">>> MAIN STARTED <<<")
+
+    send_alert(
+        "🚀 ELITE EXECUTION ENGINE ONLINE\n"
+        f"PAPER_MODE={PAPER_MODE}\n"
+        f"LIVE_TRADING={LIVE_TRADING}\n"
+        f"ALPACA_ENABLED={alpaca_client.enabled()}"
+    )
+
+    # -----------------------------------------------------
+    # FORCE TEST SIGNAL ON STARTUP
+    # -----------------------------------------------------
+    try:
+        send_alert("🔥 TEST ALERT TRIGGER")
+
+        test_alert = build_alert_payload(
+            symbol="QQQ",
+            price=518.25,
+            setup="TEST VWAP",
+            bias="bullish",
+            grade="A",
+            confidence=0.95,
+            stop_loss=516.50,
+            take_profit=522.00,
+            reason="manual startup test trigger"
+        )
+
+        process_alert(test_alert)
+
+        time.sleep(2)
+        update_open_position_prices({"QQQ": 521.40})
+
+    except Exception as e:
+        send_alert(f"❌ STARTUP TEST FAILED: {e}")
 
     last_heartbeat = 0
-    alerts_processed = False
-    prices_processed = False
+    mock_alerts_processed = False
+    mock_prices_processed = False
 
     while True:
         try:
             now = time.time()
 
-            # 1) simulate alert engine firing once
-            if not alerts_processed:
+            # ---------------------------------------------
+            # MOCK ENGINE PASS
+            # ---------------------------------------------
+            if not mock_alerts_processed:
                 alerts = get_mock_alerts()
                 for alert in alerts:
                     process_alert(alert)
-                alerts_processed = True
+                mock_alerts_processed = True
 
-            # 2) simulate live price updates once after entry
-            if alerts_processed and not prices_processed:
+            if mock_alerts_processed and not mock_prices_processed:
                 time.sleep(3)
                 latest_prices = get_mock_market_prices()
                 update_open_position_prices(latest_prices)
-                prices_processed = True
+                mock_prices_processed = True
 
-            # 3) heartbeat
+            # ---------------------------------------------
+            # HEARTBEAT
+            # ---------------------------------------------
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 send_heartbeat()
                 last_heartbeat = now
