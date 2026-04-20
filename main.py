@@ -1,973 +1,631 @@
 import os
-import time
 import json
+import time
 import uuid
-import traceback
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Tuple
-
 import requests
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
-# ============================================================
-# OPTIONAL ALPACA IMPORTS
-# ============================================================
-ALPACA_AVAILABLE = True
-try:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce
-except Exception:
-    ALPACA_AVAILABLE = False
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-APP_NAME = os.getenv("APP_NAME", "UB-ENGINE")
-APP_VERSION = os.getenv("APP_VERSION", "2.4.0")
-
-MODE = os.getenv("MODE", "paper").lower()  # paper | live | alerts_only
-LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
-COMMAND_POLL_SECONDS = int(os.getenv("COMMAND_POLL_SECONDS", "1"))
-
-PRIMARY_SYMBOL = os.getenv("PRIMARY_SYMBOL", "QQQ").upper()
-SECONDARY_SYMBOL = os.getenv("SECONDARY_SYMBOL", "SPY").upper()
-OIL_SYMBOL = os.getenv("OIL_SYMBOL", "USO").upper()
-
-ENABLE_EXECUTION = os.getenv("ENABLE_EXECUTION", "false").lower() == "true"
-ENABLE_TELEGRAM_COMMANDS = os.getenv("ENABLE_TELEGRAM_COMMANDS", "true").lower() == "true"
-
-MIN_GRADE_TO_ALERT = os.getenv("MIN_GRADE_TO_ALERT", "C").upper()
-MIN_GRADE_TO_EXECUTE = os.getenv("MIN_GRADE_TO_EXECUTE", "A").upper()
-
-DEFAULT_ORDER_QTY = float(os.getenv("DEFAULT_ORDER_QTY", "1"))
-MAX_POSITION_QTY = float(os.getenv("MAX_POSITION_QTY", "2"))
-
-ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
-KILL_SWITCH_DEFAULT = os.getenv("KILL_SWITCH_DEFAULT", "false").lower() == "true"
-
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "500"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
-COOLDOWN_AFTER_TRADE_SEC = int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "180"))
-
-PRICE_SOURCE = os.getenv("PRICE_SOURCE", "twelvedata").lower()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
-
+# =========================================================
+# ENV
+# =========================================================
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
 
-DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "")
-DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "")
-DISCORD_DEBUG_WEBHOOK = os.getenv("DISCORD_DEBUG_WEBHOOK", "")
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
+FILLS_FILE = os.getenv("FILLS_FILE", "fills.json")
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "300"))
 
-STATE_FILE = os.getenv("STATE_FILE", "ub_engine_state.json")
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
 
-MANUAL_LEVELS_QQQ = os.getenv("MANUAL_LEVELS_QQQ", "")
-MANUAL_LEVELS_SPY = os.getenv("MANUAL_LEVELS_SPY", "")
-
-REQUEST_TIMEOUT = 15
-GRADE_RANK = {"C": 1, "B": 2, "A": 3}
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-def now_ts() -> int:
-    return int(time.time())
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
+def safe_float(value, default=0.0) -> float:
     try:
         return float(value)
     except Exception:
         return default
 
+def safe_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
-def clamp(n: float, low: float, high: float) -> float:
-    return max(low, min(high, n))
+def load_json_file(path: str, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[WARN] Failed loading {path}: {e}")
+    return default
 
+def save_json_file(path: str, data) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[WARN] Failed saving {path}: {e}")
 
-def fmt_price(v: Optional[float]) -> str:
-    if v is None:
-        return "N/A"
-    return f"{v:.2f}"
+# =========================================================
+# ALERTING
+# =========================================================
+def send_to_discord(message: str) -> bool:
+    if not DISCORD_WEBHOOK_URL:
+        print("[INFO] DISCORD_WEBHOOK_URL not set")
+        return False
 
+    try:
+        payload = {"content": message[:1900]}
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        if 200 <= r.status_code < 300:
+            return True
+        print(f"[WARN] Discord failed: {r.status_code} | {r.text}")
+        return False
+    except Exception as e:
+        print(f"[WARN] Discord exception: {e}")
+        return False
 
-def parse_levels(raw: str) -> List[float]:
-    if not raw.strip():
-        return []
-    out = []
-    for x in raw.split(","):
-        x = x.strip()
-        if x:
-            out.append(safe_float(x))
-    return out
+def send_telegram_message(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[INFO] Telegram token/chat id not set")
+        return False
 
-
-def grade_meets_threshold(grade: str, threshold: str) -> bool:
-    return GRADE_RANK.get(grade, 0) >= GRADE_RANK.get(threshold, 0)
-
-
-def direction_to_side(direction: str) -> Optional[str]:
-    if direction == "CALL":
-        return "buy"
-    if direction == "PUT":
-        return "sell"
-    return None
-
-
-# ============================================================
-# DATA MODELS
-# ============================================================
-@dataclass
-class MarketSnapshot:
-    symbol: str
-    price: Optional[float] = None
-    open_price: Optional[float] = None
-    prev_close: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    volume: Optional[float] = None
-    vwap: Optional[float] = None
-    timestamp: int = field(default_factory=now_ts)
-
-
-@dataclass
-class EngineContext:
-    mode: str
-    primary: MarketSnapshot
-    secondary: MarketSnapshot
-    oil: MarketSnapshot
-    levels: Dict[str, List[float]]
-
-
-@dataclass
-class TradePlan:
-    symbol: str
-    direction: str = "NONE"
-    grade: str = "C"
-    confidence: float = 0.0
-    entry_bias: str = "WAIT"
-    reasons: List[str] = field(default_factory=list)
-    qty: float = 0.0
-    execution_ok: bool = False
-    price: Optional[float] = None
-    stop_hint: Optional[float] = None
-    take_profit_hint: Optional[float] = None
-    raw_scores: Dict[str, float] = field(default_factory=dict)
-    alert_text: str = ""
-    premium_text: str = ""
-
-
-# ============================================================
-# STATE STORE
-# ============================================================
-class EngineState:
-    def __init__(self, path: str):
-        self.path = path
-        self.state = {
-            "kill_switch": KILL_SWITCH_DEFAULT,
-            "execution_enabled": ENABLE_EXECUTION,
-            "last_trade_ts": 0,
-            "trades_today": 0,
-            "daily_realized_pnl": 0.0,
-            "last_telegram_update_id": 0,
-            "last_alert_fingerprint": "",
-            "mode_override": None,
-            "last_plan_signature": "",
-            "last_exec_signature": "",
-            "last_heartbeat_ts": 0,
-            "next_market_cycle_ts": 0,
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message[:4000]
         }
-        self.load()
+        r = requests.post(url, json=payload, timeout=15)
+        if 200 <= r.status_code < 300:
+            return True
+        print(f"[WARN] Telegram failed: {r.status_code} | {r.text}")
+        return False
+    except Exception as e:
+        print(f"[WARN] Telegram exception: {e}")
+        return False
 
-    def load(self):
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                self.state.update(loaded)
-        except Exception:
-            pass
+def send_alert(message: str) -> None:
+    print(message)
+    send_to_discord(message)
+    send_telegram_message(message)
+
+# =========================================================
+# PAPER EXECUTION ENGINE
+# =========================================================
+class PaperExecutionEngine:
+    def __init__(self, positions_file: str = POSITIONS_FILE, fills_file: str = FILLS_FILE):
+        self.positions_file = positions_file
+        self.fills_file = fills_file
+        self.positions: Dict[str, Dict[str, Any]] = load_json_file(self.positions_file, {})
+        self.fills: List[Dict[str, Any]] = load_json_file(self.fills_file, [])
 
     def save(self):
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
-        except Exception:
-            pass
+        save_json_file(self.positions_file, self.positions)
+        save_json_file(self.fills_file, self.fills)
 
-    def get(self, key: str, default=None):
-        return self.state.get(key, default)
+    def _make_fill(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        strategy: str = "",
+        reason: str = "",
+        position_id: Optional[str] = None,
+        status: str = "filled"
+    ) -> Dict[str, Any]:
+        return {
+            "fill_id": str(uuid.uuid4()),
+            "position_id": position_id,
+            "timestamp": utc_now_iso(),
+            "symbol": symbol.upper(),
+            "side": side.lower(),
+            "qty": safe_int(qty),
+            "price": round(safe_float(price), 4),
+            "strategy": strategy,
+            "reason": reason,
+            "status": status
+        }
 
-    def set(self, key: str, value: Any):
-        self.state[key] = value
-        self.save()
+    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        return self.positions.get(symbol.upper())
 
+    def get_all_positions(self) -> Dict[str, Dict[str, Any]]:
+        return self.positions
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-class TelegramNotifier:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
+    def get_fills(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.fills[-limit:]
 
-    @property
-    def enabled(self) -> bool:
-        return bool(self.bot_token and self.chat_id)
+    def open_or_add_position(
+        self,
+        symbol: str,
+        qty: int,
+        price: float,
+        strategy: str = "",
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        alert_grade: str = "",
+        note: str = ""
+    ) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        qty = safe_int(qty)
+        price = safe_float(price)
 
-    def send(self, text: str) -> bool:
-        if not self.enabled:
-            return False
-        try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            resp = requests.post(
-                url,
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            return resp.status_code == 200
-        except Exception:
-            return False
+        if qty <= 0 or price <= 0:
+            raise ValueError("qty and price must be greater than 0")
 
-    def get_updates(self, offset: Optional[int] = None) -> Dict[str, Any]:
-        if not self.enabled:
-            return {"ok": False, "result": []}
-        try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
-            params = {"timeout": 1}
-            if offset is not None:
-                params["offset"] = offset
-            resp = requests.get(url, params=params, timeout=20)
-            return resp.json()
-        except Exception:
-            return {"ok": False, "result": []}
+        existing = self.positions.get(symbol)
 
+        if existing:
+            old_qty = safe_int(existing.get("qty", 0))
+            old_avg = safe_float(existing.get("avg_price", 0.0))
+            new_qty = old_qty + qty
+            new_avg = ((old_qty * old_avg) + (qty * price)) / new_qty
 
-# ============================================================
-# DISCORD
-# ============================================================
-class DiscordNotifier:
-    def __init__(self, free_webhook: str, premium_webhook: str, debug_webhook: str):
-        self.free_webhook = free_webhook
-        self.premium_webhook = premium_webhook
-        self.debug_webhook = debug_webhook
+            existing["qty"] = new_qty
+            existing["avg_price"] = round(new_avg, 4)
+            existing["last_price"] = round(price, 4)
+            existing["market_value"] = round(new_qty * price, 4)
+            existing["unrealized_pnl"] = round((price - new_avg) * new_qty, 4)
+            existing["updated_at"] = utc_now_iso()
+            existing["strategy"] = strategy or existing.get("strategy", "")
+            existing["stop_loss"] = stop_loss if stop_loss is not None else existing.get("stop_loss")
+            existing["take_profit"] = take_profit if take_profit is not None else existing.get("take_profit")
+            existing["alert_grade"] = alert_grade or existing.get("alert_grade", "")
+            if note:
+                existing["note"] = note
 
-    @staticmethod
-    def _post(url: str, content: str) -> bool:
-        if not url:
-            return False
-        try:
-            resp = requests.post(url, json={"content": content}, timeout=REQUEST_TIMEOUT)
-            return resp.status_code in (200, 204)
-        except Exception:
-            return False
-
-    def send_free(self, content: str) -> bool:
-        return self._post(self.free_webhook, content)
-
-    def send_premium(self, content: str) -> bool:
-        return self._post(self.premium_webhook, content)
-
-    def send_debug(self, content: str) -> bool:
-        return self._post(self.debug_webhook, content)
-
-
-# ============================================================
-# BROKER
-# ============================================================
-class AlpacaBroker:
-    def __init__(self, api_key: str, secret_key: str, paper: bool):
-        self.client = None
-        if ALPACA_AVAILABLE and api_key and secret_key:
-            self.client = TradingClient(api_key, secret_key, paper=paper)
-
-    @property
-    def enabled(self) -> bool:
-        return self.client is not None
-
-    def submit_market_order(self, symbol: str, qty: float, side: str) -> Tuple[bool, str]:
-        if not self.enabled:
-            return False, "Alpaca client not configured"
-
-        try:
-            if side == "buy":
-                order_side = OrderSide.BUY
-            elif side == "sell":
-                order_side = OrderSide.SELL
-            else:
-                return False, f"Unsupported side: {side}"
-
-            order = MarketOrderRequest(
+            fill = self._make_fill(
                 symbol=symbol,
+                side="buy",
                 qty=qty,
-                side=order_side,
-                time_in_force=TimeInForce.DAY,
-                client_order_id=f"ub-{uuid.uuid4().hex[:18]}",
+                price=price,
+                strategy=strategy,
+                reason="add_to_position",
+                position_id=existing["position_id"]
             )
-            submitted = self.client.submit_order(order_data=order)
-            order_id = getattr(submitted, "id", "unknown")
-            return True, f"Order submitted: {symbol} {side} {qty} | order_id={order_id}"
-        except Exception as e:
-            return False, f"Order failed: {e}"
+            self.fills.append(fill)
+            self.save()
+            return existing
 
-    def close_all_positions(self) -> Tuple[bool, str]:
-        if not self.enabled:
-            return False, "Alpaca client not configured"
-        try:
-            result = self.client.close_all_positions(cancel_orders=True)
-            return True, f"Flatten requested: {result}"
-        except Exception as e:
-            return False, f"Flatten failed: {e}"
+        position = {
+            "position_id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": "long",
+            "qty": qty,
+            "avg_price": round(price, 4),
+            "last_price": round(price, 4),
+            "market_value": round(qty * price, 4),
+            "unrealized_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "strategy": strategy,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "alert_grade": alert_grade,
+            "note": note,
+            "opened_at": utc_now_iso(),
+            "updated_at": utc_now_iso()
+        }
 
+        self.positions[symbol] = position
 
-# ============================================================
-# MARKET DATA
-# ============================================================
-class MarketDataProvider:
-    def __init__(self, source: str, api_key: str):
-        self.source = source
-        self.api_key = api_key
+        fill = self._make_fill(
+            symbol=symbol,
+            side="buy",
+            qty=qty,
+            price=price,
+            strategy=strategy,
+            reason="new_position",
+            position_id=position["position_id"]
+        )
+        self.fills.append(fill)
+        self.save()
+        return position
 
-    def get_snapshot(self, symbol: str) -> MarketSnapshot:
-        if self.source == "twelvedata" and self.api_key:
-            return self._get_twelvedata_snapshot(symbol)
-        return MarketSnapshot(symbol=symbol)
+    def close_position(
+        self,
+        symbol: str,
+        qty: int,
+        price: float,
+        reason: str = "close",
+        strategy: str = ""
+    ) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        qty = safe_int(qty)
+        price = safe_float(price)
 
-    def _get_twelvedata_snapshot(self, symbol: str) -> MarketSnapshot:
-        try:
-            quote_resp = requests.get(
-                "https://api.twelvedata.com/quote",
-                params={"symbol": symbol, "apikey": self.api_key},
-                timeout=REQUEST_TIMEOUT,
-            )
-            quote = quote_resp.json()
+        if symbol not in self.positions:
+            raise ValueError(f"No open position found for {symbol}")
 
-            price = safe_float(quote.get("close"))
-            open_price = safe_float(quote.get("open"))
-            prev_close = safe_float(quote.get("previous_close"))
-            high = safe_float(quote.get("high"))
-            low = safe_float(quote.get("low"))
-            volume = safe_float(quote.get("volume"))
+        pos = self.positions[symbol]
+        current_qty = safe_int(pos.get("qty", 0))
+        avg_price = safe_float(pos.get("avg_price", 0.0))
 
-            vwap = None
-            if high and low and price:
-                vwap = (high + low + price) / 3.0
+        if qty <= 0 or price <= 0:
+            raise ValueError("qty and price must be greater than 0")
 
-            return MarketSnapshot(
-                symbol=symbol,
-                price=price if price else None,
-                open_price=open_price if open_price else None,
-                prev_close=prev_close if prev_close else None,
-                high=high if high else None,
-                low=low if low else None,
-                volume=volume if volume else None,
-                vwap=vwap,
-            )
-        except Exception:
-            return MarketSnapshot(symbol=symbol)
+        if qty > current_qty:
+            raise ValueError(f"Cannot close {qty}; only {current_qty} open for {symbol}")
 
+        realized = (price - avg_price) * qty
+        pos["realized_pnl"] = round(safe_float(pos.get("realized_pnl", 0.0)) + realized, 4)
+        pos["last_price"] = round(price, 4)
+        pos["updated_at"] = utc_now_iso()
 
-# ============================================================
-# STRATEGY
-# ============================================================
-def level_proximity_score(price: Optional[float], levels: List[float]) -> Tuple[float, Optional[float]]:
-    if price is None or not levels:
-        return 0.0, None
+        fill = self._make_fill(
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            price=price,
+            strategy=strategy or pos.get("strategy", ""),
+            reason=reason,
+            position_id=pos["position_id"]
+        )
+        self.fills.append(fill)
 
-    closest = min(levels, key=lambda x: abs(x - price))
-    dist_pct = abs(closest - price) / max(price, 0.01)
+        remaining_qty = current_qty - qty
 
-    if dist_pct <= 0.001:
-        score = 1.0
-    elif dist_pct <= 0.0025:
-        score = 0.8
-    elif dist_pct <= 0.005:
-        score = 0.55
-    else:
-        score = 0.2
+        if remaining_qty == 0:
+            closed_summary = {
+                **pos,
+                "closed_at": utc_now_iso(),
+                "close_price": round(price, 4),
+                "closed_qty": qty,
+                "final_realized_pnl": round(pos["realized_pnl"], 4),
+                "status": "closed"
+            }
+            del self.positions[symbol]
+            self.save()
+            return closed_summary
 
-    return score, closest
+        pos["qty"] = remaining_qty
+        pos["market_value"] = round(remaining_qty * price, 4)
+        pos["unrealized_pnl"] = round((price - avg_price) * remaining_qty, 4)
 
+        self.save()
+        return pos
 
-def price_vs_vwap_score(price: Optional[float], vwap: Optional[float]) -> Tuple[float, str]:
-    if price is None or vwap is None:
-        return 0.0, "VWAP unavailable"
-    if price > vwap:
-        return 1.0, "Above VWAP"
-    if price < vwap:
-        return -1.0, "Below VWAP"
-    return 0.0, "At VWAP"
+    def update_market_price(self, symbol: str, current_price: float) -> Optional[Dict[str, Any]]:
+        symbol = symbol.upper()
+        current_price = safe_float(current_price)
 
+        if symbol not in self.positions or current_price <= 0:
+            return None
 
-def oil_pressure_score(oil: MarketSnapshot) -> Tuple[float, str]:
-    if oil.price is None or oil.prev_close is None:
-        return 0.0, "Oil data unavailable"
+        pos = self.positions[symbol]
+        qty = safe_int(pos.get("qty", 0))
+        avg_price = safe_float(pos.get("avg_price", 0.0))
 
-    delta = oil.price - oil.prev_close
+        pos["last_price"] = round(current_price, 4)
+        pos["market_value"] = round(qty * current_price, 4)
+        pos["unrealized_pnl"] = round((current_price - avg_price) * qty, 4)
+        pos["updated_at"] = utc_now_iso()
 
-    if delta <= -2:
-        return 1.0, f"Oil relief strong ({delta:+.2f})"
-    if -2 < delta <= -0.5:
-        return 0.5, f"Oil easing ({delta:+.2f})"
-    if -0.5 < delta < 0.5:
-        return 0.1, f"Oil stable ({delta:+.2f})"
-    if 0.5 <= delta < 2:
-        return -0.5, f"Oil pressure rising ({delta:+.2f})"
-    return -1.0, f"Oil pressure strong ({delta:+.2f})"
+        self.save()
+        return pos
 
+    def mark_all_to_market(self, price_map: Dict[str, float]) -> Dict[str, Dict[str, Any]]:
+        updated = {}
+        for symbol, px in price_map.items():
+            pos = self.update_market_price(symbol, px)
+            if pos:
+                updated[symbol] = pos
+        return updated
 
-def choose_direction(vwap_score: float, oil_score: float, near_level_bias: float) -> str:
-    bullish = 0.45 * max(vwap_score, 0) + 0.35 * max(oil_score, 0) + 0.20 * near_level_bias
-    bearish = 0.45 * max(-vwap_score, 0) + 0.35 * max(-oil_score, 0) + 0.20 * near_level_bias
+    def portfolio_snapshot(self) -> Dict[str, Any]:
+        total_market_value = 0.0
+        total_unrealized = 0.0
+        total_realized_open = 0.0
 
-    if bullish > bearish and bullish >= 0.45:
-        return "CALL"
-    if bearish > bullish and bearish >= 0.45:
-        return "PUT"
-    return "NONE"
+        for pos in self.positions.values():
+            total_market_value += safe_float(pos.get("market_value", 0.0))
+            total_unrealized += safe_float(pos.get("unrealized_pnl", 0.0))
+            total_realized_open += safe_float(pos.get("realized_pnl", 0.0))
 
+        return {
+            "open_positions": len(self.positions),
+            "total_market_value": round(total_market_value, 4),
+            "total_unrealized_pnl": round(total_unrealized, 4),
+            "total_realized_pnl_on_open_positions": round(total_realized_open, 4),
+            "updated_at": utc_now_iso()
+        }
 
-def compute_grade(confidence: float) -> str:
-    if confidence >= 0.78:
-        return "A"
-    if confidence >= 0.58:
-        return "B"
-    return "C"
+paper_engine = PaperExecutionEngine()
 
-
-def build_trade_plan(ctx: EngineContext) -> TradePlan:
-    primary = ctx.primary
-    oil = ctx.oil
-    levels = ctx.levels.get(primary.symbol, [])
-
-    plan = TradePlan(symbol=primary.symbol, price=primary.price)
-
-    level_score, nearest_level = level_proximity_score(primary.price, levels)
-    vwap_score, vwap_note = price_vs_vwap_score(primary.price, primary.vwap)
-    oil_score, oil_note = oil_pressure_score(oil)
-
-    direction = choose_direction(vwap_score, oil_score, level_score)
-    confidence = clamp(
-        0.50 * abs(vwap_score) + 0.30 * abs(oil_score) + 0.20 * level_score,
-        0.0,
-        1.0,
-    )
-    grade = compute_grade(confidence)
-
-    reasons = [vwap_note, oil_note]
-    if nearest_level is not None:
-        reasons.append(f"Near key level {nearest_level:.2f}")
-    else:
-        reasons.append("No manual key levels loaded")
-
-    entry_bias = "WAIT"
-    execution_ok = False
-    qty = 0.0
-
-    if direction != "NONE":
-        if grade == "A":
-            entry_bias = "ACTIONABLE"
-            execution_ok = True
-            qty = min(DEFAULT_ORDER_QTY, MAX_POSITION_QTY)
-        elif grade == "B":
-            entry_bias = "WATCH / RETEST"
-        else:
-            entry_bias = "LOW QUALITY"
-
-    stop_hint = None
-    take_profit_hint = None
-    if primary.price is not None:
-        if direction == "CALL":
-            stop_hint = primary.price * 0.995
-            take_profit_hint = primary.price * 1.01
-        elif direction == "PUT":
-            stop_hint = primary.price * 1.005
-            take_profit_hint = primary.price * 0.99
-
-    plan.direction = direction
-    plan.grade = grade
-    plan.confidence = confidence
-    plan.entry_bias = entry_bias
-    plan.reasons = reasons
-    plan.qty = qty
-    plan.execution_ok = execution_ok
-    plan.stop_hint = stop_hint
-    plan.take_profit_hint = take_profit_hint
-    plan.raw_scores = {
-        "level_score": round(level_score, 4),
-        "vwap_score": round(vwap_score, 4),
-        "oil_score": round(oil_score, 4),
-    }
-
-    plan.alert_text = render_free_alert(plan, ctx)
-    plan.premium_text = render_premium_alert(plan, ctx)
-    return plan
-
-
-# ============================================================
-# RENDERERS
-# ============================================================
-def render_free_alert(plan: TradePlan, ctx: EngineContext) -> str:
+# =========================================================
+# FORMATTERS
+# =========================================================
+def format_position_message(pos: Dict[str, Any]) -> str:
     return (
-        f"📡 *{APP_NAME}* | {plan.symbol}\n"
-        f"Mode: `{ctx.mode}`\n"
-        f"Signal: *{plan.direction}* | Grade: *{plan.grade}*\n"
-        f"Price: `{fmt_price(plan.price)}` | Bias: `{plan.entry_bias}`\n"
-        f"Why: " + " | ".join(plan.reasons[:3])
+        f"📌 PAPER POSITION UPDATE\n"
+        f"Symbol: {pos.get('symbol')}\n"
+        f"Qty: {pos.get('qty')}\n"
+        f"Avg: {pos.get('avg_price')}\n"
+        f"Last: {pos.get('last_price')}\n"
+        f"Market Value: {pos.get('market_value')}\n"
+        f"Unrealized P&L: {pos.get('unrealized_pnl')}\n"
+        f"Realized P&L: {pos.get('realized_pnl')}\n"
+        f"Strategy: {pos.get('strategy', '')}\n"
+        f"Grade: {pos.get('alert_grade', '')}\n"
+        f"Opened: {pos.get('opened_at', '')}\n"
+        f"Updated: {pos.get('updated_at', '')}"
     )
 
-
-def render_premium_alert(plan: TradePlan, ctx: EngineContext) -> str:
+def format_close_message(closed: Dict[str, Any]) -> str:
     return (
-        f"💎 *{APP_NAME} PREMIUM* | {plan.symbol}\n"
-        f"Signal: *{plan.direction}* | Grade: *{plan.grade}* | Confidence: `{plan.confidence:.2f}`\n"
-        f"Price: `{fmt_price(plan.price)}`\n"
-        f"Stop Hint: `{fmt_price(plan.stop_hint)}` | TP Hint: `{fmt_price(plan.take_profit_hint)}`\n"
-        f"Scores: `{json.dumps(plan.raw_scores)}`\n"
-        f"Why: " + " | ".join(plan.reasons)
+        f"✅ PAPER POSITION CLOSED\n"
+        f"Symbol: {closed.get('symbol')}\n"
+        f"Closed Qty: {closed.get('closed_qty', closed.get('qty'))}\n"
+        f"Entry Avg: {closed.get('avg_price')}\n"
+        f"Exit: {closed.get('close_price', closed.get('last_price'))}\n"
+        f"Final Realized P&L: {closed.get('final_realized_pnl', closed.get('realized_pnl'))}\n"
+        f"Closed At: {closed.get('closed_at', utc_now_iso())}"
     )
 
+def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
+    return (
+        f"📊 PAPER PORTFOLIO SNAPSHOT\n"
+        f"Open Positions: {snapshot['open_positions']}\n"
+        f"Market Value: {snapshot['total_market_value']}\n"
+        f"Unrealized P&L: {snapshot['total_unrealized_pnl']}\n"
+        f"Realized P&L (open positions): {snapshot['total_realized_pnl_on_open_positions']}\n"
+        f"Updated: {snapshot['updated_at']}"
+    )
 
-def render_status(state: EngineState, plan: Optional[TradePlan]) -> str:
-    lines = [
-        f"🧠 *{APP_NAME} STATUS*",
-        f"Version: `{APP_VERSION}`",
-        f"Mode: `{state.get('mode_override') or MODE}`",
-        f"Kill Switch: `{state.get('kill_switch')}`",
-        f"Execution Enabled: `{state.get('execution_enabled')}`",
-        f"Trades Today: `{state.get('trades_today')}`",
-        f"Daily PnL: `{state.get('daily_realized_pnl')}`",
-        f"Paper Account: `{ALPACA_PAPER}`",
-    ]
-    if plan:
-        lines.extend(
-            [
-                f"Last Signal: `{plan.direction}`",
-                f"Last Grade: `{plan.grade}`",
-                f"Last Bias: `{plan.entry_bias}`",
-                f"Last Price: `{fmt_price(plan.price)}`",
-            ]
+def format_recent_fills(fills: List[Dict[str, Any]]) -> str:
+    if not fills:
+        return "🧾 NO FILLS YET"
+
+    lines = ["🧾 RECENT PAPER FILLS"]
+    for f in fills[-10:]:
+        lines.append(
+            f"{f.get('timestamp')} | {f.get('symbol')} | {f.get('side').upper()} | "
+            f"QTY {f.get('qty')} | PX {f.get('price')} | {f.get('reason')}"
         )
     return "\n".join(lines)
 
-
-# ============================================================
-# COMMANDS
-# ============================================================
-def parse_command(text: str) -> Tuple[str, List[str]]:
-    raw = (text or "").strip()
-    if not raw:
-        return "", []
-    parts = raw.split()
-    return parts[0].lower(), parts[1:]
-
-
-def command_menu_text() -> str:
-    return (
-        "✅ UB Command Center Online\n\n"
-        "Commands:\n"
-        "/start\n"
-        "/help\n"
-        "/status\n"
-        "/kill\n"
-        "/resume\n"
-        "/flatten\n"
-        "/mode paper\n"
-        "/mode live\n"
-        "/mode alerts_only\n"
-        "/exec on\n"
-        "/exec off\n"
-        "/test"
+# =========================================================
+# EXECUTION ACTIONS
+# =========================================================
+def execute_paper_entry(
+    symbol: str,
+    qty: int,
+    entry_price: float,
+    strategy: str = "",
+    grade: str = "",
+    note: str = "",
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None
+) -> Dict[str, Any]:
+    pos = paper_engine.open_or_add_position(
+        symbol=symbol,
+        qty=qty,
+        price=entry_price,
+        strategy=strategy,
+        alert_grade=grade,
+        note=note,
+        stop_loss=stop_loss,
+        take_profit=take_profit
     )
 
+    msg = format_position_message(pos)
+    send_alert(msg)
+    return pos
 
-def handle_telegram_commands(
-    tg: TelegramNotifier,
-    state: EngineState,
-    broker: AlpacaBroker,
-    last_plan: Optional[TradePlan],
-):
-    if not (ENABLE_TELEGRAM_COMMANDS and tg.enabled):
-        return
+def execute_paper_exit(
+    symbol: str,
+    qty: int,
+    exit_price: float,
+    reason: str = "take_profit",
+    strategy: str = ""
+) -> Dict[str, Any]:
+    result = paper_engine.close_position(
+        symbol=symbol,
+        qty=qty,
+        price=exit_price,
+        reason=reason,
+        strategy=strategy
+    )
 
-    offset = state.get("last_telegram_update_id", 0) + 1
-    updates = tg.get_updates(offset=offset)
-    if not updates.get("ok"):
-        return
+    if result.get("status") == "closed":
+        msg = format_close_message(result)
+    else:
+        msg = format_position_message(result)
 
-    for item in updates.get("result", []):
-        update_id = item.get("update_id", 0)
-        message = item.get("message", {}) or item.get("edited_message", {}) or {}
-        from_user = message.get("from", {}) or {}
-        from_user_id = str(from_user.get("id", ""))
-        text = message.get("text", "")
+    send_alert(msg)
+    return result
 
-        state.set("last_telegram_update_id", update_id)
+def update_open_position_prices(latest_prices: Dict[str, float]) -> Dict[str, Dict[str, Any]]:
+    updated = paper_engine.mark_all_to_market(latest_prices)
+    if updated:
+        snapshot = paper_engine.portfolio_snapshot()
+        send_alert(format_portfolio_snapshot(snapshot))
+    return updated
 
-        if TELEGRAM_ALLOWED_USER_ID and from_user_id != TELEGRAM_ALLOWED_USER_ID:
-            continue
+def send_portfolio_snapshot() -> None:
+    snapshot = paper_engine.portfolio_snapshot()
+    send_alert(format_portfolio_snapshot(snapshot))
 
-        cmd, args = parse_command(text)
+def send_recent_fills(limit: int = 10) -> None:
+    fills = paper_engine.get_fills(limit=limit)
+    send_alert(format_recent_fills(fills))
 
-        if cmd in ("/start", "start", "/help", "help"):
-            tg.send(command_menu_text())
+# =========================================================
+# OPTIONAL SIMPLE COMMAND ROUTER
+# =========================================================
+def handle_debug_command(command: str) -> None:
+    """
+    Local debug command examples:
+    entry QQQ 2 518.25
+    add QQQ 1 519.10
+    price QQQ 521.40
+    exit QQQ 1 522.00
+    snapshot
+    fills
+    """
 
-        elif cmd == "/status":
-            tg.send(render_status(state, last_plan))
+    try:
+        parts = command.strip().split()
+        if not parts:
+            return
 
-        elif cmd == "/kill":
-            state.set("kill_switch", True)
-            tg.send("🛑 Kill switch ENABLED")
+        action = parts[0].lower()
 
-        elif cmd == "/resume":
-            state.set("kill_switch", False)
-            tg.send("✅ Kill switch DISABLED")
+        if action == "entry":
+            symbol = parts[1]
+            qty = int(parts[2])
+            price = float(parts[3])
+            execute_paper_entry(
+                symbol=symbol,
+                qty=qty,
+                entry_price=price,
+                strategy="manual_debug_entry",
+                grade="A",
+                note="debug entry"
+            )
 
-        elif cmd == "/flatten":
-            ok, msg = broker.close_all_positions()
-            tg.send(("✅ " if ok else "❌ ") + msg)
+        elif action == "add":
+            symbol = parts[1]
+            qty = int(parts[2])
+            price = float(parts[3])
+            execute_paper_entry(
+                symbol=symbol,
+                qty=qty,
+                entry_price=price,
+                strategy="manual_debug_add",
+                grade="A",
+                note="debug add"
+            )
 
-        elif cmd == "/mode":
-            if not args:
-                tg.send("Use: /mode paper OR /mode live OR /mode alerts_only")
-                continue
-            new_mode = args[0].lower()
-            if new_mode not in ("paper", "live", "alerts_only"):
-                tg.send("Invalid mode. Use paper, live, or alerts_only")
-                continue
-            state.set("mode_override", new_mode)
-            tg.send(f"⚙️ Mode override set to `{new_mode}`")
-
-        elif cmd == "/exec":
-            if not args:
-                tg.send("Use: /exec on OR /exec off")
-                continue
-            val = args[0].lower()
-            if val == "on":
-                state.set("execution_enabled", True)
-                tg.send("✅ Execution enabled")
-            elif val == "off":
-                state.set("execution_enabled", False)
-                tg.send("🛑 Execution disabled")
+        elif action == "price":
+            symbol = parts[1]
+            price = float(parts[2])
+            updated = paper_engine.update_market_price(symbol, price)
+            if updated:
+                send_alert(format_position_message(updated))
             else:
-                tg.send("Use: /exec on OR /exec off")
+                send_alert(f"⚠️ No open position to update for {symbol}")
 
-        elif cmd == "/test":
-            tg.send("🚨 TEST ALERT WORKING")
-
-
-# ============================================================
-# EXECUTION FILTER
-# ============================================================
-def execution_filter(state: EngineState, plan: TradePlan) -> Tuple[bool, List[str]]:
-    notes = []
-
-    if state.get("kill_switch"):
-        notes.append("Kill switch enabled")
-        return False, notes
-
-    if not state.get("execution_enabled"):
-        notes.append("Execution disabled")
-        return False, notes
-
-    if plan.direction == "NONE":
-        notes.append("No trade direction")
-        return False, notes
-
-    if not grade_meets_threshold(plan.grade, MIN_GRADE_TO_EXECUTE):
-        notes.append(f"Grade below execute threshold ({MIN_GRADE_TO_EXECUTE})")
-        return False, notes
-
-    if not plan.execution_ok:
-        notes.append("Plan not marked execution_ok")
-        return False, notes
-
-    if plan.qty <= 0:
-        notes.append("Qty is zero")
-        return False, notes
-
-    last_trade_ts = state.get("last_trade_ts", 0)
-    if now_ts() - last_trade_ts < COOLDOWN_AFTER_TRADE_SEC:
-        notes.append("Trade cooldown active")
-        return False, notes
-
-    if state.get("trades_today", 0) >= MAX_TRADES_PER_DAY:
-        notes.append("Max trades reached")
-        return False, notes
-
-    if safe_float(state.get("daily_realized_pnl", 0.0)) <= -abs(MAX_DAILY_LOSS):
-        notes.append("Max daily loss exceeded")
-        return False, notes
-
-    if plan.direction == "PUT" and not ALLOW_SHORT:
-        notes.append("PUT execution blocked (ALLOW_SHORT=false)")
-        return False, notes
-
-    notes.append("Execution approved")
-    return True, notes
-
-
-# ============================================================
-# ENGINE
-# ============================================================
-class UBEngine:
-    def __init__(self):
-        self.state = EngineState(STATE_FILE)
-        self.tg = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        self.discord = DiscordNotifier(
-            DISCORD_FREE_WEBHOOK,
-            DISCORD_PREMIUM_WEBHOOK,
-            DISCORD_DEBUG_WEBHOOK,
-        )
-        self.broker = AlpacaBroker(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER)
-        self.market = MarketDataProvider(PRICE_SOURCE, TWELVE_DATA_API_KEY)
-        self.last_plan: Optional[TradePlan] = None
-
-    def log(self, msg: str):
-        print(msg, flush=True)
-
-    def safe_tg_send(self, text: str):
-        try:
-            self.tg.send(text)
-        except Exception:
-            pass
-
-    def safe_debug_send(self, text: str):
-        try:
-            self.discord.send_debug(text)
-        except Exception:
-            pass
-
-    def resolve_mode(self) -> str:
-        return self.state.get("mode_override") or MODE
-
-    def gather_context(self) -> EngineContext:
-        primary = self.market.get_snapshot(PRIMARY_SYMBOL)
-        secondary = self.market.get_snapshot(SECONDARY_SYMBOL)
-        oil = self.market.get_snapshot(OIL_SYMBOL)
-
-        levels = {
-            "QQQ": parse_levels(MANUAL_LEVELS_QQQ),
-            "SPY": parse_levels(MANUAL_LEVELS_SPY),
-        }
-
-        return EngineContext(
-            mode=self.resolve_mode(),
-            primary=primary,
-            secondary=secondary,
-            oil=oil,
-            levels=levels,
-        )
-
-    def make_fingerprint(self, plan: TradePlan) -> str:
-        return f"{plan.symbol}|{plan.direction}|{plan.grade}|{round(plan.price or 0, 2)}"
-
-    def make_plan_signature(self, plan: TradePlan) -> str:
-        rounded_price = round(plan.price or 0, 2)
-        return f"{plan.symbol}|{plan.direction}|{plan.grade}|{plan.entry_bias}|{rounded_price}"
-
-    def should_log_plan(self, plan: TradePlan) -> bool:
-        sig = self.make_plan_signature(plan)
-        last_sig = self.state.get("last_plan_signature", "")
-        if sig != last_sig:
-            self.state.set("last_plan_signature", sig)
-            return True
-        return False
-
-    def log_plan_if_changed(self, plan: TradePlan):
-        if self.should_log_plan(plan):
-            self.log(
-                f"[PLAN] {plan.symbol} | direction={plan.direction} | grade={plan.grade} "
-                f"| confidence={plan.confidence:.2f} | price={fmt_price(plan.price)}"
+        elif action == "exit":
+            symbol = parts[1]
+            qty = int(parts[2])
+            price = float(parts[3])
+            execute_paper_exit(
+                symbol=symbol,
+                qty=qty,
+                exit_price=price,
+                reason="manual_debug_exit"
             )
 
-    def log_exec_if_changed(self, message: str):
-        last_sig = self.state.get("last_exec_signature", "")
-        if message != last_sig:
-            self.state.set("last_exec_signature", message)
-            self.log(message)
+        elif action == "snapshot":
+            send_portfolio_snapshot()
 
-    def log_heartbeat_if_due(self):
-        last_ts = self.state.get("last_heartbeat_ts", 0)
-        now = now_ts()
-        if now - last_ts >= 300:
-            self.log(
-                f"[HEARTBEAT] alive | mode={self.resolve_mode()} "
-                f"| exec_enabled={self.state.get('execution_enabled')} "
-                f"| trades_today={self.state.get('trades_today')}"
-            )
-            self.state.set("last_heartbeat_ts", now)
+        elif action == "fills":
+            send_recent_fills()
 
-    def should_send_alert(self, plan: TradePlan) -> bool:
-        if not grade_meets_threshold(plan.grade, MIN_GRADE_TO_ALERT):
-            return False
-        return self.make_fingerprint(plan) != self.state.get("last_alert_fingerprint", "")
+        elif action == "positions":
+            positions = paper_engine.get_all_positions()
+            if not positions:
+                send_alert("📭 NO OPEN POSITIONS")
+            else:
+                for pos in positions.values():
+                    send_alert(format_position_message(pos))
 
-    def send_alerts(self, plan: TradePlan, ctx: EngineContext):
-        if not self.should_send_alert(plan):
-            return
-
-        free_sent = False
-        premium_sent = False
-
-        self.safe_tg_send(plan.alert_text)
-
-        try:
-            free_sent = self.discord.send_free(plan.alert_text)
-        except Exception:
-            free_sent = False
-
-        if plan.grade in ("A", "B"):
-            try:
-                premium_sent = self.discord.send_premium(plan.premium_text)
-            except Exception:
-                premium_sent = False
-
-        self.state.set("last_alert_fingerprint", self.make_fingerprint(plan))
-        self.log(
-            f"[ALERT] sent | {plan.symbol} | {plan.direction} | {plan.grade} "
-            f"| free={free_sent} | premium={premium_sent}"
-        )
-
-    def maybe_execute(self, plan: TradePlan, ctx: EngineContext):
-        if ctx.mode == "alerts_only":
-            self.log_exec_if_changed("[EXEC] skipped | alerts_only mode")
-            return
-
-        allowed, notes = execution_filter(self.state, plan)
-        if not allowed:
-            msg = f"[EXEC] blocked | {' | '.join(notes)}"
-            self.log_exec_if_changed(msg)
-            self.safe_debug_send(f"⚠️ EXEC BLOCKED | {plan.symbol} | {' | '.join(notes)}")
-            return
-
-        side = direction_to_side(plan.direction)
-        if side is None:
-            self.log_exec_if_changed("[EXEC] blocked | side unresolved")
-            return
-
-        approved_msg = (
-            f"[EXEC] approved | mode={ctx.mode} | symbol={plan.symbol} "
-            f"| side={side} | qty={plan.qty} | grade={plan.grade}"
-        )
-        self.log_exec_if_changed(approved_msg)
-
-        ok, msg = self.broker.submit_market_order(plan.symbol, plan.qty, side)
-        if ok:
-            self.state.set("last_trade_ts", now_ts())
-            self.state.set("trades_today", self.state.get("trades_today", 0) + 1)
-
-            exec_msg = (
-                f"✅ PAPER EXECUTION\n{msg}"
-                if ctx.mode == "paper"
-                else f"✅ LIVE EXECUTION\n{msg}"
-            )
-
-            self.safe_tg_send(exec_msg)
-
-            try:
-                self.discord.send_premium(exec_msg)
-            except Exception:
-                pass
-
-            self.log(f"[EXEC] success | {msg}")
         else:
-            fail_msg = (
-                f"❌ PAPER EXECUTION FAILED\n{msg}"
-                if ctx.mode == "paper"
-                else f"❌ LIVE EXECUTION FAILED\n{msg}"
-            )
-            self.safe_tg_send(fail_msg)
-            self.safe_debug_send(f"❌ {fail_msg}")
-            self.log(f"[EXEC] fail | {msg}")
+            send_alert(f"Unknown command: {command}")
 
-    def run_market_cycle_if_due(self):
-        now = now_ts()
-        next_cycle_ts = self.state.get("next_market_cycle_ts", 0)
+    except Exception as e:
+        send_alert(f"❌ Command failed: {command}\nError: {e}")
 
-        if now < next_cycle_ts:
-            return
+# =========================================================
+# HEARTBEAT
+# =========================================================
+def send_heartbeat() -> None:
+    snapshot = paper_engine.portfolio_snapshot()
+    msg = (
+        f"💓 ENGINE HEARTBEAT\n"
+        f"PAPER_MODE: {PAPER_MODE}\n"
+        f"Open Positions: {snapshot['open_positions']}\n"
+        f"Market Value: {snapshot['total_market_value']}\n"
+        f"Unrealized P&L: {snapshot['total_unrealized_pnl']}\n"
+        f"Updated: {snapshot['updated_at']}"
+    )
+    send_alert(msg)
 
-        ctx = self.gather_context()
-        plan = build_trade_plan(ctx)
-        self.last_plan = plan
+# =========================================================
+# MAIN LOOP
+# =========================================================
+def main():
+    send_alert("🚀 ELITE EXECUTION PHASE 1 ONLINE\nPosition tracking + paper fill tracking active")
 
-        self.log_plan_if_changed(plan)
-        self.send_alerts(plan, ctx)
-        self.maybe_execute(plan, ctx)
-        self.log_heartbeat_if_due()
+    # -----------------------------------------------------
+    # TEST BLOCKS
+    # Uncomment these one at a time if you want to test fast
+    # -----------------------------------------------------
 
-        self.state.set("next_market_cycle_ts", now + LOOP_SECONDS)
+    # execute_paper_entry(
+    #     symbol="QQQ",
+    #     qty=2,
+    #     entry_price=518.25,
+    #     strategy="VWAP reclaim + momentum",
+    #     grade="A",
+    #     note="Pressure release setup"
+    # )
 
-    def loop(self):
-        boot_msg = (
-            f"🚀 {APP_NAME} online\n"
-            f"Version: {APP_VERSION}\n"
-            f"Mode: {self.resolve_mode()}\n"
-            f"Execution Enabled: {self.state.get('execution_enabled')}\n"
-            f"Kill Switch: {self.state.get('kill_switch')}\n"
-            f"Alpaca Ready: {self.broker.enabled}\n"
-            f"Telegram Ready: {self.tg.enabled}\n"
-            f"Paper Account: {ALPACA_PAPER}\n"
-            f"Market Loop: {LOOP_SECONDS}s\n"
-            f"Command Poll: {COMMAND_POLL_SECONDS}s"
-        )
+    # execute_paper_entry(
+    #     symbol="QQQ",
+    #     qty=1,
+    #     entry_price=519.10,
+    #     strategy="VWAP reclaim + momentum",
+    #     grade="A",
+    #     note="Add on confirmation"
+    # )
 
-        self.log("[BOOT] UB-ENGINE CLEAN START")
-        self.log(boot_msg)
-        self.safe_tg_send(boot_msg)
-        self.safe_debug_send(boot_msg)
+    # update_open_position_prices({"QQQ": 521.40})
 
-        consecutive_errors = 0
-        self.state.set("next_market_cycle_ts", 0)
+    # execute_paper_exit(
+    #     symbol="QQQ",
+    #     qty=1,
+    #     exit_price=522.00,
+    #     reason="trim_strength"
+    # )
 
-        while True:
-            try:
-                handle_telegram_commands(
-                    tg=self.tg,
-                    state=self.state,
-                    broker=self.broker,
-                    last_plan=self.last_plan,
-                )
+    # execute_paper_exit(
+    #     symbol="QQQ",
+    #     qty=2,
+    #     exit_price=523.25,
+    #     reason="target_hit"
+    # )
 
-                self.run_market_cycle_if_due()
-                consecutive_errors = 0
+    # send_recent_fills()
+    # send_portfolio_snapshot()
 
-            except Exception as e:
-                consecutive_errors += 1
-                err = (
-                    f"❌ ENGINE ERROR\n"
-                    f"{e}\n\n"
-                    f"```{traceback.format_exc()[:1500]}```"
-                )
-                self.log(err)
-                self.safe_tg_send(err)
-                self.safe_debug_send(err)
+    last_heartbeat = 0
 
-                sleep_on_error = min(60, 5 * consecutive_errors)
-                self.log(f"[RECOVERY] sleeping {sleep_on_error}s after error")
-                time.sleep(sleep_on_error)
-                continue
+    while True:
+        try:
+            now = time.time()
 
-            time.sleep(max(1, COMMAND_POLL_SECONDS))
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                send_heartbeat()
+                last_heartbeat = now
 
+            time.sleep(5)
 
-# ============================================================
-# MAIN
-# ============================================================
+        except KeyboardInterrupt:
+            print("Stopped by user")
+            break
+        except Exception as e:
+            send_alert(f"❌ MAIN LOOP ERROR: {e}")
+            time.sleep(10)
+
 if __name__ == "__main__":
-    engine = UBEngine()
-    engine.loop()
+    main()
