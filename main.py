@@ -9,7 +9,10 @@ from typing import Dict, Any, List, Optional
 # =========================================================
 # ENV
 # =========================================================
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")  # main/debug
+DISCORD_FREE_LEVELS_WEBHOOK_URL = os.getenv("DISCORD_FREE_LEVELS_WEBHOOK_URL", "")
+DISCORD_PREMIUM_LEVELS_WEBHOOK_URL = os.getenv("DISCORD_PREMIUM_LEVELS_WEBHOOK_URL", "")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -23,16 +26,17 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "300"))
 MIN_ALERT_GRADE = os.getenv("MIN_ALERT_GRADE", "A")
 DEFAULT_POSITION_SIZE = int(os.getenv("DEFAULT_POSITION_SIZE", "1"))
 
+# Optional routing controls
+SEND_FREE_B_GRADE = os.getenv("SEND_FREE_B_GRADE", "true").lower() == "true"
+SEND_FREE_C_GRADE = os.getenv("SEND_FREE_C_GRADE", "false").lower() == "true"
+PREMIUM_MIN_GRADE = os.getenv("PREMIUM_MIN_GRADE", "A")
+
 # -------------------------
 # ALPACA
 # -------------------------
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-
-# Example:
-# paper: https://paper-api.alpaca.markets
-# live:  https://api.alpaca.markets
 
 # =========================================================
 # HELPERS
@@ -69,16 +73,32 @@ def save_json_file(path: str, data) -> None:
         print(f"[WARN] Failed saving {path}: {e}")
 
 # =========================================================
-# ALERT DELIVERY
+# GRADE ENGINE
 # =========================================================
-def send_to_discord(message: str) -> bool:
-    if not DISCORD_WEBHOOK_URL:
-        print("[INFO] DISCORD_WEBHOOK_URL not set")
+GRADE_RANK = {
+    "A+": 5,
+    "A": 4,
+    "B": 3,
+    "C": 2,
+    "D": 1
+}
+
+def grade_value(grade: str) -> int:
+    return GRADE_RANK.get(str(grade).upper(), 0)
+
+def grade_passes(grade: str, minimum: str = MIN_ALERT_GRADE) -> bool:
+    return grade_value(grade) >= grade_value(minimum)
+
+# =========================================================
+# DISCORD + TELEGRAM DELIVERY
+# =========================================================
+def post_to_discord_webhook(webhook_url: str, message: str) -> bool:
+    if not webhook_url:
         return False
 
     try:
         payload = {"content": message[:1900]}
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        r = requests.post(webhook_url, json=payload, timeout=15)
         if 200 <= r.status_code < 300:
             return True
         print(f"[WARN] Discord failed: {r.status_code} | {r.text}")
@@ -87,6 +107,15 @@ def send_to_discord(message: str) -> bool:
         print(f"[WARN] Discord exception: {e}")
         return False
 
+def send_main_discord(message: str) -> bool:
+    return post_to_discord_webhook(DISCORD_WEBHOOK_URL, message)
+
+def send_free_discord(message: str) -> bool:
+    return post_to_discord_webhook(DISCORD_FREE_LEVELS_WEBHOOK_URL, message)
+
+def send_premium_discord(message: str) -> bool:
+    return post_to_discord_webhook(DISCORD_PREMIUM_LEVELS_WEBHOOK_URL, message)
+
 def send_telegram_message(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[INFO] Telegram token/chat id not set")
@@ -94,7 +123,10 @@ def send_telegram_message(message: str) -> bool:
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message[:4000]}
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message[:4000]
+        }
         r = requests.post(url, json=payload, timeout=15)
         if 200 <= r.status_code < 300:
             return True
@@ -104,10 +136,38 @@ def send_telegram_message(message: str) -> bool:
         print(f"[WARN] Telegram exception: {e}")
         return False
 
-def send_alert(message: str) -> None:
+def send_main_alert(message: str, telegram: bool = True) -> None:
     print(message)
-    send_to_discord(message)
-    send_telegram_message(message)
+    send_main_discord(message)
+    if telegram:
+        send_telegram_message(message)
+
+def send_free_alert(message: str, telegram: bool = False) -> None:
+    print(message)
+    sent = send_free_discord(message)
+    if not sent:
+        print("[INFO] Free webhook not set or send failed")
+
+def send_premium_alert(message: str, telegram: bool = True) -> None:
+    print(message)
+    sent = send_premium_discord(message)
+    if not sent:
+        print("[INFO] Premium webhook not set or send failed")
+    if telegram:
+        send_telegram_message(message)
+
+def should_send_to_free(grade: str) -> bool:
+    g = str(grade).upper()
+    if g in ["A+", "A"]:
+        return True
+    if g == "B":
+        return SEND_FREE_B_GRADE
+    if g == "C":
+        return SEND_FREE_C_GRADE
+    return False
+
+def should_send_to_premium(grade: str) -> bool:
+    return grade_passes(str(grade).upper(), PREMIUM_MIN_GRADE)
 
 # =========================================================
 # ALPACA CLIENT
@@ -128,13 +188,7 @@ class AlpacaClient:
             "Content-Type": "application/json"
         }
 
-    def submit_market_order(
-        self,
-        symbol: str,
-        qty: int,
-        side: str,
-        time_in_force: str = "day"
-    ) -> Dict[str, Any]:
+    def submit_market_order(self, symbol: str, qty: int, side: str, time_in_force: str = "day") -> Dict[str, Any]:
         if not self.enabled():
             raise ValueError("Alpaca keys not configured")
 
@@ -152,29 +206,6 @@ class AlpacaClient:
             raise ValueError(f"Alpaca order failed: {r.status_code} | {r.text}")
         return r.json()
 
-    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if not self.enabled():
-            return None
-
-        url = f"{self.base_url}/v2/positions/{symbol.upper()}"
-        r = requests.get(url, headers=self._headers(), timeout=20)
-
-        if r.status_code == 404:
-            return None
-        if not (200 <= r.status_code < 300):
-            raise ValueError(f"Alpaca get_position failed: {r.status_code} | {r.text}")
-        return r.json()
-
-    def close_position(self, symbol: str) -> Dict[str, Any]:
-        if not self.enabled():
-            raise ValueError("Alpaca keys not configured")
-
-        url = f"{self.base_url}/v2/positions/{symbol.upper()}"
-        r = requests.delete(url, headers=self._headers(), timeout=20)
-        if not (200 <= r.status_code < 300):
-            raise ValueError(f"Alpaca close_position failed: {r.status_code} | {r.text}")
-        return r.json()
-
 alpaca_client = AlpacaClient(
     api_key=ALPACA_API_KEY,
     secret_key=ALPACA_SECRET_KEY,
@@ -182,7 +213,7 @@ alpaca_client = AlpacaClient(
 )
 
 # =========================================================
-# PAPER EXECUTION ENGINE
+# PAPER / POSITION TRACKING ENGINE
 # =========================================================
 class PaperExecutionEngine:
     def __init__(self, positions_file: str = POSITIONS_FILE, fills_file: str = FILLS_FILE):
@@ -386,7 +417,8 @@ class PaperExecutionEngine:
                 "final_realized_pnl": round(pos["realized_pnl"], 4),
                 "status": "closed",
                 "close_reason": reason,
-                "broker_close_order_id": broker_order_id
+                "broker_close_order_id": broker_order_id,
+                "mode": mode
             }
             del self.positions[symbol]
             self.save()
@@ -395,6 +427,7 @@ class PaperExecutionEngine:
         pos["qty"] = remaining_qty
         pos["market_value"] = round(remaining_qty * price, 4)
         pos["unrealized_pnl"] = round((price - avg_price) * remaining_qty, 4)
+        pos["mode"] = mode
         self.save()
         return pos
 
@@ -438,7 +471,7 @@ class PaperExecutionEngine:
 paper_engine = PaperExecutionEngine()
 
 # =========================================================
-# FORMATTERS
+# MESSAGE FORMATTERS
 # =========================================================
 def format_position_message(pos: Dict[str, Any]) -> str:
     return (
@@ -487,6 +520,33 @@ def format_alert_payload(alert: Dict[str, Any]) -> str:
         f"Reason: {alert.get('reason')}"
     )
 
+def format_free_alert_message(alert: Dict[str, Any]) -> str:
+    return (
+        f"📈 FREE DAILY LEVELS\n"
+        f"Symbol: {alert.get('symbol')}\n"
+        f"Price: {alert.get('price')}\n"
+        f"Grade: {alert.get('grade')}\n"
+        f"Setup: {alert.get('setup')}\n"
+        f"Bias: {alert.get('bias')}\n"
+        f"Stop: {alert.get('stop_loss')}\n"
+        f"Target: {alert.get('take_profit')}\n"
+        f"Reason: {alert.get('reason')}"
+    )
+
+def format_premium_alert_message(alert: Dict[str, Any]) -> str:
+    return (
+        f"💎 PREMIUM LEVELS ALERT\n"
+        f"Symbol: {alert.get('symbol')}\n"
+        f"Price: {alert.get('price')}\n"
+        f"Grade: {alert.get('grade')}\n"
+        f"Setup: {alert.get('setup')}\n"
+        f"Bias: {alert.get('bias')}\n"
+        f"Stop: {alert.get('stop_loss')}\n"
+        f"Target: {alert.get('take_profit')}\n"
+        f"Confidence: {alert.get('confidence')}\n"
+        f"Reason: {alert.get('reason')}"
+    )
+
 def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
     return (
         f"📊 PORTFOLIO SNAPSHOT\n"
@@ -498,19 +558,8 @@ def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
     )
 
 # =========================================================
-# ALERT ENGINE
+# ALERT BUILDERS
 # =========================================================
-GRADE_RANK = {
-    "A+": 5,
-    "A": 4,
-    "B": 3,
-    "C": 2,
-    "D": 1
-}
-
-def grade_passes(grade: str, minimum: str = MIN_ALERT_GRADE) -> bool:
-    return GRADE_RANK.get(str(grade).upper(), 0) >= GRADE_RANK.get(str(minimum).upper(), 0)
-
 def build_alert_payload(
     symbol: str,
     price: float,
@@ -546,13 +595,9 @@ def default_position_size_from_grade(grade: str) -> int:
     return 1
 
 # =========================================================
-# EXECUTION ROUTING
+# ROUTING / EXECUTION
 # =========================================================
 def route_entry_order(symbol: str, qty: int, price_hint: float) -> Dict[str, Any]:
-    """
-    Routes order either to Alpaca or paper mode.
-    Returns normalized execution result.
-    """
     if LIVE_TRADING:
         if not alpaca_client.enabled():
             raise ValueError("LIVE_TRADING is true but Alpaca keys are missing")
@@ -602,6 +647,15 @@ def route_exit_order(symbol: str, qty: int, price_hint: float) -> Dict[str, Any]
         "raw": None
     }
 
+def broadcast_alert_to_channels(alert: Dict[str, Any]) -> None:
+    send_main_alert(format_alert_payload(alert), telegram=False)
+
+    if should_send_to_free(alert.get("grade", "")):
+        send_free_alert(format_free_alert_message(alert), telegram=False)
+
+    if should_send_to_premium(alert.get("grade", "")):
+        send_premium_alert(format_premium_alert_message(alert), telegram=True)
+
 def execute_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     symbol = alert["symbol"]
     price = safe_float(alert["price"])
@@ -613,12 +667,15 @@ def execute_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     bias = alert.get("bias", "bullish")
 
     if bias != "bullish":
-        send_alert(
+        msg = (
             f"⚠️ ALERT QUALIFIED BUT NOT EXECUTED\n"
             f"Symbol: {symbol}\n"
             f"Bias: {bias}\n"
             f"Reason: this phase is long-only"
         )
+        send_main_alert(msg, telegram=False)
+        if should_send_to_premium(grade):
+            send_premium_alert(msg, telegram=True)
         return None
 
     qty = default_position_size_from_grade(grade)
@@ -638,35 +695,52 @@ def execute_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         mode=routing["mode"]
     )
 
-    send_alert(
+    premium_exec_msg = (
         f"🎯 ALERT EXECUTED\n"
         f"Execution Mode: {routing['mode']}\n\n"
-        f"{format_alert_payload(alert)}\n\n"
+        f"{format_premium_alert_message(alert)}\n\n"
         f"{format_position_message(pos)}"
     )
+    send_premium_alert(premium_exec_msg, telegram=True)
+
+    main_exec_msg = (
+        f"🎯 EXECUTION LOG\n"
+        f"Execution Mode: {routing['mode']}\n"
+        f"Symbol: {symbol}\n"
+        f"Qty: {qty}\n"
+        f"Price: {routing['filled_price']}\n"
+        f"Grade: {grade}\n"
+        f"Broker Order ID: {routing['broker_order_id']}"
+    )
+    send_main_alert(main_exec_msg, telegram=False)
+
     return pos
 
 def process_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    send_alert(format_alert_payload(alert))
+    broadcast_alert_to_channels(alert)
 
     grade = alert.get("grade", "D")
     if not grade_passes(grade):
-        send_alert(
+        blocked_msg = (
             f"⛔ ALERT BLOCKED\n"
             f"Symbol: {alert.get('symbol')}\n"
             f"Grade: {grade}\n"
             f"Minimum Required: {MIN_ALERT_GRADE}"
         )
+        send_main_alert(blocked_msg, telegram=False)
         return None
 
     existing = paper_engine.get_position(alert["symbol"])
     if existing:
-        send_alert(
+        existing_msg = (
             f"ℹ️ EXISTING POSITION FOUND\n"
             f"Symbol: {alert['symbol']}\n"
             f"Current Qty: {existing.get('qty')}\n"
             f"Engine will add to position."
         )
+        send_main_alert(existing_msg, telegram=False)
+        if should_send_to_premium(grade):
+            send_premium_alert(existing_msg, telegram=False)
 
     return execute_entry_from_alert(alert)
 
@@ -690,9 +764,21 @@ def execute_exit(
     )
 
     if result.get("status") == "closed":
-        send_alert(format_close_message(result))
+        send_premium_alert(format_close_message(result), telegram=True)
     else:
-        send_alert(format_position_message(result))
+        send_premium_alert(format_position_message(result), telegram=True)
+
+    main_msg = (
+        f"🧾 EXIT LOG\n"
+        f"Mode: {routing['mode']}\n"
+        f"Symbol: {symbol}\n"
+        f"Qty: {qty}\n"
+        f"Exit Price: {routing['filled_price']}\n"
+        f"Reason: {reason}\n"
+        f"Broker Order ID: {routing['broker_order_id']}"
+    )
+    send_main_alert(main_msg, telegram=False)
+
     return result
 
 def check_position_exit_rules(symbol: str, current_price: float) -> Optional[str]:
@@ -721,6 +807,16 @@ def update_open_position_prices(latest_prices: Dict[str, float]) -> Dict[str, Di
 
         updated_positions[symbol] = pos
 
+        premium_update = (
+            f"📡 PREMIUM LIVE UPDATE\n"
+            f"Symbol: {pos.get('symbol')}\n"
+            f"Last: {pos.get('last_price')}\n"
+            f"Unrealized P&L: {pos.get('unrealized_pnl')}\n"
+            f"Stop: {pos.get('stop_loss')}\n"
+            f"Target: {pos.get('take_profit')}"
+        )
+        send_premium_alert(premium_update, telegram=False)
+
         exit_reason = check_position_exit_rules(symbol, safe_float(current_price))
         if exit_reason:
             qty = safe_int(pos.get("qty", 0))
@@ -733,16 +829,13 @@ def update_open_position_prices(latest_prices: Dict[str, float]) -> Dict[str, Di
             )
 
     if updated_positions:
-        send_alert(format_portfolio_snapshot(paper_engine.portfolio_snapshot()))
+        send_main_alert(format_portfolio_snapshot(paper_engine.portfolio_snapshot()), telegram=False)
 
     return updated_positions
 
-def send_portfolio_snapshot() -> None:
-    send_alert(format_portfolio_snapshot(paper_engine.portfolio_snapshot()))
-
 # =========================================================
-# TEST / MOCK FEED
-# Replace these with your real engine later
+# MOCK FEED
+# Replace with your real signal engine later
 # =========================================================
 def get_mock_alerts() -> List[Dict[str, Any]]:
     return [
@@ -769,33 +862,42 @@ def get_mock_market_prices() -> Dict[str, float]:
 # =========================================================
 def send_heartbeat() -> None:
     snapshot = paper_engine.portfolio_snapshot()
-    send_alert(
+    msg = (
         f"💓 ENGINE HEARTBEAT\n"
         f"PAPER_MODE: {PAPER_MODE}\n"
         f"LIVE_TRADING: {LIVE_TRADING}\n"
         f"ALPACA_ENABLED: {alpaca_client.enabled()}\n"
         f"MIN_ALERT_GRADE: {MIN_ALERT_GRADE}\n"
+        f"PREMIUM_MIN_GRADE: {PREMIUM_MIN_GRADE}\n"
         f"Open Positions: {snapshot['open_positions']}\n"
         f"Market Value: {snapshot['total_market_value']}\n"
         f"Unrealized P&L: {snapshot['total_unrealized_pnl']}\n"
         f"Updated: {snapshot['updated_at']}"
     )
+    send_main_alert(msg, telegram=False)
 
 def main():
     print(">>> MAIN STARTED <<<")
 
-    send_alert(
+    startup_msg = (
         "🚀 ELITE EXECUTION ENGINE ONLINE\n"
         f"PAPER_MODE={PAPER_MODE}\n"
         f"LIVE_TRADING={LIVE_TRADING}\n"
-        f"ALPACA_ENABLED={alpaca_client.enabled()}"
+        f"ALPACA_ENABLED={alpaca_client.enabled()}\n"
+        f"FREE_WEBHOOK_SET={bool(DISCORD_FREE_LEVELS_WEBHOOK_URL)}\n"
+        f"PREMIUM_WEBHOOK_SET={bool(DISCORD_PREMIUM_LEVELS_WEBHOOK_URL)}\n"
+        f"MAIN_WEBHOOK_SET={bool(DISCORD_WEBHOOK_URL)}"
     )
+    send_main_alert(startup_msg, telegram=True)
 
     # -----------------------------------------------------
     # FORCE TEST SIGNAL ON STARTUP
     # -----------------------------------------------------
     try:
-        send_alert("🔥 TEST ALERT TRIGGER")
+        test_main = "🔥 TEST ALERT TRIGGER"
+        send_main_alert(test_main, telegram=False)
+        send_free_alert("🔥 FREE CHANNEL TEST", telegram=False)
+        send_premium_alert("🔥 PREMIUM CHANNEL TEST", telegram=True)
 
         test_alert = build_alert_payload(
             symbol="QQQ",
@@ -815,7 +917,7 @@ def main():
         update_open_position_prices({"QQQ": 521.40})
 
     except Exception as e:
-        send_alert(f"❌ STARTUP TEST FAILED: {e}")
+        send_main_alert(f"❌ STARTUP TEST FAILED: {e}", telegram=True)
 
     last_heartbeat = 0
     mock_alerts_processed = False
@@ -825,9 +927,6 @@ def main():
         try:
             now = time.time()
 
-            # ---------------------------------------------
-            # MOCK ENGINE PASS
-            # ---------------------------------------------
             if not mock_alerts_processed:
                 alerts = get_mock_alerts()
                 for alert in alerts:
@@ -840,9 +939,6 @@ def main():
                 update_open_position_prices(latest_prices)
                 mock_prices_processed = True
 
-            # ---------------------------------------------
-            # HEARTBEAT
-            # ---------------------------------------------
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 send_heartbeat()
                 last_heartbeat = now
@@ -853,7 +949,7 @@ def main():
             print("Stopped by user")
             break
         except Exception as e:
-            send_alert(f"❌ MAIN LOOP ERROR: {e}")
+            send_main_alert(f"❌ MAIN LOOP ERROR: {e}", telegram=True)
             time.sleep(10)
 
 if __name__ == "__main__":
