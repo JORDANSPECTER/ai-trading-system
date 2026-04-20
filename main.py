@@ -19,8 +19,12 @@ FILLS_FILE = os.getenv("FILLS_FILE", "fills.json")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "300"))
 
+# execution controls
+MIN_ALERT_GRADE = os.getenv("MIN_ALERT_GRADE", "A")   # A, B, C
+DEFAULT_POSITION_SIZE = int(os.getenv("DEFAULT_POSITION_SIZE", "1"))
+
 # =========================================================
-# BASIC HELPERS
+# HELPERS
 # =========================================================
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
@@ -54,7 +58,7 @@ def save_json_file(path: str, data) -> None:
         print(f"[WARN] Failed saving {path}: {e}")
 
 # =========================================================
-# ALERTING
+# ALERT DELIVERY
 # =========================================================
 def send_to_discord(message: str) -> bool:
     if not DISCORD_WEBHOOK_URL:
@@ -153,7 +157,8 @@ class PaperExecutionEngine:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         alert_grade: str = "",
-        note: str = ""
+        note: str = "",
+        entry_reason: str = "new_position"
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
         qty = safe_int(qty)
@@ -180,8 +185,8 @@ class PaperExecutionEngine:
             existing["stop_loss"] = stop_loss if stop_loss is not None else existing.get("stop_loss")
             existing["take_profit"] = take_profit if take_profit is not None else existing.get("take_profit")
             existing["alert_grade"] = alert_grade or existing.get("alert_grade", "")
-            if note:
-                existing["note"] = note
+            existing["note"] = note or existing.get("note", "")
+            existing["entry_count"] = safe_int(existing.get("entry_count", 1)) + 1
 
             fill = self._make_fill(
                 symbol=symbol,
@@ -211,8 +216,10 @@ class PaperExecutionEngine:
             "take_profit": take_profit,
             "alert_grade": alert_grade,
             "note": note,
+            "entry_reason": entry_reason,
             "opened_at": utc_now_iso(),
-            "updated_at": utc_now_iso()
+            "updated_at": utc_now_iso(),
+            "entry_count": 1
         }
 
         self.positions[symbol] = position
@@ -223,7 +230,7 @@ class PaperExecutionEngine:
             qty=qty,
             price=price,
             strategy=strategy,
-            reason="new_position",
+            reason=entry_reason,
             position_id=position["position_id"]
         )
         self.fills.append(fill)
@@ -280,7 +287,8 @@ class PaperExecutionEngine:
                 "close_price": round(price, 4),
                 "closed_qty": qty,
                 "final_realized_pnl": round(pos["realized_pnl"], 4),
-                "status": "closed"
+                "status": "closed",
+                "close_reason": reason
             }
             del self.positions[symbol]
             self.save()
@@ -289,7 +297,6 @@ class PaperExecutionEngine:
         pos["qty"] = remaining_qty
         pos["market_value"] = round(remaining_qty * price, 4)
         pos["unrealized_pnl"] = round((price - avg_price) * remaining_qty, 4)
-
         self.save()
         return pos
 
@@ -341,7 +348,7 @@ class PaperExecutionEngine:
 paper_engine = PaperExecutionEngine()
 
 # =========================================================
-# FORMATTERS
+# MESSAGE FORMATTERS
 # =========================================================
 def format_position_message(pos: Dict[str, Any]) -> str:
     return (
@@ -350,11 +357,14 @@ def format_position_message(pos: Dict[str, Any]) -> str:
         f"Qty: {pos.get('qty')}\n"
         f"Avg: {pos.get('avg_price')}\n"
         f"Last: {pos.get('last_price')}\n"
+        f"Stop: {pos.get('stop_loss')}\n"
+        f"Target: {pos.get('take_profit')}\n"
         f"Market Value: {pos.get('market_value')}\n"
         f"Unrealized P&L: {pos.get('unrealized_pnl')}\n"
         f"Realized P&L: {pos.get('realized_pnl')}\n"
         f"Strategy: {pos.get('strategy', '')}\n"
         f"Grade: {pos.get('alert_grade', '')}\n"
+        f"Note: {pos.get('note', '')}\n"
         f"Opened: {pos.get('opened_at', '')}\n"
         f"Updated: {pos.get('updated_at', '')}"
     )
@@ -367,7 +377,22 @@ def format_close_message(closed: Dict[str, Any]) -> str:
         f"Entry Avg: {closed.get('avg_price')}\n"
         f"Exit: {closed.get('close_price', closed.get('last_price'))}\n"
         f"Final Realized P&L: {closed.get('final_realized_pnl', closed.get('realized_pnl'))}\n"
+        f"Reason: {closed.get('close_reason', '')}\n"
         f"Closed At: {closed.get('closed_at', utc_now_iso())}"
+    )
+
+def format_alert_payload(alert: Dict[str, Any]) -> str:
+    return (
+        f"🚨 ALERT ENGINE SIGNAL\n"
+        f"Symbol: {alert.get('symbol')}\n"
+        f"Price: {alert.get('price')}\n"
+        f"Grade: {alert.get('grade')}\n"
+        f"Setup: {alert.get('setup')}\n"
+        f"Bias: {alert.get('bias')}\n"
+        f"Stop: {alert.get('stop_loss')}\n"
+        f"Target: {alert.get('take_profit')}\n"
+        f"Confidence: {alert.get('confidence')}\n"
+        f"Reason: {alert.get('reason')}"
     )
 
 def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
@@ -380,46 +405,121 @@ def format_portfolio_snapshot(snapshot: Dict[str, Any]) -> str:
         f"Updated: {snapshot['updated_at']}"
     )
 
-def format_recent_fills(fills: List[Dict[str, Any]]) -> str:
-    if not fills:
-        return "🧾 NO FILLS YET"
-
-    lines = ["🧾 RECENT PAPER FILLS"]
-    for f in fills[-10:]:
-        lines.append(
-            f"{f.get('timestamp')} | {f.get('symbol')} | {f.get('side').upper()} | "
-            f"QTY {f.get('qty')} | PX {f.get('price')} | {f.get('reason')}"
-        )
-    return "\n".join(lines)
-
 # =========================================================
-# EXECUTION ACTIONS
+# ALERT ENGINE LOGIC
 # =========================================================
-def execute_paper_entry(
+GRADE_RANK = {
+    "A+": 5,
+    "A": 4,
+    "B": 3,
+    "C": 2,
+    "D": 1
+}
+
+def grade_passes(grade: str, minimum: str = MIN_ALERT_GRADE) -> bool:
+    return GRADE_RANK.get(grade.upper(), 0) >= GRADE_RANK.get(minimum.upper(), 0)
+
+def build_alert_payload(
     symbol: str,
-    qty: int,
-    entry_price: float,
-    strategy: str = "",
-    grade: str = "",
-    note: str = "",
-    stop_loss: Optional[float] = None,
-    take_profit: Optional[float] = None
+    price: float,
+    setup: str,
+    bias: str,
+    grade: str,
+    confidence: float,
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    reason: str
 ) -> Dict[str, Any]:
+    return {
+        "symbol": symbol.upper(),
+        "price": round(safe_float(price), 4),
+        "setup": setup,
+        "bias": bias.lower(),   # bullish or bearish
+        "grade": grade.upper(),
+        "confidence": round(safe_float(confidence), 2),
+        "stop_loss": safe_float(stop_loss) if stop_loss is not None else None,
+        "take_profit": safe_float(take_profit) if take_profit is not None else None,
+        "reason": reason,
+        "timestamp": utc_now_iso()
+    }
+
+def default_position_size_from_grade(grade: str) -> int:
+    grade = grade.upper()
+    if grade == "A+":
+        return max(DEFAULT_POSITION_SIZE + 2, 3)
+    if grade == "A":
+        return max(DEFAULT_POSITION_SIZE + 1, 2)
+    if grade == "B":
+        return DEFAULT_POSITION_SIZE
+    return 1
+
+def execute_paper_entry_from_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    symbol = alert["symbol"]
+    price = safe_float(alert["price"])
+    grade = alert["grade"]
+    setup = alert["setup"]
+    stop_loss = alert.get("stop_loss")
+    take_profit = alert.get("take_profit")
+    reason = alert.get("reason", "")
+    bias = alert.get("bias", "bullish")
+
+    if bias != "bullish":
+        send_alert(
+            f"⚠️ ALERT QUALIFIED BUT NOT EXECUTED\n"
+            f"Symbol: {symbol}\n"
+            f"Bias: {bias}\n"
+            f"Reason: current paper engine is long-only in this phase"
+        )
+        return None
+
+    qty = default_position_size_from_grade(grade)
+
     pos = paper_engine.open_or_add_position(
         symbol=symbol,
         qty=qty,
-        price=entry_price,
-        strategy=strategy,
-        alert_grade=grade,
-        note=note,
+        price=price,
+        strategy=setup,
         stop_loss=stop_loss,
-        take_profit=take_profit
+        take_profit=take_profit,
+        alert_grade=grade,
+        note=reason,
+        entry_reason="alert_engine_entry"
     )
 
-    msg = format_position_message(pos)
-    send_alert(msg)
+    send_alert(
+        f"🎯 ALERT EXECUTED\n"
+        f"{format_alert_payload(alert)}\n\n"
+        f"{format_position_message(pos)}"
+    )
     return pos
 
+def process_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    send_alert(format_alert_payload(alert))
+
+    grade = alert.get("grade", "D")
+    if not grade_passes(grade):
+        send_alert(
+            f"⛔ ALERT BLOCKED\n"
+            f"Symbol: {alert.get('symbol')}\n"
+            f"Grade: {grade}\n"
+            f"Minimum Required: {MIN_ALERT_GRADE}"
+        )
+        return None
+
+    existing = paper_engine.get_position(alert["symbol"])
+    if existing:
+        send_alert(
+            f"ℹ️ EXISTING POSITION FOUND\n"
+            f"Symbol: {alert['symbol']}\n"
+            f"Current Qty: {existing.get('qty')}\n"
+            f"Engine will add to position."
+        )
+
+    return execute_paper_entry_from_alert(alert)
+
+# =========================================================
+# POSITION MANAGEMENT
+# =========================================================
 def execute_paper_exit(
     symbol: str,
     qty: int,
@@ -436,184 +536,130 @@ def execute_paper_exit(
     )
 
     if result.get("status") == "closed":
-        msg = format_close_message(result)
+        send_alert(format_close_message(result))
     else:
-        msg = format_position_message(result)
-
-    send_alert(msg)
+        send_alert(format_position_message(result))
     return result
 
+def check_position_exit_rules(symbol: str, current_price: float) -> Optional[str]:
+    pos = paper_engine.get_position(symbol)
+    if not pos:
+        return None
+
+    stop_loss = pos.get("stop_loss")
+    take_profit = pos.get("take_profit")
+
+    if stop_loss is not None and current_price <= safe_float(stop_loss):
+        return "stop_loss_hit"
+
+    if take_profit is not None and current_price >= safe_float(take_profit):
+        return "take_profit_hit"
+
+    return None
+
 def update_open_position_prices(latest_prices: Dict[str, float]) -> Dict[str, Dict[str, Any]]:
-    updated = paper_engine.mark_all_to_market(latest_prices)
-    if updated:
-        snapshot = paper_engine.portfolio_snapshot()
-        send_alert(format_portfolio_snapshot(snapshot))
-    return updated
+    updated_positions = {}
 
-def send_portfolio_snapshot() -> None:
-    snapshot = paper_engine.portfolio_snapshot()
-    send_alert(format_portfolio_snapshot(snapshot))
+    for symbol, current_price in latest_prices.items():
+        pos = paper_engine.update_market_price(symbol, current_price)
+        if not pos:
+            continue
 
-def send_recent_fills(limit: int = 10) -> None:
-    fills = paper_engine.get_fills(limit=limit)
-    send_alert(format_recent_fills(fills))
+        updated_positions[symbol] = pos
 
-# =========================================================
-# OPTIONAL SIMPLE COMMAND ROUTER
-# =========================================================
-def handle_debug_command(command: str) -> None:
-    """
-    Local debug command examples:
-    entry QQQ 2 518.25
-    add QQQ 1 519.10
-    price QQQ 521.40
-    exit QQQ 1 522.00
-    snapshot
-    fills
-    """
-
-    try:
-        parts = command.strip().split()
-        if not parts:
-            return
-
-        action = parts[0].lower()
-
-        if action == "entry":
-            symbol = parts[1]
-            qty = int(parts[2])
-            price = float(parts[3])
-            execute_paper_entry(
-                symbol=symbol,
-                qty=qty,
-                entry_price=price,
-                strategy="manual_debug_entry",
-                grade="A",
-                note="debug entry"
-            )
-
-        elif action == "add":
-            symbol = parts[1]
-            qty = int(parts[2])
-            price = float(parts[3])
-            execute_paper_entry(
-                symbol=symbol,
-                qty=qty,
-                entry_price=price,
-                strategy="manual_debug_add",
-                grade="A",
-                note="debug add"
-            )
-
-        elif action == "price":
-            symbol = parts[1]
-            price = float(parts[2])
-            updated = paper_engine.update_market_price(symbol, price)
-            if updated:
-                send_alert(format_position_message(updated))
-            else:
-                send_alert(f"⚠️ No open position to update for {symbol}")
-
-        elif action == "exit":
-            symbol = parts[1]
-            qty = int(parts[2])
-            price = float(parts[3])
+        exit_reason = check_position_exit_rules(symbol, safe_float(current_price))
+        if exit_reason:
+            qty = safe_int(pos.get("qty", 0))
             execute_paper_exit(
                 symbol=symbol,
                 qty=qty,
-                exit_price=price,
-                reason="manual_debug_exit"
+                exit_price=safe_float(current_price),
+                reason=exit_reason,
+                strategy=pos.get("strategy", "")
             )
 
-        elif action == "snapshot":
-            send_portfolio_snapshot()
+    if updated_positions:
+        snapshot = paper_engine.portfolio_snapshot()
+        send_alert(format_portfolio_snapshot(snapshot))
 
-        elif action == "fills":
-            send_recent_fills()
+    return updated_positions
 
-        elif action == "positions":
-            positions = paper_engine.get_all_positions()
-            if not positions:
-                send_alert("📭 NO OPEN POSITIONS")
-            else:
-                for pos in positions.values():
-                    send_alert(format_position_message(pos))
-
-        else:
-            send_alert(f"Unknown command: {command}")
-
-    except Exception as e:
-        send_alert(f"❌ Command failed: {command}\nError: {e}")
+def send_portfolio_snapshot() -> None:
+    send_alert(format_portfolio_snapshot(paper_engine.portfolio_snapshot()))
 
 # =========================================================
-# HEARTBEAT
+# SAMPLE ALERT SOURCE
+# Replace this with your real analyzer / scanner / API output
+# =========================================================
+def get_mock_alerts() -> List[Dict[str, Any]]:
+    """
+    This simulates your real alert engine.
+    Replace this later with your real scanner logic.
+    """
+    return [
+        build_alert_payload(
+            symbol="QQQ",
+            price=518.25,
+            setup="VWAP reclaim + momentum",
+            bias="bullish",
+            grade="A",
+            confidence=0.91,
+            stop_loss=516.90,
+            take_profit=521.75,
+            reason="reclaim over VWAP with momentum confirmation"
+        )
+    ]
+
+def get_mock_market_prices() -> Dict[str, float]:
+    """
+    This simulates market price updates.
+    Replace this later with Twelve Data / broker / market feed.
+    """
+    return {
+        "QQQ": 521.90
+    }
+
+# =========================================================
+# MAIN LOOP
 # =========================================================
 def send_heartbeat() -> None:
     snapshot = paper_engine.portfolio_snapshot()
-    msg = (
+    send_alert(
         f"💓 ENGINE HEARTBEAT\n"
         f"PAPER_MODE: {PAPER_MODE}\n"
+        f"MIN_ALERT_GRADE: {MIN_ALERT_GRADE}\n"
         f"Open Positions: {snapshot['open_positions']}\n"
         f"Market Value: {snapshot['total_market_value']}\n"
         f"Unrealized P&L: {snapshot['total_unrealized_pnl']}\n"
         f"Updated: {snapshot['updated_at']}"
     )
-    send_alert(msg)
 
-# =========================================================
-# MAIN LOOP
-# =========================================================
 def main():
-    send_alert("🚀 ELITE EXECUTION PHASE 1 ONLINE\nPosition tracking + paper fill tracking active")
-
-    # -----------------------------------------------------
-    # TEST BLOCKS
-    # Uncomment these one at a time if you want to test fast
-    # -----------------------------------------------------
-
-    # execute_paper_entry(
-    #     symbol="QQQ",
-    #     qty=2,
-    #     entry_price=518.25,
-    #     strategy="VWAP reclaim + momentum",
-    #     grade="A",
-    #     note="Pressure release setup"
-    # )
-
-    # execute_paper_entry(
-    #     symbol="QQQ",
-    #     qty=1,
-    #     entry_price=519.10,
-    #     strategy="VWAP reclaim + momentum",
-    #     grade="A",
-    #     note="Add on confirmation"
-    # )
-
-    # update_open_position_prices({"QQQ": 521.40})
-
-    # execute_paper_exit(
-    #     symbol="QQQ",
-    #     qty=1,
-    #     exit_price=522.00,
-    #     reason="trim_strength"
-    # )
-
-    # execute_paper_exit(
-    #     symbol="QQQ",
-    #     qty=2,
-    #     exit_price=523.25,
-    #     reason="target_hit"
-    # )
-
-    # send_recent_fills()
-    # send_portfolio_snapshot()
+    send_alert("🚀 ELITE EXECUTION PHASE 2 ONLINE\nAlert engine connected to paper execution")
 
     last_heartbeat = 0
+    alerts_processed = False
+    prices_processed = False
 
     while True:
         try:
             now = time.time()
 
+            # 1) simulate alert engine firing once
+            if not alerts_processed:
+                alerts = get_mock_alerts()
+                for alert in alerts:
+                    process_alert(alert)
+                alerts_processed = True
+
+            # 2) simulate live price updates once after entry
+            if alerts_processed and not prices_processed:
+                time.sleep(3)
+                latest_prices = get_mock_market_prices()
+                update_open_position_prices(latest_prices)
+                prices_processed = True
+
+            # 3) heartbeat
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 send_heartbeat()
                 last_heartbeat = now
