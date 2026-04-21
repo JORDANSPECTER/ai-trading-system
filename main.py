@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import uuid
 import requests
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
@@ -65,6 +66,16 @@ SEND_FREE_ALERTS = os.getenv("SEND_FREE_ALERTS", "true").lower() == "true"
 SEND_PREMIUM_ALERTS = os.getenv("SEND_PREMIUM_ALERTS", "true").lower() == "true"
 SEND_TELEGRAM_ALERTS = os.getenv("SEND_TELEGRAM_ALERTS", "true").lower() == "true"
 DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "true").lower() == "true"
+
+# =========================================================
+# BROKER ENV CONFIG
+# =========================================================
+BROKER_ENABLED = os.getenv("BROKER_ENABLED", "false").lower() == "true"
+BROKER_NAME = os.getenv("BROKER_NAME", "stub").strip().lower()
+BROKER_PAPER = os.getenv("BROKER_PAPER", "true").lower() == "true"
+BROKER_BASE_URL = os.getenv("BROKER_BASE_URL", "").strip()
+BROKER_API_KEY = os.getenv("BROKER_API_KEY", "").strip()
+BROKER_API_SECRET = os.getenv("BROKER_API_SECRET", "").strip()
 
 # =========================================================
 # HELPERS
@@ -149,10 +160,7 @@ def send_telegram_message(text: str) -> bool:
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:3900]
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}
         r = requests.post(url, json=payload, timeout=15)
         return 200 <= r.status_code < 300
     except Exception as e:
@@ -297,6 +305,94 @@ def grade_from_score(score: float) -> str:
     if score >= 70:
         return "C"
     return "D"
+
+# =========================================================
+# BROKER BRIDGE
+# =========================================================
+class BrokerBridge:
+    def __init__(self):
+        self.enabled = BROKER_ENABLED
+        self.name = BROKER_NAME
+        self.paper = BROKER_PAPER
+        self.base_url = BROKER_BASE_URL
+        self.api_key = BROKER_API_KEY
+        self.api_secret = BROKER_API_SECRET
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "broker_enabled": self.enabled,
+            "broker_name": self.name,
+            "broker_paper": self.paper,
+            "broker_has_key": bool(self.api_key),
+            "broker_has_secret": bool(self.api_secret),
+            "broker_base_url": self.base_url or "not_set"
+        }
+
+    def submit_entry_order(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        PAPER MODE:
+            Creates a local simulated fill immediately.
+        LIVE MODE:
+            Replace this stub with your broker API order submission logic.
+        """
+        if PAPER_TRADING or not self.enabled:
+            broker_order_id = f"paper_entry_{uuid.uuid4().hex[:12]}"
+            return {
+                "ok": True,
+                "broker_order_id": broker_order_id,
+                "broker_status": "filled",
+                "fill_price": position["entry_price"],
+                "mode": "PAPER"
+            }
+
+        # ==============================
+        # LIVE BROKER STUB START
+        # ==============================
+        # Replace this with your real broker order submit logic.
+        # Example shape of return expected:
+        #
+        # return {
+        #     "ok": True,
+        #     "broker_order_id": "abc123",
+        #     "broker_status": "submitted",
+        #     "fill_price": None,
+        #     "mode": "LIVE"
+        # }
+        #
+        # If broker rejects:
+        # return {"ok": False, "reason": "broker rejected order"}
+        # ==============================
+        return {"ok": False, "reason": "Live broker submit not implemented"}
+
+    def submit_close_order(self, position: Dict[str, Any], exit_price: float) -> Dict[str, Any]:
+        """
+        PAPER MODE:
+            Simulates immediate close.
+        LIVE MODE:
+            Replace with real broker close logic.
+        """
+        if PAPER_TRADING or not self.enabled:
+            broker_order_id = f"paper_close_{uuid.uuid4().hex[:12]}"
+            return {
+                "ok": True,
+                "broker_order_id": broker_order_id,
+                "broker_status": "filled",
+                "fill_price": round(exit_price, 2),
+                "mode": "PAPER"
+            }
+
+        return {"ok": False, "reason": "Live broker close not implemented"}
+
+    def sync_position(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Optional future upgrade:
+        pull live broker state and update local position.
+        """
+        if PAPER_TRADING or not self.enabled:
+            return {"ok": True, "synced": False, "reason": "paper/local mode"}
+        return {"ok": False, "reason": "Live broker sync not implemented"}
+
+broker_bridge = BrokerBridge()
 
 # =========================================================
 # BOT LOGIC / SIGNAL ENGINE
@@ -672,8 +768,22 @@ class EliteExecutionEngine:
             "notes": signal.get("notes", ""),
             "mode": "PAPER" if PAPER_TRADING else "LIVE",
             "manual": signal.get("manual", False),
+            "broker_order_id": None,
+            "broker_status": None,
             "meta": signal.get("meta", {})
         }
+
+        broker_result = broker_bridge.submit_entry_order(position)
+        if not broker_result.get("ok"):
+            return {"ok": False, "reason": broker_result.get("reason", "broker entry failed")}
+
+        position["broker_order_id"] = broker_result.get("broker_order_id")
+        position["broker_status"] = broker_result.get("broker_status")
+
+        fill_price = broker_result.get("fill_price")
+        if fill_price is not None:
+            position["entry_price"] = round(safe_float(fill_price, position["entry_price"]), 2)
+            position["current_price"] = position["entry_price"]
 
         self.state["open_positions"][trade_id] = position
         self.state["daily_trade_count"] += 1
@@ -691,7 +801,9 @@ class EliteExecutionEngine:
             "contracts": position["contracts"],
             "risk_dollars": position["risk_dollars"],
             "mode": position["mode"],
-            "manual": position["manual"]
+            "manual": position["manual"],
+            "broker_order_id": position["broker_order_id"],
+            "broker_status": position["broker_status"]
         })
 
         return {"ok": True, "trade_id": trade_id, "position": position}
@@ -752,14 +864,23 @@ class EliteExecutionEngine:
         if exit_price <= 0:
             return {"ok": False, "reason": "Invalid exit_price"}
 
-        pnl_per_contract = (exit_price - pos["entry_price"]) * 100
+        broker_result = broker_bridge.submit_close_order(pos, exit_price)
+        if not broker_result.get("ok"):
+            return {"ok": False, "reason": broker_result.get("reason", "broker close failed")}
+
+        actual_exit = broker_result.get("fill_price", exit_price)
+        actual_exit = round(safe_float(actual_exit, exit_price), 2)
+
+        pnl_per_contract = (actual_exit - pos["entry_price"]) * 100
         total_pnl = round(pnl_per_contract * pos["contracts"], 2)
 
         pos["status"] = "CLOSED"
         pos["closed_at"] = now_str()
-        pos["exit_price"] = round(exit_price, 2)
+        pos["exit_price"] = actual_exit
         pos["realized_pnl"] = total_pnl
         pos["close_reason"] = reason
+        pos["broker_close_order_id"] = broker_result.get("broker_order_id")
+        pos["broker_close_status"] = broker_result.get("broker_status")
 
         self.state["daily_realized_pnl"] += total_pnl
         self.set_cooldown(pos["symbol"], pos["side"], COOLDOWN_MINUTES)
@@ -774,7 +895,9 @@ class EliteExecutionEngine:
             "exit_price": pos["exit_price"],
             "contracts": pos["contracts"],
             "pnl": total_pnl,
-            "reason": reason
+            "reason": reason,
+            "broker_close_order_id": pos.get("broker_close_order_id"),
+            "broker_close_status": pos.get("broker_close_status")
         })
 
         if self.state["daily_realized_pnl"] <= -abs(MAX_DAILY_LOSS):
@@ -813,9 +936,6 @@ class EliteExecutionEngine:
             "open_positions": self.get_open_positions()
         }
 
-# =========================================================
-# GLOBAL ENGINE
-# =========================================================
 elite_engine = EliteExecutionEngine()
 
 # =========================================================
@@ -856,9 +976,22 @@ def cmd_positions_text() -> str:
     for p in positions[:10]:
         lines.append(
             f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | "
-            f"Entry {p['entry_price']} | Current {p['current_price']} | Contracts {p['contracts']}"
+            f"Entry {p['entry_price']} | Current {p['current_price']} | Contracts {p['contracts']} | "
+            f"Broker {p.get('broker_status')}"
         )
     return "\n".join(lines)
+
+def cmd_broker_status_text() -> str:
+    s = broker_bridge.status()
+    return (
+        "Broker Status\n"
+        f"Enabled: {s['broker_enabled']}\n"
+        f"Name: {s['broker_name']}\n"
+        f"Paper: {s['broker_paper']}\n"
+        f"Has Key: {s['broker_has_key']}\n"
+        f"Has Secret: {s['broker_has_secret']}\n"
+        f"Base URL: {s['broker_base_url']}"
+    )
 
 # =========================================================
 # TELEGRAM COMMAND CENTER
@@ -873,6 +1006,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "/status - engine status\n"
             "/summary - summary\n"
             "/positions - open positions\n"
+            "/brokerstatus - broker bridge status\n"
             "/lock - lock engine\n"
             "/unlock - unlock engine\n"
             "/flatten - close open positions\n"
@@ -916,6 +1050,9 @@ def handle_telegram_command(text: str) -> Optional[str]:
 
     if text == "/positions":
         return cmd_positions_text()
+
+    if text == "/brokerstatus":
+        return cmd_broker_status_text()
 
     if text == "/lock":
         return cmd_lock("Telegram manual lock")["message"]
@@ -1040,7 +1177,7 @@ def process_signals(signals: List[Dict[str, Any]]):
 # MAIN LOOP
 # =========================================================
 def run_engine_loop():
-    log_debug("Elite merged engine started.")
+    log_debug("Elite broker bridge engine started.")
     print("=== ENGINE LOOP STARTED ===", flush=True)
 
     last_scan_ts = 0.0
@@ -1116,6 +1253,7 @@ def run_test_mode():
     result = process_trade_signal(test_signal)
     print("TRADE RESULT:", result, flush=True)
     print("STATUS:", cmd_status(), flush=True)
+    print("BROKER STATUS:", broker_bridge.status(), flush=True)
     print("SUMMARY:", cmd_summary(), flush=True)
 
 # =========================================================
@@ -1132,6 +1270,9 @@ if __name__ == "__main__":
     print(f"SCAN_SECONDS: {SCAN_SECONDS}", flush=True)
     print(f"TELEGRAM_POLL_SECONDS: {TELEGRAM_POLL_SECONDS}", flush=True)
     print(f"TELEGRAM_COMMANDS_ENABLED: {TELEGRAM_COMMANDS_ENABLED}", flush=True)
+    print(f"BROKER_ENABLED: {BROKER_ENABLED}", flush=True)
+    print(f"BROKER_NAME: {BROKER_NAME}", flush=True)
+    print(f"BROKER_PAPER: {BROKER_PAPER}", flush=True)
     print(f"MARKET_IS_OPEN_NOW: {market_is_open()}", flush=True)
 
     if TEST_MODE:
