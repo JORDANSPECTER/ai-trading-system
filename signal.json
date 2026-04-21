@@ -1,0 +1,41 @@
+{
+  "signal_id": "UB-QQQ-TEST-001",
+
+  "ticker": "QQQ",
+  "direction": "CALL",
+  "confidence": "A",
+
+  "asset_class": "option",
+
+  "symbol": "QQQ260421C00492000",
+
+  "price": 492.18,
+
+  "contract_price": 1.35,
+  "entry_contract": 1.35,
+  "limit_entry_price": 1.30,
+  "use_limit_entry": false,
+
+  "stop_contract": 0.95,
+  "tp1_contract": 1.75,
+  "tp2_contract": 2.20,
+  "trail_pct": 0.20,
+
+  "qty": 1,
+  "risk": 1.0,
+
+  "entry": "Break and hold above VWAP reclaim",
+  "stop": "Below higher low support",
+  "target_1": "First resistance / intraday high",
+  "target_2": "Momentum continuation breakout",
+
+  "reason": "VWAP reclaim + higher low + volume expansion through resistance.",
+  "public_reason": "Bullish strength building over support with confirmation.",
+
+  "trigger": "Break and hold above reclaim candle",
+  "bias": "Bullish",
+  "timeframe": "5m / 15m",
+
+  "source": "manual_test",
+  "timestamp": 9999999999
+}
