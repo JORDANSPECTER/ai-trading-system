@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import math
 import requests
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
@@ -17,26 +16,23 @@ MAX_HISTORY = 500
 # =========================================================
 # ENV CONFIG
 # =========================================================
-# --- General ---
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 AUTO_EXECUTION_ENABLED = os.getenv("AUTO_EXECUTION_ENABLED", "true").lower() == "true"
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 
 SCAN_SYMBOLS = [s.strip().upper() for s in os.getenv("SCAN_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
-SCAN_INTERVAL = os.getenv("SCAN_INTERVAL", "5min")           # Twelve Data interval
+SCAN_INTERVAL = os.getenv("SCAN_INTERVAL", "5min")
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
 MIN_BARS = int(os.getenv("MIN_BARS", "40"))
 
 ALLOW_CALLS = os.getenv("ALLOW_CALLS", "true").lower() == "true"
 ALLOW_PUTS = os.getenv("ALLOW_PUTS", "true").lower() == "true"
 
-# --- Signal thresholds ---
 MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "80"))
 FREE_MIN_SCORE = float(os.getenv("FREE_MIN_SCORE", "90"))
 PREMIUM_MIN_SCORE = float(os.getenv("PREMIUM_MIN_SCORE", "80"))
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "300"))
 
-# --- Risk controls ---
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "6"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "500"))
@@ -48,13 +44,11 @@ DEFAULT_TP1_PCT = float(os.getenv("DEFAULT_TP1_PCT", "0.30"))
 DEFAULT_TP2_PCT = float(os.getenv("DEFAULT_TP2_PCT", "0.60"))
 DEFAULT_TRAIL_AFTER_TP1 = os.getenv("DEFAULT_TRAIL_AFTER_TP1", "true").lower() == "true"
 
-# --- Market hours ---
 MARKET_OPEN_HOUR = int(os.getenv("MARKET_OPEN_HOUR", "9"))
 MARKET_OPEN_MINUTE = int(os.getenv("MARKET_OPEN_MINUTE", "30"))
 MARKET_CLOSE_HOUR = int(os.getenv("MARKET_CLOSE_HOUR", "16"))
 MARKET_CLOSE_MINUTE = int(os.getenv("MARKET_CLOSE_MINUTE", "0"))
 
-# --- APIs / Webhooks ---
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
@@ -64,11 +58,8 @@ DISCORD_DEBUG_WEBHOOK = os.getenv("DISCORD_DEBUG_WEBHOOK", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
-
-# --- Command center ---
 TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "true").lower() == "true"
 
-# --- Mode ---
 SEND_FREE_ALERTS = os.getenv("SEND_FREE_ALERTS", "true").lower() == "true"
 SEND_PREMIUM_ALERTS = os.getenv("SEND_PREMIUM_ALERTS", "true").lower() == "true"
 SEND_TELEGRAM_ALERTS = os.getenv("SEND_TELEGRAM_ALERTS", "true").lower() == "true"
@@ -114,21 +105,13 @@ def market_is_open() -> bool:
     close_dt = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
     return now.weekday() < 5 and open_dt <= now <= close_dt
 
-def interval_to_minutes(interval: str) -> int:
-    interval = interval.lower().strip()
-    if interval.endswith("min"):
-        return int(interval.replace("min", ""))
-    if interval.endswith("h"):
-        return int(interval.replace("h", "")) * 60
-    return 5
-
 def log_debug(message: str):
-    print(f"[{now_str()}] {message}")
+    print(f"[DEBUG {now_str()}] {message}", flush=True)
     if DEBUG_LOGGING and DISCORD_DEBUG_WEBHOOK:
         send_discord_message(DISCORD_DEBUG_WEBHOOK, f"```{message[:1800]}```")
 
 # =========================================================
-# RUNTIME FILE
+# RUNTIME STATE
 # =========================================================
 def default_runtime_state() -> Dict[str, Any]:
     return {
@@ -157,7 +140,7 @@ def send_discord_message(webhook_url: str, content: str) -> bool:
         r = requests.post(webhook_url, json={"content": content[:1900]}, timeout=15)
         return 200 <= r.status_code < 300
     except Exception as e:
-        print(f"Discord error: {e}")
+        print(f"Discord error: {e}", flush=True)
         return False
 
 def send_telegram_message(text: str) -> bool:
@@ -167,13 +150,12 @@ def send_telegram_message(text: str) -> bool:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:3900],
-            "parse_mode": "Markdown"
+            "text": text[:3900]
         }
         r = requests.post(url, json=payload, timeout=15)
         return 200 <= r.status_code < 300
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"Telegram send error: {e}", flush=True)
         return False
 
 def get_telegram_updates() -> List[Dict[str, Any]]:
@@ -187,6 +169,7 @@ def get_telegram_updates() -> List[Dict[str, Any]]:
         }
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
+
         if not data.get("ok"):
             return []
 
@@ -196,7 +179,7 @@ def get_telegram_updates() -> List[Dict[str, Any]]:
             save_runtime_state(RUNTIME_STATE)
         return results
     except Exception as e:
-        print(f"Telegram update error: {e}")
+        print(f"Telegram update error: {e}", flush=True)
         return []
 
 # =========================================================
@@ -221,8 +204,9 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
     if "values" not in data:
         raise ValueError(f"Twelve Data error for {symbol}: {data}")
 
-    values = list(reversed(data["values"]))  # oldest -> newest
+    values = list(reversed(data["values"]))
     bars = []
+
     for row in values:
         bars.append({
             "datetime": row.get("datetime"),
@@ -232,6 +216,7 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
             "close": safe_float(row.get("close")),
             "volume": safe_float(row.get("volume"))
         })
+
     return bars
 
 # =========================================================
@@ -249,6 +234,7 @@ def compute_vwap(bars: List[Dict[str, Any]]) -> float:
 
     if cumulative_vol == 0:
         return bars[-1]["close"]
+
     return cumulative_pv / cumulative_vol
 
 def compute_rsi(closes: List[float], period: int = 14) -> float:
@@ -257,6 +243,7 @@ def compute_rsi(closes: List[float], period: int = 14) -> float:
 
     gains = []
     losses = []
+
     for i in range(1, period + 1):
         diff = closes[-i] - closes[-i - 1]
         if diff >= 0:
@@ -271,6 +258,7 @@ def compute_rsi(closes: List[float], period: int = 14) -> float:
 
     if avg_loss == 0:
         return 100.0
+
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -287,7 +275,7 @@ def price_change_pct(a: float, b: float) -> float:
     return ((b - a) / a) * 100.0
 
 # =========================================================
-# SIGNAL ENGINE / BOT LOGIC
+# SIGNAL COOLDOWN
 # =========================================================
 def signal_cooldown_hit(symbol: str, side: str) -> bool:
     key = f"{symbol}_{side}"
@@ -299,6 +287,9 @@ def stamp_signal_time(symbol: str, side: str):
     RUNTIME_STATE["last_signal_times"][key] = time.time()
     save_runtime_state(RUNTIME_STATE)
 
+# =========================================================
+# GRADE HELPERS
+# =========================================================
 def grade_from_score(score: float) -> str:
     if score >= 95:
         return "A+"
@@ -312,6 +303,9 @@ def grade_from_score(score: float) -> str:
         return "C"
     return "D"
 
+# =========================================================
+# BOT LOGIC / SIGNAL ENGINE
+# =========================================================
 def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(bars) < MIN_BARS:
         return None
@@ -337,60 +331,64 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
     notes_call = []
     notes_put = []
 
-    # -------------------------
-    # CALL logic
-    # -------------------------
     if last_close > vwap:
         call_score += 28
         notes_call.append("price above VWAP")
+
     if prev_close <= vwap and last_close > vwap:
         call_score += 18
         notes_call.append("fresh VWAP reclaim")
+
     if 52 <= rsi <= 72:
         call_score += 18
-        notes_call.append(f"RSI supportive ({round(rsi,1)})")
+        notes_call.append(f"RSI supportive ({round(rsi, 1)})")
     elif rsi > 72:
         call_score += 5
-        notes_call.append(f"RSI strong but extended ({round(rsi,1)})")
+        notes_call.append(f"RSI strong but extended ({round(rsi, 1)})")
+
     if vol_ratio >= 1.2:
         call_score += 15
-        notes_call.append(f"volume expansion x{round(vol_ratio,2)}")
+        notes_call.append(f"volume expansion x{round(vol_ratio, 2)}")
+
     if momentum_pct > 0:
         call_score += min(15, momentum_pct * 20)
-        notes_call.append(f"positive momentum {round(momentum_pct,2)}%")
+        notes_call.append(f"positive momentum {round(momentum_pct, 2)}%")
+
     if last_bar["close"] > prev_bar["high"]:
         call_score += 10
         notes_call.append("broke previous candle high")
 
-    # -------------------------
-    # PUT logic
-    # -------------------------
     if last_close < vwap:
         put_score += 28
         notes_put.append("price below VWAP")
+
     if prev_close >= vwap and last_close < vwap:
         put_score += 18
         notes_put.append("fresh VWAP rejection")
+
     if 28 <= rsi <= 48:
         put_score += 18
-        notes_put.append(f"RSI bearish ({round(rsi,1)})")
+        notes_put.append(f"RSI bearish ({round(rsi, 1)})")
     elif rsi < 28:
         put_score += 5
-        notes_put.append(f"RSI weak but extended ({round(rsi,1)})")
+        notes_put.append(f"RSI weak but extended ({round(rsi, 1)})")
+
     if vol_ratio >= 1.2:
         put_score += 15
-        notes_put.append(f"volume expansion x{round(vol_ratio,2)}")
+        notes_put.append(f"volume expansion x{round(vol_ratio, 2)}")
+
     if momentum_pct < 0:
         put_score += min(15, abs(momentum_pct) * 20)
-        notes_put.append(f"negative momentum {round(momentum_pct,2)}%")
+        notes_put.append(f"negative momentum {round(momentum_pct, 2)}%")
+
     if last_bar["close"] < prev_bar["low"]:
         put_score += 10
         notes_put.append("broke previous candle low")
 
-    # Decide best side
     side = None
     score = 0.0
     notes = []
+
     if call_score >= put_score and ALLOW_CALLS:
         side = "CALL"
         score = min(99, round(call_score, 1))
@@ -410,7 +408,8 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
         return None
 
     grade = grade_from_score(score)
-    entry_price_proxy = max(0.50, round(abs(last_close * 0.0025), 2))  # proxy option premium placeholder
+
+    entry_price_proxy = max(0.50, round(abs(last_close * 0.0025), 2))
 
     signal = {
         "signal_id": f"{symbol}_{side}_{int(time.time())}",
@@ -440,24 +439,25 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
 def build_alert_text(signal: Dict[str, Any], execution_result: Optional[Dict[str, Any]] = None) -> str:
     meta = signal.get("meta", {})
     lines = [
-        f"🚨 *{signal['symbol']} {signal['side']} SIGNAL*",
-        f"Grade: *{signal['grade']}* | Score: *{signal['score']}*",
-        f"Underlying: `{meta.get('underlying_price', 'N/A')}` | VWAP: `{meta.get('vwap', 'N/A')}` | RSI: `{meta.get('rsi', 'N/A')}`",
-        f"Vol Ratio: `{meta.get('volume_ratio', 'N/A')}` | Momentum: `{meta.get('momentum_pct', 'N/A')}%`",
-        f"Entry Proxy: `{signal.get('entry_price')}` | Risk: `${signal.get('risk_amount')}`",
+        f"🚨 {signal['symbol']} {signal['side']} SIGNAL",
+        f"Grade: {signal['grade']} | Score: {signal['score']}",
+        f"Underlying: {meta.get('underlying_price', 'N/A')} | VWAP: {meta.get('vwap', 'N/A')} | RSI: {meta.get('rsi', 'N/A')}",
+        f"Vol Ratio: {meta.get('volume_ratio', 'N/A')} | Momentum: {meta.get('momentum_pct', 'N/A')}%",
+        f"Entry Proxy: {signal.get('entry_price')} | Risk: ${signal.get('risk_amount')}",
         f"Notes: {signal.get('notes', '')}",
-        f"Bar Time: `{meta.get('bar_time', 'N/A')}`"
+        f"Bar Time: {meta.get('bar_time', 'N/A')}"
     ]
 
     if execution_result:
         if execution_result.get("ok"):
             pos = execution_result.get("position", {})
             lines.append(
-                f"Execution: ✅ {pos.get('mode','PAPER')} | Contracts: `{pos.get('contracts')}` | "
-                f"Stop: `{pos.get('stop_price')}` | TP1: `{pos.get('tp1_price')}` | TP2: `{pos.get('tp2_price')}`"
+                f"Execution: OK | Mode: {pos.get('mode', 'PAPER')} | Contracts: {pos.get('contracts')} | "
+                f"Stop: {pos.get('stop_price')} | TP1: {pos.get('tp1_price')} | TP2: {pos.get('tp2_price')}"
             )
         else:
-            lines.append(f"Execution: ❌ {execution_result.get('reason', 'unknown')}")
+            lines.append(f"Execution Blocked: {execution_result.get('reason', 'unknown')}")
+
     return "\n".join(lines)
 
 def route_signal_alerts(signal: Dict[str, Any], execution_result: Optional[Dict[str, Any]] = None):
@@ -472,22 +472,8 @@ def route_signal_alerts(signal: Dict[str, Any], execution_result: Optional[Dict[
     if SEND_TELEGRAM_ALERTS:
         send_telegram_message(text)
 
-def send_status_to_debug():
-    status = cmd_status()
-    summary = cmd_summary()
-    text = (
-        f"🧠 Engine Status\n"
-        f"Locked: {status['engine_locked']}\n"
-        f"Reason: {status['lock_reason']}\n"
-        f"Daily PnL: {status['daily_realized_pnl']}\n"
-        f"Daily Trades: {status['daily_trade_count']}\n"
-        f"Open Positions: {summary['open_positions_count']}"
-    )
-    if DISCORD_DEBUG_WEBHOOK:
-        send_discord_message(DISCORD_DEBUG_WEBHOOK, text)
-
 # =========================================================
-# DEFAULT ENGINE STATE
+# ENGINE STATE
 # =========================================================
 def default_engine_state() -> Dict[str, Any]:
     return {
@@ -517,6 +503,7 @@ def load_engine_state() -> Dict[str, Any]:
     state.setdefault("open_positions", {})
     state.setdefault("last_signal_ids", [])
     state.setdefault("last_reset", now_str())
+
     return state
 
 def save_engine_state(state: Dict[str, Any]):
@@ -888,7 +875,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
 
     if text in ["/start", "/help"]:
         return (
-            "🧠 UB Engine Command Center\n\n"
+            "UB Engine Command Center\n\n"
             "/status - engine status\n"
             "/summary - open positions summary\n"
             "/lock - lock engine\n"
@@ -900,12 +887,12 @@ def handle_telegram_command(text: str) -> Optional[str]:
         )
 
     if text == "/ping":
-        return "✅ Bot is alive."
+        return "Bot is alive."
 
     if text == "/status":
         s = cmd_status()
         return (
-            f"🧠 Status\n"
+            f"Status\n"
             f"Paper: {s['paper_trading']}\n"
             f"Auto Exec: {s['auto_execution_enabled']}\n"
             f"Locked: {s['engine_locked']}\n"
@@ -918,7 +905,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
     if text == "/summary":
         s = cmd_summary()
         lines = [
-            f"📊 Summary",
+            f"Summary",
             f"Date: {s['date']}",
             f"Locked: {s['engine_locked']}",
             f"Daily PnL: {s['daily_realized_pnl']}",
@@ -992,17 +979,23 @@ def poll_telegram_commands():
             send_telegram_message(reply)
 
 # =========================================================
-# SIGNAL SCAN LOOP
+# SCAN
 # =========================================================
 def scan_once() -> List[Dict[str, Any]]:
     signals = []
 
     for symbol in SCAN_SYMBOLS:
         try:
+            print(f"[SCAN] Pulling bars for {symbol}", flush=True)
             bars = fetch_twelve_data_bars(symbol, SCAN_INTERVAL, outputsize=max(MIN_BARS + 10, 60))
             signal = analyze_symbol(symbol, bars)
+
             if signal:
+                print(f"[SCAN] SIGNAL FOUND -> {signal['symbol']} {signal['side']} {signal['grade']} {signal['score']}", flush=True)
                 signals.append(signal)
+            else:
+                print(f"[SCAN] No qualifying signal for {symbol}", flush=True)
+
         except Exception as e:
             log_debug(f"SCAN ERROR [{symbol}]: {e}")
 
@@ -1010,6 +1003,7 @@ def scan_once() -> List[Dict[str, Any]]:
 
 def process_signals(signals: List[Dict[str, Any]]):
     for signal in signals:
+        print(f"[PROCESS] Sending signal into engine -> {signal['symbol']} {signal['side']}", flush=True)
         result = process_trade_signal(signal)
         route_signal_alerts(signal, result)
 
@@ -1024,17 +1018,27 @@ def process_signals(signals: List[Dict[str, Any]]):
 # =========================================================
 def run_engine_loop():
     log_debug("Elite merged engine started.")
-    send_status_to_debug()
+    print("=== ENGINE LOOP STARTED ===", flush=True)
 
     while True:
         try:
+            print(f"Loop heartbeat: {now_str()}", flush=True)
+
             if TELEGRAM_COMMANDS_ENABLED:
+                print("[TELEGRAM] Polling commands...", flush=True)
                 poll_telegram_commands()
 
-            if market_is_open() or TEST_MODE:
+            current_market_status = market_is_open()
+            print(f"Market open: {current_market_status} | TEST_MODE: {TEST_MODE}", flush=True)
+
+            if current_market_status or TEST_MODE:
                 signals = scan_once()
+                print(f"Signals found: {len(signals)}", flush=True)
+
                 if signals:
                     process_signals(signals)
+            else:
+                print("Market closed. Waiting for next loop.", flush=True)
 
             time.sleep(SCAN_SECONDS)
 
@@ -1043,13 +1047,15 @@ def run_engine_loop():
             break
         except Exception as e:
             log_debug(f"MAIN LOOP ERROR: {e}")
+            print(f"MAIN LOOP ERROR: {e}", flush=True)
             time.sleep(5)
 
 # =========================================================
 # TEST MODE
 # =========================================================
 def run_test_mode():
-    print("Running TEST_MODE...")
+    print("Running TEST_MODE...", flush=True)
+
     test_signal = {
         "signal_id": f"TEST_QQQ_CALL_{int(time.time())}",
         "symbol": "QQQ",
@@ -1074,29 +1080,40 @@ def run_test_mode():
     }
 
     result = process_trade_signal(test_signal)
-    print("TRADE RESULT:", result)
-    print("STATUS:", cmd_status())
-    print("SUMMARY:", cmd_summary())
+    print("TRADE RESULT:", result, flush=True)
+    print("STATUS:", cmd_status(), flush=True)
+    print("SUMMARY:", cmd_summary(), flush=True)
 
     if result.get("ok"):
         trade_id = result["trade_id"]
 
-        print("\n--- SIMULATE TP1 ---")
-        print(elite_engine.update_position_price(trade_id, 1.90))
+        print("\n--- SIMULATE TP1 ---", flush=True)
+        print(elite_engine.update_position_price(trade_id, 1.90), flush=True)
 
-        print("\n--- SIMULATE TP2 ---")
-        print(elite_engine.update_position_price(trade_id, 2.35))
+        print("\n--- SIMULATE TP2 ---", flush=True)
+        print(elite_engine.update_position_price(trade_id, 2.35), flush=True)
 
-        print("\n--- MANUAL CLOSE ---")
-        print(cmd_close_trade(trade_id, 2.10))
+        print("\n--- MANUAL CLOSE ---", flush=True)
+        print(cmd_close_trade(trade_id, 2.10), flush=True)
 
-        print("\n--- FINAL SUMMARY ---")
-        print(cmd_summary())
+        print("\n--- FINAL SUMMARY ---", flush=True)
+        print(cmd_summary(), flush=True)
 
 # =========================================================
 # ENTRY
 # =========================================================
 if __name__ == "__main__":
+    print("=== UB ENGINE BOOTING ===", flush=True)
+    print(f"TIME: {now_str()}", flush=True)
+    print(f"TEST_MODE: {TEST_MODE}", flush=True)
+    print(f"PAPER_TRADING: {PAPER_TRADING}", flush=True)
+    print(f"AUTO_EXECUTION_ENABLED: {AUTO_EXECUTION_ENABLED}", flush=True)
+    print(f"SCAN_SYMBOLS: {SCAN_SYMBOLS}", flush=True)
+    print(f"SCAN_INTERVAL: {SCAN_INTERVAL}", flush=True)
+    print(f"SCAN_SECONDS: {SCAN_SECONDS}", flush=True)
+    print(f"TELEGRAM_COMMANDS_ENABLED: {TELEGRAM_COMMANDS_ENABLED}", flush=True)
+    print(f"MARKET_IS_OPEN_NOW: {market_is_open()}", flush=True)
+
     if TEST_MODE:
         run_test_mode()
     else:
