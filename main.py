@@ -71,11 +71,11 @@ MIN_OPTION_PRICE = float(os.getenv("MIN_OPTION_PRICE", "0.05"))
 # OPTION CONTRACT SELECTION CONFIG
 # =========================================================
 OPTION_EXPIRY_MODE = os.getenv("OPTION_EXPIRY_MODE", "0dte_or_next").strip().lower()
-OPTION_MAX_DAYS_OUT = int(os.getenv("OPTION_MAX_DAYS_OUT", "7"))
+OPTION_MAX_DAYS_OUT = int(os.getenv("OPTION_MAX_DAYS_OUT", "14"))
 OPTION_STRIKE_MODE = os.getenv("OPTION_STRIKE_MODE", "atm").strip().lower()  # atm, itm1
 OPTION_MIN_OPEN_INTEREST = int(os.getenv("OPTION_MIN_OPEN_INTEREST", "0"))
-OPTION_MIN_PRICE = float(os.getenv("OPTION_MIN_PRICE", "0.10"))
-OPTION_MAX_PRICE = float(os.getenv("OPTION_MAX_PRICE", "5.00"))
+OPTION_MIN_PRICE = float(os.getenv("OPTION_MIN_PRICE", "0.05"))
+OPTION_MAX_PRICE = float(os.getenv("OPTION_MAX_PRICE", "20.00"))
 OPTION_ORDER_TYPE = os.getenv("OPTION_ORDER_TYPE", "market").strip().lower()  # market, limit
 OPTION_LIMIT_SLIPPAGE_PCT = float(os.getenv("OPTION_LIMIT_SLIPPAGE_PCT", "0.03"))
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "indicative").strip().lower()  # indicative, opra
@@ -90,6 +90,7 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
 DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "").strip()
 DISCORD_DEBUG_WEBHOOK = os.getenv("DISCORD_DEBUG_WEBHOOK", "").strip()
+DISCORD_REASONING_WEBHOOK = os.getenv("DISCORD_REASONING_WEBHOOK", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -259,6 +260,59 @@ def send_trade_alert(message: str, channel: str = "premium"):
 
     if SEND_TELEGRAM_ALERTS:
         send_telegram_message(message)
+
+def send_reasoning_alert(content: str) -> bool:
+    if not DISCORD_REASONING_WEBHOOK:
+        return False
+    return send_discord_message(DISCORD_REASONING_WEBHOOK, content)
+
+def format_reasoning_block(signal: Dict[str, Any]) -> str:
+    meta = signal.get("meta", {})
+    side = signal.get("side", "N/A")
+    grade = signal.get("grade", "N/A")
+    score = signal.get("score", 0)
+    notes_text = signal.get("notes", "") or "N/A"
+
+    note_lines = [n.strip() for n in notes_text.split("|") if n.strip()]
+    if not note_lines:
+        note_lines = ["No reasoning notes available"]
+
+    reasons_block = "\n".join([f"• {n}" for n in note_lines])
+
+    warnings = []
+    momentum_pct = safe_float(meta.get("momentum_pct"), 0.0)
+    rsi = safe_float(meta.get("rsi"), 50.0)
+
+    if abs(momentum_pct) > 0.35:
+        warnings.append("Price is extended from the trigger level")
+    if side == "CALL" and rsi >= 70:
+        warnings.append("Long entry is getting extended on RSI")
+    if side == "PUT" and rsi <= 30:
+        warnings.append("Short entry is getting extended on RSI")
+
+    if not warnings:
+        warnings.append("No major warning flags")
+
+    warnings_block = "\n".join([f"• {w}" for w in warnings])
+
+    return (
+        "🧠 AI REASONING BREAKDOWN\n"
+        f"Direction: {side}\n"
+        f"Grade: {grade}\n"
+        f"Confidence: {score}\n\n"
+        "Reasons:\n"
+        f"{reasons_block}\n\n"
+        "Warnings:\n"
+        f"{warnings_block}\n\n"
+        "📊 AI MARKET CONTEXT\n\n"
+        f"{signal.get('symbol', 'N/A')} Underlying: {meta.get('underlying_price', 'N/A')}\n"
+        f"VWAP: {meta.get('vwap', 'N/A')}\n"
+        f"RSI: {meta.get('rsi', 'N/A')}\n"
+        f"Volume Ratio: {meta.get('volume_ratio', 'N/A')}\n"
+        f"Momentum: {meta.get('momentum_pct', 'N/A')}\n"
+        f"Interval: {meta.get('interval', 'N/A')}\n"
+        f"Bar Time: {meta.get('bar_time', 'N/A')}"
+    )
 
 # =========================================================
 # DATA FETCH
@@ -507,7 +561,6 @@ class BrokerBridge:
         filtered = []
         today = str(datetime.now().date())
 
-        # Expiry preference
         if OPTION_EXPIRY_MODE == "0dte":
             contracts = [c for c in contracts if c.get("expiration_date") == today]
         elif OPTION_EXPIRY_MODE == "0dte_or_next":
@@ -533,21 +586,23 @@ class BrokerBridge:
                 ask = safe_float(latest_quote.get("ap"), 0.0)
                 mid = round((bid + ask) / 2.0, 2) if (bid > 0 and ask > 0) else round(max(bid, ask), 2)
 
+                priced = True
                 if mid <= 0:
                     quote_result = self.fetch_latest_option_quote(symbol)
                     if quote_result.get("ok"):
                         bid = safe_float(quote_result.get("bid"), 0.0)
                         ask = safe_float(quote_result.get("ask"), 0.0)
                         mid = safe_float(quote_result.get("mid"), 0.0)
+                    else:
+                        priced = False
+                        mid = 0.0
 
-                if mid <= 0:
-                    continue
-                if mid < OPTION_MIN_PRICE or mid > OPTION_MAX_PRICE:
-                    continue
+                if priced:
+                    if mid < OPTION_MIN_PRICE or mid > OPTION_MAX_PRICE:
+                        continue
 
                 distance = abs(strike - underlying_price)
 
-                # ITM preference
                 itm_bonus = 0.0
                 if OPTION_STRIKE_MODE == "itm1":
                     if side.upper() == "CALL" and strike <= underlying_price:
@@ -563,6 +618,7 @@ class BrokerBridge:
                     "bid": bid,
                     "ask": ask,
                     "mid": mid,
+                    "priced": priced,
                     "distance": distance,
                     "itm_bonus": itm_bonus,
                     "contract": c
@@ -571,14 +627,14 @@ class BrokerBridge:
                 continue
 
         if not filtered:
-            return {"ok": False, "reason": f"no priced contract found for {underlying_symbol} {side}"}
+            return {"ok": False, "reason": f"no contract found for {underlying_symbol} {side}"}
 
         filtered.sort(
             key=lambda x: (
                 x["expiration_date"],
+                0 if x["priced"] else 1,
                 x["distance"] - x["itm_bonus"],
-                -x["open_interest"],
-                x["mid"]
+                -x["open_interest"]
             )
         )
 
@@ -591,6 +647,7 @@ class BrokerBridge:
             "bid": best["bid"],
             "ask": best["ask"],
             "mid": best["mid"],
+            "priced": best["priced"],
             "open_interest": best["open_interest"],
             "contract": best["contract"]
         }
@@ -620,10 +677,11 @@ class BrokerBridge:
 
             if payload["type"] == "limit":
                 quote = self.fetch_latest_option_quote(position["contract_symbol"])
-                if not quote.get("ok"):
-                    return {"ok": False, "reason": f"no quote for limit entry: {quote.get('reason')}"}
-                ask = safe_float(quote.get("ask"), 0.0)
-                limit_price = ask if ask > 0 else safe_float(quote.get("mid"), position["entry_price"])
+                if quote.get("ok"):
+                    ask = safe_float(quote.get("ask"), 0.0)
+                    limit_price = ask if ask > 0 else safe_float(quote.get("mid"), position["entry_price"])
+                else:
+                    limit_price = position["entry_price"]
                 limit_price = round(limit_price * (1 + OPTION_LIMIT_SLIPPAGE_PCT), 2)
                 payload["limit_price"] = str(limit_price)
 
@@ -761,47 +819,47 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
 
     if last_close > vwap:
         call_score += 28
-        notes_call.append("price above VWAP")
+        notes_call.append("Price above VWAP")
     if prev_close <= vwap and last_close > vwap:
         call_score += 18
-        notes_call.append("fresh VWAP reclaim")
+        notes_call.append("Fresh VWAP reclaim")
     if 52 <= rsi <= 72:
         call_score += 18
-        notes_call.append(f"RSI supportive ({round(rsi, 1)})")
+        notes_call.append(f"RSI supportive at {round(rsi, 1)}")
     elif rsi > 72:
         call_score += 5
-        notes_call.append(f"RSI strong but extended ({round(rsi, 1)})")
+        notes_call.append(f"RSI strong but extended at {round(rsi, 1)}")
     if vol_ratio >= 1.2:
         call_score += 15
-        notes_call.append(f"volume expansion x{round(vol_ratio, 2)}")
+        notes_call.append(f"Volume expansion x{round(vol_ratio, 2)}")
     if momentum_pct > 0:
         call_score += min(15, momentum_pct * 20)
-        notes_call.append(f"positive momentum {round(momentum_pct, 2)}%")
+        notes_call.append(f"Positive momentum {round(momentum_pct, 2)}%")
     if last_bar["close"] > prev_bar["high"]:
         call_score += 10
-        notes_call.append("broke previous candle high")
+        notes_call.append("Broke previous candle high")
 
     if last_close < vwap:
         put_score += 28
-        notes_put.append("price below VWAP")
+        notes_put.append("Price below VWAP")
     if prev_close >= vwap and last_close < vwap:
         put_score += 18
-        notes_put.append("fresh VWAP rejection")
+        notes_put.append("Fresh VWAP rejection")
     if 28 <= rsi <= 48:
         put_score += 18
-        notes_put.append(f"RSI bearish ({round(rsi, 1)})")
+        notes_put.append(f"RSI bearish at {round(rsi, 1)}")
     elif rsi < 28:
         put_score += 5
-        notes_put.append(f"RSI weak but extended ({round(rsi, 1)})")
+        notes_put.append(f"RSI weak but extended at {round(rsi, 1)}")
     if vol_ratio >= 1.2:
         put_score += 15
-        notes_put.append(f"volume expansion x{round(vol_ratio, 2)}")
+        notes_put.append(f"Volume expansion x{round(vol_ratio, 2)}")
     if momentum_pct < 0:
         put_score += min(15, abs(momentum_pct) * 20)
-        notes_put.append(f"negative momentum {round(momentum_pct, 2)}%")
+        notes_put.append(f"Negative momentum {round(momentum_pct, 2)}%")
     if last_bar["close"] < prev_bar["low"]:
         put_score += 10
-        notes_put.append("broke previous candle low")
+        notes_put.append("Broke previous candle low")
 
     side = None
     score = 0.0
@@ -1147,7 +1205,9 @@ class EliteExecutionEngine:
         if not contract_pick.get("ok"):
             return {"ok": False, "reason": f"contract selection failed: {contract_pick.get('reason')}"}
 
-        signal["entry_price"] = round(safe_float(contract_pick.get("mid"), signal.get("entry_price", 0.0)), 2)
+        contract_mid = safe_float(contract_pick.get("mid"), 0.0)
+        if contract_mid > 0:
+            signal["entry_price"] = round(contract_mid, 2)
 
         plan = self.build_trade_plan(signal)
         trade_id = f"{symbol}_{side}_{int(time.time())}"
@@ -1162,6 +1222,7 @@ class EliteExecutionEngine:
             "contract_strike": safe_float(contract_pick.get("strike_price"), 0.0),
             "contract_bid": safe_float(contract_pick.get("bid"), 0.0),
             "contract_ask": safe_float(contract_pick.get("ask"), 0.0),
+            "contract_priced": bool(contract_pick.get("priced", False)),
             "grade": signal.get("grade", "N/A"),
             "score": safe_float(signal.get("score", 0)),
             "status": "OPEN",
@@ -1209,7 +1270,6 @@ class EliteExecutionEngine:
             position["current_price"] = position["entry_price"]
             position["monitor"]["last_option_price"] = position["entry_price"]
 
-            # rebuild levels off actual fill if different
             position["stop_price"] = round(position["entry_price"] * (1 - safe_float(signal.get("stop_pct", DEFAULT_STOP_PCT))), 2)
             position["tp1_price"] = round(position["entry_price"] * (1 + safe_float(signal.get("tp1_pct", DEFAULT_TP1_PCT))), 2)
             position["tp2_price"] = round(position["entry_price"] * (1 + safe_float(signal.get("tp2_pct", DEFAULT_TP2_PCT))), 2)
@@ -1499,7 +1559,6 @@ def estimate_option_price_from_underlying(position: Dict[str, Any], underlying_p
         return max(MIN_OPTION_PRICE, round(safe_float(position.get("current_price", entry_option), entry_option), 2))
 
     move_pct = (underlying_price - entry_underlying) / entry_underlying
-
     if position.get("side") == "PUT":
         move_pct = -move_pct
 
@@ -1508,9 +1567,7 @@ def estimate_option_price_from_underlying(position: Dict[str, Any], underlying_p
     return round(est, 2)
 
 def fetch_live_position_price(position: Dict[str, Any]) -> Tuple[bool, float, str]:
-    source = OPTION_MARK_SOURCE
-
-    if source == "alpaca":
+    if OPTION_MARK_SOURCE == "alpaca":
         live = broker_bridge.fetch_option_market_price(position)
         if live.get("ok"):
             return True, round(safe_float(live["price"]), 2), "alpaca"
@@ -1790,9 +1847,9 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "stop_pct": 0.25,
             "tp1_pct": 0.30,
             "tp2_pct": 0.60,
-            "notes": "Telegram test CALL",
+            "notes": "Telegram test CALL | Power hour volatility increased | 5m momentum confirms entry | Above VWAP",
             "manual": True,
-            "meta": {"underlying_price": 500.0}
+            "meta": {"underlying_price": 500.0, "vwap": 498.4, "rsi": 65.2, "volume_ratio": 1.4, "momentum_pct": 0.22, "interval": SCAN_INTERVAL, "bar_time": now_str()}
         }
         result = process_trade_signal(signal)
         return f"TEST CALL: {result}"
@@ -1809,9 +1866,9 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "stop_pct": 0.25,
             "tp1_pct": 0.30,
             "tp2_pct": 0.60,
-            "notes": "Telegram test PUT",
+            "notes": "Telegram test PUT | Fresh VWAP rejection | Negative momentum confirmed",
             "manual": True,
-            "meta": {"underlying_price": 500.0}
+            "meta": {"underlying_price": 500.0, "vwap": 501.2, "rsi": 38.7, "volume_ratio": 1.5, "momentum_pct": -0.24, "interval": SCAN_INTERVAL, "bar_time": now_str()}
         }
         result = process_trade_signal(signal)
         return f"TEST PUT: {result}"
@@ -1865,6 +1922,12 @@ def scan_once() -> List[Dict[str, Any]]:
 
 def process_signals(signals: List[Dict[str, Any]]):
     for signal in signals:
+        try:
+            reasoning_msg = format_reasoning_block(signal)
+            send_reasoning_alert(reasoning_msg)
+        except Exception as e:
+            log_debug(f"REASONING ALERT ERROR [{signal.get('symbol', 'N/A')}]: {e}")
+
         print(f"[PROCESS] Sending signal into engine -> {signal['symbol']} {signal['side']}", flush=True)
         result = process_trade_signal(signal)
 
@@ -1943,11 +2006,12 @@ def run_test_mode():
         "stop_pct": 0.25,
         "tp1_pct": 0.30,
         "tp2_pct": 0.60,
-        "notes": "VWAP reclaim + premium test",
+        "notes": "VWAP reclaim + premium test | Tech strong | 5m momentum confirms entry",
         "manual": True,
-        "meta": {"underlying_price": 500.0}
+        "meta": {"underlying_price": 500.0, "vwap": 498.4, "rsi": 65.2, "volume_ratio": 1.4, "momentum_pct": 0.22, "interval": SCAN_INTERVAL, "bar_time": now_str()}
     }
 
+    print("REASONING:", format_reasoning_block(test_signal), flush=True)
     result = process_trade_signal(test_signal)
     print("TRADE RESULT:", result, flush=True)
     print("STATUS:", cmd_status(), flush=True)
@@ -1989,6 +2053,7 @@ if __name__ == "__main__":
     print(f"BROKER_PAPER: {BROKER_PAPER}", flush=True)
     print(f"ALPACA_TRADING_BASE_URL: {ALPACA_TRADING_BASE_URL}", flush=True)
     print(f"ALPACA_DATA_BASE_URL: {ALPACA_DATA_BASE_URL}", flush=True)
+    print(f"DISCORD_REASONING_WEBHOOK_SET: {bool(DISCORD_REASONING_WEBHOOK)}", flush=True)
     print(f"MARKET_IS_OPEN_NOW: {market_is_open()}", flush=True)
 
     if TEST_MODE:
