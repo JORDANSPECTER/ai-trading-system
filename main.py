@@ -329,12 +329,6 @@ class BrokerBridge:
         }
 
     def submit_entry_order(self, position: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        PAPER MODE:
-            Creates a local simulated fill immediately.
-        LIVE MODE:
-            Replace this stub with your broker API order submission logic.
-        """
         if PAPER_TRADING or not self.enabled:
             broker_order_id = f"paper_entry_{uuid.uuid4().hex[:12]}"
             return {
@@ -345,32 +339,9 @@ class BrokerBridge:
                 "mode": "PAPER"
             }
 
-        # ==============================
-        # LIVE BROKER STUB START
-        # ==============================
-        # Replace this with your real broker order submit logic.
-        # Example shape of return expected:
-        #
-        # return {
-        #     "ok": True,
-        #     "broker_order_id": "abc123",
-        #     "broker_status": "submitted",
-        #     "fill_price": None,
-        #     "mode": "LIVE"
-        # }
-        #
-        # If broker rejects:
-        # return {"ok": False, "reason": "broker rejected order"}
-        # ==============================
         return {"ok": False, "reason": "Live broker submit not implemented"}
 
     def submit_close_order(self, position: Dict[str, Any], exit_price: float) -> Dict[str, Any]:
-        """
-        PAPER MODE:
-            Simulates immediate close.
-        LIVE MODE:
-            Replace with real broker close logic.
-        """
         if PAPER_TRADING or not self.enabled:
             broker_order_id = f"paper_close_{uuid.uuid4().hex[:12]}"
             return {
@@ -384,10 +355,6 @@ class BrokerBridge:
         return {"ok": False, "reason": "Live broker close not implemented"}
 
     def sync_position(self, position: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Optional future upgrade:
-        pull live broker state and update local position.
-        """
         if PAPER_TRADING or not self.enabled:
             return {"ok": True, "synced": False, "reason": "paper/local mode"}
         return {"ok": False, "reason": "Live broker sync not implemented"}
@@ -939,6 +906,41 @@ class EliteExecutionEngine:
 elite_engine = EliteExecutionEngine()
 
 # =========================================================
+# PAPER FILL CONTROL HELPERS
+# =========================================================
+def get_open_position_by_trade_id(trade_id: str) -> Optional[Dict[str, Any]]:
+    pos = elite_engine.state["open_positions"].get(trade_id)
+    if not pos:
+        return None
+    if pos.get("status") != "OPEN":
+        return None
+    return pos
+
+def cmd_set_price(trade_id: str, price: float) -> Dict[str, Any]:
+    return elite_engine.update_position_price(trade_id, price)
+
+def cmd_hit_tp1(trade_id: str) -> Dict[str, Any]:
+    pos = get_open_position_by_trade_id(trade_id)
+    if not pos:
+        return {"ok": False, "reason": "Trade not found or not open"}
+    target_price = pos["tp1_price"]
+    return elite_engine.update_position_price(trade_id, target_price)
+
+def cmd_hit_tp2(trade_id: str) -> Dict[str, Any]:
+    pos = get_open_position_by_trade_id(trade_id)
+    if not pos:
+        return {"ok": False, "reason": "Trade not found or not open"}
+    target_price = pos["tp2_price"]
+    return elite_engine.update_position_price(trade_id, target_price)
+
+def cmd_hit_stop(trade_id: str) -> Dict[str, Any]:
+    pos = get_open_position_by_trade_id(trade_id)
+    if not pos:
+        return {"ok": False, "reason": "Trade not found or not open"}
+    stop_price = pos["stop_price"]
+    return elite_engine.update_position_price(trade_id, stop_price)
+
+# =========================================================
 # COMMAND HELPERS
 # =========================================================
 def process_trade_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
@@ -976,8 +978,8 @@ def cmd_positions_text() -> str:
     for p in positions[:10]:
         lines.append(
             f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | "
-            f"Entry {p['entry_price']} | Current {p['current_price']} | Contracts {p['contracts']} | "
-            f"Broker {p.get('broker_status')}"
+            f"Entry {p['entry_price']} | Current {p['current_price']} | Stop {p['stop_price']} | "
+            f"TP1 {p['tp1_price']} | TP2 {p['tp2_price']} | Contracts {p['contracts']} | Broker {p.get('broker_status')}"
         )
     return "\n".join(lines)
 
@@ -1013,7 +1015,11 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "/closeall - close open positions\n"
             "/close <trade_id> - close a specific trade\n"
             "/testcall - create test CALL signal\n"
-            "/testput - create test PUT signal"
+            "/testput - create test PUT signal\n"
+            "/setprice <trade_id> <price> - set current price\n"
+            "/tp1 <trade_id> - simulate TP1 hit\n"
+            "/tp2 <trade_id> - simulate TP2 hit\n"
+            "/stop <trade_id> - simulate stop hit"
         )
 
     if text == "/ping":
@@ -1044,7 +1050,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
         ]
         for p in s["open_positions"][:5]:
             lines.append(
-                f"- {p['symbol']} {p['side']} | {p['grade']} | Entry {p['entry_price']} | Current {p['current_price']}"
+                f"- {p['trade_id']} | {p['symbol']} {p['side']} | Entry {p['entry_price']} | Current {p['current_price']}"
             )
         return "\n".join(lines)
 
@@ -1077,6 +1083,38 @@ def handle_telegram_command(text: str) -> Optional[str]:
         exit_price = safe_float(pos.get("current_price", pos.get("entry_price", 0)))
         result = cmd_close_trade(trade_id, exit_price)
         return f"CLOSE RESULT: {result}"
+
+    if text.startswith("/setprice "):
+        parts = text.split()
+        if len(parts) != 3:
+            return "Usage: /setprice <trade_id> <price>"
+        trade_id = parts[1].strip()
+        price = safe_float(parts[2], -1)
+        if price <= 0:
+            return "Invalid price."
+        result = cmd_set_price(trade_id, price)
+        return f"SET PRICE RESULT: {result}"
+
+    if text.startswith("/tp1 "):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            return "Usage: /tp1 <trade_id>"
+        result = cmd_hit_tp1(parts[1].strip())
+        return f"TP1 RESULT: {result}"
+
+    if text.startswith("/tp2 "):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            return "Usage: /tp2 <trade_id>"
+        result = cmd_hit_tp2(parts[1].strip())
+        return f"TP2 RESULT: {result}"
+
+    if text.startswith("/stop "):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            return "Usage: /stop <trade_id>"
+        result = cmd_hit_stop(parts[1].strip())
+        return f"STOP RESULT: {result}"
 
     if text == "/testcall":
         signal = {
@@ -1177,7 +1215,7 @@ def process_signals(signals: List[Dict[str, Any]]):
 # MAIN LOOP
 # =========================================================
 def run_engine_loop():
-    log_debug("Elite broker bridge engine started.")
+    log_debug("Paper fill control engine started.")
     print("=== ENGINE LOOP STARTED ===", flush=True)
 
     last_scan_ts = 0.0
