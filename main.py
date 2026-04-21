@@ -23,6 +23,7 @@ TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 SCAN_SYMBOLS = [s.strip().upper() for s in os.getenv("SCAN_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
 SCAN_INTERVAL = os.getenv("SCAN_INTERVAL", "5min")
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
+TELEGRAM_POLL_SECONDS = int(os.getenv("TELEGRAM_POLL_SECONDS", "2"))
 MIN_BARS = int(os.getenv("MIN_BARS", "40"))
 
 ALLOW_CALLS = os.getenv("ALLOW_CALLS", "true").lower() == "true"
@@ -206,7 +207,6 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
 
     values = list(reversed(data["values"]))
     bars = []
-
     for row in values:
         bars.append({
             "datetime": row.get("datetime"),
@@ -216,7 +216,6 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
             "close": safe_float(row.get("close")),
             "volume": safe_float(row.get("volume"))
         })
-
     return bars
 
 # =========================================================
@@ -225,16 +224,13 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
 def compute_vwap(bars: List[Dict[str, Any]]) -> float:
     cumulative_pv = 0.0
     cumulative_vol = 0.0
-
     for b in bars:
         typical = (b["high"] + b["low"] + b["close"]) / 3.0
         vol = max(b["volume"], 0.0)
         cumulative_pv += typical * vol
         cumulative_vol += vol
-
     if cumulative_vol == 0:
         return bars[-1]["close"]
-
     return cumulative_pv / cumulative_vol
 
 def compute_rsi(closes: List[float], period: int = 14) -> float:
@@ -243,7 +239,6 @@ def compute_rsi(closes: List[float], period: int = 14) -> float:
 
     gains = []
     losses = []
-
     for i in range(1, period + 1):
         diff = closes[-i] - closes[-i - 1]
         if diff >= 0:
@@ -319,11 +314,9 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
 
     vwap = compute_vwap(bars[-30:])
     rsi = compute_rsi(closes, 14)
-
     avg_vol = average_volume(bars[:-1], 10)
     last_vol = last_bar["volume"]
     vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 1.0
-
     momentum_pct = price_change_pct(prev_close, last_close)
 
     call_score = 0.0
@@ -334,26 +327,21 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
     if last_close > vwap:
         call_score += 28
         notes_call.append("price above VWAP")
-
     if prev_close <= vwap and last_close > vwap:
         call_score += 18
         notes_call.append("fresh VWAP reclaim")
-
     if 52 <= rsi <= 72:
         call_score += 18
         notes_call.append(f"RSI supportive ({round(rsi, 1)})")
     elif rsi > 72:
         call_score += 5
         notes_call.append(f"RSI strong but extended ({round(rsi, 1)})")
-
     if vol_ratio >= 1.2:
         call_score += 15
         notes_call.append(f"volume expansion x{round(vol_ratio, 2)}")
-
     if momentum_pct > 0:
         call_score += min(15, momentum_pct * 20)
         notes_call.append(f"positive momentum {round(momentum_pct, 2)}%")
-
     if last_bar["close"] > prev_bar["high"]:
         call_score += 10
         notes_call.append("broke previous candle high")
@@ -361,26 +349,21 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
     if last_close < vwap:
         put_score += 28
         notes_put.append("price below VWAP")
-
     if prev_close >= vwap and last_close < vwap:
         put_score += 18
         notes_put.append("fresh VWAP rejection")
-
     if 28 <= rsi <= 48:
         put_score += 18
         notes_put.append(f"RSI bearish ({round(rsi, 1)})")
     elif rsi < 28:
         put_score += 5
         notes_put.append(f"RSI weak but extended ({round(rsi, 1)})")
-
     if vol_ratio >= 1.2:
         put_score += 15
         notes_put.append(f"volume expansion x{round(vol_ratio, 2)}")
-
     if momentum_pct < 0:
         put_score += min(15, abs(momentum_pct) * 20)
         notes_put.append(f"negative momentum {round(momentum_pct, 2)}%")
-
     if last_bar["close"] < prev_bar["low"]:
         put_score += 10
         notes_put.append("broke previous candle low")
@@ -400,17 +383,15 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
 
     if not side:
         return None
-
     if score < PREMIUM_MIN_SCORE:
         return None
-
     if signal_cooldown_hit(symbol, side):
         return None
 
     grade = grade_from_score(score)
     entry_price_proxy = max(0.50, round(abs(last_close * 0.0025), 2))
 
-    signal = {
+    return {
         "signal_id": f"{symbol}_{side}_{int(time.time())}",
         "symbol": symbol,
         "side": side,
@@ -433,8 +414,6 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
             "bar_time": last_bar["datetime"]
         }
     }
-
-    return signal
 
 def build_alert_text(signal: Dict[str, Any], execution_result: Optional[Dict[str, Any]] = None) -> str:
     meta = signal.get("meta", {})
@@ -503,7 +482,6 @@ def load_engine_state() -> Dict[str, Any]:
     state.setdefault("open_positions", {})
     state.setdefault("last_signal_ids", [])
     state.setdefault("last_reset", now_str())
-
     return state
 
 def save_engine_state(state: Dict[str, Any]):
@@ -736,7 +714,6 @@ class EliteExecutionEngine:
             pos["tp1_hit"] = True
             if pos["trail_after_tp1"]:
                 pos["stop_price"] = round(pos["entry_price"], 2)
-
             append_trade_log({
                 "event": "TP1_HIT",
                 "time": now_str(),
@@ -870,6 +847,19 @@ def cmd_flatten(exit_price_map: Optional[Dict[str, float]] = None):
 def cmd_close_trade(trade_id: str, exit_price: float):
     return elite_engine.close_position(trade_id, exit_price, "MANUAL_CLOSE")
 
+def cmd_positions_text() -> str:
+    positions = elite_engine.get_open_positions()
+    if not positions:
+        return "No open positions."
+
+    lines = ["Open Positions"]
+    for p in positions[:10]:
+        lines.append(
+            f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | "
+            f"Entry {p['entry_price']} | Current {p['current_price']} | Contracts {p['contracts']}"
+        )
+    return "\n".join(lines)
+
 # =========================================================
 # TELEGRAM COMMAND CENTER
 # =========================================================
@@ -879,14 +869,17 @@ def handle_telegram_command(text: str) -> Optional[str]:
     if text in ["/start", "/help"]:
         return (
             "UB Engine Command Center\n\n"
+            "/ping - test bot\n"
             "/status - engine status\n"
-            "/summary - open positions summary\n"
+            "/summary - summary\n"
+            "/positions - open positions\n"
             "/lock - lock engine\n"
             "/unlock - unlock engine\n"
             "/flatten - close open positions\n"
+            "/closeall - close open positions\n"
+            "/close <trade_id> - close a specific trade\n"
             "/testcall - create test CALL signal\n"
-            "/testput - create test PUT signal\n"
-            "/ping - test bot"
+            "/testput - create test PUT signal"
         )
 
     if text == "/ping":
@@ -921,15 +914,32 @@ def handle_telegram_command(text: str) -> Optional[str]:
             )
         return "\n".join(lines)
 
+    if text == "/positions":
+        return cmd_positions_text()
+
     if text == "/lock":
         return cmd_lock("Telegram manual lock")["message"]
 
     if text == "/unlock":
         return cmd_unlock()["message"]
 
-    if text == "/flatten":
+    if text in ["/flatten", "/closeall"]:
         result = cmd_flatten()
-        return f"Flatten sent. Closed: {len(result.get('results', []))}"
+        return f"Close all sent. Closed: {len(result.get('results', []))}"
+
+    if text.startswith("/close "):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            return "Usage: /close <trade_id>"
+        trade_id = parts[1].strip()
+
+        pos = elite_engine.state["open_positions"].get(trade_id)
+        if not pos or pos.get("status") != "OPEN":
+            return f"Trade not found or already closed: {trade_id}"
+
+        exit_price = safe_float(pos.get("current_price", pos.get("entry_price", 0)))
+        result = cmd_close_trade(trade_id, exit_price)
+        return f"CLOSE RESULT: {result}"
 
     if text == "/testcall":
         signal = {
@@ -971,15 +981,23 @@ def handle_telegram_command(text: str) -> Optional[str]:
 
 def poll_telegram_commands():
     updates = get_telegram_updates()
+    if not updates:
+        return
+
     for update in updates:
         message = update.get("message", {})
         text = message.get("text", "")
         chat = str(message.get("chat", {}).get("id", ""))
 
+        print(f"[TELEGRAM CMD] Received: {text}", flush=True)
+
         if TELEGRAM_CHAT_ID and chat != TELEGRAM_CHAT_ID:
+            print(f"[TELEGRAM CMD] Ignored wrong chat: {chat}", flush=True)
             continue
 
         reply = handle_telegram_command(text)
+        print(f"[TELEGRAM CMD] Reply: {reply}", flush=True)
+
         if reply:
             send_telegram_message(reply)
 
@@ -1025,27 +1043,37 @@ def run_engine_loop():
     log_debug("Elite merged engine started.")
     print("=== ENGINE LOOP STARTED ===", flush=True)
 
+    last_scan_ts = 0.0
+    last_heartbeat_ts = 0.0
+    heartbeat_interval = 30
+
     while True:
         try:
-            print(f"Loop heartbeat: {now_str()}", flush=True)
+            now_ts = time.time()
+
+            if now_ts - last_heartbeat_ts >= heartbeat_interval:
+                print(f"Loop heartbeat: {now_str()}", flush=True)
+                last_heartbeat_ts = now_ts
 
             if TELEGRAM_COMMANDS_ENABLED:
-                print("[TELEGRAM] Polling commands...", flush=True)
                 poll_telegram_commands()
 
             current_market_status = market_is_open()
-            print(f"Market open: {current_market_status} | TEST_MODE: {TEST_MODE}", flush=True)
+            should_scan = (now_ts - last_scan_ts) >= SCAN_SECONDS
 
-            if current_market_status or TEST_MODE:
-                signals = scan_once()
-                print(f"Signals found: {len(signals)}", flush=True)
+            if should_scan:
+                last_scan_ts = now_ts
+                print(f"[SCAN TIMER] Market open: {current_market_status} | TEST_MODE: {TEST_MODE}", flush=True)
 
-                if signals:
-                    process_signals(signals)
-            else:
-                print("Market closed. Waiting for next loop.", flush=True)
+                if current_market_status or TEST_MODE:
+                    signals = scan_once()
+                    print(f"[SCAN TIMER] Signals found: {len(signals)}", flush=True)
+                    if signals:
+                        process_signals(signals)
+                else:
+                    print("[SCAN TIMER] Market closed. Waiting for next scan window.", flush=True)
 
-            time.sleep(SCAN_SECONDS)
+            time.sleep(TELEGRAM_POLL_SECONDS)
 
         except KeyboardInterrupt:
             log_debug("Engine stopped by user.")
@@ -1090,21 +1118,6 @@ def run_test_mode():
     print("STATUS:", cmd_status(), flush=True)
     print("SUMMARY:", cmd_summary(), flush=True)
 
-    if result.get("ok"):
-        trade_id = result["trade_id"]
-
-        print("\n--- SIMULATE TP1 ---", flush=True)
-        print(elite_engine.update_position_price(trade_id, 1.90), flush=True)
-
-        print("\n--- SIMULATE TP2 ---", flush=True)
-        print(elite_engine.update_position_price(trade_id, 2.35), flush=True)
-
-        print("\n--- MANUAL CLOSE ---", flush=True)
-        print(cmd_close_trade(trade_id, 2.10), flush=True)
-
-        print("\n--- FINAL SUMMARY ---", flush=True)
-        print(cmd_summary(), flush=True)
-
 # =========================================================
 # ENTRY
 # =========================================================
@@ -1117,6 +1130,7 @@ if __name__ == "__main__":
     print(f"SCAN_SYMBOLS: {SCAN_SYMBOLS}", flush=True)
     print(f"SCAN_INTERVAL: {SCAN_INTERVAL}", flush=True)
     print(f"SCAN_SECONDS: {SCAN_SECONDS}", flush=True)
+    print(f"TELEGRAM_POLL_SECONDS: {TELEGRAM_POLL_SECONDS}", flush=True)
     print(f"TELEGRAM_COMMANDS_ENABLED: {TELEGRAM_COMMANDS_ENABLED}", flush=True)
     print(f"MARKET_IS_OPEN_NOW: {market_is_open()}", flush=True)
 
