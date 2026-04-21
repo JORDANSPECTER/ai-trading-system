@@ -408,7 +408,6 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
         return None
 
     grade = grade_from_score(score)
-
     entry_price_proxy = max(0.50, round(abs(last_close * 0.0025), 2))
 
     signal = {
@@ -423,6 +422,7 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
         "tp1_pct": DEFAULT_TP1_PCT,
         "tp2_pct": DEFAULT_TP2_PCT,
         "notes": " | ".join(notes),
+        "manual": False,
         "meta": {
             "underlying_price": round(last_close, 2),
             "vwap": round(vwap, 2),
@@ -589,7 +589,8 @@ class EliteExecutionEngine:
         if not AUTO_EXECUTION_ENABLED:
             return False, "Auto execution disabled"
 
-        if not market_is_open() and not TEST_MODE:
+        is_manual = signal.get("manual", False)
+        if not market_is_open() and not TEST_MODE and not is_manual:
             return False, "Market is closed"
 
         if self.state["daily_trade_count"] >= MAX_TRADES_PER_DAY:
@@ -692,6 +693,7 @@ class EliteExecutionEngine:
             "close_reason": "",
             "notes": signal.get("notes", ""),
             "mode": "PAPER" if PAPER_TRADING else "LIVE",
+            "manual": signal.get("manual", False),
             "meta": signal.get("meta", {})
         }
 
@@ -710,7 +712,8 @@ class EliteExecutionEngine:
             "entry_price": position["entry_price"],
             "contracts": position["contracts"],
             "risk_dollars": position["risk_dollars"],
-            "mode": position["mode"]
+            "mode": position["mode"],
+            "manual": position["manual"]
         })
 
         return {"ok": True, "trade_id": trade_id, "position": position}
@@ -905,7 +908,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
     if text == "/summary":
         s = cmd_summary()
         lines = [
-            f"Summary",
+            "Summary",
             f"Date: {s['date']}",
             f"Locked: {s['engine_locked']}",
             f"Daily PnL: {s['daily_realized_pnl']}",
@@ -940,7 +943,8 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "stop_pct": 0.25,
             "tp1_pct": 0.30,
             "tp2_pct": 0.60,
-            "notes": "Telegram test CALL"
+            "notes": "Telegram test CALL",
+            "manual": True
         }
         result = process_trade_signal(signal)
         return f"TEST CALL: {result}"
@@ -957,7 +961,8 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "stop_pct": 0.25,
             "tp1_pct": 0.30,
             "tp2_pct": 0.60,
-            "notes": "Telegram test PUT"
+            "notes": "Telegram test PUT",
+            "manual": True
         }
         result = process_trade_signal(signal)
         return f"TEST PUT: {result}"
@@ -1068,6 +1073,7 @@ def run_test_mode():
         "tp1_pct": 0.30,
         "tp2_pct": 0.60,
         "notes": "VWAP reclaim + premium test",
+        "manual": True,
         "meta": {
             "underlying_price": 450.0,
             "vwap": 449.2,
