@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import math
 import requests
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
@@ -12,7 +13,7 @@ from typing import Dict, Any, Optional, List, Tuple
 ENGINE_STATE_FILE = "engine_state.json"
 TRADE_LOG_FILE = "trade_log.json"
 BOT_RUNTIME_FILE = "bot_runtime.json"
-MAX_HISTORY = 500
+MAX_HISTORY = 1000
 
 # =========================================================
 # ENV CONFIG
@@ -45,6 +46,26 @@ DEFAULT_STOP_PCT = float(os.getenv("DEFAULT_STOP_PCT", "0.25"))
 DEFAULT_TP1_PCT = float(os.getenv("DEFAULT_TP1_PCT", "0.30"))
 DEFAULT_TP2_PCT = float(os.getenv("DEFAULT_TP2_PCT", "0.60"))
 DEFAULT_TRAIL_AFTER_TP1 = os.getenv("DEFAULT_TRAIL_AFTER_TP1", "true").lower() == "true"
+
+# =========================================================
+# AUTO SCALE / TRAIL CONFIG
+# =========================================================
+AUTO_SCALE_ENABLED = os.getenv("AUTO_SCALE_ENABLED", "true").lower() == "true"
+TP1_SCALE_PCT = float(os.getenv("TP1_SCALE_PCT", "0.50"))   # close 50% at TP1
+TP2_SCALE_PCT = float(os.getenv("TP2_SCALE_PCT", "0.50"))   # close 50% of remaining at TP2
+SMART_TRAIL_ENABLED = os.getenv("SMART_TRAIL_ENABLED", "true").lower() == "true"
+TRAIL_BEFORE_TP2_PCT = float(os.getenv("TRAIL_BEFORE_TP2_PCT", "0.10"))
+TRAIL_AFTER_TP2_PCT = float(os.getenv("TRAIL_AFTER_TP2_PCT", "0.08"))
+MIN_CONTRACTS_TO_SCALE = int(os.getenv("MIN_CONTRACTS_TO_SCALE", "2"))
+
+# =========================================================
+# LIVE POSITION MONITOR CONFIG
+# =========================================================
+POSITION_MONITOR_ENABLED = os.getenv("POSITION_MONITOR_ENABLED", "true").lower() == "true"
+POSITION_MONITOR_SECONDS = int(os.getenv("POSITION_MONITOR_SECONDS", "5"))
+OPTION_MARK_SOURCE = os.getenv("OPTION_MARK_SOURCE", "auto").strip().lower()   # auto, broker, estimate
+OPTION_PRICE_SENSITIVITY = float(os.getenv("OPTION_PRICE_SENSITIVITY", "18"))
+MIN_OPTION_PRICE = float(os.getenv("MIN_OPTION_PRICE", "0.05"))
 
 MARKET_OPEN_HOUR = int(os.getenv("MARKET_OPEN_HOUR", "9"))
 MARKET_OPEN_MINUTE = int(os.getenv("MARKET_OPEN_MINUTE", "30"))
@@ -91,6 +112,15 @@ def safe_float(value, default=0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+def safe_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 def load_json_file(path: str, default):
     if not os.path.exists(path):
@@ -191,6 +221,22 @@ def get_telegram_updates() -> List[Dict[str, Any]]:
         print(f"Telegram update error: {e}", flush=True)
         return []
 
+def send_trade_alert(message: str, channel: str = "premium"):
+    print(f"[ALERT] {message}", flush=True)
+
+    if channel == "free":
+        if SEND_FREE_ALERTS and DISCORD_FREE_WEBHOOK:
+            send_discord_message(DISCORD_FREE_WEBHOOK, message)
+    elif channel == "premium":
+        if SEND_PREMIUM_ALERTS and DISCORD_PREMIUM_WEBHOOK:
+            send_discord_message(DISCORD_PREMIUM_WEBHOOK, message)
+    elif channel == "debug":
+        if DEBUG_LOGGING and DISCORD_DEBUG_WEBHOOK:
+            send_discord_message(DISCORD_DEBUG_WEBHOOK, message)
+
+    if SEND_TELEGRAM_ALERTS:
+        send_telegram_message(message)
+
 # =========================================================
 # DATA FETCH
 # =========================================================
@@ -225,6 +271,12 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
             "volume": safe_float(row.get("volume"))
         })
     return bars
+
+def fetch_latest_underlying_price(symbol: str) -> float:
+    bars = fetch_twelve_data_bars(symbol, interval=SCAN_INTERVAL, outputsize=2)
+    if not bars:
+        raise ValueError(f"No bars for {symbol}")
+    return safe_float(bars[-1]["close"], 0.0)
 
 # =========================================================
 # INDICATORS
@@ -341,6 +393,21 @@ class BrokerBridge:
 
         return {"ok": False, "reason": "Live broker submit not implemented"}
 
+    def submit_partial_close_order(self, position: Dict[str, Any], exit_price: float, contracts_to_close: int, reason: str) -> Dict[str, Any]:
+        if PAPER_TRADING or not self.enabled:
+            broker_order_id = f"paper_partial_{uuid.uuid4().hex[:12]}"
+            return {
+                "ok": True,
+                "broker_order_id": broker_order_id,
+                "broker_status": "filled",
+                "fill_price": round(exit_price, 2),
+                "contracts_closed": contracts_to_close,
+                "reason": reason,
+                "mode": "PAPER"
+            }
+
+        return {"ok": False, "reason": "Live broker partial close not implemented"}
+
     def submit_close_order(self, position: Dict[str, Any], exit_price: float) -> Dict[str, Any]:
         if PAPER_TRADING or not self.enabled:
             broker_order_id = f"paper_close_{uuid.uuid4().hex[:12]}"
@@ -354,10 +421,41 @@ class BrokerBridge:
 
         return {"ok": False, "reason": "Live broker close not implemented"}
 
-    def sync_position(self, position: Dict[str, Any]) -> Dict[str, Any]:
-        if PAPER_TRADING or not self.enabled:
-            return {"ok": True, "synced": False, "reason": "paper/local mode"}
-        return {"ok": False, "reason": "Live broker sync not implemented"}
+    def fetch_option_market_price(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Expected live broker endpoint example:
+        GET {BROKER_BASE_URL}/option_price?symbol=QQQ&side=CALL&trade_id=...
+        Returns:
+        {
+            "ok": true,
+            "price": 1.42
+        }
+        """
+        if not self.enabled or not self.base_url:
+            return {"ok": False, "reason": "broker price endpoint unavailable"}
+
+        try:
+            url = f"{self.base_url.rstrip('/')}/option_price"
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            params = {
+                "symbol": position.get("symbol"),
+                "side": position.get("side"),
+                "trade_id": position.get("trade_id"),
+                "broker_order_id": position.get("broker_order_id", "")
+            }
+
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            data = r.json()
+            price = safe_float(data.get("price"), 0.0)
+
+            if price > 0:
+                return {"ok": True, "price": round(price, 2)}
+            return {"ok": False, "reason": f"invalid broker price response: {data}"}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
 
 broker_bridge = BrokerBridge()
 
@@ -477,42 +575,6 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
             "bar_time": last_bar["datetime"]
         }
     }
-
-def build_alert_text(signal: Dict[str, Any], execution_result: Optional[Dict[str, Any]] = None) -> str:
-    meta = signal.get("meta", {})
-    lines = [
-        f"🚨 {signal['symbol']} {signal['side']} SIGNAL",
-        f"Grade: {signal['grade']} | Score: {signal['score']}",
-        f"Underlying: {meta.get('underlying_price', 'N/A')} | VWAP: {meta.get('vwap', 'N/A')} | RSI: {meta.get('rsi', 'N/A')}",
-        f"Vol Ratio: {meta.get('volume_ratio', 'N/A')} | Momentum: {meta.get('momentum_pct', 'N/A')}%",
-        f"Entry Proxy: {signal.get('entry_price')} | Risk: ${signal.get('risk_amount')}",
-        f"Notes: {signal.get('notes', '')}",
-        f"Bar Time: {meta.get('bar_time', 'N/A')}"
-    ]
-
-    if execution_result:
-        if execution_result.get("ok"):
-            pos = execution_result.get("position", {})
-            lines.append(
-                f"Execution: OK | Mode: {pos.get('mode', 'PAPER')} | Contracts: {pos.get('contracts')} | "
-                f"Stop: {pos.get('stop_price')} | TP1: {pos.get('tp1_price')} | TP2: {pos.get('tp2_price')}"
-            )
-        else:
-            lines.append(f"Execution Blocked: {execution_result.get('reason', 'unknown')}")
-
-    return "\n".join(lines)
-
-def route_signal_alerts(signal: Dict[str, Any], execution_result: Optional[Dict[str, Any]] = None):
-    text = build_alert_text(signal, execution_result)
-
-    if SEND_PREMIUM_ALERTS and signal["score"] >= PREMIUM_MIN_SCORE and DISCORD_PREMIUM_WEBHOOK:
-        send_discord_message(DISCORD_PREMIUM_WEBHOOK, text)
-
-    if SEND_FREE_ALERTS and signal["score"] >= FREE_MIN_SCORE and DISCORD_FREE_WEBHOOK:
-        send_discord_message(DISCORD_FREE_WEBHOOK, text)
-
-    if SEND_TELEGRAM_ALERTS:
-        send_telegram_message(text)
 
 # =========================================================
 # ENGINE STATE
@@ -692,6 +754,97 @@ class EliteExecutionEngine:
             "trail_after_tp1": DEFAULT_TRAIL_AFTER_TP1
         }
 
+    def _append_scale_event(self, position: Dict[str, Any], contracts_closed: int, fill_price: float, reason: str, pnl_realized: float):
+        position.setdefault("scale_events", [])
+        position["scale_events"].append({
+            "time": now_str(),
+            "contracts_closed": contracts_closed,
+            "fill_price": round(fill_price, 2),
+            "reason": reason,
+            "pnl_realized": round(pnl_realized, 2)
+        })
+
+    def _compute_smart_trailing_stop(self, pos: Dict[str, Any], current_price: float) -> float:
+        if not SMART_TRAIL_ENABLED:
+            return pos["stop_price"]
+
+        current_stop = safe_float(pos["stop_price"], 0)
+
+        if pos.get("tp2_hit"):
+            candidate = round(current_price * (1 - TRAIL_AFTER_TP2_PCT), 2)
+            return max(current_stop, candidate)
+
+        if pos.get("tp1_hit"):
+            candidate = round(current_price * (1 - TRAIL_BEFORE_TP2_PCT), 2)
+            candidate = max(candidate, pos["entry_price"])
+            return max(current_stop, candidate)
+
+        return current_stop
+
+    def _partial_close(self, trade_id: str, contracts_to_close: int, fill_price: float, reason: str) -> Dict[str, Any]:
+        pos = self.state["open_positions"].get(trade_id)
+        if not pos:
+            return {"ok": False, "reason": "Trade not found"}
+
+        if pos.get("status") != "OPEN":
+            return {"ok": False, "reason": "Trade not open"}
+
+        contracts_open = safe_int(pos.get("contracts_open", pos.get("contracts", 0)), 0)
+        if contracts_open <= 0:
+            return {"ok": False, "reason": "No contracts left"}
+
+        contracts_to_close = min(max(1, contracts_to_close), contracts_open)
+
+        broker_result = broker_bridge.submit_partial_close_order(pos, fill_price, contracts_to_close, reason)
+        if not broker_result.get("ok"):
+            return {"ok": False, "reason": broker_result.get("reason", "partial close failed")}
+
+        actual_exit = round(safe_float(broker_result.get("fill_price", fill_price), fill_price), 2)
+        pnl_per_contract = (actual_exit - pos["entry_price"]) * 100
+        realized = round(pnl_per_contract * contracts_to_close, 2)
+
+        pos["contracts_open"] = contracts_open - contracts_to_close
+        pos["contracts_closed_total"] = safe_int(pos.get("contracts_closed_total", 0), 0) + contracts_to_close
+        pos["realized_pnl"] = round(safe_float(pos.get("realized_pnl", 0.0), 0.0) + realized, 2)
+
+        self.state["daily_realized_pnl"] += realized
+
+        self._append_scale_event(pos, contracts_to_close, actual_exit, reason, realized)
+
+        append_trade_log({
+            "event": "PARTIAL_CLOSE",
+            "time": now_str(),
+            "trade_id": trade_id,
+            "symbol": pos["symbol"],
+            "side": pos["side"],
+            "contracts_closed": contracts_to_close,
+            "fill_price": actual_exit,
+            "reason": reason,
+            "realized_pnl": realized
+        })
+
+        send_trade_alert(
+            f"💰 PARTIAL CLOSE\n"
+            f"Trade: {trade_id}\n"
+            f"{pos['symbol']} {pos['side']}\n"
+            f"Reason: {reason}\n"
+            f"Closed: {contracts_to_close}\n"
+            f"Fill: {actual_exit}\n"
+            f"Remaining: {pos['contracts_open']}\n"
+            f"Realized: ${realized}",
+            channel="premium"
+        )
+
+        if pos["contracts_open"] <= 0:
+            pos["status"] = "CLOSED"
+            pos["closed_at"] = now_str()
+            pos["exit_price"] = actual_exit
+            pos["close_reason"] = reason
+            self.set_cooldown(pos["symbol"], pos["side"], COOLDOWN_MINUTES)
+
+        save_engine_state(self.state)
+        return {"ok": True, "position": pos, "contracts_closed": contracts_to_close, "fill_price": actual_exit, "realized_pnl": realized}
+
     def place_trade(self, signal: Dict[str, Any]) -> Dict[str, Any]:
         symbol = signal.get("symbol", "").upper().strip()
         side = signal.get("side", "").upper().strip()
@@ -725,6 +878,8 @@ class EliteExecutionEngine:
             "tp1_price": plan["tp1_price"],
             "tp2_price": plan["tp2_price"],
             "contracts": plan["contracts"],
+            "contracts_open": plan["contracts"],
+            "contracts_closed_total": 0,
             "risk_dollars": plan["risk_dollars"],
             "trail_after_tp1": plan["trail_after_tp1"],
             "tp1_hit": False,
@@ -737,7 +892,14 @@ class EliteExecutionEngine:
             "manual": signal.get("manual", False),
             "broker_order_id": None,
             "broker_status": None,
-            "meta": signal.get("meta", {})
+            "scale_events": [],
+            "meta": signal.get("meta", {}),
+            "monitor": {
+                "last_underlying_price": safe_float(signal.get("meta", {}).get("underlying_price"), 0.0),
+                "last_option_price": plan["entry_price"],
+                "last_monitor_update": now_str(),
+                "price_source": "entry"
+            }
         }
 
         broker_result = broker_bridge.submit_entry_order(position)
@@ -751,6 +913,7 @@ class EliteExecutionEngine:
         if fill_price is not None:
             position["entry_price"] = round(safe_float(fill_price, position["entry_price"]), 2)
             position["current_price"] = position["entry_price"]
+            position["monitor"]["last_option_price"] = position["entry_price"]
 
         self.state["open_positions"][trade_id] = position
         self.state["daily_trade_count"] += 1
@@ -773,6 +936,20 @@ class EliteExecutionEngine:
             "broker_status": position["broker_status"]
         })
 
+        send_trade_alert(
+            f"🚀 OPEN TRADE\n"
+            f"Trade: {trade_id}\n"
+            f"{symbol} {side}\n"
+            f"Grade: {position['grade']} ({position['score']})\n"
+            f"Entry: {position['entry_price']}\n"
+            f"Stop: {position['stop_price']}\n"
+            f"TP1: {position['tp1_price']}\n"
+            f"TP2: {position['tp2_price']}\n"
+            f"Contracts: {position['contracts']}\n"
+            f"Mode: {position['mode']}",
+            channel="premium"
+        )
+
         return {"ok": True, "trade_id": trade_id, "position": position}
 
     def update_position_price(self, trade_id: str, new_price: float) -> Dict[str, Any]:
@@ -787,12 +964,27 @@ class EliteExecutionEngine:
         if new_price <= 0:
             return {"ok": False, "reason": "Invalid price"}
 
+        prev_tp1 = bool(pos.get("tp1_hit"))
+        prev_tp2 = bool(pos.get("tp2_hit"))
+        old_stop = safe_float(pos.get("stop_price", 0.0), 0.0)
+
         pos["current_price"] = round(new_price, 2)
 
+        # TP1
         if not pos["tp1_hit"] and new_price >= pos["tp1_price"]:
             pos["tp1_hit"] = True
+
             if pos["trail_after_tp1"]:
-                pos["stop_price"] = round(pos["entry_price"], 2)
+                pos["stop_price"] = round(max(pos["stop_price"], pos["entry_price"]), 2)
+
+            if AUTO_SCALE_ENABLED and safe_int(pos.get("contracts_open", 0), 0) >= MIN_CONTRACTS_TO_SCALE:
+                contracts_open = safe_int(pos["contracts_open"], 0)
+                contracts_to_close = max(1, math.floor(contracts_open * TP1_SCALE_PCT))
+                if contracts_to_close >= contracts_open:
+                    contracts_to_close = max(1, contracts_open - 1) if contracts_open > 1 else 1
+
+                self._partial_close(trade_id, contracts_to_close, new_price, "AUTO_TP1_SCALE")
+
             append_trade_log({
                 "event": "TP1_HIT",
                 "time": now_str(),
@@ -802,8 +994,27 @@ class EliteExecutionEngine:
                 "price": round(new_price, 2)
             })
 
-        if not pos["tp2_hit"] and new_price >= pos["tp2_price"]:
+            send_trade_alert(
+                f"🎯 TP1 HIT\n"
+                f"Trade: {trade_id}\n"
+                f"{pos['symbol']} {pos['side']}\n"
+                f"Price: {round(new_price, 2)}\n"
+                f"Stop moved to: {pos['stop_price']}",
+                channel="premium"
+            )
+
+        # TP2
+        if pos.get("status") == "OPEN" and not pos["tp2_hit"] and new_price >= pos["tp2_price"]:
             pos["tp2_hit"] = True
+
+            if AUTO_SCALE_ENABLED and safe_int(pos.get("contracts_open", 0), 0) >= 1:
+                contracts_open = safe_int(pos["contracts_open"], 0)
+                contracts_to_close = max(1, math.floor(contracts_open * TP2_SCALE_PCT))
+                if contracts_to_close > contracts_open:
+                    contracts_to_close = contracts_open
+
+                self._partial_close(trade_id, contracts_to_close, new_price, "AUTO_TP2_SCALE")
+
             append_trade_log({
                 "event": "TP2_HIT",
                 "time": now_str(),
@@ -813,6 +1024,45 @@ class EliteExecutionEngine:
                 "price": round(new_price, 2)
             })
 
+            send_trade_alert(
+                f"🏁 TP2 HIT\n"
+                f"Trade: {trade_id}\n"
+                f"{pos['symbol']} {pos['side']}\n"
+                f"Price: {round(new_price, 2)}",
+                channel="premium"
+            )
+
+        # refresh pos in case partial close updated state
+        pos = self.state["open_positions"].get(trade_id)
+        if not pos or pos.get("status") != "OPEN":
+            save_engine_state(self.state)
+            return {"ok": True, "position": pos}
+
+        # smart trailing
+        new_trail = self._compute_smart_trailing_stop(pos, new_price)
+        if new_trail > safe_float(pos["stop_price"], 0):
+            pos["stop_price"] = round(new_trail, 2)
+            append_trade_log({
+                "event": "TRAIL_STOP_UPDATE",
+                "time": now_str(),
+                "trade_id": trade_id,
+                "symbol": pos["symbol"],
+                "side": pos["side"],
+                "new_stop": pos["stop_price"],
+                "price": round(new_price, 2)
+            })
+
+            send_trade_alert(
+                f"📈 TRAIL UPDATED\n"
+                f"Trade: {trade_id}\n"
+                f"{pos['symbol']} {pos['side']}\n"
+                f"Price: {round(new_price, 2)}\n"
+                f"Old Stop: {old_stop}\n"
+                f"New Stop: {pos['stop_price']}",
+                channel="premium"
+            )
+
+        # stop logic
         if new_price <= pos["stop_price"]:
             return self.close_position(trade_id, new_price, "STOP_HIT")
 
@@ -831,6 +1081,12 @@ class EliteExecutionEngine:
         if exit_price <= 0:
             return {"ok": False, "reason": "Invalid exit_price"}
 
+        contracts_open = safe_int(pos.get("contracts_open", pos.get("contracts", 0)), 0)
+        if contracts_open <= 0:
+            pos["status"] = "CLOSED"
+            save_engine_state(self.state)
+            return {"ok": True, "position": pos}
+
         broker_result = broker_bridge.submit_close_order(pos, exit_price)
         if not broker_result.get("ok"):
             return {"ok": False, "reason": broker_result.get("reason", "broker close failed")}
@@ -839,17 +1095,21 @@ class EliteExecutionEngine:
         actual_exit = round(safe_float(actual_exit, exit_price), 2)
 
         pnl_per_contract = (actual_exit - pos["entry_price"]) * 100
-        total_pnl = round(pnl_per_contract * pos["contracts"], 2)
+        realized = round(pnl_per_contract * contracts_open, 2)
 
+        pos["contracts_closed_total"] = safe_int(pos.get("contracts_closed_total", 0), 0) + contracts_open
+        pos["contracts_open"] = 0
         pos["status"] = "CLOSED"
         pos["closed_at"] = now_str()
         pos["exit_price"] = actual_exit
-        pos["realized_pnl"] = total_pnl
+        pos["realized_pnl"] = round(safe_float(pos.get("realized_pnl", 0.0), 0.0) + realized, 2)
         pos["close_reason"] = reason
         pos["broker_close_order_id"] = broker_result.get("broker_order_id")
         pos["broker_close_status"] = broker_result.get("broker_status")
 
-        self.state["daily_realized_pnl"] += total_pnl
+        self._append_scale_event(pos, contracts_open, actual_exit, reason, realized)
+
+        self.state["daily_realized_pnl"] += realized
         self.set_cooldown(pos["symbol"], pos["side"], COOLDOWN_MINUTES)
 
         append_trade_log({
@@ -860,8 +1120,8 @@ class EliteExecutionEngine:
             "side": pos["side"],
             "entry_price": pos["entry_price"],
             "exit_price": pos["exit_price"],
-            "contracts": pos["contracts"],
-            "pnl": total_pnl,
+            "contracts_closed": contracts_open,
+            "pnl": realized,
             "reason": reason,
             "broker_close_order_id": pos.get("broker_close_order_id"),
             "broker_close_status": pos.get("broker_close_status")
@@ -871,6 +1131,20 @@ class EliteExecutionEngine:
             self.lock_engine("Max daily loss breached after close")
 
         save_engine_state(self.state)
+
+        icon = "⛔" if reason == "STOP_HIT" else "✅"
+        send_trade_alert(
+            f"{icon} CLOSE TRADE\n"
+            f"Trade: {trade_id}\n"
+            f"{pos['symbol']} {pos['side']}\n"
+            f"Reason: {reason}\n"
+            f"Exit: {actual_exit}\n"
+            f"Contracts Closed: {contracts_open}\n"
+            f"Realized: ${realized}\n"
+            f"Day PnL: ${round(self.state['daily_realized_pnl'], 2)}",
+            channel="premium"
+        )
+
         return {"ok": True, "position": pos}
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
@@ -906,6 +1180,87 @@ class EliteExecutionEngine:
 elite_engine = EliteExecutionEngine()
 
 # =========================================================
+# LIVE POSITION MONITOR
+# =========================================================
+def estimate_option_price_from_underlying(position: Dict[str, Any], underlying_price: float) -> float:
+    entry_option = safe_float(position.get("entry_price"), 0.0)
+    if entry_option <= 0:
+        entry_option = MIN_OPTION_PRICE
+
+    entry_underlying = safe_float(position.get("meta", {}).get("underlying_price"), 0.0)
+    if entry_underlying <= 0:
+        entry_underlying = safe_float(position.get("monitor", {}).get("last_underlying_price"), 0.0)
+
+    if entry_underlying <= 0 or underlying_price <= 0:
+        return max(MIN_OPTION_PRICE, round(safe_float(position.get("current_price", entry_option), entry_option), 2))
+
+    move_pct = (underlying_price - entry_underlying) / entry_underlying
+
+    if position.get("side") == "PUT":
+        move_pct = -move_pct
+
+    est = entry_option * (1 + (move_pct * OPTION_PRICE_SENSITIVITY))
+    est = max(MIN_OPTION_PRICE, est)
+    return round(est, 2)
+
+def fetch_live_position_price(position: Dict[str, Any]) -> Tuple[bool, float, str]:
+    source = OPTION_MARK_SOURCE
+
+    if source in ["auto", "broker"]:
+        broker_price = broker_bridge.fetch_option_market_price(position)
+        if broker_price.get("ok"):
+            return True, round(safe_float(broker_price["price"]), 2), "broker"
+        if source == "broker":
+            return False, 0.0, broker_price.get("reason", "broker price failed")
+
+    try:
+        underlying = fetch_latest_underlying_price(position["symbol"])
+        est_option = estimate_option_price_from_underlying(position, underlying)
+        return True, est_option, "estimate"
+    except Exception as e:
+        return False, 0.0, str(e)
+
+def monitor_open_positions():
+    if not POSITION_MONITOR_ENABLED:
+        return
+
+    open_positions = elite_engine.get_open_positions()
+    if not open_positions:
+        return
+
+    for pos in open_positions:
+        trade_id = pos.get("trade_id")
+        if not trade_id:
+            continue
+
+        ok, live_price, source = fetch_live_position_price(pos)
+        if not ok or live_price <= 0:
+            log_debug(f"MONITOR PRICE FAIL [{trade_id}] -> {source}")
+            continue
+
+        pos["monitor"]["last_option_price"] = round(live_price, 2)
+        pos["monitor"]["last_monitor_update"] = now_str()
+        pos["monitor"]["price_source"] = source
+
+        try:
+            underlying = fetch_latest_underlying_price(pos["symbol"])
+            pos["monitor"]["last_underlying_price"] = round(underlying, 2)
+        except Exception:
+            pass
+
+        result = elite_engine.update_position_price(trade_id, live_price)
+
+        if result.get("ok"):
+            log_debug(
+                f"MONITOR UPDATE [{trade_id}] "
+                f"{pos['symbol']} {pos['side']} "
+                f"price={live_price} source={source} "
+                f"tp1={pos.get('tp1_hit')} tp2={pos.get('tp2_hit')} stop={pos.get('stop_price')}"
+            )
+        else:
+            log_debug(f"MONITOR UPDATE FAIL [{trade_id}] -> {result.get('reason')}")
+
+# =========================================================
 # PAPER FILL CONTROL HELPERS
 # =========================================================
 def get_open_position_by_trade_id(trade_id: str) -> Optional[Dict[str, Any]]:
@@ -923,22 +1278,19 @@ def cmd_hit_tp1(trade_id: str) -> Dict[str, Any]:
     pos = get_open_position_by_trade_id(trade_id)
     if not pos:
         return {"ok": False, "reason": "Trade not found or not open"}
-    target_price = pos["tp1_price"]
-    return elite_engine.update_position_price(trade_id, target_price)
+    return elite_engine.update_position_price(trade_id, pos["tp1_price"])
 
 def cmd_hit_tp2(trade_id: str) -> Dict[str, Any]:
     pos = get_open_position_by_trade_id(trade_id)
     if not pos:
         return {"ok": False, "reason": "Trade not found or not open"}
-    target_price = pos["tp2_price"]
-    return elite_engine.update_position_price(trade_id, target_price)
+    return elite_engine.update_position_price(trade_id, pos["tp2_price"])
 
 def cmd_hit_stop(trade_id: str) -> Dict[str, Any]:
     pos = get_open_position_by_trade_id(trade_id)
     if not pos:
         return {"ok": False, "reason": "Trade not found or not open"}
-    stop_price = pos["stop_price"]
-    return elite_engine.update_position_price(trade_id, stop_price)
+    return elite_engine.update_position_price(trade_id, pos["stop_price"])
 
 # =========================================================
 # COMMAND HELPERS
@@ -976,10 +1328,13 @@ def cmd_positions_text() -> str:
 
     lines = ["Open Positions"]
     for p in positions[:10]:
+        mon = p.get("monitor", {})
         lines.append(
             f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | "
             f"Entry {p['entry_price']} | Current {p['current_price']} | Stop {p['stop_price']} | "
-            f"TP1 {p['tp1_price']} | TP2 {p['tp2_price']} | Contracts {p['contracts']} | Broker {p.get('broker_status')}"
+            f"TP1 {p['tp1_price']} | TP2 {p['tp2_price']} | OpenCtr {p.get('contracts_open')} | "
+            f"ClosedCtr {p.get('contracts_closed_total')} | Realized {p.get('realized_pnl')} | "
+            f"PriceSrc {mon.get('price_source', 'n/a')} | Broker {p.get('broker_status')}"
         )
     return "\n".join(lines)
 
@@ -1050,7 +1405,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
         ]
         for p in s["open_positions"][:5]:
             lines.append(
-                f"- {p['trade_id']} | {p['symbol']} {p['side']} | Entry {p['entry_price']} | Current {p['current_price']}"
+                f"- {p['trade_id']} | {p['symbol']} {p['side']} | Entry {p['entry_price']} | Current {p['current_price']} | OpenCtr {p.get('contracts_open')}"
             )
         return "\n".join(lines)
 
@@ -1129,7 +1484,8 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "tp1_pct": 0.30,
             "tp2_pct": 0.60,
             "notes": "Telegram test CALL",
-            "manual": True
+            "manual": True,
+            "meta": {"underlying_price": 500.0}
         }
         result = process_trade_signal(signal)
         return f"TEST CALL: {result}"
@@ -1147,7 +1503,8 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "tp1_pct": 0.30,
             "tp2_pct": 0.60,
             "notes": "Telegram test PUT",
-            "manual": True
+            "manual": True,
+            "meta": {"underlying_price": 500.0}
         }
         result = process_trade_signal(signal)
         return f"TEST PUT: {result}"
@@ -1203,7 +1560,6 @@ def process_signals(signals: List[Dict[str, Any]]):
     for signal in signals:
         print(f"[PROCESS] Sending signal into engine -> {signal['symbol']} {signal['side']}", flush=True)
         result = process_trade_signal(signal)
-        route_signal_alerts(signal, result)
 
         if result.get("ok"):
             stamp_signal_time(signal["symbol"], signal["side"])
@@ -1215,11 +1571,12 @@ def process_signals(signals: List[Dict[str, Any]]):
 # MAIN LOOP
 # =========================================================
 def run_engine_loop():
-    log_debug("Paper fill control engine started.")
+    log_debug("Auto TP / scale-out / smart trail engine started.")
     print("=== ENGINE LOOP STARTED ===", flush=True)
 
     last_scan_ts = 0.0
     last_heartbeat_ts = 0.0
+    last_position_monitor_ts = 0.0
     heartbeat_interval = 30
 
     while True:
@@ -1232,6 +1589,10 @@ def run_engine_loop():
 
             if TELEGRAM_COMMANDS_ENABLED:
                 poll_telegram_commands()
+
+            if POSITION_MONITOR_ENABLED and (now_ts - last_position_monitor_ts) >= POSITION_MONITOR_SECONDS:
+                last_position_monitor_ts = now_ts
+                monitor_open_positions()
 
             current_market_status = market_is_open()
             should_scan = (now_ts - last_scan_ts) >= SCAN_SECONDS
@@ -1277,15 +1638,7 @@ def run_test_mode():
         "tp2_pct": 0.60,
         "notes": "VWAP reclaim + premium test",
         "manual": True,
-        "meta": {
-            "underlying_price": 450.0,
-            "vwap": 449.2,
-            "rsi": 61.4,
-            "volume_ratio": 1.55,
-            "momentum_pct": 0.42,
-            "interval": SCAN_INTERVAL,
-            "bar_time": now_str()
-        }
+        "meta": {"underlying_price": 500.0}
     }
 
     result = process_trade_signal(test_signal)
@@ -1303,6 +1656,16 @@ if __name__ == "__main__":
     print(f"TEST_MODE: {TEST_MODE}", flush=True)
     print(f"PAPER_TRADING: {PAPER_TRADING}", flush=True)
     print(f"AUTO_EXECUTION_ENABLED: {AUTO_EXECUTION_ENABLED}", flush=True)
+    print(f"AUTO_SCALE_ENABLED: {AUTO_SCALE_ENABLED}", flush=True)
+    print(f"SMART_TRAIL_ENABLED: {SMART_TRAIL_ENABLED}", flush=True)
+    print(f"POSITION_MONITOR_ENABLED: {POSITION_MONITOR_ENABLED}", flush=True)
+    print(f"POSITION_MONITOR_SECONDS: {POSITION_MONITOR_SECONDS}", flush=True)
+    print(f"OPTION_MARK_SOURCE: {OPTION_MARK_SOURCE}", flush=True)
+    print(f"OPTION_PRICE_SENSITIVITY: {OPTION_PRICE_SENSITIVITY}", flush=True)
+    print(f"TP1_SCALE_PCT: {TP1_SCALE_PCT}", flush=True)
+    print(f"TP2_SCALE_PCT: {TP2_SCALE_PCT}", flush=True)
+    print(f"TRAIL_BEFORE_TP2_PCT: {TRAIL_BEFORE_TP2_PCT}", flush=True)
+    print(f"TRAIL_AFTER_TP2_PCT: {TRAIL_AFTER_TP2_PCT}", flush=True)
     print(f"SCAN_SYMBOLS: {SCAN_SYMBOLS}", flush=True)
     print(f"SCAN_INTERVAL: {SCAN_INTERVAL}", flush=True)
     print(f"SCAN_SECONDS: {SCAN_SECONDS}", flush=True)
