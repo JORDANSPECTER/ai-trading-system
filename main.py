@@ -4,7 +4,7 @@ import time
 import uuid
 import math
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 
 # =========================================================
@@ -51,8 +51,8 @@ DEFAULT_TRAIL_AFTER_TP1 = os.getenv("DEFAULT_TRAIL_AFTER_TP1", "true").lower() =
 # AUTO SCALE / TRAIL CONFIG
 # =========================================================
 AUTO_SCALE_ENABLED = os.getenv("AUTO_SCALE_ENABLED", "true").lower() == "true"
-TP1_SCALE_PCT = float(os.getenv("TP1_SCALE_PCT", "0.50"))   # close 50% at TP1
-TP2_SCALE_PCT = float(os.getenv("TP2_SCALE_PCT", "0.50"))   # close 50% of remaining at TP2
+TP1_SCALE_PCT = float(os.getenv("TP1_SCALE_PCT", "0.50"))
+TP2_SCALE_PCT = float(os.getenv("TP2_SCALE_PCT", "0.50"))
 SMART_TRAIL_ENABLED = os.getenv("SMART_TRAIL_ENABLED", "true").lower() == "true"
 TRAIL_BEFORE_TP2_PCT = float(os.getenv("TRAIL_BEFORE_TP2_PCT", "0.10"))
 TRAIL_AFTER_TP2_PCT = float(os.getenv("TRAIL_AFTER_TP2_PCT", "0.08"))
@@ -63,9 +63,22 @@ MIN_CONTRACTS_TO_SCALE = int(os.getenv("MIN_CONTRACTS_TO_SCALE", "2"))
 # =========================================================
 POSITION_MONITOR_ENABLED = os.getenv("POSITION_MONITOR_ENABLED", "true").lower() == "true"
 POSITION_MONITOR_SECONDS = int(os.getenv("POSITION_MONITOR_SECONDS", "5"))
-OPTION_MARK_SOURCE = os.getenv("OPTION_MARK_SOURCE", "auto").strip().lower()   # auto, broker, estimate
-OPTION_PRICE_SENSITIVITY = float(os.getenv("OPTION_PRICE_SENSITIVITY", "18"))
+OPTION_MARK_SOURCE = os.getenv("OPTION_MARK_SOURCE", "alpaca").strip().lower()   # alpaca, estimate
+OPTION_PRICE_SENSITIVITY = float(os.getenv("OPTION_PRICE_SENSITIVITY", "10"))
 MIN_OPTION_PRICE = float(os.getenv("MIN_OPTION_PRICE", "0.05"))
+
+# =========================================================
+# OPTION CONTRACT SELECTION CONFIG
+# =========================================================
+OPTION_EXPIRY_MODE = os.getenv("OPTION_EXPIRY_MODE", "0dte_or_next").strip().lower()
+OPTION_MAX_DAYS_OUT = int(os.getenv("OPTION_MAX_DAYS_OUT", "7"))
+OPTION_STRIKE_MODE = os.getenv("OPTION_STRIKE_MODE", "atm").strip().lower()  # atm, itm1
+OPTION_MIN_OPEN_INTEREST = int(os.getenv("OPTION_MIN_OPEN_INTEREST", "0"))
+OPTION_MIN_PRICE = float(os.getenv("OPTION_MIN_PRICE", "0.10"))
+OPTION_MAX_PRICE = float(os.getenv("OPTION_MAX_PRICE", "5.00"))
+OPTION_ORDER_TYPE = os.getenv("OPTION_ORDER_TYPE", "market").strip().lower()  # market, limit
+OPTION_LIMIT_SLIPPAGE_PCT = float(os.getenv("OPTION_LIMIT_SLIPPAGE_PCT", "0.03"))
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "indicative").strip().lower()  # indicative, opra
 
 MARKET_OPEN_HOUR = int(os.getenv("MARKET_OPEN_HOUR", "9"))
 MARKET_OPEN_MINUTE = int(os.getenv("MARKET_OPEN_MINUTE", "30"))
@@ -91,12 +104,22 @@ DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "true").lower() == "true"
 # =========================================================
 # BROKER ENV CONFIG
 # =========================================================
-BROKER_ENABLED = os.getenv("BROKER_ENABLED", "false").lower() == "true"
-BROKER_NAME = os.getenv("BROKER_NAME", "stub").strip().lower()
+BROKER_ENABLED = os.getenv("BROKER_ENABLED", "true").lower() == "true"
+BROKER_NAME = os.getenv("BROKER_NAME", "alpaca").strip().lower()
 BROKER_PAPER = os.getenv("BROKER_PAPER", "true").lower() == "true"
-BROKER_BASE_URL = os.getenv("BROKER_BASE_URL", "").strip()
-BROKER_API_KEY = os.getenv("BROKER_API_KEY", "").strip()
-BROKER_API_SECRET = os.getenv("BROKER_API_SECRET", "").strip()
+
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
+
+ALPACA_TRADING_BASE_URL = os.getenv(
+    "ALPACA_TRADING_BASE_URL",
+    "https://paper-api.alpaca.markets" if BROKER_PAPER else "https://api.alpaca.markets"
+).strip().rstrip("/")
+
+ALPACA_DATA_BASE_URL = os.getenv(
+    "ALPACA_DATA_BASE_URL",
+    "https://data.alpaca.markets"
+).strip().rstrip("/")
 
 # =========================================================
 # HELPERS
@@ -359,6 +382,25 @@ def grade_from_score(score: float) -> str:
     return "D"
 
 # =========================================================
+# ALPACA HELPERS
+# =========================================================
+def alpaca_trading_headers() -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+        "Content-Type": "application/json"
+    }
+
+def alpaca_data_headers() -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET
+    }
+
+def alpaca_enabled() -> bool:
+    return bool(ALPACA_API_KEY and ALPACA_API_SECRET)
+
+# =========================================================
 # BROKER BRIDGE
 # =========================================================
 class BrokerBridge:
@@ -366,96 +408,328 @@ class BrokerBridge:
         self.enabled = BROKER_ENABLED
         self.name = BROKER_NAME
         self.paper = BROKER_PAPER
-        self.base_url = BROKER_BASE_URL
-        self.api_key = BROKER_API_KEY
-        self.api_secret = BROKER_API_SECRET
 
     def status(self) -> Dict[str, Any]:
         return {
             "broker_enabled": self.enabled,
             "broker_name": self.name,
             "broker_paper": self.paper,
-            "broker_has_key": bool(self.api_key),
-            "broker_has_secret": bool(self.api_secret),
-            "broker_base_url": self.base_url or "not_set"
+            "alpaca_has_key": bool(ALPACA_API_KEY),
+            "alpaca_has_secret": bool(ALPACA_API_SECRET),
+            "alpaca_trading_base_url": ALPACA_TRADING_BASE_URL or "not_set",
+            "alpaca_data_base_url": ALPACA_DATA_BASE_URL or "not_set",
+            "alpaca_data_feed": ALPACA_DATA_FEED
+        }
+
+    def fetch_option_contracts(self, underlying_symbol: str, option_type: str) -> Dict[str, Any]:
+        if not self.enabled or not alpaca_enabled():
+            return {"ok": False, "reason": "Alpaca credentials missing"}
+
+        today = datetime.now().date()
+        end_date = today + timedelta(days=max(1, OPTION_MAX_DAYS_OUT))
+
+        params = {
+            "underlying_symbols": underlying_symbol,
+            "status": "active",
+            "type": "call" if option_type.upper() == "CALL" else "put",
+            "expiration_date_gte": str(today),
+            "expiration_date_lte": str(end_date),
+            "limit": 100
+        }
+
+        try:
+            r = requests.get(
+                f"{ALPACA_TRADING_BASE_URL}/v2/options/contracts",
+                headers=alpaca_trading_headers(),
+                params=params,
+                timeout=20
+            )
+            data = r.json()
+            contracts = data.get("option_contracts", [])
+            return {"ok": True, "contracts": contracts}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    def fetch_option_chain_snapshots(self, underlying_symbol: str) -> Dict[str, Any]:
+        if not self.enabled or not alpaca_enabled():
+            return {"ok": False, "reason": "Alpaca credentials missing"}
+
+        try:
+            r = requests.get(
+                f"{ALPACA_DATA_BASE_URL}/v1beta1/options/snapshots/{underlying_symbol}",
+                headers=alpaca_data_headers(),
+                params={"feed": ALPACA_DATA_FEED, "limit": 1000},
+                timeout=20
+            )
+            data = r.json()
+            snapshots = data.get("snapshots", {})
+            return {"ok": True, "snapshots": snapshots}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    def fetch_latest_option_quote(self, contract_symbol: str) -> Dict[str, Any]:
+        if not self.enabled or not alpaca_enabled():
+            return {"ok": False, "reason": "Alpaca credentials missing"}
+
+        try:
+            r = requests.get(
+                f"{ALPACA_DATA_BASE_URL}/v1beta1/options/quotes/latest",
+                headers=alpaca_data_headers(),
+                params={"symbols": contract_symbol, "feed": ALPACA_DATA_FEED},
+                timeout=20
+            )
+            data = r.json()
+            quotes = data.get("quotes", {})
+            q = quotes.get(contract_symbol, {})
+            bid = safe_float(q.get("bp"), 0.0)
+            ask = safe_float(q.get("ap"), 0.0)
+
+            if bid <= 0 and ask <= 0:
+                return {"ok": False, "reason": f"no quote for {contract_symbol}"}
+
+            mid = round((bid + ask) / 2.0, 2) if (bid > 0 and ask > 0) else round(max(bid, ask), 2)
+            return {"ok": True, "bid": bid, "ask": ask, "mid": mid, "raw": q}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    def pick_best_contract(self, underlying_symbol: str, side: str, underlying_price: float) -> Dict[str, Any]:
+        contracts_result = self.fetch_option_contracts(underlying_symbol, side)
+        if not contracts_result.get("ok"):
+            return contracts_result
+
+        snapshots_result = self.fetch_option_chain_snapshots(underlying_symbol)
+        snapshots = snapshots_result.get("snapshots", {}) if snapshots_result.get("ok") else {}
+
+        contracts = contracts_result.get("contracts", [])
+        if not contracts:
+            return {"ok": False, "reason": f"no contracts returned for {underlying_symbol} {side}"}
+
+        filtered = []
+        today = str(datetime.now().date())
+
+        # Expiry preference
+        if OPTION_EXPIRY_MODE == "0dte":
+            contracts = [c for c in contracts if c.get("expiration_date") == today]
+        elif OPTION_EXPIRY_MODE == "0dte_or_next":
+            same_day = [c for c in contracts if c.get("expiration_date") == today]
+            if same_day:
+                contracts = same_day
+
+        for c in contracts:
+            try:
+                symbol = c.get("symbol")
+                strike = safe_float(c.get("strike_price"), 0.0)
+                expiration_date = c.get("expiration_date", "")
+                open_interest = safe_int(c.get("open_interest", 0), 0)
+
+                if strike <= 0 or not symbol:
+                    continue
+                if OPTION_MIN_OPEN_INTEREST > 0 and open_interest < OPTION_MIN_OPEN_INTEREST:
+                    continue
+
+                snap = snapshots.get(symbol, {})
+                latest_quote = snap.get("latestQuote", {}) or snap.get("latest_quote", {})
+                bid = safe_float(latest_quote.get("bp"), 0.0)
+                ask = safe_float(latest_quote.get("ap"), 0.0)
+                mid = round((bid + ask) / 2.0, 2) if (bid > 0 and ask > 0) else round(max(bid, ask), 2)
+
+                if mid <= 0:
+                    quote_result = self.fetch_latest_option_quote(symbol)
+                    if quote_result.get("ok"):
+                        bid = safe_float(quote_result.get("bid"), 0.0)
+                        ask = safe_float(quote_result.get("ask"), 0.0)
+                        mid = safe_float(quote_result.get("mid"), 0.0)
+
+                if mid <= 0:
+                    continue
+                if mid < OPTION_MIN_PRICE or mid > OPTION_MAX_PRICE:
+                    continue
+
+                distance = abs(strike - underlying_price)
+
+                # ITM preference
+                itm_bonus = 0.0
+                if OPTION_STRIKE_MODE == "itm1":
+                    if side.upper() == "CALL" and strike <= underlying_price:
+                        itm_bonus = 0.25
+                    elif side.upper() == "PUT" and strike >= underlying_price:
+                        itm_bonus = 0.25
+
+                filtered.append({
+                    "symbol": symbol,
+                    "strike_price": strike,
+                    "expiration_date": expiration_date,
+                    "open_interest": open_interest,
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "distance": distance,
+                    "itm_bonus": itm_bonus,
+                    "contract": c
+                })
+            except Exception:
+                continue
+
+        if not filtered:
+            return {"ok": False, "reason": f"no priced contract found for {underlying_symbol} {side}"}
+
+        filtered.sort(
+            key=lambda x: (
+                x["expiration_date"],
+                x["distance"] - x["itm_bonus"],
+                -x["open_interest"],
+                x["mid"]
+            )
+        )
+
+        best = filtered[0]
+        return {
+            "ok": True,
+            "contract_symbol": best["symbol"],
+            "strike_price": best["strike_price"],
+            "expiration_date": best["expiration_date"],
+            "bid": best["bid"],
+            "ask": best["ask"],
+            "mid": best["mid"],
+            "open_interest": best["open_interest"],
+            "contract": best["contract"]
         }
 
     def submit_entry_order(self, position: Dict[str, Any]) -> Dict[str, Any]:
-        if PAPER_TRADING or not self.enabled:
-            broker_order_id = f"paper_entry_{uuid.uuid4().hex[:12]}"
+        if PAPER_TRADING and not self.enabled:
             return {
                 "ok": True,
-                "broker_order_id": broker_order_id,
+                "broker_order_id": f"paper_entry_{uuid.uuid4().hex[:12]}",
                 "broker_status": "filled",
                 "fill_price": position["entry_price"],
                 "mode": "PAPER"
             }
 
-        return {"ok": False, "reason": "Live broker submit not implemented"}
-
-    def submit_partial_close_order(self, position: Dict[str, Any], exit_price: float, contracts_to_close: int, reason: str) -> Dict[str, Any]:
-        if PAPER_TRADING or not self.enabled:
-            broker_order_id = f"paper_partial_{uuid.uuid4().hex[:12]}"
-            return {
-                "ok": True,
-                "broker_order_id": broker_order_id,
-                "broker_status": "filled",
-                "fill_price": round(exit_price, 2),
-                "contracts_closed": contracts_to_close,
-                "reason": reason,
-                "mode": "PAPER"
-            }
-
-        return {"ok": False, "reason": "Live broker partial close not implemented"}
-
-    def submit_close_order(self, position: Dict[str, Any], exit_price: float) -> Dict[str, Any]:
-        if PAPER_TRADING or not self.enabled:
-            broker_order_id = f"paper_close_{uuid.uuid4().hex[:12]}"
-            return {
-                "ok": True,
-                "broker_order_id": broker_order_id,
-                "broker_status": "filled",
-                "fill_price": round(exit_price, 2),
-                "mode": "PAPER"
-            }
-
-        return {"ok": False, "reason": "Live broker close not implemented"}
-
-    def fetch_option_market_price(self, position: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Expected live broker endpoint example:
-        GET {BROKER_BASE_URL}/option_price?symbol=QQQ&side=CALL&trade_id=...
-        Returns:
-        {
-            "ok": true,
-            "price": 1.42
-        }
-        """
-        if not self.enabled or not self.base_url:
-            return {"ok": False, "reason": "broker price endpoint unavailable"}
+        if not alpaca_enabled():
+            return {"ok": False, "reason": "Alpaca credentials missing"}
 
         try:
-            url = f"{self.base_url.rstrip('/')}/option_price"
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-
-            params = {
-                "symbol": position.get("symbol"),
-                "side": position.get("side"),
-                "trade_id": position.get("trade_id"),
-                "broker_order_id": position.get("broker_order_id", "")
+            payload = {
+                "symbol": position["contract_symbol"],
+                "qty": str(int(position["contracts"])),
+                "side": "buy",
+                "type": OPTION_ORDER_TYPE if OPTION_ORDER_TYPE in ["market", "limit"] else "market",
+                "time_in_force": "day",
+                "client_order_id": position["signal_id"][:48]
             }
 
-            r = requests.get(url, params=params, headers=headers, timeout=15)
-            data = r.json()
-            price = safe_float(data.get("price"), 0.0)
+            if payload["type"] == "limit":
+                quote = self.fetch_latest_option_quote(position["contract_symbol"])
+                if not quote.get("ok"):
+                    return {"ok": False, "reason": f"no quote for limit entry: {quote.get('reason')}"}
+                ask = safe_float(quote.get("ask"), 0.0)
+                limit_price = ask if ask > 0 else safe_float(quote.get("mid"), position["entry_price"])
+                limit_price = round(limit_price * (1 + OPTION_LIMIT_SLIPPAGE_PCT), 2)
+                payload["limit_price"] = str(limit_price)
 
-            if price > 0:
-                return {"ok": True, "price": round(price, 2)}
-            return {"ok": False, "reason": f"invalid broker price response: {data}"}
+            r = requests.post(
+                f"{ALPACA_TRADING_BASE_URL}/v2/orders",
+                headers=alpaca_trading_headers(),
+                json=payload,
+                timeout=20
+            )
+            data = r.json()
+
+            if r.status_code >= 300:
+                return {"ok": False, "reason": str(data)}
+
+            fill_price = safe_float(data.get("filled_avg_price"), 0.0)
+            if fill_price <= 0:
+                fill_price = position["entry_price"]
+
+            return {
+                "ok": True,
+                "broker_order_id": data.get("id"),
+                "broker_status": data.get("status"),
+                "fill_price": round(fill_price, 2),
+                "mode": "PAPER" if PAPER_TRADING else "LIVE",
+                "raw": data
+            }
         except Exception as e:
             return {"ok": False, "reason": str(e)}
+
+    def submit_partial_close_order(self, position: Dict[str, Any], exit_price: float, contracts_to_close: int, reason: str) -> Dict[str, Any]:
+        if not alpaca_enabled():
+            return {"ok": False, "reason": "Alpaca credentials missing"}
+
+        try:
+            payload = {
+                "symbol": position["contract_symbol"],
+                "qty": str(int(contracts_to_close)),
+                "side": "sell",
+                "type": OPTION_ORDER_TYPE if OPTION_ORDER_TYPE in ["market", "limit"] else "market",
+                "time_in_force": "day",
+                "client_order_id": f"{position['trade_id']}_{reason}_{int(time.time())}"[:48]
+            }
+
+            if payload["type"] == "limit":
+                quote = self.fetch_latest_option_quote(position["contract_symbol"])
+                if quote.get("ok"):
+                    bid = safe_float(quote.get("bid"), 0.0)
+                    limit_price = bid if bid > 0 else safe_float(quote.get("mid"), exit_price)
+                else:
+                    limit_price = exit_price
+                payload["limit_price"] = str(round(limit_price, 2))
+
+            r = requests.post(
+                f"{ALPACA_TRADING_BASE_URL}/v2/orders",
+                headers=alpaca_trading_headers(),
+                json=payload,
+                timeout=20
+            )
+            data = r.json()
+
+            if r.status_code >= 300:
+                return {"ok": False, "reason": str(data)}
+
+            fill_price = safe_float(data.get("filled_avg_price"), 0.0)
+            if fill_price <= 0:
+                fill_price = exit_price
+
+            return {
+                "ok": True,
+                "broker_order_id": data.get("id"),
+                "broker_status": data.get("status"),
+                "fill_price": round(fill_price, 2),
+                "contracts_closed": contracts_to_close,
+                "reason": reason,
+                "mode": "PAPER" if PAPER_TRADING else "LIVE",
+                "raw": data
+            }
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    def submit_close_order(self, position: Dict[str, Any], exit_price: float) -> Dict[str, Any]:
+        contracts_open = safe_int(position.get("contracts_open", position.get("contracts", 0)), 0)
+        if contracts_open <= 0:
+            return {"ok": False, "reason": "No contracts to close"}
+        return self.submit_partial_close_order(position, exit_price, contracts_open, "FULL_CLOSE")
+
+    def fetch_option_market_price(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        contract_symbol = position.get("contract_symbol", "").strip()
+        if not contract_symbol:
+            return {"ok": False, "reason": "No contract symbol on position"}
+
+        quote = self.fetch_latest_option_quote(contract_symbol)
+        if not quote.get("ok"):
+            return quote
+
+        mid = safe_float(quote.get("mid"), 0.0)
+        if mid <= 0:
+            return {"ok": False, "reason": "No valid option mid price"}
+
+        return {
+            "ok": True,
+            "price": round(mid, 2),
+            "bid": safe_float(quote.get("bid"), 0.0),
+            "ask": safe_float(quote.get("ask"), 0.0),
+            "mid": mid
+        }
 
 broker_bridge = BrokerBridge()
 
@@ -817,6 +1091,7 @@ class EliteExecutionEngine:
             "trade_id": trade_id,
             "symbol": pos["symbol"],
             "side": pos["side"],
+            "contract_symbol": pos.get("contract_symbol"),
             "contracts_closed": contracts_to_close,
             "fill_price": actual_exit,
             "reason": reason,
@@ -827,6 +1102,7 @@ class EliteExecutionEngine:
             f"💰 PARTIAL CLOSE\n"
             f"Trade: {trade_id}\n"
             f"{pos['symbol']} {pos['side']}\n"
+            f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
             f"Reason: {reason}\n"
             f"Closed: {contracts_to_close}\n"
             f"Fill: {actual_exit}\n"
@@ -860,6 +1136,19 @@ class EliteExecutionEngine:
         if not allowed:
             return {"ok": False, "reason": reason}
 
+        underlying_price = safe_float(signal.get("meta", {}).get("underlying_price"), 0.0)
+        if underlying_price <= 0:
+            try:
+                underlying_price = fetch_latest_underlying_price(symbol)
+            except Exception:
+                underlying_price = 0.0
+
+        contract_pick = broker_bridge.pick_best_contract(symbol, side, underlying_price)
+        if not contract_pick.get("ok"):
+            return {"ok": False, "reason": f"contract selection failed: {contract_pick.get('reason')}"}
+
+        signal["entry_price"] = round(safe_float(contract_pick.get("mid"), signal.get("entry_price", 0.0)), 2)
+
         plan = self.build_trade_plan(signal)
         trade_id = f"{symbol}_{side}_{int(time.time())}"
 
@@ -868,6 +1157,11 @@ class EliteExecutionEngine:
             "signal_id": signal_id,
             "symbol": symbol,
             "side": side,
+            "contract_symbol": contract_pick["contract_symbol"],
+            "contract_expiration": contract_pick.get("expiration_date"),
+            "contract_strike": safe_float(contract_pick.get("strike_price"), 0.0),
+            "contract_bid": safe_float(contract_pick.get("bid"), 0.0),
+            "contract_ask": safe_float(contract_pick.get("ask"), 0.0),
             "grade": signal.get("grade", "N/A"),
             "score": safe_float(signal.get("score", 0)),
             "status": "OPEN",
@@ -895,10 +1189,10 @@ class EliteExecutionEngine:
             "scale_events": [],
             "meta": signal.get("meta", {}),
             "monitor": {
-                "last_underlying_price": safe_float(signal.get("meta", {}).get("underlying_price"), 0.0),
+                "last_underlying_price": underlying_price,
                 "last_option_price": plan["entry_price"],
                 "last_monitor_update": now_str(),
-                "price_source": "entry"
+                "price_source": "alpaca_contract_select"
             }
         }
 
@@ -915,6 +1209,11 @@ class EliteExecutionEngine:
             position["current_price"] = position["entry_price"]
             position["monitor"]["last_option_price"] = position["entry_price"]
 
+            # rebuild levels off actual fill if different
+            position["stop_price"] = round(position["entry_price"] * (1 - safe_float(signal.get("stop_pct", DEFAULT_STOP_PCT))), 2)
+            position["tp1_price"] = round(position["entry_price"] * (1 + safe_float(signal.get("tp1_pct", DEFAULT_TP1_PCT))), 2)
+            position["tp2_price"] = round(position["entry_price"] * (1 + safe_float(signal.get("tp2_pct", DEFAULT_TP2_PCT))), 2)
+
         self.state["open_positions"][trade_id] = position
         self.state["daily_trade_count"] += 1
         save_engine_state(self.state)
@@ -925,6 +1224,9 @@ class EliteExecutionEngine:
             "trade_id": trade_id,
             "symbol": symbol,
             "side": side,
+            "contract_symbol": position["contract_symbol"],
+            "expiration": position["contract_expiration"],
+            "strike": position["contract_strike"],
             "grade": position["grade"],
             "score": position["score"],
             "entry_price": position["entry_price"],
@@ -940,6 +1242,8 @@ class EliteExecutionEngine:
             f"🚀 OPEN TRADE\n"
             f"Trade: {trade_id}\n"
             f"{symbol} {side}\n"
+            f"Contract: {position['contract_symbol']}\n"
+            f"Exp: {position['contract_expiration']} | Strike: {position['contract_strike']}\n"
             f"Grade: {position['grade']} ({position['score']})\n"
             f"Entry: {position['entry_price']}\n"
             f"Stop: {position['stop_price']}\n"
@@ -964,13 +1268,9 @@ class EliteExecutionEngine:
         if new_price <= 0:
             return {"ok": False, "reason": "Invalid price"}
 
-        prev_tp1 = bool(pos.get("tp1_hit"))
-        prev_tp2 = bool(pos.get("tp2_hit"))
         old_stop = safe_float(pos.get("stop_price", 0.0), 0.0)
-
         pos["current_price"] = round(new_price, 2)
 
-        # TP1
         if not pos["tp1_hit"] and new_price >= pos["tp1_price"]:
             pos["tp1_hit"] = True
 
@@ -991,6 +1291,7 @@ class EliteExecutionEngine:
                 "trade_id": trade_id,
                 "symbol": pos["symbol"],
                 "side": pos["side"],
+                "contract_symbol": pos.get("contract_symbol"),
                 "price": round(new_price, 2)
             })
 
@@ -998,12 +1299,12 @@ class EliteExecutionEngine:
                 f"🎯 TP1 HIT\n"
                 f"Trade: {trade_id}\n"
                 f"{pos['symbol']} {pos['side']}\n"
+                f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
                 f"Price: {round(new_price, 2)}\n"
                 f"Stop moved to: {pos['stop_price']}",
                 channel="premium"
             )
 
-        # TP2
         if pos.get("status") == "OPEN" and not pos["tp2_hit"] and new_price >= pos["tp2_price"]:
             pos["tp2_hit"] = True
 
@@ -1021,6 +1322,7 @@ class EliteExecutionEngine:
                 "trade_id": trade_id,
                 "symbol": pos["symbol"],
                 "side": pos["side"],
+                "contract_symbol": pos.get("contract_symbol"),
                 "price": round(new_price, 2)
             })
 
@@ -1028,17 +1330,16 @@ class EliteExecutionEngine:
                 f"🏁 TP2 HIT\n"
                 f"Trade: {trade_id}\n"
                 f"{pos['symbol']} {pos['side']}\n"
+                f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
                 f"Price: {round(new_price, 2)}",
                 channel="premium"
             )
 
-        # refresh pos in case partial close updated state
         pos = self.state["open_positions"].get(trade_id)
         if not pos or pos.get("status") != "OPEN":
             save_engine_state(self.state)
             return {"ok": True, "position": pos}
 
-        # smart trailing
         new_trail = self._compute_smart_trailing_stop(pos, new_price)
         if new_trail > safe_float(pos["stop_price"], 0):
             pos["stop_price"] = round(new_trail, 2)
@@ -1048,6 +1349,7 @@ class EliteExecutionEngine:
                 "trade_id": trade_id,
                 "symbol": pos["symbol"],
                 "side": pos["side"],
+                "contract_symbol": pos.get("contract_symbol"),
                 "new_stop": pos["stop_price"],
                 "price": round(new_price, 2)
             })
@@ -1056,13 +1358,13 @@ class EliteExecutionEngine:
                 f"📈 TRAIL UPDATED\n"
                 f"Trade: {trade_id}\n"
                 f"{pos['symbol']} {pos['side']}\n"
+                f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
                 f"Price: {round(new_price, 2)}\n"
                 f"Old Stop: {old_stop}\n"
                 f"New Stop: {pos['stop_price']}",
                 channel="premium"
             )
 
-        # stop logic
         if new_price <= pos["stop_price"]:
             return self.close_position(trade_id, new_price, "STOP_HIT")
 
@@ -1118,6 +1420,7 @@ class EliteExecutionEngine:
             "trade_id": trade_id,
             "symbol": pos["symbol"],
             "side": pos["side"],
+            "contract_symbol": pos.get("contract_symbol"),
             "entry_price": pos["entry_price"],
             "exit_price": pos["exit_price"],
             "contracts_closed": contracts_open,
@@ -1137,6 +1440,7 @@ class EliteExecutionEngine:
             f"{icon} CLOSE TRADE\n"
             f"Trade: {trade_id}\n"
             f"{pos['symbol']} {pos['side']}\n"
+            f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
             f"Reason: {reason}\n"
             f"Exit: {actual_exit}\n"
             f"Contracts Closed: {contracts_open}\n"
@@ -1206,12 +1510,11 @@ def estimate_option_price_from_underlying(position: Dict[str, Any], underlying_p
 def fetch_live_position_price(position: Dict[str, Any]) -> Tuple[bool, float, str]:
     source = OPTION_MARK_SOURCE
 
-    if source in ["auto", "broker"]:
-        broker_price = broker_bridge.fetch_option_market_price(position)
-        if broker_price.get("ok"):
-            return True, round(safe_float(broker_price["price"]), 2), "broker"
-        if source == "broker":
-            return False, 0.0, broker_price.get("reason", "broker price failed")
+    if source == "alpaca":
+        live = broker_bridge.fetch_option_market_price(position)
+        if live.get("ok"):
+            return True, round(safe_float(live["price"]), 2), "alpaca"
+        return False, 0.0, live.get("reason", "alpaca price failed")
 
     try:
         underlying = fetch_latest_underlying_price(position["symbol"])
@@ -1233,6 +1536,12 @@ def monitor_open_positions():
         if not trade_id:
             continue
 
+        try:
+            underlying = fetch_latest_underlying_price(pos["symbol"])
+            pos["monitor"]["last_underlying_price"] = round(underlying, 2)
+        except Exception:
+            underlying = safe_float(pos.get("monitor", {}).get("last_underlying_price"), 0.0)
+
         ok, live_price, source = fetch_live_position_price(pos)
         if not ok or live_price <= 0:
             log_debug(f"MONITOR PRICE FAIL [{trade_id}] -> {source}")
@@ -1242,18 +1551,13 @@ def monitor_open_positions():
         pos["monitor"]["last_monitor_update"] = now_str()
         pos["monitor"]["price_source"] = source
 
-        try:
-            underlying = fetch_latest_underlying_price(pos["symbol"])
-            pos["monitor"]["last_underlying_price"] = round(underlying, 2)
-        except Exception:
-            pass
-
         result = elite_engine.update_position_price(trade_id, live_price)
 
         if result.get("ok"):
             log_debug(
                 f"MONITOR UPDATE [{trade_id}] "
                 f"{pos['symbol']} {pos['side']} "
+                f"contract={pos.get('contract_symbol')} "
                 f"price={live_price} source={source} "
                 f"tp1={pos.get('tp1_hit')} tp2={pos.get('tp2_hit')} stop={pos.get('stop_price')}"
             )
@@ -1331,6 +1635,7 @@ def cmd_positions_text() -> str:
         mon = p.get("monitor", {})
         lines.append(
             f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | "
+            f"{p.get('contract_symbol', 'NO_CONTRACT')} | Exp {p.get('contract_expiration')} | Strike {p.get('contract_strike')} | "
             f"Entry {p['entry_price']} | Current {p['current_price']} | Stop {p['stop_price']} | "
             f"TP1 {p['tp1_price']} | TP2 {p['tp2_price']} | OpenCtr {p.get('contracts_open')} | "
             f"ClosedCtr {p.get('contracts_closed_total')} | Realized {p.get('realized_pnl')} | "
@@ -1345,9 +1650,11 @@ def cmd_broker_status_text() -> str:
         f"Enabled: {s['broker_enabled']}\n"
         f"Name: {s['broker_name']}\n"
         f"Paper: {s['broker_paper']}\n"
-        f"Has Key: {s['broker_has_key']}\n"
-        f"Has Secret: {s['broker_has_secret']}\n"
-        f"Base URL: {s['broker_base_url']}"
+        f"Has Key: {s['alpaca_has_key']}\n"
+        f"Has Secret: {s['alpaca_has_secret']}\n"
+        f"Trading Base URL: {s['alpaca_trading_base_url']}\n"
+        f"Data Base URL: {s['alpaca_data_base_url']}\n"
+        f"Data Feed: {s['alpaca_data_feed']}"
     )
 
 # =========================================================
@@ -1405,7 +1712,7 @@ def handle_telegram_command(text: str) -> Optional[str]:
         ]
         for p in s["open_positions"][:5]:
             lines.append(
-                f"- {p['trade_id']} | {p['symbol']} {p['side']} | Entry {p['entry_price']} | Current {p['current_price']} | OpenCtr {p.get('contracts_open')}"
+                f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p.get('contract_symbol')} | Entry {p['entry_price']} | Current {p['current_price']} | OpenCtr {p.get('contracts_open')}"
             )
         return "\n".join(lines)
 
@@ -1571,7 +1878,7 @@ def process_signals(signals: List[Dict[str, Any]]):
 # MAIN LOOP
 # =========================================================
 def run_engine_loop():
-    log_debug("Auto TP / scale-out / smart trail engine started.")
+    log_debug("Alpaca options engine started.")
     print("=== ENGINE LOOP STARTED ===", flush=True)
 
     last_scan_ts = 0.0
@@ -1661,7 +1968,13 @@ if __name__ == "__main__":
     print(f"POSITION_MONITOR_ENABLED: {POSITION_MONITOR_ENABLED}", flush=True)
     print(f"POSITION_MONITOR_SECONDS: {POSITION_MONITOR_SECONDS}", flush=True)
     print(f"OPTION_MARK_SOURCE: {OPTION_MARK_SOURCE}", flush=True)
-    print(f"OPTION_PRICE_SENSITIVITY: {OPTION_PRICE_SENSITIVITY}", flush=True)
+    print(f"OPTION_EXPIRY_MODE: {OPTION_EXPIRY_MODE}", flush=True)
+    print(f"OPTION_MAX_DAYS_OUT: {OPTION_MAX_DAYS_OUT}", flush=True)
+    print(f"OPTION_STRIKE_MODE: {OPTION_STRIKE_MODE}", flush=True)
+    print(f"OPTION_MIN_PRICE: {OPTION_MIN_PRICE}", flush=True)
+    print(f"OPTION_MAX_PRICE: {OPTION_MAX_PRICE}", flush=True)
+    print(f"OPTION_ORDER_TYPE: {OPTION_ORDER_TYPE}", flush=True)
+    print(f"ALPACA_DATA_FEED: {ALPACA_DATA_FEED}", flush=True)
     print(f"TP1_SCALE_PCT: {TP1_SCALE_PCT}", flush=True)
     print(f"TP2_SCALE_PCT: {TP2_SCALE_PCT}", flush=True)
     print(f"TRAIL_BEFORE_TP2_PCT: {TRAIL_BEFORE_TP2_PCT}", flush=True)
@@ -1674,6 +1987,8 @@ if __name__ == "__main__":
     print(f"BROKER_ENABLED: {BROKER_ENABLED}", flush=True)
     print(f"BROKER_NAME: {BROKER_NAME}", flush=True)
     print(f"BROKER_PAPER: {BROKER_PAPER}", flush=True)
+    print(f"ALPACA_TRADING_BASE_URL: {ALPACA_TRADING_BASE_URL}", flush=True)
+    print(f"ALPACA_DATA_BASE_URL: {ALPACA_DATA_BASE_URL}", flush=True)
     print(f"MARKET_IS_OPEN_NOW: {market_is_open()}", flush=True)
 
     if TEST_MODE:
