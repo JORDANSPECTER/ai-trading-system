@@ -63,7 +63,7 @@ MIN_CONTRACTS_TO_SCALE = int(os.getenv("MIN_CONTRACTS_TO_SCALE", "2"))
 # =========================================================
 POSITION_MONITOR_ENABLED = os.getenv("POSITION_MONITOR_ENABLED", "true").lower() == "true"
 POSITION_MONITOR_SECONDS = int(os.getenv("POSITION_MONITOR_SECONDS", "5"))
-OPTION_MARK_SOURCE = os.getenv("OPTION_MARK_SOURCE", "alpaca").strip().lower()   # alpaca, estimate
+OPTION_MARK_SOURCE = os.getenv("OPTION_MARK_SOURCE", "alpaca").strip().lower()  # alpaca, estimate
 OPTION_PRICE_SENSITIVITY = float(os.getenv("OPTION_PRICE_SENSITIVITY", "10"))
 MIN_OPTION_PRICE = float(os.getenv("MIN_OPTION_PRICE", "0.05"))
 
@@ -87,10 +87,14 @@ MARKET_CLOSE_MINUTE = int(os.getenv("MARKET_CLOSE_MINUTE", "0"))
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
+# Canonical + legacy webhook names both supported
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
 DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "").strip()
 DISCORD_DEBUG_WEBHOOK = os.getenv("DISCORD_DEBUG_WEBHOOK", "").strip()
 DISCORD_REASONING_WEBHOOK = os.getenv("DISCORD_REASONING_WEBHOOK", "").strip()
+DISCORD_FREE_LEVELS_WEBHOOK_URL = os.getenv("DISCORD_FREE_LEVELS_WEBHOOK_URL", "").strip()
+DISCORD_PREMIUM_LEVELS_WEBHOOK_URL = os.getenv("DISCORD_PREMIUM_LEVELS_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -173,8 +177,22 @@ def market_is_open() -> bool:
 
 def log_debug(message: str):
     print(f"[DEBUG {now_str()}] {message}", flush=True)
-    if DEBUG_LOGGING and DISCORD_DEBUG_WEBHOOK:
-        send_discord_message(DISCORD_DEBUG_WEBHOOK, f"```{message[:1800]}```")
+    if DEBUG_LOGGING:
+        debug_hook = get_debug_hook()
+        if debug_hook:
+            send_discord_message(debug_hook, f"```{message[:1800]}```")
+
+# =========================================================
+# WEBHOOK ROUTING
+# =========================================================
+def get_free_hook() -> str:
+    return DISCORD_FREE_WEBHOOK or DISCORD_FREE_LEVELS_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+
+def get_premium_hook() -> str:
+    return DISCORD_PREMIUM_WEBHOOK or DISCORD_PREMIUM_LEVELS_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+
+def get_debug_hook() -> str:
+    return DISCORD_DEBUG_WEBHOOK or DISCORD_WEBHOOK_URL
 
 # =========================================================
 # RUNTIME STATE
@@ -246,25 +264,43 @@ def get_telegram_updates() -> List[Dict[str, Any]]:
         return []
 
 def send_trade_alert(message: str, channel: str = "premium"):
-    print(f"[ALERT] {message}", flush=True)
+    print(f"[ALERT:{channel.upper()}] {message}", flush=True)
+
+    free_hook = get_free_hook()
+    premium_hook = get_premium_hook()
+    debug_hook = get_debug_hook()
+
+    sent = False
 
     if channel == "free":
-        if SEND_FREE_ALERTS and DISCORD_FREE_WEBHOOK:
-            send_discord_message(DISCORD_FREE_WEBHOOK, message)
+        if SEND_FREE_ALERTS and free_hook:
+            sent = send_discord_message(free_hook, message)
     elif channel == "premium":
-        if SEND_PREMIUM_ALERTS and DISCORD_PREMIUM_WEBHOOK:
-            send_discord_message(DISCORD_PREMIUM_WEBHOOK, message)
+        if SEND_PREMIUM_ALERTS and premium_hook:
+            sent = send_discord_message(premium_hook, message)
     elif channel == "debug":
-        if DEBUG_LOGGING and DISCORD_DEBUG_WEBHOOK:
-            send_discord_message(DISCORD_DEBUG_WEBHOOK, message)
+        if DEBUG_LOGGING and debug_hook:
+            sent = send_discord_message(debug_hook, message)
+    else:
+        if premium_hook:
+            sent = send_discord_message(premium_hook, message)
 
     if SEND_TELEGRAM_ALERTS:
         send_telegram_message(message)
 
+    print(
+        f"[ALERT ROUTE] channel={channel} free_hook_set={bool(free_hook)} "
+        f"premium_hook_set={bool(premium_hook)} debug_hook_set={bool(debug_hook)} "
+        f"discord_sent={sent}",
+        flush=True,
+    )
+
 def send_reasoning_alert(content: str) -> bool:
     if not DISCORD_REASONING_WEBHOOK:
         return False
-    return send_discord_message(DISCORD_REASONING_WEBHOOK, content)
+    sent = send_discord_message(DISCORD_REASONING_WEBHOOK, content)
+    print(f"[ALERT ROUTE] channel=reasoning reasoning_hook_set={bool(DISCORD_REASONING_WEBHOOK)} discord_sent={sent}", flush=True)
+    return sent
 
 def format_reasoning_block(signal: Dict[str, Any]) -> str:
     meta = signal.get("meta", {})
@@ -289,7 +325,6 @@ def format_reasoning_block(signal: Dict[str, Any]) -> str:
         warnings.append("Long entry is getting extended on RSI")
     if side == "PUT" and rsi <= 30:
         warnings.append("Short entry is getting extended on RSI")
-
     if not warnings:
         warnings.append("No major warning flags")
 
@@ -327,7 +362,7 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
         "interval": interval,
         "outputsize": outputsize,
         "format": "JSON",
-        "apikey": TWELVE_DATA_API_KEY
+        "apikey": TWELVE_DATA_API_KEY,
     }
 
     r = requests.get(url, params=params, timeout=20)
@@ -345,7 +380,7 @@ def fetch_twelve_data_bars(symbol: str, interval: str = SCAN_INTERVAL, outputsiz
             "high": safe_float(row.get("high")),
             "low": safe_float(row.get("low")),
             "close": safe_float(row.get("close")),
-            "volume": safe_float(row.get("volume"))
+            "volume": safe_float(row.get("volume")),
         })
     return bars
 
@@ -442,13 +477,13 @@ def alpaca_trading_headers() -> Dict[str, str]:
     return {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
 def alpaca_data_headers() -> Dict[str, str]:
     return {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_API_SECRET
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
     }
 
 def alpaca_enabled() -> bool:
@@ -472,7 +507,7 @@ class BrokerBridge:
             "alpaca_has_secret": bool(ALPACA_API_SECRET),
             "alpaca_trading_base_url": ALPACA_TRADING_BASE_URL or "not_set",
             "alpaca_data_base_url": ALPACA_DATA_BASE_URL or "not_set",
-            "alpaca_data_feed": ALPACA_DATA_FEED
+            "alpaca_data_feed": ALPACA_DATA_FEED,
         }
 
     def fetch_option_contracts(self, underlying_symbol: str, option_type: str) -> Dict[str, Any]:
@@ -488,7 +523,7 @@ class BrokerBridge:
             "type": "call" if option_type.upper() == "CALL" else "put",
             "expiration_date_gte": str(today),
             "expiration_date_lte": str(end_date),
-            "limit": 100
+            "limit": 100,
         }
 
         try:
@@ -496,7 +531,7 @@ class BrokerBridge:
                 f"{ALPACA_TRADING_BASE_URL}/v2/options/contracts",
                 headers=alpaca_trading_headers(),
                 params=params,
-                timeout=20
+                timeout=20,
             )
             data = r.json()
             contracts = data.get("option_contracts", [])
@@ -513,7 +548,7 @@ class BrokerBridge:
                 f"{ALPACA_DATA_BASE_URL}/v1beta1/options/snapshots/{underlying_symbol}",
                 headers=alpaca_data_headers(),
                 params={"feed": ALPACA_DATA_FEED, "limit": 1000},
-                timeout=20
+                timeout=20,
             )
             data = r.json()
             snapshots = data.get("snapshots", {})
@@ -530,7 +565,7 @@ class BrokerBridge:
                 f"{ALPACA_DATA_BASE_URL}/v1beta1/options/quotes/latest",
                 headers=alpaca_data_headers(),
                 params={"symbols": contract_symbol, "feed": ALPACA_DATA_FEED},
-                timeout=20
+                timeout=20,
             )
             data = r.json()
             quotes = data.get("quotes", {})
@@ -597,12 +632,10 @@ class BrokerBridge:
                         priced = False
                         mid = 0.0
 
-                if priced:
-                    if mid < OPTION_MIN_PRICE or mid > OPTION_MAX_PRICE:
-                        continue
+                if priced and (mid < OPTION_MIN_PRICE or mid > OPTION_MAX_PRICE):
+                    continue
 
                 distance = abs(strike - underlying_price)
-
                 itm_bonus = 0.0
                 if OPTION_STRIKE_MODE == "itm1":
                     if side.upper() == "CALL" and strike <= underlying_price:
@@ -621,7 +654,7 @@ class BrokerBridge:
                     "priced": priced,
                     "distance": distance,
                     "itm_bonus": itm_bonus,
-                    "contract": c
+                    "contract": c,
                 })
             except Exception:
                 continue
@@ -634,7 +667,7 @@ class BrokerBridge:
                 x["expiration_date"],
                 0 if x["priced"] else 1,
                 x["distance"] - x["itm_bonus"],
-                -x["open_interest"]
+                -x["open_interest"],
             )
         )
 
@@ -649,7 +682,7 @@ class BrokerBridge:
             "mid": best["mid"],
             "priced": best["priced"],
             "open_interest": best["open_interest"],
-            "contract": best["contract"]
+            "contract": best["contract"],
         }
 
     def submit_entry_order(self, position: Dict[str, Any]) -> Dict[str, Any]:
@@ -659,7 +692,7 @@ class BrokerBridge:
                 "broker_order_id": f"paper_entry_{uuid.uuid4().hex[:12]}",
                 "broker_status": "filled",
                 "fill_price": position["entry_price"],
-                "mode": "PAPER"
+                "mode": "PAPER",
             }
 
         if not alpaca_enabled():
@@ -672,7 +705,7 @@ class BrokerBridge:
                 "side": "buy",
                 "type": OPTION_ORDER_TYPE if OPTION_ORDER_TYPE in ["market", "limit"] else "market",
                 "time_in_force": "day",
-                "client_order_id": position["signal_id"][:48]
+                "client_order_id": position["signal_id"][:48],
             }
 
             if payload["type"] == "limit":
@@ -689,7 +722,7 @@ class BrokerBridge:
                 f"{ALPACA_TRADING_BASE_URL}/v2/orders",
                 headers=alpaca_trading_headers(),
                 json=payload,
-                timeout=20
+                timeout=20,
             )
             data = r.json()
 
@@ -706,7 +739,7 @@ class BrokerBridge:
                 "broker_status": data.get("status"),
                 "fill_price": round(fill_price, 2),
                 "mode": "PAPER" if PAPER_TRADING else "LIVE",
-                "raw": data
+                "raw": data,
             }
         except Exception as e:
             return {"ok": False, "reason": str(e)}
@@ -722,7 +755,7 @@ class BrokerBridge:
                 "side": "sell",
                 "type": OPTION_ORDER_TYPE if OPTION_ORDER_TYPE in ["market", "limit"] else "market",
                 "time_in_force": "day",
-                "client_order_id": f"{position['trade_id']}_{reason}_{int(time.time())}"[:48]
+                "client_order_id": f"{position['trade_id']}_{reason}_{int(time.time())}"[:48],
             }
 
             if payload["type"] == "limit":
@@ -738,7 +771,7 @@ class BrokerBridge:
                 f"{ALPACA_TRADING_BASE_URL}/v2/orders",
                 headers=alpaca_trading_headers(),
                 json=payload,
-                timeout=20
+                timeout=20,
             )
             data = r.json()
 
@@ -757,7 +790,7 @@ class BrokerBridge:
                 "contracts_closed": contracts_to_close,
                 "reason": reason,
                 "mode": "PAPER" if PAPER_TRADING else "LIVE",
-                "raw": data
+                "raw": data,
             }
         except Exception as e:
             return {"ok": False, "reason": str(e)}
@@ -786,7 +819,7 @@ class BrokerBridge:
             "price": round(mid, 2),
             "bid": safe_float(quote.get("bid"), 0.0),
             "ask": safe_float(quote.get("ask"), 0.0),
-            "mid": mid
+            "mid": mid,
         }
 
 broker_bridge = BrokerBridge()
@@ -904,8 +937,8 @@ def analyze_symbol(symbol: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str
             "volume_ratio": round(vol_ratio, 2),
             "momentum_pct": round(momentum_pct, 3),
             "interval": SCAN_INTERVAL,
-            "bar_time": last_bar["datetime"]
-        }
+            "bar_time": last_bar["datetime"],
+        },
     }
 
 # =========================================================
@@ -921,7 +954,7 @@ def default_engine_state() -> Dict[str, Any]:
         "cooldowns": {},
         "open_positions": {},
         "last_signal_ids": [],
-        "last_reset": now_str()
+        "last_reset": now_str(),
     }
 
 def load_engine_state() -> Dict[str, Any]:
@@ -966,7 +999,7 @@ class EliteExecutionEngine:
             "daily_realized_pnl": round(self.state["daily_realized_pnl"], 2),
             "daily_trade_count": self.state["daily_trade_count"],
             "open_positions_count": len([p for p in self.state["open_positions"].values() if p.get("status") == "OPEN"]),
-            "cooldowns": self.state["cooldowns"]
+            "cooldowns": self.state["cooldowns"],
         }
 
     def lock_engine(self, reason: str):
@@ -1007,11 +1040,7 @@ class EliteExecutionEngine:
 
     def has_same_direction_open(self, symbol: str, side: str) -> bool:
         for pos in self.state["open_positions"].values():
-            if (
-                pos.get("status") == "OPEN"
-                and pos.get("symbol") == symbol.upper()
-                and pos.get("side") == side.upper()
-            ):
+            if pos.get("status") == "OPEN" and pos.get("symbol") == symbol.upper() and pos.get("side") == side.upper():
                 return True
         return False
 
@@ -1044,16 +1073,12 @@ class EliteExecutionEngine:
 
         if score < MIN_SIGNAL_SCORE:
             return False, f"Signal below minimum score ({score} < {MIN_SIGNAL_SCORE})"
-
         if side == "CALL" and not ALLOW_CALLS:
             return False, "CALL trades disabled"
-
         if side == "PUT" and not ALLOW_PUTS:
             return False, "PUT trades disabled"
-
         if self.in_cooldown(symbol, side):
             return False, f"{symbol} {side} still in cooldown"
-
         if self.has_same_direction_open(symbol, side):
             return False, f"{symbol} {side} already open"
 
@@ -1071,7 +1096,6 @@ class EliteExecutionEngine:
 
         risk_per_contract = entry_price * stop_pct * 100
         contracts = max(1, int(risk_amount // max(risk_per_contract, 0.01)))
-
         stop_price = round(entry_price * (1 - stop_pct), 2)
         tp1_price = round(entry_price * (1 + tp1_pct), 2)
         tp2_price = round(entry_price * (1 + tp2_pct), 2)
@@ -1083,7 +1107,7 @@ class EliteExecutionEngine:
             "tp2_price": tp2_price,
             "contracts": contracts,
             "risk_dollars": round(risk_per_contract * contracts, 2),
-            "trail_after_tp1": DEFAULT_TRAIL_AFTER_TP1
+            "trail_after_tp1": DEFAULT_TRAIL_AFTER_TP1,
         }
 
     def _append_scale_event(self, position: Dict[str, Any], contracts_closed: int, fill_price: float, reason: str, pnl_realized: float):
@@ -1093,7 +1117,7 @@ class EliteExecutionEngine:
             "contracts_closed": contracts_closed,
             "fill_price": round(fill_price, 2),
             "reason": reason,
-            "pnl_realized": round(pnl_realized, 2)
+            "pnl_realized": round(pnl_realized, 2),
         })
 
     def _compute_smart_trailing_stop(self, pos: Dict[str, Any], current_price: float) -> float:
@@ -1101,23 +1125,19 @@ class EliteExecutionEngine:
             return pos["stop_price"]
 
         current_stop = safe_float(pos["stop_price"], 0)
-
         if pos.get("tp2_hit"):
             candidate = round(current_price * (1 - TRAIL_AFTER_TP2_PCT), 2)
             return max(current_stop, candidate)
-
         if pos.get("tp1_hit"):
             candidate = round(current_price * (1 - TRAIL_BEFORE_TP2_PCT), 2)
             candidate = max(candidate, pos["entry_price"])
             return max(current_stop, candidate)
-
         return current_stop
 
     def _partial_close(self, trade_id: str, contracts_to_close: int, fill_price: float, reason: str) -> Dict[str, Any]:
         pos = self.state["open_positions"].get(trade_id)
         if not pos:
             return {"ok": False, "reason": "Trade not found"}
-
         if pos.get("status") != "OPEN":
             return {"ok": False, "reason": "Trade not open"}
 
@@ -1126,7 +1146,6 @@ class EliteExecutionEngine:
             return {"ok": False, "reason": "No contracts left"}
 
         contracts_to_close = min(max(1, contracts_to_close), contracts_open)
-
         broker_result = broker_bridge.submit_partial_close_order(pos, fill_price, contracts_to_close, reason)
         if not broker_result.get("ok"):
             return {"ok": False, "reason": broker_result.get("reason", "partial close failed")}
@@ -1138,7 +1157,6 @@ class EliteExecutionEngine:
         pos["contracts_open"] = contracts_open - contracts_to_close
         pos["contracts_closed_total"] = safe_int(pos.get("contracts_closed_total", 0), 0) + contracts_to_close
         pos["realized_pnl"] = round(safe_float(pos.get("realized_pnl", 0.0), 0.0) + realized, 2)
-
         self.state["daily_realized_pnl"] += realized
 
         self._append_scale_event(pos, contracts_to_close, actual_exit, reason, realized)
@@ -1153,20 +1171,14 @@ class EliteExecutionEngine:
             "contracts_closed": contracts_to_close,
             "fill_price": actual_exit,
             "reason": reason,
-            "realized_pnl": realized
+            "realized_pnl": realized,
         })
 
         send_trade_alert(
-            f"💰 PARTIAL CLOSE\n"
-            f"Trade: {trade_id}\n"
-            f"{pos['symbol']} {pos['side']}\n"
-            f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
-            f"Reason: {reason}\n"
-            f"Closed: {contracts_to_close}\n"
-            f"Fill: {actual_exit}\n"
-            f"Remaining: {pos['contracts_open']}\n"
-            f"Realized: ${realized}",
-            channel="premium"
+            f"💰 PARTIAL CLOSE\nTrade: {trade_id}\n{pos['symbol']} {pos['side']}\n"
+            f"Contract: {pos.get('contract_symbol', 'n/a')}\nReason: {reason}\nClosed: {contracts_to_close}\n"
+            f"Fill: {actual_exit}\nRemaining: {pos['contracts_open']}\nRealized: ${realized}",
+            channel="premium",
         )
 
         if pos["contracts_open"] <= 0:
@@ -1182,10 +1194,7 @@ class EliteExecutionEngine:
     def place_trade(self, signal: Dict[str, Any]) -> Dict[str, Any]:
         symbol = signal.get("symbol", "").upper().strip()
         side = signal.get("side", "").upper().strip()
-        signal_id = str(signal.get("signal_id", "")).strip()
-
-        if not signal_id:
-            signal_id = f"{symbol}_{side}_{int(time.time())}"
+        signal_id = str(signal.get("signal_id", "")).strip() or f"{symbol}_{side}_{int(time.time())}"
 
         if self.is_duplicate_signal(signal_id):
             return {"ok": False, "reason": "Duplicate signal blocked"}
@@ -1253,8 +1262,8 @@ class EliteExecutionEngine:
                 "last_underlying_price": underlying_price,
                 "last_option_price": plan["entry_price"],
                 "last_monitor_update": now_str(),
-                "price_source": "alpaca_contract_select"
-            }
+                "price_source": "alpaca_contract_select",
+            },
         }
 
         broker_result = broker_bridge.submit_entry_order(position)
@@ -1269,7 +1278,6 @@ class EliteExecutionEngine:
             position["entry_price"] = round(safe_float(fill_price, position["entry_price"]), 2)
             position["current_price"] = position["entry_price"]
             position["monitor"]["last_option_price"] = position["entry_price"]
-
             position["stop_price"] = round(position["entry_price"] * (1 - safe_float(signal.get("stop_pct", DEFAULT_STOP_PCT))), 2)
             position["tp1_price"] = round(position["entry_price"] * (1 + safe_float(signal.get("tp1_pct", DEFAULT_TP1_PCT))), 2)
             position["tp2_price"] = round(position["entry_price"] * (1 + safe_float(signal.get("tp2_pct", DEFAULT_TP2_PCT))), 2)
@@ -1295,23 +1303,16 @@ class EliteExecutionEngine:
             "mode": position["mode"],
             "manual": position["manual"],
             "broker_order_id": position["broker_order_id"],
-            "broker_status": position["broker_status"]
+            "broker_status": position["broker_status"],
         })
 
         send_trade_alert(
-            f"🚀 OPEN TRADE\n"
-            f"Trade: {trade_id}\n"
-            f"{symbol} {side}\n"
-            f"Contract: {position['contract_symbol']}\n"
+            f"🚀 OPEN TRADE\nTrade: {trade_id}\n{symbol} {side}\nContract: {position['contract_symbol']}\n"
             f"Exp: {position['contract_expiration']} | Strike: {position['contract_strike']}\n"
-            f"Grade: {position['grade']} ({position['score']})\n"
-            f"Entry: {position['entry_price']}\n"
-            f"Stop: {position['stop_price']}\n"
-            f"TP1: {position['tp1_price']}\n"
-            f"TP2: {position['tp2_price']}\n"
-            f"Contracts: {position['contracts']}\n"
-            f"Mode: {position['mode']}",
-            channel="premium"
+            f"Grade: {position['grade']} ({position['score']})\nEntry: {position['entry_price']}\n"
+            f"Stop: {position['stop_price']}\nTP1: {position['tp1_price']}\nTP2: {position['tp2_price']}\n"
+            f"Contracts: {position['contracts']}\nMode: {position['mode']}",
+            channel="premium",
         )
 
         return {"ok": True, "trade_id": trade_id, "position": position}
@@ -1320,7 +1321,6 @@ class EliteExecutionEngine:
         pos = self.state["open_positions"].get(trade_id)
         if not pos:
             return {"ok": False, "reason": "Trade not found"}
-
         if pos.get("status") != "OPEN":
             return {"ok": False, "reason": "Trade already closed"}
 
@@ -1333,16 +1333,13 @@ class EliteExecutionEngine:
 
         if not pos["tp1_hit"] and new_price >= pos["tp1_price"]:
             pos["tp1_hit"] = True
-
             if pos["trail_after_tp1"]:
                 pos["stop_price"] = round(max(pos["stop_price"], pos["entry_price"]), 2)
-
             if AUTO_SCALE_ENABLED and safe_int(pos.get("contracts_open", 0), 0) >= MIN_CONTRACTS_TO_SCALE:
                 contracts_open = safe_int(pos["contracts_open"], 0)
                 contracts_to_close = max(1, math.floor(contracts_open * TP1_SCALE_PCT))
                 if contracts_to_close >= contracts_open:
                     contracts_to_close = max(1, contracts_open - 1) if contracts_open > 1 else 1
-
                 self._partial_close(trade_id, contracts_to_close, new_price, "AUTO_TP1_SCALE")
 
             append_trade_log({
@@ -1352,28 +1349,22 @@ class EliteExecutionEngine:
                 "symbol": pos["symbol"],
                 "side": pos["side"],
                 "contract_symbol": pos.get("contract_symbol"),
-                "price": round(new_price, 2)
+                "price": round(new_price, 2),
             })
 
             send_trade_alert(
-                f"🎯 TP1 HIT\n"
-                f"Trade: {trade_id}\n"
-                f"{pos['symbol']} {pos['side']}\n"
-                f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
-                f"Price: {round(new_price, 2)}\n"
-                f"Stop moved to: {pos['stop_price']}",
-                channel="premium"
+                f"🎯 TP1 HIT\nTrade: {trade_id}\n{pos['symbol']} {pos['side']}\nContract: {pos.get('contract_symbol', 'n/a')}\n"
+                f"Price: {round(new_price, 2)}\nStop moved to: {pos['stop_price']}",
+                channel="premium",
             )
 
         if pos.get("status") == "OPEN" and not pos["tp2_hit"] and new_price >= pos["tp2_price"]:
             pos["tp2_hit"] = True
-
             if AUTO_SCALE_ENABLED and safe_int(pos.get("contracts_open", 0), 0) >= 1:
                 contracts_open = safe_int(pos["contracts_open"], 0)
                 contracts_to_close = max(1, math.floor(contracts_open * TP2_SCALE_PCT))
                 if contracts_to_close > contracts_open:
                     contracts_to_close = contracts_open
-
                 self._partial_close(trade_id, contracts_to_close, new_price, "AUTO_TP2_SCALE")
 
             append_trade_log({
@@ -1383,16 +1374,12 @@ class EliteExecutionEngine:
                 "symbol": pos["symbol"],
                 "side": pos["side"],
                 "contract_symbol": pos.get("contract_symbol"),
-                "price": round(new_price, 2)
+                "price": round(new_price, 2),
             })
 
             send_trade_alert(
-                f"🏁 TP2 HIT\n"
-                f"Trade: {trade_id}\n"
-                f"{pos['symbol']} {pos['side']}\n"
-                f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
-                f"Price: {round(new_price, 2)}",
-                channel="premium"
+                f"🏁 TP2 HIT\nTrade: {trade_id}\n{pos['symbol']} {pos['side']}\nContract: {pos.get('contract_symbol', 'n/a')}\nPrice: {round(new_price, 2)}",
+                channel="premium",
             )
 
         pos = self.state["open_positions"].get(trade_id)
@@ -1411,18 +1398,12 @@ class EliteExecutionEngine:
                 "side": pos["side"],
                 "contract_symbol": pos.get("contract_symbol"),
                 "new_stop": pos["stop_price"],
-                "price": round(new_price, 2)
+                "price": round(new_price, 2),
             })
-
             send_trade_alert(
-                f"📈 TRAIL UPDATED\n"
-                f"Trade: {trade_id}\n"
-                f"{pos['symbol']} {pos['side']}\n"
-                f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
-                f"Price: {round(new_price, 2)}\n"
-                f"Old Stop: {old_stop}\n"
-                f"New Stop: {pos['stop_price']}",
-                channel="premium"
+                f"📈 TRAIL UPDATED\nTrade: {trade_id}\n{pos['symbol']} {pos['side']}\nContract: {pos.get('contract_symbol', 'n/a')}\n"
+                f"Price: {round(new_price, 2)}\nOld Stop: {old_stop}\nNew Stop: {pos['stop_price']}",
+                channel="premium",
             )
 
         if new_price <= pos["stop_price"]:
@@ -1435,7 +1416,6 @@ class EliteExecutionEngine:
         pos = self.state["open_positions"].get(trade_id)
         if not pos:
             return {"ok": False, "reason": "Trade not found"}
-
         if pos.get("status") != "OPEN":
             return {"ok": False, "reason": "Trade already closed"}
 
@@ -1453,9 +1433,7 @@ class EliteExecutionEngine:
         if not broker_result.get("ok"):
             return {"ok": False, "reason": broker_result.get("reason", "broker close failed")}
 
-        actual_exit = broker_result.get("fill_price", exit_price)
-        actual_exit = round(safe_float(actual_exit, exit_price), 2)
-
+        actual_exit = round(safe_float(broker_result.get("fill_price", exit_price), exit_price), 2)
         pnl_per_contract = (actual_exit - pos["entry_price"]) * 100
         realized = round(pnl_per_contract * contracts_open, 2)
 
@@ -1470,7 +1448,6 @@ class EliteExecutionEngine:
         pos["broker_close_status"] = broker_result.get("broker_status")
 
         self._append_scale_event(pos, contracts_open, actual_exit, reason, realized)
-
         self.state["daily_realized_pnl"] += realized
         self.set_cooldown(pos["symbol"], pos["side"], COOLDOWN_MINUTES)
 
@@ -1487,7 +1464,7 @@ class EliteExecutionEngine:
             "pnl": realized,
             "reason": reason,
             "broker_close_order_id": pos.get("broker_close_order_id"),
-            "broker_close_status": pos.get("broker_close_status")
+            "broker_close_status": pos.get("broker_close_status"),
         })
 
         if self.state["daily_realized_pnl"] <= -abs(MAX_DAILY_LOSS):
@@ -1497,16 +1474,10 @@ class EliteExecutionEngine:
 
         icon = "⛔" if reason == "STOP_HIT" else "✅"
         send_trade_alert(
-            f"{icon} CLOSE TRADE\n"
-            f"Trade: {trade_id}\n"
-            f"{pos['symbol']} {pos['side']}\n"
-            f"Contract: {pos.get('contract_symbol', 'n/a')}\n"
-            f"Reason: {reason}\n"
-            f"Exit: {actual_exit}\n"
-            f"Contracts Closed: {contracts_open}\n"
-            f"Realized: ${realized}\n"
-            f"Day PnL: ${round(self.state['daily_realized_pnl'], 2)}",
-            channel="premium"
+            f"{icon} CLOSE TRADE\nTrade: {trade_id}\n{pos['symbol']} {pos['side']}\nContract: {pos.get('contract_symbol', 'n/a')}\n"
+            f"Reason: {reason}\nExit: {actual_exit}\nContracts Closed: {contracts_open}\n"
+            f"Realized: ${realized}\nDay PnL: ${round(self.state['daily_realized_pnl'], 2)}",
+            channel="premium",
         )
 
         return {"ok": True, "position": pos}
@@ -1517,17 +1488,13 @@ class EliteExecutionEngine:
     def flatten_all_positions(self, exit_price_map: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         exit_price_map = exit_price_map or {}
         results = []
-
         for trade_id, pos in list(self.state["open_positions"].items()):
             if pos.get("status") != "OPEN":
                 continue
-
             exit_price = safe_float(exit_price_map.get(trade_id, pos.get("current_price", pos.get("entry_price", 0))))
             if exit_price <= 0:
                 exit_price = pos.get("entry_price", 0)
-
             results.append(self.close_position(trade_id, exit_price, "FLATTEN_ALL"))
-
         return {"ok": True, "results": results}
 
     def get_trade_summary(self) -> Dict[str, Any]:
@@ -1538,7 +1505,7 @@ class EliteExecutionEngine:
             "daily_realized_pnl": round(self.state["daily_realized_pnl"], 2),
             "daily_trade_count": self.state["daily_trade_count"],
             "open_positions_count": len(self.get_open_positions()),
-            "open_positions": self.get_open_positions()
+            "open_positions": self.get_open_positions(),
         }
 
 elite_engine = EliteExecutionEngine()
@@ -1597,7 +1564,7 @@ def monitor_open_positions():
             underlying = fetch_latest_underlying_price(pos["symbol"])
             pos["monitor"]["last_underlying_price"] = round(underlying, 2)
         except Exception:
-            underlying = safe_float(pos.get("monitor", {}).get("last_underlying_price"), 0.0)
+            pass
 
         ok, live_price, source = fetch_live_position_price(pos)
         if not ok or live_price <= 0:
@@ -1609,14 +1576,10 @@ def monitor_open_positions():
         pos["monitor"]["price_source"] = source
 
         result = elite_engine.update_position_price(trade_id, live_price)
-
         if result.get("ok"):
             log_debug(
-                f"MONITOR UPDATE [{trade_id}] "
-                f"{pos['symbol']} {pos['side']} "
-                f"contract={pos.get('contract_symbol')} "
-                f"price={live_price} source={source} "
-                f"tp1={pos.get('tp1_hit')} tp2={pos.get('tp2_hit')} stop={pos.get('stop_price')}"
+                f"MONITOR UPDATE [{trade_id}] {pos['symbol']} {pos['side']} contract={pos.get('contract_symbol')} "
+                f"price={live_price} source={source} tp1={pos.get('tp1_hit')} tp2={pos.get('tp2_hit')} stop={pos.get('stop_price')}"
             )
         else:
             log_debug(f"MONITOR UPDATE FAIL [{trade_id}] -> {result.get('reason')}")
@@ -1626,9 +1589,7 @@ def monitor_open_positions():
 # =========================================================
 def get_open_position_by_trade_id(trade_id: str) -> Optional[Dict[str, Any]]:
     pos = elite_engine.state["open_positions"].get(trade_id)
-    if not pos:
-        return None
-    if pos.get("status") != "OPEN":
+    if not pos or pos.get("status") != "OPEN":
         return None
     return pos
 
@@ -1691,11 +1652,10 @@ def cmd_positions_text() -> str:
     for p in positions[:10]:
         mon = p.get("monitor", {})
         lines.append(
-            f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | "
-            f"{p.get('contract_symbol', 'NO_CONTRACT')} | Exp {p.get('contract_expiration')} | Strike {p.get('contract_strike')} | "
-            f"Entry {p['entry_price']} | Current {p['current_price']} | Stop {p['stop_price']} | "
-            f"TP1 {p['tp1_price']} | TP2 {p['tp2_price']} | OpenCtr {p.get('contracts_open')} | "
-            f"ClosedCtr {p.get('contracts_closed_total')} | Realized {p.get('realized_pnl')} | "
+            f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p['grade']} | {p.get('contract_symbol', 'NO_CONTRACT')} | "
+            f"Exp {p.get('contract_expiration')} | Strike {p.get('contract_strike')} | Entry {p['entry_price']} | "
+            f"Current {p['current_price']} | Stop {p['stop_price']} | TP1 {p['tp1_price']} | TP2 {p['tp2_price']} | "
+            f"OpenCtr {p.get('contracts_open')} | ClosedCtr {p.get('contracts_closed_total')} | Realized {p.get('realized_pnl')} | "
             f"PriceSrc {mon.get('price_source', 'n/a')} | Broker {p.get('broker_status')}"
         )
     return "\n".join(lines)
@@ -1738,25 +1698,19 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "/setprice <trade_id> <price> - set current price\n"
             "/tp1 <trade_id> - simulate TP1 hit\n"
             "/tp2 <trade_id> - simulate TP2 hit\n"
-            "/stop <trade_id> - simulate stop hit"
+            "/stop <trade_id> - simulate stop hit\n"
+            "/testdiscord - send free/premium/debug/reasoning test alerts"
         )
 
     if text == "/ping":
         return "Bot is alive."
-
     if text == "/status":
         s = cmd_status()
         return (
-            f"Status\n"
-            f"Paper: {s['paper_trading']}\n"
-            f"Auto Exec: {s['auto_execution_enabled']}\n"
-            f"Locked: {s['engine_locked']}\n"
-            f"Reason: {s['lock_reason']}\n"
-            f"Daily PnL: {s['daily_realized_pnl']}\n"
-            f"Daily Trades: {s['daily_trade_count']}\n"
+            f"Status\nPaper: {s['paper_trading']}\nAuto Exec: {s['auto_execution_enabled']}\nLocked: {s['engine_locked']}\n"
+            f"Reason: {s['lock_reason']}\nDaily PnL: {s['daily_realized_pnl']}\nDaily Trades: {s['daily_trade_count']}\n"
             f"Open Positions: {s['open_positions_count']}"
         )
-
     if text == "/summary":
         s = cmd_summary()
         lines = [
@@ -1765,26 +1719,21 @@ def handle_telegram_command(text: str) -> Optional[str]:
             f"Locked: {s['engine_locked']}",
             f"Daily PnL: {s['daily_realized_pnl']}",
             f"Daily Trades: {s['daily_trade_count']}",
-            f"Open Positions: {s['open_positions_count']}"
+            f"Open Positions: {s['open_positions_count']}",
         ]
         for p in s["open_positions"][:5]:
             lines.append(
                 f"- {p['trade_id']} | {p['symbol']} {p['side']} | {p.get('contract_symbol')} | Entry {p['entry_price']} | Current {p['current_price']} | OpenCtr {p.get('contracts_open')}"
             )
         return "\n".join(lines)
-
     if text == "/positions":
         return cmd_positions_text()
-
     if text == "/brokerstatus":
         return cmd_broker_status_text()
-
     if text == "/lock":
         return cmd_lock("Telegram manual lock")["message"]
-
     if text == "/unlock":
         return cmd_unlock()["message"]
-
     if text in ["/flatten", "/closeall"]:
         result = cmd_flatten()
         return f"Close all sent. Closed: {len(result.get('results', []))}"
@@ -1794,11 +1743,9 @@ def handle_telegram_command(text: str) -> Optional[str]:
         if len(parts) < 2:
             return "Usage: /close <trade_id>"
         trade_id = parts[1].strip()
-
         pos = elite_engine.state["open_positions"].get(trade_id)
         if not pos or pos.get("status") != "OPEN":
             return f"Trade not found or already closed: {trade_id}"
-
         exit_price = safe_float(pos.get("current_price", pos.get("entry_price", 0)))
         result = cmd_close_trade(trade_id, exit_price)
         return f"CLOSE RESULT: {result}"
@@ -1835,6 +1782,13 @@ def handle_telegram_command(text: str) -> Optional[str]:
         result = cmd_hit_stop(parts[1].strip())
         return f"STOP RESULT: {result}"
 
+    if text == "/testdiscord":
+        send_trade_alert("🧪 FREE ROUTE TEST", channel="free")
+        send_trade_alert("🧪 PREMIUM ROUTE TEST", channel="premium")
+        send_trade_alert("🧪 DEBUG ROUTE TEST", channel="debug")
+        send_reasoning_alert("🧠 REASONING ROUTE TEST")
+        return "Discord route test sent."
+
     if text == "/testcall":
         signal = {
             "signal_id": f"TEST_QQQ_CALL_{int(time.time())}",
@@ -1849,8 +1803,9 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "tp2_pct": 0.60,
             "notes": "Telegram test CALL | Power hour volatility increased | 5m momentum confirms entry | Above VWAP",
             "manual": True,
-            "meta": {"underlying_price": 500.0, "vwap": 498.4, "rsi": 65.2, "volume_ratio": 1.4, "momentum_pct": 0.22, "interval": SCAN_INTERVAL, "bar_time": now_str()}
+            "meta": {"underlying_price": 500.0, "vwap": 498.4, "rsi": 65.2, "volume_ratio": 1.4, "momentum_pct": 0.22, "interval": SCAN_INTERVAL, "bar_time": now_str()},
         }
+        send_reasoning_alert(format_reasoning_block(signal))
         result = process_trade_signal(signal)
         return f"TEST CALL: {result}"
 
@@ -1868,8 +1823,9 @@ def handle_telegram_command(text: str) -> Optional[str]:
             "tp2_pct": 0.60,
             "notes": "Telegram test PUT | Fresh VWAP rejection | Negative momentum confirmed",
             "manual": True,
-            "meta": {"underlying_price": 500.0, "vwap": 501.2, "rsi": 38.7, "volume_ratio": 1.5, "momentum_pct": -0.24, "interval": SCAN_INTERVAL, "bar_time": now_str()}
+            "meta": {"underlying_price": 500.0, "vwap": 501.2, "rsi": 38.7, "volume_ratio": 1.5, "momentum_pct": -0.24, "interval": SCAN_INTERVAL, "bar_time": now_str()},
         }
+        send_reasoning_alert(format_reasoning_block(signal))
         result = process_trade_signal(signal)
         return f"TEST PUT: {result}"
 
@@ -1886,14 +1842,12 @@ def poll_telegram_commands():
         chat = str(message.get("chat", {}).get("id", ""))
 
         print(f"[TELEGRAM CMD] Received: {text}", flush=True)
-
         if TELEGRAM_CHAT_ID and chat != TELEGRAM_CHAT_ID:
             print(f"[TELEGRAM CMD] Ignored wrong chat: {chat}", flush=True)
             continue
 
         reply = handle_telegram_command(text)
         print(f"[TELEGRAM CMD] Reply: {reply}", flush=True)
-
         if reply:
             send_telegram_message(reply)
 
@@ -1902,35 +1856,29 @@ def poll_telegram_commands():
 # =========================================================
 def scan_once() -> List[Dict[str, Any]]:
     signals = []
-
     for symbol in SCAN_SYMBOLS:
         try:
             print(f"[SCAN] Pulling bars for {symbol}", flush=True)
             bars = fetch_twelve_data_bars(symbol, SCAN_INTERVAL, outputsize=max(MIN_BARS + 10, 60))
             signal = analyze_symbol(symbol, bars)
-
             if signal:
                 print(f"[SCAN] SIGNAL FOUND -> {signal['symbol']} {signal['side']} {signal['grade']} {signal['score']}", flush=True)
                 signals.append(signal)
             else:
                 print(f"[SCAN] No qualifying signal for {symbol}", flush=True)
-
         except Exception as e:
             log_debug(f"SCAN ERROR [{symbol}]: {e}")
-
     return signals
 
 def process_signals(signals: List[Dict[str, Any]]):
     for signal in signals:
         try:
-            reasoning_msg = format_reasoning_block(signal)
-            send_reasoning_alert(reasoning_msg)
+            send_reasoning_alert(format_reasoning_block(signal))
         except Exception as e:
             log_debug(f"REASONING ALERT ERROR [{signal.get('symbol', 'N/A')}]: {e}")
 
         print(f"[PROCESS] Sending signal into engine -> {signal['symbol']} {signal['side']}", flush=True)
         result = process_trade_signal(signal)
-
         if result.get("ok"):
             stamp_signal_time(signal["symbol"], signal["side"])
             log_debug(f"EXECUTED: {signal['symbol']} {signal['side']} {signal['grade']} {signal['score']}")
@@ -1952,7 +1900,6 @@ def run_engine_loop():
     while True:
         try:
             now_ts = time.time()
-
             if now_ts - last_heartbeat_ts >= heartbeat_interval:
                 print(f"Loop heartbeat: {now_str()}", flush=True)
                 last_heartbeat_ts = now_ts
@@ -1966,11 +1913,9 @@ def run_engine_loop():
 
             current_market_status = market_is_open()
             should_scan = (now_ts - last_scan_ts) >= SCAN_SECONDS
-
             if should_scan:
                 last_scan_ts = now_ts
                 print(f"[SCAN TIMER] Market open: {current_market_status} | TEST_MODE: {TEST_MODE}", flush=True)
-
                 if current_market_status or TEST_MODE:
                     signals = scan_once()
                     print(f"[SCAN TIMER] Signals found: {len(signals)}", flush=True)
@@ -1980,7 +1925,6 @@ def run_engine_loop():
                     print("[SCAN TIMER] Market closed. Waiting for next scan window.", flush=True)
 
             time.sleep(TELEGRAM_POLL_SECONDS)
-
         except KeyboardInterrupt:
             log_debug("Engine stopped by user.")
             break
@@ -1994,7 +1938,6 @@ def run_engine_loop():
 # =========================================================
 def run_test_mode():
     print("Running TEST_MODE...", flush=True)
-
     test_signal = {
         "signal_id": f"TEST_QQQ_CALL_{int(time.time())}",
         "symbol": "QQQ",
@@ -2008,9 +1951,8 @@ def run_test_mode():
         "tp2_pct": 0.60,
         "notes": "VWAP reclaim + premium test | Tech strong | 5m momentum confirms entry",
         "manual": True,
-        "meta": {"underlying_price": 500.0, "vwap": 498.4, "rsi": 65.2, "volume_ratio": 1.4, "momentum_pct": 0.22, "interval": SCAN_INTERVAL, "bar_time": now_str()}
+        "meta": {"underlying_price": 500.0, "vwap": 498.4, "rsi": 65.2, "volume_ratio": 1.4, "momentum_pct": 0.22, "interval": SCAN_INTERVAL, "bar_time": now_str()},
     }
-
     print("REASONING:", format_reasoning_block(test_signal), flush=True)
     result = process_trade_signal(test_signal)
     print("TRADE RESULT:", result, flush=True)
@@ -2053,6 +1995,11 @@ if __name__ == "__main__":
     print(f"BROKER_PAPER: {BROKER_PAPER}", flush=True)
     print(f"ALPACA_TRADING_BASE_URL: {ALPACA_TRADING_BASE_URL}", flush=True)
     print(f"ALPACA_DATA_BASE_URL: {ALPACA_DATA_BASE_URL}", flush=True)
+    print(f"DISCORD_FREE_WEBHOOK_SET: {bool(DISCORD_FREE_WEBHOOK)}", flush=True)
+    print(f"DISCORD_FREE_LEVELS_WEBHOOK_URL_SET: {bool(DISCORD_FREE_LEVELS_WEBHOOK_URL)}", flush=True)
+    print(f"DISCORD_PREMIUM_WEBHOOK_SET: {bool(DISCORD_PREMIUM_WEBHOOK)}", flush=True)
+    print(f"DISCORD_PREMIUM_LEVELS_WEBHOOK_URL_SET: {bool(DISCORD_PREMIUM_LEVELS_WEBHOOK_URL)}", flush=True)
+    print(f"DISCORD_DEBUG_WEBHOOK_SET: {bool(DISCORD_DEBUG_WEBHOOK)}", flush=True)
     print(f"DISCORD_REASONING_WEBHOOK_SET: {bool(DISCORD_REASONING_WEBHOOK)}", flush=True)
     print(f"MARKET_IS_OPEN_NOW: {market_is_open()}", flush=True)
 
