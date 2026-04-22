@@ -16,7 +16,7 @@ import requests
 # FULL MAIN.PY
 # DISCORD + TELEGRAM + SIGNAL PARSER + FILE DEBUG
 # + PAPER + ALPACA + RISK POLICY + POSITION SIZING
-# + PRE-TRADE VALIDATOR
+# + PRE-TRADE VALIDATOR + PORTFOLIO RISK MANAGER
 # =========================================================
 
 
@@ -110,6 +110,18 @@ REJECT_DUPLICATE_OPEN_SYMBOL = os.getenv("REJECT_DUPLICATE_OPEN_SYMBOL", "true")
 ENFORCE_NO_TRADE_WINDOW = os.getenv("ENFORCE_NO_TRADE_WINDOW", "false").lower() == "true"
 NO_TRADE_START_HHMM = os.getenv("NO_TRADE_START_HHMM", "09:30").strip()
 NO_TRADE_END_HHMM = os.getenv("NO_TRADE_END_HHMM", "09:33").strip()
+
+# =========================
+# PORTFOLIO RISK MANAGER
+# =========================
+MAX_PROJECTED_PORTFOLIO_HEAT_PCT = float(os.getenv("MAX_PROJECTED_PORTFOLIO_HEAT_PCT", "0.03"))
+MAX_SYMBOL_PORTFOLIO_COUNT = int(os.getenv("MAX_SYMBOL_PORTFOLIO_COUNT", "1"))
+MAX_DIRECTIONAL_INDEX_COUNT = int(os.getenv("MAX_DIRECTIONAL_INDEX_COUNT", "2"))
+MAX_CORRELATED_THEME_COUNT = int(os.getenv("MAX_CORRELATED_THEME_COUNT", "2"))
+
+CORRELATED_TICKERS = {
+    "SPY", "QQQ", "IWM", "DIA", "NVDA", "TSLA", "AAPL", "MSFT", "META", "AMD"
+}
 
 
 # =========================================================
@@ -271,7 +283,6 @@ def default_state() -> Dict[str, Any]:
         "boot_time": epoch(),
         "notes": "",
 
-        # risk tracking
         "daily_realized_pnl_pct": 0.0,
         "consecutive_losses": 0,
         "last_trade_day": current_trade_day(),
@@ -804,6 +815,65 @@ def validate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================================
+# PORTFOLIO RISK MANAGER
+# =========================================================
+def is_correlated_ticker(ticker: str) -> bool:
+    return str(ticker).upper().strip() in CORRELATED_TICKERS
+
+
+def evaluate_portfolio_risk(signal: Dict[str, Any]) -> Dict[str, Any]:
+    reasons = []
+
+    open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+    new_ticker = str(signal.get("ticker", "")).upper().strip()
+    new_symbol = str(signal.get("symbol", "")).strip()
+    new_direction = str(signal.get("direction", "")).upper().strip()
+
+    equity = get_account_equity()
+    proposed_trade_risk = estimate_trade_risk_dollars(signal)
+    proposed_trade_risk_pct = proposed_trade_risk / equity if equity > 0 else 0.0
+
+    current_heat = portfolio_heat_pct()
+    projected_heat = current_heat + proposed_trade_risk_pct
+
+    if projected_heat > MAX_PROJECTED_PORTFOLIO_HEAT_PCT:
+        reasons.append("projected_portfolio_heat_limit_hit")
+
+    symbol_count = sum(1 for p in open_positions if p.get("symbol") == new_symbol)
+    if symbol_count >= MAX_SYMBOL_PORTFOLIO_COUNT:
+        reasons.append("symbol_portfolio_count_limit_hit")
+
+    same_direction_index_count = sum(
+        1
+        for p in open_positions
+        if str(p.get("direction", "")).upper().strip() == new_direction
+        and is_correlated_ticker(p.get("ticker", ""))
+    )
+    if is_correlated_ticker(new_ticker) and same_direction_index_count >= MAX_DIRECTIONAL_INDEX_COUNT:
+        reasons.append("directional_index_exposure_limit_hit")
+
+    correlated_theme_count = sum(
+        1 for p in open_positions if is_correlated_ticker(p.get("ticker", ""))
+    )
+    if is_correlated_ticker(new_ticker) and correlated_theme_count >= MAX_CORRELATED_THEME_COUNT:
+        reasons.append("correlated_theme_exposure_limit_hit")
+
+    approved = len(reasons) == 0
+
+    return {
+        "approved": approved,
+        "stage": "portfolio_risk",
+        "reject_reasons": reasons,
+        "portfolio_heat_pct": round(current_heat, 6),
+        "projected_heat_pct": round(projected_heat, 6),
+        "max_projected_heat_pct": MAX_PROJECTED_PORTFOLIO_HEAT_PCT,
+        "symbol_portfolio_count": symbol_count,
+        "same_direction_index_count": same_direction_index_count,
+        "correlated_theme_count": correlated_theme_count
+    }
+
+
+# =========================================================
 # SIGNAL NORMALIZATION
 # =========================================================
 def normalize_confidence(conf) -> str:
@@ -1111,6 +1181,22 @@ def build_validation_block_message(signal: Dict[str, Any], validation_decision: 
         f"Reasons: {reasons}\n"
         f"Reward/Risk: {validation_decision.get('reward_to_risk', 0.0)}\n"
         f"Unit Risk: {validation_decision.get('unit_risk', 0.0)}\n"
+        f"⏰ {now_ts()}"
+    )
+
+
+def build_portfolio_block_message(signal: Dict[str, Any], portfolio_decision: Dict[str, Any]) -> str:
+    reasons = ", ".join(portfolio_decision.get("reject_reasons", [])) or "unknown"
+    return (
+        f"🚫 PORTFOLIO RISK BLOCKED SIGNAL\n"
+        f"Ticker: {signal['ticker']}\n"
+        f"Symbol: {signal['symbol']}\n"
+        f"Reasons: {reasons}\n"
+        f"Current Heat %: {round(portfolio_decision.get('portfolio_heat_pct', 0.0) * 100, 3)}\n"
+        f"Projected Heat %: {round(portfolio_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n"
+        f"Symbol Count: {portfolio_decision.get('symbol_portfolio_count', 0)}\n"
+        f"Directional Index Count: {portfolio_decision.get('same_direction_index_count', 0)}\n"
+        f"Correlated Theme Count: {portfolio_decision.get('correlated_theme_count', 0)}\n"
         f"⏰ {now_ts()}"
     )
 
@@ -1539,7 +1625,6 @@ def handle_new_signal(signal: Dict[str, Any]):
         manage_open_positions(signal)
         return
 
-    # STEP 3: pre-trade validator
     validation_decision = validate_signal(signal)
     if not validation_decision["approved"]:
         log(f"🚫 VALIDATION BLOCKED SIGNAL: {validation_decision['reject_reasons']}")
@@ -1548,7 +1633,6 @@ def handle_new_signal(signal: Dict[str, Any]):
         send_to_telegram(validation_msg)
         return
 
-    # STEP 2: position sizing by stop distance
     size_decision = size_signal_by_stop(signal)
     if not size_decision["approved"]:
         log(f"🚫 SIZING BLOCKED SIGNAL: {size_decision['reject_reasons']}")
@@ -1559,13 +1643,20 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     sized_signal = apply_size_decision_to_signal(signal, size_decision)
 
-    # STEP 1: risk veto on sized signal
     risk_decision = evaluate_risk_policy(sized_signal)
     if not risk_decision["approved"]:
         log(f"🚫 RISK BLOCKED SIGNAL: {risk_decision['reject_reasons']}")
         reject_msg = build_risk_block_message(sized_signal, risk_decision)
         send_to_discord(DISCORD_AI_WEBHOOK, reject_msg, "AI")
         send_to_telegram(reject_msg)
+        return
+
+    portfolio_decision = evaluate_portfolio_risk(sized_signal)
+    if not portfolio_decision["approved"]:
+        log(f"🚫 PORTFOLIO BLOCKED SIGNAL: {portfolio_decision['reject_reasons']}")
+        portfolio_msg = build_portfolio_block_message(sized_signal, portfolio_decision)
+        send_to_discord(DISCORD_AI_WEBHOOK, portfolio_msg, "AI")
+        send_to_telegram(portfolio_msg)
         return
 
     route_signal(sized_signal, GLOBAL_STATE)
