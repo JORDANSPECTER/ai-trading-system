@@ -3,22 +3,26 @@ import sys
 import json
 import time
 import math
+import hashlib
+import tempfile
 import traceback
 from copy import deepcopy
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 
-
 # =========================================================
-# UNBIASED TRADES ELITE ENGINE
-# FULL MAIN.PY
-# DISCORD + TELEGRAM + SIGNAL PARSER + FILE DEBUG
-# + PAPER + ALPACA + RISK POLICY + POSITION SIZING
-# + PRE-TRADE VALIDATOR + PORTFOLIO RISK MANAGER
-# + REGIME ENGINE
-# + LIVE OPTIONS MODE UPDATE
+# UNBIASED TRADES ELITE ENGINE - HARDENED MAIN.PY
+# Added:
+# - Atomic JSON writes + backup recovery
+# - Schema-safe state loading
+# - Order lifecycle store
+# - Startup reconciliation and safety block
+# - Partial fill / fill-aware local updates
+# - Clearer trust boundaries:
+#     broker = live truth
+#     local files = cache + audit log
 # =========================================================
 
 
@@ -33,7 +37,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BOT_NAME = os.getenv("BOT_NAME", "UnBiased Trades Engine").strip()
-
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 RUN_TEST_ON_START = os.getenv("RUN_TEST_ON_START", "true").lower() == "true"
 RUN_LOOP = os.getenv("RUN_LOOP", "true").lower() == "true"
@@ -44,6 +47,8 @@ HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "30"))
 SIGNAL_FILE = os.getenv("SIGNAL_FILE", "signal.json").strip()
 STATE_FILE = os.getenv("STATE_FILE", "engine_state.json").strip()
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json").strip()
+ORDERS_FILE = os.getenv("ORDERS_FILE", "orders.json").strip()
+RECON_FILE = os.getenv("RECON_FILE", "reconciliation.json").strip()
 
 ENABLE_TELEGRAM_COMMANDS = os.getenv("ENABLE_TELEGRAM_COMMANDS", "true").lower() == "true"
 ENABLE_PAPER_EXECUTION = os.getenv("ENABLE_PAPER_EXECUTION", "true").lower() == "true"
@@ -51,9 +56,7 @@ ENABLE_DISCORD = os.getenv("ENABLE_DISCORD", "true").lower() == "true"
 ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "true").lower() == "true"
 ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
 
-# =========================
 # ALPACA
-# =========================
 ENABLE_ALPACA = os.getenv("ENABLE_ALPACA", "false").lower() == "true"
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
@@ -65,61 +68,46 @@ ALPACA_LIVE_OPTIONS_APPROVED = os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", "false"
 USE_ALPACA_OPTIONS_BUYING_POWER = os.getenv("USE_ALPACA_OPTIONS_BUYING_POWER", "true").lower() == "true"
 LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
 
-# =========================
 # SIGNAL / EXECUTION DEFAULTS
-# =========================
 MAX_SIGNAL_AGE_SECONDS = int(os.getenv("MAX_SIGNAL_AGE_SECONDS", "180"))
-
 DEFAULT_PAPER_QTY = int(os.getenv("DEFAULT_PAPER_QTY", "1"))
 DEFAULT_LIVE_QTY = int(os.getenv("DEFAULT_LIVE_QTY", "1"))
 DEFAULT_RISK_PER_TRADE = float(os.getenv("DEFAULT_RISK_PER_TRADE", "1.0"))
-
 DEFAULT_SCALE1_PCT = float(os.getenv("DEFAULT_SCALE1_PCT", "0.50"))
 DEFAULT_SCALE2_PCT = float(os.getenv("DEFAULT_SCALE2_PCT", "0.25"))
 DEFAULT_TRAIL_PCT = float(os.getenv("DEFAULT_TRAIL_PCT", "0.20"))
 DEFAULT_BREAK_EVEN_AFTER_TP1 = os.getenv("DEFAULT_BREAK_EVEN_AFTER_TP1", "true").lower() == "true"
-
 ALLOW_LIVE_BUYS = os.getenv("ALLOW_LIVE_BUYS", "false").lower() == "true"
 ALLOW_LIVE_SELLS = os.getenv("ALLOW_LIVE_SELLS", "true").lower() == "true"
 REQUIRE_OPTION_SYMBOL = os.getenv("REQUIRE_OPTION_SYMBOL", "true").lower() == "true"
 
-# =========================
 # RISK LIMITS
-# =========================
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.005"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.02"))
 MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("MAX_PORTFOLIO_HEAT_PCT", "0.03"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 MAX_SAME_TICKER_POSITIONS = int(os.getenv("MAX_SAME_TICKER_POSITIONS", "1"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
-
 PAPER_ACCOUNT_EQUITY = float(os.getenv("PAPER_ACCOUNT_EQUITY", "25000"))
 LIVE_ACCOUNT_EQUITY_FALLBACK = float(os.getenv("LIVE_ACCOUNT_EQUITY_FALLBACK", "25000"))
 
-# =========================
 # POSITION SIZING
-# =========================
 MIN_POSITION_QTY = int(os.getenv("MIN_POSITION_QTY", "1"))
 MAX_POSITION_QTY = int(os.getenv("MAX_POSITION_QTY", "10"))
 USE_SIGNAL_QTY_AS_MAX = os.getenv("USE_SIGNAL_QTY_AS_MAX", "false").lower() == "true"
-
 CONFIDENCE_MULT_A_PLUS = float(os.getenv("CONFIDENCE_MULT_A_PLUS", "1.00"))
 CONFIDENCE_MULT_A = float(os.getenv("CONFIDENCE_MULT_A", "1.00"))
 CONFIDENCE_MULT_B = float(os.getenv("CONFIDENCE_MULT_B", "0.70"))
 CONFIDENCE_MULT_C = float(os.getenv("CONFIDENCE_MULT_C", "0.40"))
 
-# =========================
 # PRE-TRADE VALIDATOR
-# =========================
 MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "1.2"))
 REJECT_DUPLICATE_OPEN_SYMBOL = os.getenv("REJECT_DUPLICATE_OPEN_SYMBOL", "true").lower() == "true"
 ENFORCE_NO_TRADE_WINDOW = os.getenv("ENFORCE_NO_TRADE_WINDOW", "false").lower() == "true"
 NO_TRADE_START_HHMM = os.getenv("NO_TRADE_START_HHMM", "09:30").strip()
 NO_TRADE_END_HHMM = os.getenv("NO_TRADE_END_HHMM", "09:33").strip()
 
-# =========================
-# PORTFOLIO RISK MANAGER
-# =========================
+# PORTFOLIO RISK
 MAX_PROJECTED_PORTFOLIO_HEAT_PCT = float(os.getenv("MAX_PROJECTED_PORTFOLIO_HEAT_PCT", "0.03"))
 MAX_SYMBOL_PORTFOLIO_COUNT = int(os.getenv("MAX_SYMBOL_PORTFOLIO_COUNT", "1"))
 MAX_DIRECTIONAL_INDEX_COUNT = int(os.getenv("MAX_DIRECTIONAL_INDEX_COUNT", "2"))
@@ -129,18 +117,20 @@ CORRELATED_TICKERS = {
     "SPY", "QQQ", "IWM", "DIA", "NVDA", "TSLA", "AAPL", "MSFT", "META", "AMD"
 }
 
-# =========================
-# REGIME ENGINE
-# =========================
+# REGIME
 ENABLE_REGIME_ENGINE = os.getenv("ENABLE_REGIME_ENGINE", "true").lower() == "true"
 ALLOWED_REGIMES = {
-    part.strip().upper()
-    for part in os.getenv("ALLOWED_REGIMES", "TREND,EXPANSION,NORMAL").split(",")
-    if part.strip()
+    p.strip().upper() for p in os.getenv("ALLOWED_REGIMES", "TREND,EXPANSION,NORMAL").split(",") if p.strip()
 }
 MIN_REGIME_SCORE = float(os.getenv("MIN_REGIME_SCORE", "0.50"))
 BLOCK_CHOP_REGIME = os.getenv("BLOCK_CHOP_REGIME", "true").lower() == "true"
 ALLOW_EVENT_REGIME = os.getenv("ALLOW_EVENT_REGIME", "false").lower() == "true"
+
+# RECON / SAFETY
+STRICT_STARTUP_RECON = os.getenv("STRICT_STARTUP_RECON", "true").lower() == "true"
+BLOCK_NEW_TRADES_ON_RECON_MISMATCH = os.getenv("BLOCK_NEW_TRADES_ON_RECON_MISMATCH", "true").lower() == "true"
+RECON_LOOKBACK_ORDERS = int(os.getenv("RECON_LOOKBACK_ORDERS", "50"))
+MAX_ORDER_STALE_SECONDS = int(os.getenv("MAX_ORDER_STALE_SECONDS", "120"))
 
 
 # =========================================================
@@ -148,6 +138,8 @@ ALLOW_EVENT_REGIME = os.getenv("ALLOW_EVENT_REGIME", "false").lower() == "true"
 # =========================================================
 GLOBAL_STATE = None
 GLOBAL_POSITIONS = None
+GLOBAL_ORDERS = None
+GLOBAL_RECON = None
 
 
 # =========================================================
@@ -183,7 +175,7 @@ def safe_int(v, default=0) -> int:
     try:
         if v is None or v == "":
             return int(default)
-        return int(v)
+        return int(float(v))
     except Exception:
         return int(default)
 
@@ -192,39 +184,16 @@ def file_exists(path: str) -> bool:
     return os.path.exists(path)
 
 
-def load_json_file(path: str, default):
-    try:
-        if not file_exists(path):
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"❌ Failed reading {path}: {e}")
-        return default
-
-
-def save_json_file(path: str, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        log(f"❌ Failed saving {path}: {e}")
-        return False
-
-
-def pct_change(entry: float, last: float) -> float:
-    if entry <= 0:
-        return 0.0
-    return ((last - entry) / entry) * 100.0
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def signal_hash(signal: Dict[str, Any]) -> str:
     try:
-        key = json.dumps(signal, sort_keys=True)
-        return str(abs(hash(key)))
+        key = json.dumps(signal, sort_keys=True, default=str)
+        return sha256_text(key)
     except Exception:
-        return str(epoch())
+        return sha256_text(str(epoch()))
 
 
 def current_trade_day() -> str:
@@ -236,10 +205,11 @@ def current_hhmm() -> str:
 
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    parts = hhmm.split(":")
-    if len(parts) != 2:
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
         return 0
-    return int(parts[0]) * 60 + int(parts[1])
 
 
 def is_now_in_no_trade_window() -> bool:
@@ -251,38 +221,87 @@ def is_now_in_no_trade_window() -> bool:
     return start_m <= now_m <= end_m
 
 
+def pct_change(entry: float, last: float) -> float:
+    if entry <= 0:
+        return 0.0
+    return ((last - entry) / entry) * 100.0
+
+
+def weighted_avg_price(old_qty: int, old_avg: float, fill_qty: int, fill_price: float) -> float:
+    total_qty = old_qty + fill_qty
+    if total_qty <= 0:
+        return 0.0
+    return ((old_qty * old_avg) + (fill_qty * fill_price)) / total_qty
+
+
+def atomic_write_json(path: str, data: Any) -> bool:
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    tmp_fd = None
+    tmp_path = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=f".{base}.", suffix=".tmp", dir=directory)
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if file_exists(path):
+            backup = f"{path}.bak"
+            try:
+                with open(path, "r", encoding="utf-8") as src, open(backup, "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+        return True
+    except Exception as e:
+        log(f"❌ Atomic save failed for {path}: {e}")
+        try:
+            if tmp_path and file_exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def load_json_file(path: str, default: Any):
+    candidates = [path, f"{path}.bak"]
+    for candidate in candidates:
+        try:
+            if not file_exists(candidate):
+                continue
+            with open(candidate, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"❌ Failed reading {candidate}: {e}")
+    return deepcopy(default)
+
+
+def save_json_file(path: str, data: Any) -> bool:
+    return atomic_write_json(path, data)
+
+
 def debug_file_lookup(path: str):
     try:
         cwd = os.getcwd()
         abs_path = os.path.abspath(path)
-
         log("📁 FILE DEBUG MODE")
         log(f"Working directory: {cwd}")
-        log(f"Requested SIGNAL_FILE: {path}")
-        log(f"Absolute SIGNAL_FILE path: {abs_path}")
+        log(f"Requested path: {path}")
+        log(f"Absolute path: {abs_path}")
         log(f"Exists?: {os.path.exists(path)}")
         log(f"Absolute exists?: {os.path.exists(abs_path)}")
-
         try:
-            root_files = os.listdir(cwd)
-            log(f"Files in working directory: {root_files}")
-        except Exception as inner_e:
-            log(f"❌ Could not list working directory files: {inner_e}")
-
-        repo_guess = "/opt/render/project/src"
-        if os.path.exists(repo_guess):
-            try:
-                repo_files = os.listdir(repo_guess)
-                log(f"Files in /opt/render/project/src: {repo_files}")
-            except Exception as inner_e:
-                log(f"❌ Could not list /opt/render/project/src: {inner_e}")
-
+            log(f"Files in cwd: {os.listdir(cwd)}")
+        except Exception as inner:
+            log(f"❌ Could not list cwd: {inner}")
     except Exception as e:
         log(f"❌ debug_file_lookup failed: {e}")
 
 
 # =========================================================
-# STATE
+# DEFAULT STORES
 # =========================================================
 def default_state() -> Dict[str, Any]:
     return {
@@ -293,6 +312,7 @@ def default_state() -> Dict[str, Any]:
         "alpaca_enabled": ENABLE_ALPACA,
         "last_signal_hash": "",
         "last_signal_time": 0,
+        "recent_signal_hashes": [],
         "last_signal_file_mtime": 0,
         "last_heartbeat_time": 0,
         "last_telegram_update_id": 0,
@@ -306,42 +326,84 @@ def default_state() -> Dict[str, Any]:
         "last_trade_day": current_trade_day(),
         "kill_switch": False,
         "bot_paused": False,
-        "last_mode": "LIVE" if LIVE_MODE else "PAPER"
+        "last_mode": "LIVE" if LIVE_MODE else "PAPER",
+        "reconciliation_required": False,
+        "reconciliation_block_reason": "",
     }
-
-
-def load_state() -> Dict[str, Any]:
-    state = load_json_file(STATE_FILE, default_state())
-    merged = default_state()
-    merged.update(state)
-    return merged
-
-
-def save_state(state: Dict[str, Any]):
-    save_json_file(STATE_FILE, state)
 
 
 def default_positions() -> Dict[str, Any]:
     return {
         "open_positions": [],
         "closed_positions": [],
-        "last_position_id": 0
+        "last_position_id": 0,
     }
 
 
-def load_positions() -> Dict[str, Any]:
-    positions = load_json_file(POSITIONS_FILE, default_positions())
-    merged = default_positions()
-    merged.update(positions)
+def default_orders() -> Dict[str, Any]:
+    return {
+        "orders": [],
+        "last_local_order_id": 0,
+    }
+
+
+def default_recon() -> Dict[str, Any]:
+    return {
+        "last_boot_reconciliation_at": 0,
+        "last_boot_report": {},
+        "last_runtime_reconciliation_at": 0,
+    }
+
+
+def safe_merge(default_obj: Dict[str, Any], loaded: Dict[str, Any]) -> Dict[str, Any]:
+    merged = deepcopy(default_obj)
+    if isinstance(loaded, dict):
+        merged.update(loaded)
     return merged
+
+
+def load_state() -> Dict[str, Any]:
+    return safe_merge(default_state(), load_json_file(STATE_FILE, default_state()))
+
+
+def save_state(state: Dict[str, Any]):
+    save_json_file(STATE_FILE, state)
+
+
+def load_positions() -> Dict[str, Any]:
+    data = safe_merge(default_positions(), load_json_file(POSITIONS_FILE, default_positions()))
+    if not isinstance(data.get("open_positions"), list):
+        data["open_positions"] = []
+    if not isinstance(data.get("closed_positions"), list):
+        data["closed_positions"] = []
+    return data
 
 
 def save_positions(positions: Dict[str, Any]):
     save_json_file(POSITIONS_FILE, positions)
 
 
+def load_orders() -> Dict[str, Any]:
+    data = safe_merge(default_orders(), load_json_file(ORDERS_FILE, default_orders()))
+    if not isinstance(data.get("orders"), list):
+        data["orders"] = []
+    return data
+
+
+def save_orders(orders: Dict[str, Any]):
+    save_json_file(ORDERS_FILE, orders)
+
+
+def load_recon() -> Dict[str, Any]:
+    return safe_merge(default_recon(), load_json_file(RECON_FILE, default_recon()))
+
+
+def save_recon(recon: Dict[str, Any]):
+    save_json_file(RECON_FILE, recon)
+
+
 # =========================================================
-# RISK HELPERS
+# STATE HELPERS
 # =========================================================
 def reset_daily_risk_counters_if_needed(state: Dict[str, Any]):
     today = current_trade_day()
@@ -352,84 +414,37 @@ def reset_daily_risk_counters_if_needed(state: Dict[str, Any]):
         save_state(state)
 
 
-def get_account_equity() -> float:
-    if ENABLE_ALPACA and GLOBAL_STATE and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
-        acct = alpaca_get_account()
-        if acct:
-            equity = safe_float(acct.get("equity", LIVE_ACCOUNT_EQUITY_FALLBACK), LIVE_ACCOUNT_EQUITY_FALLBACK)
-            return max(equity, 1.0)
-    return max(PAPER_ACCOUNT_EQUITY, 1.0)
+def append_recent_signal_hash(state: Dict[str, Any], sig_hash: str, max_keep: int = 50):
+    hashes = state.get("recent_signal_hashes", [])
+    if not isinstance(hashes, list):
+        hashes = []
+    hashes.append(sig_hash)
+    state["recent_signal_hashes"] = hashes[-max_keep:]
 
 
-def get_options_buying_power() -> float:
-    if ENABLE_ALPACA and GLOBAL_STATE and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() and USE_ALPACA_OPTIONS_BUYING_POWER:
-        acct = alpaca_get_account()
-        if acct:
-            obp = safe_float(acct.get("options_buying_power", 0), 0)
-            if obp > 0:
-                return obp
-            buying_power = safe_float(acct.get("buying_power", 0), 0)
-            return max(buying_power, 0)
-    return get_account_equity()
+def clear_reconciliation_block():
+    GLOBAL_STATE["reconciliation_required"] = False
+    GLOBAL_STATE["reconciliation_block_reason"] = ""
+    save_state(GLOBAL_STATE)
 
 
-def estimate_unit_risk(signal: Dict[str, Any]) -> float:
-    entry = safe_float(signal.get("entry_contract", 0), 0)
-    stop = safe_float(signal.get("stop_contract", 0), 0)
-    if entry <= 0 or stop <= 0:
-        return 0.0
-    return max(entry - stop, 0.0)
-
-
-def estimate_trade_risk_dollars(signal: Dict[str, Any]) -> float:
-    qty = max(1, safe_int(signal.get("qty", 1), 1))
-    unit_risk = estimate_unit_risk(signal)
-    return qty * unit_risk * 100.0
-
-
-def estimate_trade_notional_dollars(signal: Dict[str, Any]) -> float:
-    qty = max(1, safe_int(signal.get("qty", 1), 1))
-    entry = safe_float(signal.get("entry_contract", 0), 0)
-    return qty * entry * 100.0
-
-
-def estimate_open_position_risk_dollars(position: Dict[str, Any]) -> float:
-    qty_open = max(0, safe_int(position.get("qty_open", 0), 0))
-    entry = safe_float(position.get("entry_price", 0), 0)
-    stop = safe_float(position.get("stop_price", 0), 0)
-    if qty_open <= 0 or entry <= 0 or stop <= 0:
-        return 0.0
-    unit_risk = max(entry - stop, 0.0)
-    return qty_open * unit_risk * 100.0
-
-
-def portfolio_heat_pct() -> float:
-    equity = get_account_equity()
-    if equity <= 0:
-        return 0.0
-    total_open_risk = 0.0
-    for p in GLOBAL_POSITIONS.get("open_positions", []):
-        total_open_risk += estimate_open_position_risk_dollars(p)
-    return total_open_risk / equity
-
-
-def is_correlated_ticker(ticker: str) -> bool:
-    return str(ticker).upper().strip() in CORRELATED_TICKERS
+def set_reconciliation_block(reason: str):
+    GLOBAL_STATE["reconciliation_required"] = True
+    GLOBAL_STATE["reconciliation_block_reason"] = reason
+    save_state(GLOBAL_STATE)
 
 
 # =========================================================
-# DISCORD
+# DISCORD / TELEGRAM
 # =========================================================
 def send_to_discord(webhook_url: str, message: str, label: str = "UNKNOWN") -> bool:
     if not ENABLE_DISCORD:
-        debug(f"Discord disabled, skipped {label}")
         return False
     if not webhook_url:
         log(f"❌ Missing Discord webhook for {label}")
         return False
     try:
-        payload = {"content": message[:2000]}
-        r = requests.post(webhook_url, json=payload, timeout=15)
+        r = requests.post(webhook_url, json={"content": message[:2000]}, timeout=15)
         if 200 <= r.status_code < 300:
             log(f"✅ Discord sent -> {label}")
             return True
@@ -440,26 +455,17 @@ def send_to_discord(webhook_url: str, message: str, label: str = "UNKNOWN") -> b
         return False
 
 
-# =========================================================
-# TELEGRAM
-# =========================================================
 def telegram_api_url(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
 
 def send_to_telegram(message: str) -> bool:
     if not ENABLE_TELEGRAM_ALERTS:
-        debug("Telegram alerts disabled")
         return False
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        debug("Telegram token/chat id missing")
         return False
     try:
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message[:4096],
-            "disable_web_page_preview": True,
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message[:4096], "disable_web_page_preview": True}
         r = requests.post(telegram_api_url("sendMessage"), data=payload, timeout=15)
         if 200 <= r.status_code < 300:
             log("✅ Telegram sent")
@@ -480,11 +486,9 @@ def get_telegram_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
             params["offset"] = offset
         r = requests.get(telegram_api_url("getUpdates"), params=params, timeout=20)
         if r.status_code != 200:
-            debug(f"Telegram getUpdates failed: {r.status_code} {r.text}")
             return []
         data = r.json()
         if not data.get("ok"):
-            debug(f"Telegram getUpdates not ok: {data}")
             return []
         return data.get("result", [])
     except Exception as e:
@@ -508,18 +512,15 @@ def alpaca_headers() -> Dict[str, str]:
 
 
 def alpaca_get(path: str, params: Optional[Dict[str, Any]] = None):
-    url = f"{ALPACA_BASE_URL}{path}"
-    return requests.get(url, headers=alpaca_headers(), params=params or {}, timeout=ALPACA_ORDER_TIMEOUT)
+    return requests.get(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), params=params or {}, timeout=ALPACA_ORDER_TIMEOUT)
 
 
 def alpaca_post(path: str, payload: Dict[str, Any]):
-    url = f"{ALPACA_BASE_URL}{path}"
-    return requests.post(url, headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
+    return requests.post(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
 
 
 def alpaca_delete(path: str):
-    url = f"{ALPACA_BASE_URL}{path}"
-    return requests.delete(url, headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
+    return requests.delete(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
 
 
 def alpaca_get_account() -> Optional[Dict[str, Any]]:
@@ -529,11 +530,10 @@ def alpaca_get_account() -> Optional[Dict[str, Any]]:
         r = alpaca_get("/v2/account")
         if r.status_code == 200:
             return r.json()
-        log(f"❌ Alpaca account check failed | {r.status_code} | {r.text}")
-        return None
+        log(f"❌ Alpaca account failed | {r.status_code} | {r.text}")
     except Exception as e:
         log(f"❌ Alpaca account exception: {e}")
-        return None
+    return None
 
 
 def alpaca_list_positions() -> List[Dict[str, Any]]:
@@ -545,10 +545,9 @@ def alpaca_list_positions() -> List[Dict[str, Any]]:
             data = r.json()
             return data if isinstance(data, list) else []
         log(f"❌ Alpaca positions failed | {r.status_code} | {r.text}")
-        return []
     except Exception as e:
         log(f"❌ Alpaca positions exception: {e}")
-        return []
+    return []
 
 
 def alpaca_get_open_position(symbol: str) -> Optional[Dict[str, Any]]:
@@ -558,9 +557,35 @@ def alpaca_get_open_position(symbol: str) -> Optional[Dict[str, Any]]:
         r = alpaca_get(f"/v2/positions/{symbol}")
         if r.status_code == 200:
             return r.json()
-        return None
     except Exception:
+        pass
+    return None
+
+
+def alpaca_list_orders(status: str = "open", limit: int = RECON_LOOKBACK_ORDERS) -> List[Dict[str, Any]]:
+    if not alpaca_ready():
+        return []
+    try:
+        r = alpaca_get("/v2/orders", params={"status": status, "limit": limit, "direction": "desc", "nested": "false"})
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, list) else []
+        log(f"❌ Alpaca list orders failed | {r.status_code} | {r.text}")
+    except Exception as e:
+        log(f"❌ Alpaca list orders exception: {e}")
+    return []
+
+
+def alpaca_get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    if not alpaca_ready() or not order_id:
         return None
+    try:
+        r = alpaca_get(f"/v2/orders/{order_id}")
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
 
 
 def alpaca_submit_order(symbol: str, qty: int, side: str, order_type: str = "market", tif: str = "day", limit_price: Optional[float] = None, client_order_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -575,14 +600,11 @@ def alpaca_submit_order(symbol: str, qty: int, side: str, order_type: str = "mar
     try:
         r = alpaca_post("/v2/orders", payload)
         if r.status_code in (200, 201):
-            data = r.json()
-            log(f"✅ Alpaca order submitted | {side} {qty} {symbol}")
-            return data
+            return r.json()
         log(f"❌ Alpaca submit failed | {r.status_code} | {r.text}")
-        return None
     except Exception as e:
         log(f"❌ Alpaca submit exception: {e}")
-        return None
+    return None
 
 
 def alpaca_close_position_market(symbol: str, qty: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -595,14 +617,170 @@ def alpaca_close_position_market(symbol: str, qty: Optional[int] = None) -> Opti
     except Exception:
         open_qty = 0
     if open_qty <= 0:
-        log(f"❌ Position qty invalid for {symbol}")
         return None
     sell_qty = open_qty if qty is None else min(open_qty, int(qty))
     return alpaca_submit_order(symbol=symbol, qty=sell_qty, side="sell", order_type="market", tif="day", client_order_id=f"ub-close-{symbol}-{epoch()}")
 
 
+def get_account_equity() -> float:
+    if ENABLE_ALPACA and GLOBAL_STATE and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+        acct = alpaca_get_account()
+        if acct:
+            return max(safe_float(acct.get("equity", LIVE_ACCOUNT_EQUITY_FALLBACK), LIVE_ACCOUNT_EQUITY_FALLBACK), 1.0)
+    return max(PAPER_ACCOUNT_EQUITY, 1.0)
+
+
+def get_options_buying_power() -> float:
+    if ENABLE_ALPACA and GLOBAL_STATE and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() and USE_ALPACA_OPTIONS_BUYING_POWER:
+        acct = alpaca_get_account()
+        if acct:
+            obp = safe_float(acct.get("options_buying_power", 0), 0)
+            if obp > 0:
+                return obp
+            return max(safe_float(acct.get("buying_power", 0), 0), 0)
+    return get_account_equity()
+
+
 # =========================================================
-# POSITION SIZER
+# ORDER STORE / LIFECYCLE
+# =========================================================
+def next_local_order_id() -> int:
+    GLOBAL_ORDERS["last_local_order_id"] = safe_int(GLOBAL_ORDERS.get("last_local_order_id", 0), 0) + 1
+    return GLOBAL_ORDERS["last_local_order_id"]
+
+
+def make_order_record(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str, limit_price: Optional[float] = None) -> Dict[str, Any]:
+    local_id = next_local_order_id()
+    symbol = str(signal.get("symbol", "")).strip()
+    client_order_id = f"ub-{side}-{symbol}-{epoch()}-{local_id}"
+    return {
+        "local_order_id": local_id,
+        "signal_id": signal.get("signal_id", ""),
+        "position_id": None,
+        "ticker": signal.get("ticker", ""),
+        "symbol": symbol,
+        "side": side,
+        "qty_requested": int(qty),
+        "qty_filled": 0,
+        "qty_remaining": int(qty),
+        "avg_fill_price": 0.0,
+        "mode": mode,
+        "type": order_type,
+        "limit_price": safe_float(limit_price, 0.0),
+        "client_order_id": client_order_id,
+        "broker_order_id": "",
+        "status": "created",
+        "created_at": epoch(),
+        "updated_at": epoch(),
+        "closed_at": 0,
+        "notes": [],
+    }
+
+
+def save_order_record(order_record: Dict[str, Any]):
+    GLOBAL_ORDERS["orders"].append(order_record)
+    save_orders(GLOBAL_ORDERS)
+
+
+def get_order_by_local_id(local_order_id: int) -> Optional[Dict[str, Any]]:
+    for o in GLOBAL_ORDERS.get("orders", []):
+        if safe_int(o.get("local_order_id", 0), 0) == safe_int(local_order_id, 0):
+            return o
+    return None
+
+
+def get_order_by_broker_id(broker_order_id: str) -> Optional[Dict[str, Any]]:
+    for o in GLOBAL_ORDERS.get("orders", []):
+        if o.get("broker_order_id") == broker_order_id:
+            return o
+    return None
+
+
+def get_orders_for_position(position_id: int) -> List[Dict[str, Any]]:
+    return [o for o in GLOBAL_ORDERS.get("orders", []) if safe_int(o.get("position_id", 0), 0) == safe_int(position_id, 0)]
+
+
+def update_order_status(order_record: Dict[str, Any], status: str, note: Optional[str] = None):
+    order_record["status"] = status
+    order_record["updated_at"] = epoch()
+    if status in {"filled", "canceled", "rejected", "expired"}:
+        order_record["closed_at"] = epoch()
+    if note:
+        order_record.setdefault("notes", []).append(note)
+    save_orders(GLOBAL_ORDERS)
+
+
+def apply_broker_order_snapshot(order_record: Dict[str, Any], broker_order: Dict[str, Any]):
+    if not broker_order:
+        return
+    order_record["broker_order_id"] = broker_order.get("id", order_record.get("broker_order_id", ""))
+    order_record["client_order_id"] = broker_order.get("client_order_id", order_record.get("client_order_id", ""))
+    order_record["status"] = str(broker_order.get("status", order_record.get("status", "submitted"))).lower()
+    order_record["qty_filled"] = safe_int(broker_order.get("filled_qty", order_record.get("qty_filled", 0)), order_record.get("qty_filled", 0))
+    order_record["qty_remaining"] = max(0, safe_int(order_record.get("qty_requested", 0), 0) - safe_int(order_record.get("qty_filled", 0), 0))
+    order_record["avg_fill_price"] = safe_float(broker_order.get("filled_avg_price", order_record.get("avg_fill_price", 0.0)), order_record.get("avg_fill_price", 0.0))
+    order_record["updated_at"] = epoch()
+    save_orders(GLOBAL_ORDERS)
+
+
+def refresh_open_order_states():
+    for order_record in GLOBAL_ORDERS.get("orders", []):
+        status = str(order_record.get("status", "")).lower()
+        broker_id = order_record.get("broker_order_id", "")
+        if status in {"filled", "canceled", "rejected", "expired"}:
+            continue
+        if not broker_id:
+            continue
+        broker_order = alpaca_get_order(broker_id)
+        if broker_order:
+            apply_broker_order_snapshot(order_record, broker_order)
+
+
+# =========================================================
+# RISK HELPERS
+# =========================================================
+def estimate_unit_risk(signal: Dict[str, Any]) -> float:
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    stop = safe_float(signal.get("stop_contract", 0), 0)
+    if entry <= 0 or stop <= 0:
+        return 0.0
+    return max(entry - stop, 0.0)
+
+
+def estimate_trade_risk_dollars(signal: Dict[str, Any]) -> float:
+    qty = max(1, safe_int(signal.get("qty", 1), 1))
+    return qty * estimate_unit_risk(signal) * 100.0
+
+
+def estimate_trade_notional_dollars(signal: Dict[str, Any]) -> float:
+    qty = max(1, safe_int(signal.get("qty", 1), 1))
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    return qty * entry * 100.0
+
+
+def estimate_open_position_risk_dollars(position: Dict[str, Any]) -> float:
+    qty_open = max(0, safe_int(position.get("qty_open", 0), 0))
+    entry = safe_float(position.get("entry_price", 0), 0)
+    stop = safe_float(position.get("stop_price", 0), 0)
+    if qty_open <= 0 or entry <= 0 or stop <= 0:
+        return 0.0
+    return qty_open * max(entry - stop, 0.0) * 100.0
+
+
+def portfolio_heat_pct() -> float:
+    equity = get_account_equity()
+    if equity <= 0:
+        return 0.0
+    total_open_risk = sum(estimate_open_position_risk_dollars(p) for p in GLOBAL_POSITIONS.get("open_positions", []))
+    return total_open_risk / equity
+
+
+def is_correlated_ticker(ticker: str) -> bool:
+    return str(ticker).upper().strip() in CORRELATED_TICKERS
+
+
+# =========================================================
+# POSITION SIZING / VALIDATION / RISK
 # =========================================================
 def confidence_size_multiplier(confidence: str) -> float:
     c = str(confidence).upper().strip()
@@ -621,30 +799,34 @@ def size_signal_by_stop(signal: Dict[str, Any]) -> Dict[str, Any]:
     unit_risk = max(entry - stop, 0.0)
     if entry <= 0 or stop <= 0 or unit_risk <= 0:
         return {"approved": False, "reject_reasons": ["invalid_entry_or_stop_for_sizing"], "risk_dollars": 0.0, "unit_risk": unit_risk, "unit_risk_dollars": 0.0, "raw_size": 0, "final_size": 0, "adjustments": []}
+
     equity = get_account_equity()
-    confidence_mult = confidence_size_multiplier(signal.get("confidence", "C"))
-    base_risk_dollars = equity * MAX_RISK_PER_TRADE_PCT
-    adjusted_risk_dollars = base_risk_dollars * confidence_mult
+    adjusted_risk_dollars = equity * MAX_RISK_PER_TRADE_PCT * confidence_size_multiplier(signal.get("confidence", "C"))
     unit_risk_dollars = unit_risk * 100.0
     raw_size = math.floor(adjusted_risk_dollars / unit_risk_dollars) if unit_risk_dollars > 0 else 0
-    adjustments = []
     final_size = raw_size
+    adjustments = []
+
     if final_size > MAX_POSITION_QTY:
         final_size = MAX_POSITION_QTY
         adjustments.append("capped_by_max_position_qty")
+
     signal_qty_hint = safe_int(signal.get("qty", 0), 0)
     if USE_SIGNAL_QTY_AS_MAX and signal_qty_hint > 0 and final_size > signal_qty_hint:
         final_size = signal_qty_hint
         adjustments.append("capped_by_signal_qty_hint")
+
     options_bp = get_options_buying_power()
     est_notional = final_size * entry * 100.0
     if options_bp > 0 and est_notional > options_bp:
         bp_cap_qty = math.floor(options_bp / max(entry * 100.0, 1.0))
         final_size = max(0, min(final_size, bp_cap_qty))
         adjustments.append("capped_by_options_buying_power")
+
     if final_size < MIN_POSITION_QTY:
         final_size = 0
         adjustments.append("below_min_position_qty")
+
     return {
         "approved": final_size >= MIN_POSITION_QTY,
         "reject_reasons": [] if final_size >= MIN_POSITION_QTY else ["sized_qty_below_minimum"],
@@ -653,27 +835,23 @@ def size_signal_by_stop(signal: Dict[str, Any]) -> Dict[str, Any]:
         "unit_risk_dollars": round(unit_risk_dollars, 2),
         "raw_size": int(raw_size),
         "final_size": int(final_size),
-        "confidence_multiplier": confidence_mult,
+        "confidence_multiplier": confidence_size_multiplier(signal.get("confidence", "C")),
         "adjustments": adjustments,
     }
 
 
 def apply_size_decision_to_signal(signal: Dict[str, Any], size_decision: Dict[str, Any]) -> Dict[str, Any]:
-    sized_signal = deepcopy(signal)
-    sized_signal["qty"] = int(size_decision["final_size"])
-    sized_signal["size_decision"] = size_decision
-    return sized_signal
+    x = deepcopy(signal)
+    x["qty"] = int(size_decision["final_size"])
+    x["size_decision"] = size_decision
+    return x
 
 
-# =========================================================
-# PRE-TRADE VALIDATOR
-# =========================================================
 def validate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     reasons = []
     required_fields = ["ticker", "symbol", "direction", "confidence", "entry_contract", "stop_contract", "tp1_contract", "timestamp"]
     for field in required_fields:
-        value = signal.get(field)
-        if value is None or value == "":
+        if signal.get(field) in (None, ""):
             reasons.append(f"missing_{field}")
 
     entry = safe_float(signal.get("entry_contract", 0), 0)
@@ -699,14 +877,12 @@ def validate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         rr_candidates.append((tp1 - entry) / unit_risk)
     if tp2 > entry and unit_risk > 0:
         rr_candidates.append((tp2 - entry) / unit_risk)
-
     best_rr = max(rr_candidates) if rr_candidates else 0.0
     if best_rr < MIN_RR_RATIO:
         reasons.append("reward_to_risk_too_low")
 
-    if REQUIRE_OPTION_SYMBOL and signal.get("asset_class") == "option":
-        if signal.get("symbol") == signal.get("ticker"):
-            reasons.append("missing_full_option_symbol")
+    if REQUIRE_OPTION_SYMBOL and signal.get("asset_class") == "option" and signal.get("symbol") == signal.get("ticker"):
+        reasons.append("missing_full_option_symbol")
 
     if REJECT_DUPLICATE_OPEN_SYMBOL:
         open_symbols = {p.get("symbol") for p in GLOBAL_POSITIONS.get("open_positions", [])}
@@ -716,13 +892,9 @@ def validate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if is_now_in_no_trade_window():
         reasons.append("inside_no_trade_window")
 
-    approved = len(reasons) == 0
-    return {"approved": approved, "stage": "pretrade_validator", "reject_reasons": reasons, "reward_to_risk": round(best_rr, 4), "unit_risk": round(unit_risk, 4)}
+    return {"approved": len(reasons) == 0, "stage": "pretrade_validator", "reject_reasons": reasons, "reward_to_risk": round(best_rr, 4), "unit_risk": round(unit_risk, 4)}
 
 
-# =========================================================
-# RISK POLICY MANAGER
-# =========================================================
 def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
     reasons = []
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
@@ -733,10 +905,11 @@ def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("bot_paused")
     if not GLOBAL_STATE.get("engine_enabled", True):
         reasons.append("engine_disabled")
+    if GLOBAL_STATE.get("reconciliation_required", False):
+        reasons.append("reconciliation_block_active")
 
     open_positions = GLOBAL_POSITIONS.get("open_positions", [])
-    open_count = len(open_positions)
-    if open_count >= MAX_OPEN_POSITIONS:
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
         reasons.append("max_open_positions_hit")
 
     ticker = str(signal.get("ticker", "")).upper().strip()
@@ -761,8 +934,7 @@ def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
     if projected_heat > MAX_PORTFOLIO_HEAT_PCT:
         reasons.append("projected_heat_limit_hit")
 
-    consecutive_losses = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0)
-    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+    if safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) >= MAX_CONSECUTIVE_LOSSES:
         reasons.append("max_consecutive_losses_hit")
 
     notional = estimate_trade_notional_dollars(signal)
@@ -770,27 +942,23 @@ def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
     if options_bp > 0 and notional > options_bp:
         reasons.append("insufficient_options_buying_power")
 
-    approved = len(reasons) == 0
     return {
-        "approved": approved,
+        "approved": len(reasons) == 0,
         "stage": "risk_policy",
         "reject_reasons": reasons,
         "risk_per_trade_pct": round(risk_per_trade_pct, 6),
         "portfolio_heat_pct": round(current_heat, 6),
         "projected_heat_pct": round(projected_heat, 6),
         "daily_realized_pnl_pct": round(safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0), 6),
-        "consecutive_losses": consecutive_losses,
+        "consecutive_losses": safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0),
         "trade_risk_dollars": round(trade_risk_dollars, 2),
         "options_buying_power": round(options_bp, 2),
         "notional_dollars": round(notional, 2),
         "same_ticker_count": same_ticker_count,
-        "open_positions": open_count,
+        "open_positions": len(open_positions),
     }
 
 
-# =========================================================
-# PORTFOLIO RISK MANAGER
-# =========================================================
 def evaluate_portfolio_risk(signal: Dict[str, Any]) -> Dict[str, Any]:
     reasons = []
     open_positions = GLOBAL_POSITIONS.get("open_positions", [])
@@ -819,9 +987,8 @@ def evaluate_portfolio_risk(signal: Dict[str, Any]) -> Dict[str, Any]:
     if is_correlated_ticker(new_ticker) and correlated_theme_count >= MAX_CORRELATED_THEME_COUNT:
         reasons.append("correlated_theme_exposure_limit_hit")
 
-    approved = len(reasons) == 0
     return {
-        "approved": approved,
+        "approved": len(reasons) == 0,
         "stage": "portfolio_risk",
         "reject_reasons": reasons,
         "portfolio_heat_pct": round(current_heat, 6),
@@ -838,58 +1005,39 @@ def evaluate_portfolio_risk(signal: Dict[str, Any]) -> Dict[str, Any]:
 # =========================================================
 def infer_regime_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     explicit_regime = str(signal.get("regime") or signal.get("market_regime") or signal.get("regime_hint") or "").upper().strip()
-
-    text_blob = " ".join([
-        str(signal.get("reason", "")),
-        str(signal.get("public_reason", "")),
-        str(signal.get("trigger", "")),
-        str(signal.get("bias", "")),
-        str(signal.get("entry", "")),
-    ]).lower()
+    text_blob = " ".join([str(signal.get("reason", "")), str(signal.get("public_reason", "")), str(signal.get("trigger", "")), str(signal.get("bias", "")), str(signal.get("entry", ""))]).lower()
 
     tags = []
     if explicit_regime:
-        regime = explicit_regime
-        score = 0.90
+        regime, score = explicit_regime, 0.90
         tags.append("explicit_regime")
     else:
-        regime = "NORMAL"
-        score = 0.55
+        regime, score = "NORMAL", 0.55
         if any(k in text_blob for k in ["compression", "expansion", "squeeze", "breakout expansion"]):
-            regime = "EXPANSION"
-            score = 0.85
+            regime, score = "EXPANSION", 0.85
             tags.append("compression_expansion_language")
         if any(k in text_blob for k in ["trend", "trend day", "vwap reclaim", "higher low", "lower high", "break and hold", "retest hold"]):
-            regime = "TREND"
-            score = max(score, 0.80)
+            regime, score = "TREND", max(score, 0.80)
             tags.append("trend_language")
         if any(k in text_blob for k in ["chop", "range", "whipsaw", "inside range", "mean reversion chop"]):
-            regime = "CHOP"
-            score = 0.25
+            regime, score = "CHOP", 0.25
             tags.append("chop_language")
         if any(k in text_blob for k in ["cpi", "fomc", "powell", "fed", "event", "nfp", "earnings", "geopolitics", "news spike"]):
-            regime = "EVENT"
-            score = 0.40
+            regime, score = "EVENT", 0.40
             tags.append("event_language")
 
-    regime = regime.upper().strip()
     if regime not in {"TREND", "EXPANSION", "NORMAL", "CHOP", "EVENT"}:
         regime = "NORMAL"
-
     return {"regime": regime, "regime_score": round(score, 4), "tags": tags}
 
 
 def evaluate_regime(signal: Dict[str, Any]) -> Dict[str, Any]:
+    inferred = infer_regime_from_signal(signal)
     if not ENABLE_REGIME_ENGINE:
-        inferred = infer_regime_from_signal(signal)
         return {"approved": True, "stage": "regime_engine", "regime": inferred["regime"], "regime_score": inferred["regime_score"], "reject_reasons": [], "tags": inferred["tags"]}
 
-    inferred = infer_regime_from_signal(signal)
-    regime = inferred["regime"]
-    regime_score = inferred["regime_score"]
-    tags = inferred["tags"]
+    regime, regime_score, tags = inferred["regime"], inferred["regime_score"], inferred["tags"]
     reasons = []
-
     if regime_score < MIN_REGIME_SCORE:
         reasons.append("regime_score_too_low")
     if regime == "CHOP" and BLOCK_CHOP_REGIME:
@@ -898,33 +1046,22 @@ def evaluate_regime(signal: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("event_regime_blocked")
     if regime not in ALLOWED_REGIMES:
         reasons.append("regime_not_allowed")
-
-    approved = len(reasons) == 0
-    return {
-        "approved": approved,
-        "stage": "regime_engine",
-        "regime": regime,
-        "regime_score": regime_score,
-        "reject_reasons": reasons,
-        "tags": tags,
-    }
+    return {"approved": len(reasons) == 0, "stage": "regime_engine", "regime": regime, "regime_score": regime_score, "reject_reasons": reasons, "tags": tags}
 
 
 def apply_regime_to_signal(signal: Dict[str, Any], regime_decision: Dict[str, Any]) -> Dict[str, Any]:
-    enriched = deepcopy(signal)
-    enriched["regime"] = regime_decision["regime"]
-    enriched["regime_score"] = regime_decision["regime_score"]
-    enriched["regime_tags"] = regime_decision.get("tags", [])
-    return enriched
+    x = deepcopy(signal)
+    x["regime"] = regime_decision["regime"]
+    x["regime_score"] = regime_decision["regime_score"]
+    x["regime_tags"] = regime_decision.get("tags", [])
+    return x
 
 
 # =========================================================
 # SIGNAL NORMALIZATION
 # =========================================================
 def normalize_confidence(conf) -> str:
-    if conf is None:
-        return "C"
-    s = str(conf).upper().strip()
+    s = str(conf or "C").upper().strip()
     if s in {"A+", "A", "B", "C"}:
         return s
     if "A" in s:
@@ -935,9 +1072,7 @@ def normalize_confidence(conf) -> str:
 
 
 def normalize_direction(direction: Any) -> str:
-    if direction is None:
-        return "CALL"
-    s = str(direction).upper().strip()
+    s = str(direction or "CALL").upper().strip()
     if s in {"CALL", "PUT"}:
         return s
     if s in {"C", "LONGCALL"}:
@@ -952,7 +1087,6 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["ticker"] = str(signal.get("ticker", "SPY")).upper().strip()
     signal["direction"] = normalize_direction(signal.get("direction", "CALL"))
     signal["confidence"] = normalize_confidence(signal.get("confidence", "C"))
-
     signal["price"] = safe_float(signal.get("price", 0))
     signal["contract_price"] = safe_float(signal.get("contract_price", signal.get("option_price", 0)))
     signal["entry_contract"] = safe_float(signal.get("entry_contract", signal["contract_price"]))
@@ -960,7 +1094,6 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["tp1_contract"] = safe_float(signal.get("tp1_contract", 0))
     signal["tp2_contract"] = safe_float(signal.get("tp2_contract", 0))
     signal["trail_pct"] = safe_float(signal.get("trail_pct", DEFAULT_TRAIL_PCT))
-
     signal["entry"] = str(signal.get("entry", "Watch confirmation"))
     signal["stop"] = str(signal.get("stop", "Risk-defined"))
     signal["target_1"] = str(signal.get("target_1", "Scale at first push"))
@@ -972,13 +1105,11 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["timeframe"] = str(signal.get("timeframe", "5m / 15m"))
     signal["timestamp"] = safe_int(signal.get("timestamp", epoch()), epoch())
     signal["source"] = str(signal.get("source", "signal_file"))
-
     signal["qty"] = safe_int(signal.get("qty", DEFAULT_LIVE_QTY), DEFAULT_LIVE_QTY)
     signal["qty_hint"] = safe_int(signal.get("qty_hint", signal["qty"]), signal["qty"])
     signal["use_limit_entry"] = bool(signal.get("use_limit_entry", False))
     signal["limit_entry_price"] = safe_float(signal.get("limit_entry_price", signal["entry_contract"]))
     signal["asset_class"] = str(signal.get("asset_class", "option")).lower().strip()
-
     signal["symbol"] = str(signal.get("symbol", signal.get("contract_symbol", signal["ticker"]))).strip()
     signal["signal_id"] = str(signal.get("signal_id", signal_hash(signal)))
     return signal
@@ -986,26 +1117,20 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def is_signal_fresh(signal: Dict[str, Any]) -> bool:
     ts = safe_int(signal.get("timestamp", 0), 0)
-    if ts <= 0:
-        return True
-    return (epoch() - ts) <= MAX_SIGNAL_AGE_SECONDS
+    return True if ts <= 0 else (epoch() - ts) <= MAX_SIGNAL_AGE_SECONDS
 
 
 def load_live_signal() -> Optional[Dict[str, Any]]:
     debug_file_lookup(SIGNAL_FILE)
     if not SIGNAL_FILE:
-        log("❌ SIGNAL_FILE env var is empty")
         return None
     if not file_exists(SIGNAL_FILE):
         log(f"❌ SIGNAL_FILE not found: {SIGNAL_FILE}")
-        log(f"❌ Absolute path checked: {os.path.abspath(SIGNAL_FILE)}")
         return None
     try:
         with open(SIGNAL_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        log(f"✅ Loaded signal from {SIGNAL_FILE}")
         if not isinstance(raw, dict):
-            log("❌ signal file is not a JSON object")
             return None
         signal = normalize_signal(raw)
         if not is_signal_fresh(signal):
@@ -1026,77 +1151,18 @@ def signal_file_changed(state: Dict[str, Any]) -> bool:
             state["last_signal_file_mtime"] = mtime
             save_state(state)
             return True
-        return False
     except Exception as e:
         log(f"❌ Signal file watcher error: {e}")
-        return False
+    return False
 
 
 # =========================================================
-# ROUTING MESSAGES
+# MESSAGES
 # =========================================================
-def build_risk_block_message(signal: Dict[str, Any], risk_decision: Dict[str, Any]) -> str:
-    reasons = ", ".join(risk_decision.get("reject_reasons", [])) or "unknown"
-    return (
-        f"🚫 SIGNAL BLOCKED\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nReasons: {reasons}\n"
-        f"Risk/Trade %: {round(risk_decision.get('risk_per_trade_pct', 0.0) * 100, 3)}\n"
-        f"Portfolio Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0) * 100, 3)}\n"
-        f"Projected Heat %: {round(risk_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n"
-        f"Options BP: {risk_decision.get('options_buying_power', 0.0)}\n"
-        f"Notional: {risk_decision.get('notional_dollars', 0.0)}\n⏰ {now_ts()}"
-    )
-
-
-def build_size_block_message(signal: Dict[str, Any], size_decision: Dict[str, Any]) -> str:
-    reasons = ", ".join(size_decision.get("reject_reasons", [])) or "unknown"
-    adjustments = ", ".join(size_decision.get("adjustments", [])) or "none"
-    return (
-        f"🚫 SIZING BLOCKED SIGNAL\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nReasons: {reasons}\n"
-        f"Risk Dollars: {size_decision.get('risk_dollars', 0.0)}\nUnit Risk: {size_decision.get('unit_risk', 0.0)}\n"
-        f"Raw Size: {size_decision.get('raw_size', 0)}\nFinal Size: {size_decision.get('final_size', 0)}\n"
-        f"Adjustments: {adjustments}\n⏰ {now_ts()}"
-    )
-
-
-def build_validation_block_message(signal: Dict[str, Any], validation_decision: Dict[str, Any]) -> str:
-    reasons = ", ".join(validation_decision.get("reject_reasons", [])) or "unknown"
-    return (
-        f"🚫 VALIDATION BLOCKED SIGNAL\nTicker: {signal.get('ticker', 'N/A')}\nSymbol: {signal.get('symbol', 'N/A')}\n"
-        f"Reasons: {reasons}\nReward/Risk: {validation_decision.get('reward_to_risk', 0.0)}\n"
-        f"Unit Risk: {validation_decision.get('unit_risk', 0.0)}\n⏰ {now_ts()}"
-    )
-
-
-def build_portfolio_block_message(signal: Dict[str, Any], portfolio_decision: Dict[str, Any]) -> str:
-    reasons = ", ".join(portfolio_decision.get("reject_reasons", [])) or "unknown"
-    return (
-        f"🚫 PORTFOLIO RISK BLOCKED SIGNAL\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nReasons: {reasons}\n"
-        f"Current Heat %: {round(portfolio_decision.get('portfolio_heat_pct', 0.0) * 100, 3)}\n"
-        f"Projected Heat %: {round(portfolio_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n"
-        f"Symbol Count: {portfolio_decision.get('symbol_portfolio_count', 0)}\n"
-        f"Directional Index Count: {portfolio_decision.get('same_direction_index_count', 0)}\n"
-        f"Correlated Theme Count: {portfolio_decision.get('correlated_theme_count', 0)}\n⏰ {now_ts()}"
-    )
-
-
-def build_regime_block_message(signal: Dict[str, Any], regime_decision: Dict[str, Any]) -> str:
-    reasons = ", ".join(regime_decision.get("reject_reasons", [])) or "unknown"
-    tags = ", ".join(regime_decision.get("tags", [])) or "none"
-    return (
-        f"🚫 REGIME BLOCKED SIGNAL\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\n"
-        f"Regime: {regime_decision.get('regime', 'N/A')}\nRegime Score: {regime_decision.get('regime_score', 0.0)}\n"
-        f"Reasons: {reasons}\nTags: {tags}\n⏰ {now_ts()}"
-    )
-
-
 def build_ai_reasoning_message(signal: Dict[str, Any]) -> str:
-    size_text = ""
-    size_decision = signal.get("size_decision")
-    if isinstance(size_decision, dict):
-        size_text = f"\nSized Qty: {signal.get('qty', 'N/A')}\nRisk Dollars: {size_decision.get('risk_dollars', 'N/A')}\nUnit Risk: {size_decision.get('unit_risk', 'N/A')}"
-    regime_text = ""
-    if signal.get("regime"):
-        regime_text = f"\nRegime: {signal.get('regime')}\nRegime Score: {signal.get('regime_score', 'N/A')}"
+    size_decision = signal.get("size_decision", {}) if isinstance(signal.get("size_decision"), dict) else {}
+    regime_text = f"\nRegime: {signal.get('regime')}\nRegime Score: {signal.get('regime_score', 'N/A')}" if signal.get("regime") else ""
+    size_text = f"\nSized Qty: {signal.get('qty', 'N/A')}\nRisk Dollars: {size_decision.get('risk_dollars', 'N/A')}\nUnit Risk: {size_decision.get('unit_risk', 'N/A')}" if size_decision else ""
     return (
         f"🧠 AI REASONING ALERT\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nDirection: {signal['direction']}\n"
         f"Underlying Price: {signal['price']}\nContract Price: {signal['contract_price']}\nConfidence: {signal['confidence']}\n"
@@ -1114,11 +1180,10 @@ def build_free_message(signal: Dict[str, Any]) -> str:
 
 def build_premium_message(signal: Dict[str, Any]) -> str:
     title = "💎 PREMIUM A SETUP" if signal["confidence"] in {"A", "A+"} else "⚠️ PREMIUM WATCH ALERT"
-    size_line = f"Qty: {signal.get('qty', 'N/A')}\n"
     regime_line = f"Regime: {signal.get('regime')} ({signal.get('regime_score', 'N/A')})\n" if signal.get("regime") else ""
     return (
         f"{title}\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nDirection: {signal['direction']}\n"
-        f"Underlying Price: {signal['price']}\nContract Entry: {signal['entry_contract']}\n{size_line}{regime_line}"
+        f"Underlying Price: {signal['price']}\nContract Entry: {signal['entry_contract']}\nQty: {signal.get('qty', 'N/A')}\n{regime_line}"
         f"Confidence: {signal['confidence']}\nEntry: {signal['entry']}\nStop: {signal['stop']}\n"
         f"Target 1: {signal['target_1']}\nTarget 2: {signal['target_2']}\n\nReason:\n{signal['reason']}\n\n⏰ {now_ts()}"
     )
@@ -1134,21 +1199,19 @@ def build_telegram_signal_message(signal: Dict[str, Any]) -> str:
 
 
 def build_live_order_message(order: Dict[str, Any], side_note: str = "") -> str:
-    status = order.get("status", "unknown")
-    symbol = order.get("symbol", "N/A")
-    qty = order.get("qty", "N/A")
-    side = order.get("side", "N/A")
-    oid = order.get("id", "N/A")
     line2 = f"\nNote: {side_note}" if side_note else ""
-    return f"🟣 ALPACA ORDER\nOrder ID: {oid}\nSymbol: {symbol}\nSide: {side}\nQty: {qty}\nStatus: {status}{line2}\n⏰ {now_ts()}"
+    return (
+        f"🟣 ORDER UPDATE\nLocal ID: {order.get('local_order_id', 'N/A')}\nBroker ID: {order.get('broker_order_id', 'N/A')}\n"
+        f"Symbol: {order.get('symbol', 'N/A')}\nSide: {order.get('side', 'N/A')}\nQty Requested: {order.get('qty_requested', 'N/A')}\n"
+        f"Qty Filled: {order.get('qty_filled', 'N/A')}\nAvg Fill: {order.get('avg_fill_price', 'N/A')}\nStatus: {order.get('status', 'unknown')}{line2}\n⏰ {now_ts()}"
+    )
 
 
 def build_position_open_message(position: Dict[str, Any]) -> str:
     return (
         f"🟢 POSITION OPENED\nID: {position['id']}\nMode: {position['mode']}\nTicker: {position['ticker']}\n"
         f"Symbol: {position['symbol']}\nDirection: {position['direction']}\nQty: {position['qty_open']}\n"
-        f"Entry: {position['entry_price']}\nStop: {position['stop_price']}\nTP1: {position['tp1_price']}\n"
-        f"TP2: {position['tp2_price']}\nTrail %: {position['trail_pct']}\n⏰ {now_ts()}"
+        f"Entry: {position['entry_price']}\nStop: {position['stop_price']}\nTP1: {position['tp1_price']}\nTP2: {position['tp2_price']}\nTrail %: {position['trail_pct']}\n⏰ {now_ts()}"
     )
 
 
@@ -1168,53 +1231,49 @@ def build_position_close_message(position: Dict[str, Any], note: str) -> str:
     )
 
 
-# =========================================================
-# ROUTING
-# =========================================================
+def build_block_message(title: str, signal: Dict[str, Any], reasons: List[str], extras: Optional[str] = None) -> str:
+    msg = f"🚫 {title}\nTicker: {signal.get('ticker', 'N/A')}\nSymbol: {signal.get('symbol', 'N/A')}\nReasons: {', '.join(reasons) or 'unknown'}"
+    if extras:
+        msg += f"\n{extras}"
+    msg += f"\n⏰ {now_ts()}"
+    return msg
+
+
+def build_reconciliation_message(report: Dict[str, Any]) -> str:
+    mismatches = report.get("mismatches", [])
+    details = "\n".join(f"- {m}" for m in mismatches[:20]) if mismatches else "- none"
+    return f"🔄 STARTUP RECONCILIATION\nSafe: {report.get('safe_to_trade', False)}\nBroker Positions: {report.get('broker_position_count', 0)}\nBroker Orders: {report.get('broker_open_order_count', 0)}\nLocal Positions: {report.get('local_open_position_count', 0)}\nLocal Pending Orders: {report.get('local_pending_order_count', 0)}\nMismatches:\n{details}\n⏰ {now_ts()}"
+
+
 def route_signal(signal: Dict[str, Any], state: Dict[str, Any]):
-    ai_msg = build_ai_reasoning_message(signal)
-    free_msg = build_free_message(signal)
-    premium_msg = build_premium_message(signal)
-    tg_msg = build_telegram_signal_message(signal)
     if state.get("discord_enabled", True):
-        send_to_discord(DISCORD_AI_WEBHOOK, ai_msg, "AI")
-        send_to_discord(DISCORD_FREE_WEBHOOK, free_msg, "FREE")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, premium_msg, "PREMIUM")
+        send_to_discord(DISCORD_AI_WEBHOOK, build_ai_reasoning_message(signal), "AI")
+        send_to_discord(DISCORD_FREE_WEBHOOK, build_free_message(signal), "FREE")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, build_premium_message(signal), "PREMIUM")
     if state.get("telegram_enabled", True):
-        send_to_telegram(tg_msg)
+        send_to_telegram(build_telegram_signal_message(signal))
 
 
 # =========================================================
 # POSITION STORE
 # =========================================================
-def next_position_id(positions: Dict[str, Any]) -> int:
-    positions["last_position_id"] = safe_int(positions.get("last_position_id", 0), 0) + 1
-    return positions["last_position_id"]
+def next_position_id() -> int:
+    GLOBAL_POSITIONS["last_position_id"] = safe_int(GLOBAL_POSITIONS.get("last_position_id", 0), 0) + 1
+    return GLOBAL_POSITIONS["last_position_id"]
 
 
-def make_local_position(signal: Dict[str, Any], mode: str, broker_order: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    entry = safe_float(signal.get("entry_contract", 0), 0)
-    if entry <= 0:
-        entry = safe_float(signal.get("contract_price", 0), 0)
-    qty = safe_int(signal.get("qty", DEFAULT_LIVE_QTY), DEFAULT_LIVE_QTY)
-    qty = max(1, qty)
-    stop_price = safe_float(signal.get("stop_contract", 0), 0)
-    tp1_price = safe_float(signal.get("tp1_contract", 0), 0)
-    tp2_price = safe_float(signal.get("tp2_contract", 0), 0)
-    if stop_price <= 0:
-        stop_price = round(entry * 0.70, 4)
-    if tp1_price <= 0:
-        tp1_price = round(entry * 1.30, 4)
-    if tp2_price <= 0:
-        tp2_price = round(entry * 1.60, 4)
-    order_id = broker_order.get("id") if broker_order else ""
-    client_order_id = broker_order.get("client_order_id") if broker_order else ""
+def make_local_position(signal: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    entry = safe_float(signal.get("entry_contract", 0), 0) or safe_float(signal.get("contract_price", 0), 0)
+    qty = max(1, safe_int(signal.get("qty", DEFAULT_LIVE_QTY), DEFAULT_LIVE_QTY))
+    stop_price = safe_float(signal.get("stop_contract", 0), 0) or round(entry * 0.70, 4)
+    tp1_price = safe_float(signal.get("tp1_contract", 0), 0) or round(entry * 1.30, 4)
+    tp2_price = safe_float(signal.get("tp2_contract", 0), 0) or round(entry * 1.60, 4)
     return {
-        "id": next_position_id(GLOBAL_POSITIONS),
+        "id": next_position_id(),
         "signal_id": signal["signal_id"],
         "mode": mode,
-        "broker_order_id": order_id,
-        "client_order_id": client_order_id,
+        "broker_order_id": "",
+        "client_order_id": "",
         "ticker": signal["ticker"],
         "symbol": signal["symbol"],
         "direction": signal["direction"],
@@ -1243,6 +1302,10 @@ def make_local_position(signal: Dict[str, Any], mode: str, broker_order: Optiona
         "closed_at": 0,
         "break_even_after_tp1": DEFAULT_BREAK_EVEN_AFTER_TP1,
         "notes": [],
+        "entry_filled": False if mode == "LIVE" else True,
+        "avg_fill_price": 0.0 if mode == "LIVE" else entry,
+        "filled_qty_total": 0 if mode == "LIVE" else qty,
+        "pending_close_qty": 0,
     }
 
 
@@ -1251,13 +1314,21 @@ def save_new_position(position: Dict[str, Any]):
     save_positions(GLOBAL_POSITIONS)
 
 
+def get_open_position_by_id(position_id: int) -> Optional[Dict[str, Any]]:
+    for p in GLOBAL_POSITIONS.get("open_positions", []):
+        if safe_int(p.get("id", 0), 0) == safe_int(position_id, 0):
+            return p
+    return None
+
+
 def update_position_market_price(position: Dict[str, Any], new_price: float):
     if new_price <= 0:
         return
     position["last_price"] = new_price
     position["highest_price"] = max(position.get("highest_price", new_price), new_price)
     position["lowest_price"] = min(position.get("lowest_price", new_price), new_price)
-    position["pnl_pct"] = pct_change(position["entry_price"], new_price)
+    basis = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+    position["pnl_pct"] = pct_change(basis, new_price)
 
 
 def scale_out_local(position: Dict[str, Any], qty_to_close: int, fill_price: float, note: str) -> bool:
@@ -1276,16 +1347,14 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     position["closed_at"] = epoch()
     position["qty_closed"] = position["qty_total"]
     position["qty_open"] = 0
-    position["realized_pnl_pct"] = pct_change(position["entry_price"], position["exit_price"])
+    basis = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+    position["realized_pnl_pct"] = pct_change(basis, position["exit_price"])
     position["notes"].append(note)
 
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
     realized_pct_decimal = position["realized_pnl_pct"] / 100.0
     GLOBAL_STATE["daily_realized_pnl_pct"] = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0) + realized_pct_decimal
-    if position["realized_pnl_pct"] < 0:
-        GLOBAL_STATE["consecutive_losses"] = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) + 1
-    else:
-        GLOBAL_STATE["consecutive_losses"] = 0
+    GLOBAL_STATE["consecutive_losses"] = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) + 1 if position["realized_pnl_pct"] < 0 else 0
     save_state(GLOBAL_STATE)
 
     GLOBAL_POSITIONS["open_positions"] = [p for p in GLOBAL_POSITIONS["open_positions"] if p["id"] != position["id"]]
@@ -1297,22 +1366,23 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
 
-# =========================================================
-# PAPER EXECUTION
-# =========================================================
-def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    position = make_local_position(signal, mode="PAPER")
-    save_new_position(position)
-    GLOBAL_STATE["paper_trade_count"] = safe_int(GLOBAL_STATE.get("paper_trade_count", 0), 0) + 1
-    save_state(GLOBAL_STATE)
-    msg = build_position_open_message(position)
-    send_to_telegram(msg)
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
-    return position
+def recalc_position_from_fill(position: Dict[str, Any], fill_qty: int, fill_price: float):
+    if fill_qty <= 0 or fill_price <= 0:
+        return
+    old_filled = safe_int(position.get("filled_qty_total", 0), 0)
+    old_avg = safe_float(position.get("avg_fill_price", 0), 0)
+    new_avg = weighted_avg_price(old_filled, old_avg, fill_qty, fill_price) if old_filled > 0 else fill_price
+    position["filled_qty_total"] = old_filled + fill_qty
+    position["avg_fill_price"] = round(new_avg, 4)
+    position["entry_price"] = round(new_avg, 4)
+    position["last_price"] = fill_price
+    position["entry_filled"] = position["filled_qty_total"] > 0
+    position["qty_total"] = max(position["qty_total"], position["filled_qty_total"])
+    position["qty_open"] = max(position.get("qty_open", 0), position["filled_qty_total"] - position.get("qty_closed", 0))
 
 
 # =========================================================
-# LIVE ALPACA EXECUTION
+# EXECUTION
 # =========================================================
 def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
     if not GLOBAL_STATE.get("alpaca_enabled", False):
@@ -1331,75 +1401,97 @@ def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
         if not ALPACA_LIVE_OPTIONS_APPROVED:
             log("❌ LIVE BLOCKED: ALPACA_LIVE_OPTIONS_APPROVED=false")
             return False
-    if REQUIRE_OPTION_SYMBOL and signal.get("asset_class") == "option":
-        if signal["symbol"] == signal["ticker"]:
-            log("❌ LIVE BLOCKED: option signal missing actual option contract symbol")
-            return False
-    if signal["qty"] <= 0:
-        log("❌ LIVE BLOCKED: qty invalid")
+    if REQUIRE_OPTION_SYMBOL and signal.get("asset_class") == "option" and signal["symbol"] == signal["ticker"]:
+        log("❌ LIVE BLOCKED: option signal missing actual option contract symbol")
         return False
-    notional = estimate_trade_notional_dollars(signal)
-    options_bp = get_options_buying_power()
-    if options_bp > 0 and notional > options_bp:
+    if signal["qty"] <= 0:
+        return False
+    if get_options_buying_power() > 0 and estimate_trade_notional_dollars(signal) > get_options_buying_power():
         log("❌ LIVE BLOCKED: not enough options buying power")
         return False
     return True
 
 
-def submit_live_entry(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not ALLOW_LIVE_BUYS:
-        log("❌ LIVE BUY BLOCKED: ALLOW_LIVE_BUYS=false")
-        return None
-    if not validate_live_signal_for_alpaca(signal):
-        return None
-
-    side = "buy"
-    qty = signal["qty"]
-    symbol = signal["symbol"]
-    client_order_id = f"ub-entry-{symbol}-{epoch()}"
-
-    if signal.get("use_limit_entry", False):
-        limit_price = safe_float(signal.get("limit_entry_price", 0), 0)
-        if limit_price <= 0:
-            log("❌ LIVE LIMIT ENTRY BLOCKED: invalid limit price")
-            return None
-        order = alpaca_submit_order(symbol=symbol, qty=qty, side=side, order_type="limit", tif="day", limit_price=limit_price, client_order_id=client_order_id)
-    else:
-        order = alpaca_submit_order(symbol=symbol, qty=qty, side=side, order_type="market", tif="day", client_order_id=client_order_id)
-
-    if order:
-        GLOBAL_STATE["live_trade_count"] = safe_int(GLOBAL_STATE.get("live_trade_count", 0), 0) + 1
-        save_state(GLOBAL_STATE)
-        msg = build_live_order_message(order, "LIVE ENTRY SUBMITTED")
-        send_to_telegram(msg)
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
-    return order
-
-
-def open_live_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    order = submit_live_entry(signal)
-    if not order:
-        return None
-    position = make_local_position(signal, mode="LIVE", broker_order=order)
+def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    position = make_local_position(signal, mode="PAPER")
     save_new_position(position)
+    GLOBAL_STATE["paper_trade_count"] = safe_int(GLOBAL_STATE.get("paper_trade_count", 0), 0) + 1
+    save_state(GLOBAL_STATE)
     msg = build_position_open_message(position)
     send_to_telegram(msg)
     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
     return position
 
 
+def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not ALLOW_LIVE_BUYS:
+        log("❌ LIVE BUY BLOCKED: ALLOW_LIVE_BUYS=false")
+        return None
+    if not validate_live_signal_for_alpaca(signal):
+        return None
+
+    order_type = "limit" if signal.get("use_limit_entry", False) else "market"
+    limit_price = safe_float(signal.get("limit_entry_price", 0), 0) if order_type == "limit" else None
+    order_record = make_order_record(signal=signal, side="buy", qty=signal["qty"], mode="LIVE", order_type=order_type, limit_price=limit_price)
+    order_record["position_id"] = position["id"]
+    save_order_record(order_record)
+
+    broker_order = alpaca_submit_order(
+        symbol=signal["symbol"],
+        qty=signal["qty"],
+        side="buy",
+        order_type=order_type,
+        tif="day",
+        limit_price=limit_price,
+        client_order_id=order_record["client_order_id"],
+    )
+    if not broker_order:
+        update_order_status(order_record, "rejected", "broker submit failed")
+        return None
+
+    apply_broker_order_snapshot(order_record, broker_order)
+    update_order_status(order_record, order_record.get("status", "submitted"), "live entry submitted")
+    position["broker_order_id"] = order_record.get("broker_order_id", "")
+    position["client_order_id"] = order_record.get("client_order_id", "")
+    save_positions(GLOBAL_POSITIONS)
+    GLOBAL_STATE["live_trade_count"] = safe_int(GLOBAL_STATE.get("live_trade_count", 0), 0) + 1
+    save_state(GLOBAL_STATE)
+    msg = build_live_order_message(order_record, "LIVE ENTRY SUBMITTED")
+    send_to_telegram(msg)
+    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    return order_record
+
+
+def open_live_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    position = make_local_position(signal, mode="LIVE")
+    save_new_position(position)
+    order_record = submit_live_entry(signal, position)
+    if not order_record:
+        position["notes"].append("entry submit failed")
+        save_positions(GLOBAL_POSITIONS)
+        return None
+    return position
+
+
 def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bool:
     if not ALLOW_LIVE_SELLS:
-        log("❌ LIVE SELL BLOCKED: ALLOW_LIVE_SELLS=false")
         return False
     qty_to_close = int(max(0, min(qty_to_close, position["qty_open"])))
     if qty_to_close <= 0:
         return False
-    order = alpaca_submit_order(symbol=position["symbol"], qty=qty_to_close, side="sell", order_type="market", tif="day", client_order_id=f"ub-scale-{position['symbol']}-{epoch()}")
-    if not order:
+    signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", "")}
+    order_record = make_order_record(signal_stub, side="sell", qty=qty_to_close, mode="LIVE", order_type="market")
+    order_record["position_id"] = position["id"]
+    save_order_record(order_record)
+    broker_order = alpaca_submit_order(symbol=position["symbol"], qty=qty_to_close, side="sell", order_type="market", tif="day", client_order_id=order_record["client_order_id"])
+    if not broker_order:
+        update_order_status(order_record, "rejected", "scale out submit failed")
         return False
-    scale_out_local(position, qty_to_close, position["last_price"], note)
-    msg = build_live_order_message(order, note)
+    apply_broker_order_snapshot(order_record, broker_order)
+    update_order_status(order_record, order_record.get("status", "submitted"), note)
+    position["pending_close_qty"] = safe_int(position.get("pending_close_qty", 0), 0) + qty_to_close
+    save_positions(GLOBAL_POSITIONS)
+    msg = build_live_order_message(order_record, note)
     send_to_telegram(msg)
     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
     return True
@@ -1407,16 +1499,142 @@ def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bo
 
 def live_close_position(position: Dict[str, Any], note: str) -> bool:
     if not ALLOW_LIVE_SELLS:
-        log("❌ LIVE SELL BLOCKED: ALLOW_LIVE_SELLS=false")
         return False
-    order = alpaca_close_position_market(position["symbol"], qty=position["qty_open"])
-    if not order:
+    qty_open = safe_int(position.get("qty_open", 0), 0)
+    if qty_open <= 0:
         return False
-    msg = build_live_order_message(order, note)
+    signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", "")}
+    order_record = make_order_record(signal_stub, side="sell", qty=qty_open, mode="LIVE", order_type="market")
+    order_record["position_id"] = position["id"]
+    save_order_record(order_record)
+    broker_order = alpaca_close_position_market(position["symbol"], qty=qty_open)
+    if not broker_order:
+        update_order_status(order_record, "rejected", "live close submit failed")
+        return False
+    apply_broker_order_snapshot(order_record, broker_order)
+    update_order_status(order_record, order_record.get("status", "submitted"), note)
+    position["pending_close_qty"] = safe_int(position.get("pending_close_qty", 0), 0) + qty_open
+    save_positions(GLOBAL_POSITIONS)
+    msg = build_live_order_message(order_record, note)
     send_to_telegram(msg)
     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
-    finalize_close_position(position, position["last_price"], note)
     return True
+
+
+# =========================================================
+# ORDER/POSITION RECONCILIATION
+# =========================================================
+def sync_live_positions_from_alpaca():
+    if not ALPACA_SYNC_POSITIONS or not ENABLE_ALPACA or not GLOBAL_STATE.get("alpaca_enabled", False):
+        return
+    broker_positions = alpaca_list_positions()
+    if broker_positions is None:
+        return
+    local_live = [p for p in GLOBAL_POSITIONS["open_positions"] if p.get("mode") == "LIVE"]
+    local_by_symbol = {p["symbol"]: p for p in local_live}
+
+    for bp in broker_positions:
+        symbol = str(bp.get("symbol", "")).strip()
+        if not symbol:
+            continue
+        if symbol in local_by_symbol:
+            local_pos = local_by_symbol[symbol]
+            market_price = safe_float(bp.get("current_price", local_pos.get("last_price", 0)), local_pos.get("last_price", 0))
+            qty = abs(safe_int(bp.get("qty", local_pos.get("qty_open", 0)), local_pos.get("qty_open", 0)))
+            avg_entry = safe_float(bp.get("avg_entry_price", local_pos.get("avg_fill_price", local_pos.get("entry_price", 0))), local_pos.get("entry_price", 0))
+            local_pos["avg_fill_price"] = avg_entry
+            local_pos["entry_price"] = avg_entry
+            local_pos["qty_open"] = qty
+            local_pos["entry_filled"] = qty > 0
+            local_pos["filled_qty_total"] = max(qty + safe_int(local_pos.get("qty_closed", 0), 0), safe_int(local_pos.get("filled_qty_total", 0), 0))
+            update_position_market_price(local_pos, market_price)
+        else:
+            log(f"⚠️ Broker has open position not in local state: {symbol}")
+
+    # any local live positions missing at broker are suspicious; handled by startup/runtime recon
+    save_positions(GLOBAL_POSITIONS)
+
+
+def reconcile_order_fills_into_positions():
+    refresh_open_order_states()
+    for order in GLOBAL_ORDERS.get("orders", []):
+        pid = safe_int(order.get("position_id", 0), 0)
+        if pid <= 0:
+            continue
+        position = get_open_position_by_id(pid)
+        if not position:
+            continue
+        status = str(order.get("status", "")).lower()
+        filled_qty = safe_int(order.get("qty_filled", 0), 0)
+        avg_fill = safe_float(order.get("avg_fill_price", 0), 0)
+        last_applied = safe_int(order.get("applied_filled_qty", 0), 0)
+        delta_fill = max(0, filled_qty - last_applied)
+        if delta_fill <= 0:
+            continue
+
+        if str(order.get("side", "")).lower() == "buy":
+            recalc_position_from_fill(position, delta_fill, avg_fill)
+        else:
+            scale_out_local(position, delta_fill, avg_fill or position.get("last_price", 0), f"sell fill applied from order {order.get('local_order_id')}")
+            position["pending_close_qty"] = max(0, safe_int(position.get("pending_close_qty", 0), 0) - delta_fill)
+
+        order["applied_filled_qty"] = filled_qty
+        save_orders(GLOBAL_ORDERS)
+        save_positions(GLOBAL_POSITIONS)
+
+        if status == "filled" and str(order.get("side", "")).lower() == "sell" and position.get("qty_open", 0) <= 0:
+            finalize_close_position(position, avg_fill or position.get("last_price", 0), f"Order {order.get('local_order_id')} fully closed position")
+
+
+def build_boot_reconciliation_report() -> Dict[str, Any]:
+    broker_positions = alpaca_list_positions() if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() else []
+    broker_orders = alpaca_list_orders(status="open") if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() else []
+    local_open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+    local_pending_orders = [o for o in GLOBAL_ORDERS.get("orders", []) if str(o.get("status", "")).lower() not in {"filled", "canceled", "rejected", "expired"}]
+
+    broker_symbols = {str(p.get("symbol", "")).strip() for p in broker_positions if str(p.get("symbol", "")).strip()}
+    local_live_symbols = {str(p.get("symbol", "")).strip() for p in local_open_positions if p.get("mode") == "LIVE"}
+    broker_order_ids = {str(o.get("id", "")).strip() for o in broker_orders if str(o.get("id", "")).strip()}
+    local_broker_order_ids = {str(o.get("broker_order_id", "")).strip() for o in local_pending_orders if str(o.get("broker_order_id", "")).strip()}
+
+    mismatches = []
+    for sym in sorted(broker_symbols - local_live_symbols):
+        mismatches.append(f"broker position exists but local live position missing: {sym}")
+    for sym in sorted(local_live_symbols - broker_symbols):
+        mismatches.append(f"local live position exists but broker position missing: {sym}")
+    for oid in sorted(broker_order_ids - local_broker_order_ids):
+        mismatches.append(f"broker open order exists but local pending order missing: {oid}")
+    for oid in sorted(local_broker_order_ids - broker_order_ids):
+        mismatches.append(f"local pending order exists but broker open order missing: {oid}")
+
+    safe_to_trade = len(mismatches) == 0
+    report = {
+        "generated_at": epoch(),
+        "safe_to_trade": safe_to_trade,
+        "broker_position_count": len(broker_positions),
+        "broker_open_order_count": len(broker_orders),
+        "local_open_position_count": len(local_open_positions),
+        "local_pending_order_count": len(local_pending_orders),
+        "mismatches": mismatches,
+    }
+    GLOBAL_RECON["last_boot_reconciliation_at"] = epoch()
+    GLOBAL_RECON["last_boot_report"] = report
+    save_recon(GLOBAL_RECON)
+    return report
+
+
+def startup_reconcile_and_gate():
+    report = build_boot_reconciliation_report()
+    msg = build_reconciliation_message(report)
+    send_to_telegram(msg)
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    if report.get("safe_to_trade", False):
+        clear_reconciliation_block()
+        return
+    reason = "; ".join(report.get("mismatches", [])[:5]) or "startup reconciliation mismatch"
+    if STRICT_STARTUP_RECON or BLOCK_NEW_TRADES_ON_RECON_MISMATCH:
+        set_reconciliation_block(reason)
+        log(f"🚫 Trading blocked by startup reconciliation: {reason}")
 
 
 # =========================================================
@@ -1437,54 +1655,37 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
 
         update_position_market_price(position, live_price)
 
+        if position["mode"] == "LIVE" and not position.get("entry_filled", False):
+            continue
+
         if not position["tp1_hit"] and live_price >= position["tp1_price"]:
-            qty1 = max(1, math.floor(position["qty_total"] * position["scale1_pct"]))
-            qty1 = min(qty1, position["qty_open"])
-            if position["mode"] == "LIVE":
-                ok = live_scale_out(position, qty1, "TP1 HIT - live scale-out")
+            qty1 = min(max(1, math.floor(position["qty_total"] * position["scale1_pct"])), position["qty_open"])
+            if qty1 > 0:
+                ok = live_scale_out(position, qty1, "TP1 HIT - live scale-out") if position["mode"] == "LIVE" else scale_out_local(position, qty1, live_price, "TP1 HIT - paper scale-out")
                 if ok:
                     position["tp1_hit"] = True
                     if position.get("break_even_after_tp1", False):
-                        position["stop_price"] = max(position["stop_price"], position["entry_price"])
-                    msg = build_position_update_message(position, "TP1 HIT - live scale-out")
-                    send_to_telegram(msg)
-                    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
-            else:
-                ok = scale_out_local(position, qty1, live_price, "TP1 HIT - paper scale-out")
-                if ok:
-                    position["tp1_hit"] = True
-                    if position.get("break_even_after_tp1", False):
-                        position["stop_price"] = max(position["stop_price"], position["entry_price"])
-                    msg = build_position_update_message(position, "TP1 HIT - paper scale-out")
+                        position["stop_price"] = max(position["stop_price"], position.get("avg_fill_price", position["entry_price"]))
+                    msg = build_position_update_message(position, "TP1 HIT")
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
         if not position["tp2_hit"] and live_price >= position["tp2_price"]:
-            qty2 = max(1, math.floor(position["qty_total"] * position["scale2_pct"]))
-            qty2 = min(qty2, position["qty_open"])
-            if position["mode"] == "LIVE":
-                ok = live_scale_out(position, qty2, "TP2 HIT - live scale-out")
+            qty2 = min(max(1, math.floor(position["qty_total"] * position["scale2_pct"])), position["qty_open"])
+            if qty2 > 0:
+                ok = live_scale_out(position, qty2, "TP2 HIT - live scale-out") if position["mode"] == "LIVE" else scale_out_local(position, qty2, live_price, "TP2 HIT - paper scale-out")
                 if ok:
                     position["tp2_hit"] = True
-                    msg = build_position_update_message(position, "TP2 HIT - live scale-out")
-                    send_to_telegram(msg)
-                    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
-            else:
-                ok = scale_out_local(position, qty2, live_price, "TP2 HIT - paper scale-out")
-                if ok:
-                    position["tp2_hit"] = True
-                    msg = build_position_update_message(position, "TP2 HIT - paper scale-out")
+                    msg = build_position_update_message(position, "TP2 HIT")
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
-        entry_price = safe_float(position.get("entry_price", 0), 0)
+        entry_price = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
         highest_price = safe_float(position.get("highest_price", live_price), live_price)
         trail_pct = safe_float(position.get("trail_pct", DEFAULT_TRAIL_PCT), DEFAULT_TRAIL_PCT)
-
         if highest_price > entry_price and trail_pct > 0:
             profit_open = highest_price - entry_price
-            trail_buffer = profit_open * trail_pct
-            trailed_stop = highest_price - trail_buffer
+            trailed_stop = highest_price - (profit_open * trail_pct)
             if trailed_stop > position["stop_price"]:
                 position["stop_price"] = round(trailed_stop, 4)
 
@@ -1495,33 +1696,9 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                 finalize_close_position(position, live_price, "STOP HIT / trailing stop")
             continue
 
-        if position["qty_open"] <= 0:
+        if position["mode"] == "PAPER" and position["qty_open"] <= 0:
             finalize_close_position(position, live_price, "All size scaled out")
-            continue
 
-    save_positions(GLOBAL_POSITIONS)
-
-
-# =========================================================
-# ALPACA POSITION SYNC
-# =========================================================
-def sync_live_positions_from_alpaca():
-    if not ALPACA_SYNC_POSITIONS or not ENABLE_ALPACA or not GLOBAL_STATE.get("alpaca_enabled", False):
-        return
-    broker_positions = alpaca_list_positions()
-    if not broker_positions:
-        return
-    local_live = [p for p in GLOBAL_POSITIONS["open_positions"] if p.get("mode") == "LIVE"]
-    local_by_symbol = {p["symbol"]: p for p in local_live}
-    for bp in broker_positions:
-        symbol = str(bp.get("symbol", "")).strip()
-        if not symbol or symbol not in local_by_symbol:
-            continue
-        local_pos = local_by_symbol[symbol]
-        market_price = safe_float(bp.get("current_price", local_pos["last_price"]), local_pos["last_price"])
-        qty = safe_int(bp.get("qty", local_pos["qty_open"]), local_pos["qty_open"])
-        local_pos["qty_open"] = qty
-        update_position_market_price(local_pos, market_price)
     save_positions(GLOBAL_POSITIONS)
 
 
@@ -1531,20 +1708,20 @@ def sync_live_positions_from_alpaca():
 def should_route_signal(signal: Dict[str, Any]) -> bool:
     new_hash = signal_hash(signal)
     if new_hash == GLOBAL_STATE.get("last_signal_hash", ""):
-        debug("Duplicate signal skipped")
+        return False
+    recent_hashes = GLOBAL_STATE.get("recent_signal_hashes", [])
+    if isinstance(recent_hashes, list) and new_hash in recent_hashes:
         return False
     return True
 
 
 def handle_new_signal(signal: Dict[str, Any]):
-    if not GLOBAL_STATE.get("engine_enabled", True):
-        debug("Engine disabled; signal ignored")
+    if not GLOBAL_STATE.get("engine_enabled", True) or GLOBAL_STATE.get("kill_switch", False) or GLOBAL_STATE.get("bot_paused", False):
         return
-    if GLOBAL_STATE.get("kill_switch", False):
-        debug("Kill switch active; signal ignored")
-        return
-    if GLOBAL_STATE.get("bot_paused", False):
-        debug("Bot paused; signal ignored")
+    if GLOBAL_STATE.get("reconciliation_required", False):
+        msg = f"🚫 NEW TRADE BLOCKED\nReason: {GLOBAL_STATE.get('reconciliation_block_reason', 'reconciliation required')}\n⏰ {now_ts()}"
+        send_to_telegram(msg)
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
         return
     if not should_route_signal(signal):
         manage_open_positions(signal)
@@ -1552,52 +1729,47 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     validation_decision = validate_signal(signal)
     if not validation_decision["approved"]:
-        log(f"🚫 VALIDATION BLOCKED SIGNAL: {validation_decision['reject_reasons']}")
-        validation_msg = build_validation_block_message(signal, validation_decision)
-        send_to_discord(DISCORD_AI_WEBHOOK, validation_msg, "AI")
-        send_to_telegram(validation_msg)
+        msg = build_block_message("VALIDATION BLOCKED SIGNAL", signal, validation_decision["reject_reasons"], f"Reward/Risk: {validation_decision.get('reward_to_risk', 0.0)}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
         return
 
     regime_decision = evaluate_regime(signal)
     if not regime_decision["approved"]:
-        log(f"🚫 REGIME BLOCKED SIGNAL: {regime_decision['reject_reasons']}")
-        regime_msg = build_regime_block_message(signal, regime_decision)
-        send_to_discord(DISCORD_AI_WEBHOOK, regime_msg, "AI")
-        send_to_telegram(regime_msg)
+        msg = build_block_message("REGIME BLOCKED SIGNAL", signal, regime_decision["reject_reasons"], f"Regime: {regime_decision.get('regime')} | Score: {regime_decision.get('regime_score')}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
         return
 
     regime_signal = apply_regime_to_signal(signal, regime_decision)
-
     size_decision = size_signal_by_stop(regime_signal)
     if not size_decision["approved"]:
-        log(f"🚫 SIZING BLOCKED SIGNAL: {size_decision['reject_reasons']}")
-        size_block_msg = build_size_block_message(regime_signal, size_decision)
-        send_to_discord(DISCORD_AI_WEBHOOK, size_block_msg, "AI")
-        send_to_telegram(size_block_msg)
+        msg = build_block_message("SIZING BLOCKED SIGNAL", regime_signal, size_decision["reject_reasons"], f"Raw Size: {size_decision.get('raw_size')} | Final Size: {size_decision.get('final_size')}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
         return
 
     sized_signal = apply_size_decision_to_signal(regime_signal, size_decision)
-
     risk_decision = evaluate_risk_policy(sized_signal)
     if not risk_decision["approved"]:
-        log(f"🚫 RISK BLOCKED SIGNAL: {risk_decision['reject_reasons']}")
-        reject_msg = build_risk_block_message(sized_signal, risk_decision)
-        send_to_discord(DISCORD_AI_WEBHOOK, reject_msg, "AI")
-        send_to_telegram(reject_msg)
+        msg = build_block_message("RISK BLOCKED SIGNAL", sized_signal, risk_decision["reject_reasons"], f"Risk %: {round(risk_decision.get('risk_per_trade_pct', 0.0)*100, 3)} | Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0)*100, 3)}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
         return
 
     portfolio_decision = evaluate_portfolio_risk(sized_signal)
     if not portfolio_decision["approved"]:
-        log(f"🚫 PORTFOLIO BLOCKED SIGNAL: {portfolio_decision['reject_reasons']}")
-        portfolio_msg = build_portfolio_block_message(sized_signal, portfolio_decision)
-        send_to_discord(DISCORD_AI_WEBHOOK, portfolio_msg, "AI")
-        send_to_telegram(portfolio_msg)
+        msg = build_block_message("PORTFOLIO BLOCKED SIGNAL", sized_signal, portfolio_decision["reject_reasons"], f"Projected Heat %: {round(portfolio_decision.get('projected_heat_pct', 0.0)*100, 3)}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
         return
 
     route_signal(sized_signal, GLOBAL_STATE)
-    GLOBAL_STATE["last_signal_hash"] = signal_hash(signal)
+    sig_hash = signal_hash(signal)
+    GLOBAL_STATE["last_signal_hash"] = sig_hash
     GLOBAL_STATE["last_signal_time"] = epoch()
     GLOBAL_STATE["signal_count"] = safe_int(GLOBAL_STATE.get("signal_count", 0), 0) + 1
+    append_recent_signal_hash(GLOBAL_STATE, sig_hash)
     save_state(GLOBAL_STATE)
 
     if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True):
@@ -1616,13 +1788,12 @@ def build_status_text() -> str:
         f"🤖 {BOT_NAME} STATUS\nEngine Enabled: {GLOBAL_STATE['engine_enabled']}\nPaper Enabled: {GLOBAL_STATE['paper_enabled']}\n"
         f"Discord Enabled: {GLOBAL_STATE['discord_enabled']}\nTelegram Enabled: {GLOBAL_STATE['telegram_enabled']}\n"
         f"Alpaca Enabled: {GLOBAL_STATE['alpaca_enabled']}\nKill Switch: {GLOBAL_STATE.get('kill_switch', False)}\n"
-        f"Bot Paused: {GLOBAL_STATE.get('bot_paused', False)}\n"
+        f"Bot Paused: {GLOBAL_STATE.get('bot_paused', False)}\nRecon Block: {GLOBAL_STATE.get('reconciliation_required', False)}\n"
         f"Daily Realized PnL %: {round(safe_float(GLOBAL_STATE.get('daily_realized_pnl_pct', 0.0), 0.0) * 100, 2)}\n"
-        f"Consecutive Losses: {GLOBAL_STATE.get('consecutive_losses', 0)}\n"
-        f"Portfolio Heat %: {round(portfolio_heat_pct() * 100, 2)}\n"
-        f"Signals Routed: {GLOBAL_STATE['signal_count']}\nPaper Trades: {GLOBAL_STATE['paper_trade_count']}\n"
-        f"Live Trades: {GLOBAL_STATE['live_trade_count']}\nOpen Positions: {len(GLOBAL_POSITIONS['open_positions'])}\n"
-        f"Closed Positions: {len(GLOBAL_POSITIONS['closed_positions'])}\n⏰ {now_ts()}"
+        f"Consecutive Losses: {GLOBAL_STATE.get('consecutive_losses', 0)}\nPortfolio Heat %: {round(portfolio_heat_pct() * 100, 2)}\n"
+        f"Signals Routed: {GLOBAL_STATE['signal_count']}\nPaper Trades: {GLOBAL_STATE['paper_trade_count']}\nLive Trades: {GLOBAL_STATE['live_trade_count']}\n"
+        f"Open Positions: {len(GLOBAL_POSITIONS['open_positions'])}\nClosed Positions: {len(GLOBAL_POSITIONS['closed_positions'])}\n"
+        f"Tracked Orders: {len(GLOBAL_ORDERS['orders'])}\n⏰ {now_ts()}"
     )
 
 
@@ -1631,9 +1802,18 @@ def build_positions_text() -> str:
         return f"📭 No open positions.\n⏰ {now_ts()}"
     lines = ["📌 OPEN POSITIONS"]
     for p in GLOBAL_POSITIONS["open_positions"]:
-        lines.append(
-            f"ID {p['id']} | {p['mode']} | {p['symbol']} | Entry {p['entry_price']} | Live {p['last_price']} | PnL {round(p['pnl_pct'], 2)}% | Qty {p['qty_open']}"
-        )
+        lines.append(f"ID {p['id']} | {p['mode']} | {p['symbol']} | Entry {p['entry_price']} | AvgFill {p.get('avg_fill_price', 0)} | Live {p['last_price']} | PnL {round(p['pnl_pct'], 2)}% | Qty {p['qty_open']}")
+    lines.append(f"⏰ {now_ts()}")
+    return "\n".join(lines)
+
+
+def build_orders_text() -> str:
+    orders = GLOBAL_ORDERS.get("orders", [])[-10:]
+    if not orders:
+        return f"📭 No tracked orders.\n⏰ {now_ts()}"
+    lines = ["🧾 RECENT ORDERS"]
+    for o in orders:
+        lines.append(f"Local {o.get('local_order_id')} | {o.get('symbol')} | {o.get('side')} | req {o.get('qty_requested')} | fill {o.get('qty_filled')} | {o.get('status')}")
     lines.append(f"⏰ {now_ts()}")
     return "\n".join(lines)
 
@@ -1648,121 +1828,66 @@ def close_all_open_positions():
             live_close_position(position, "Manual close all")
         else:
             finalize_close_position(position, position["last_price"], "Manual close all")
-    send_to_telegram("✅ All open positions closed.")
+    send_to_telegram("✅ All open positions close instructions sent.")
 
 
 def handle_telegram_command(text: str):
     cmd = parse_command(text)
     if cmd in {"/start", "/help", "help"}:
-        send_to_telegram(
-            "📘 COMMANDS\n/status\n/positions\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/cancel_orders\n/close_all\n"
-        )
+        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n")
         return
-
     if cmd == "/status":
-        send_to_telegram(build_status_text())
-        return
+        send_to_telegram(build_status_text()); return
     if cmd == "/positions":
-        send_to_telegram(build_positions_text())
-        return
+        send_to_telegram(build_positions_text()); return
+    if cmd == "/orders":
+        send_to_telegram(build_orders_text()); return
     if cmd == "/engine_on":
-        GLOBAL_STATE["engine_enabled"] = True
-        save_state(GLOBAL_STATE)
-        send_to_telegram("✅ Engine enabled")
-        return
+        GLOBAL_STATE["engine_enabled"] = True; save_state(GLOBAL_STATE); send_to_telegram("✅ Engine enabled"); return
     if cmd == "/engine_off":
-        GLOBAL_STATE["engine_enabled"] = False
-        save_state(GLOBAL_STATE)
-        send_to_telegram("🛑 Engine disabled")
-        return
+        GLOBAL_STATE["engine_enabled"] = False; save_state(GLOBAL_STATE); send_to_telegram("🛑 Engine disabled"); return
     if cmd == "/paper_on":
-        GLOBAL_STATE["paper_enabled"] = True
-        GLOBAL_STATE["last_mode"] = "PAPER"
-        save_state(GLOBAL_STATE)
-        send_to_telegram("✅ Paper mode enabled")
-        return
+        GLOBAL_STATE["paper_enabled"] = True; GLOBAL_STATE["last_mode"] = "PAPER"; save_state(GLOBAL_STATE); send_to_telegram("✅ Paper mode enabled"); return
     if cmd == "/paper_off":
-        GLOBAL_STATE["paper_enabled"] = False
-        GLOBAL_STATE["last_mode"] = "LIVE"
-        save_state(GLOBAL_STATE)
-        send_to_telegram("🛑 Paper mode disabled")
-        return
+        GLOBAL_STATE["paper_enabled"] = False; GLOBAL_STATE["last_mode"] = "LIVE"; save_state(GLOBAL_STATE); send_to_telegram("🛑 Paper mode disabled"); return
     if cmd == "/alpaca_on":
-        GLOBAL_STATE["alpaca_enabled"] = True
-        GLOBAL_STATE["paper_enabled"] = False
-        GLOBAL_STATE["last_mode"] = "LIVE"
-        save_state(GLOBAL_STATE)
-        send_to_telegram("✅ Alpaca mode enabled")
-        return
+        GLOBAL_STATE["alpaca_enabled"] = True; GLOBAL_STATE["paper_enabled"] = False; GLOBAL_STATE["last_mode"] = "LIVE"; save_state(GLOBAL_STATE); send_to_telegram("✅ Alpaca mode enabled"); return
     if cmd == "/alpaca_off":
-        GLOBAL_STATE["alpaca_enabled"] = False
-        save_state(GLOBAL_STATE)
-        send_to_telegram("🛑 Alpaca mode disabled")
-        return
+        GLOBAL_STATE["alpaca_enabled"] = False; save_state(GLOBAL_STATE); send_to_telegram("🛑 Alpaca mode disabled"); return
     if cmd == "/discord_on":
-        GLOBAL_STATE["discord_enabled"] = True
-        save_state(GLOBAL_STATE)
-        send_to_telegram("✅ Discord routing enabled")
-        return
+        GLOBAL_STATE["discord_enabled"] = True; save_state(GLOBAL_STATE); send_to_telegram("✅ Discord routing enabled"); return
     if cmd == "/discord_off":
-        GLOBAL_STATE["discord_enabled"] = False
-        save_state(GLOBAL_STATE)
-        send_to_telegram("🛑 Discord routing disabled")
-        return
+        GLOBAL_STATE["discord_enabled"] = False; save_state(GLOBAL_STATE); send_to_telegram("🛑 Discord routing disabled"); return
     if cmd == "/telegram_on":
-        GLOBAL_STATE["telegram_enabled"] = True
-        save_state(GLOBAL_STATE)
-        send_to_telegram("✅ Telegram alerts enabled")
-        return
+        GLOBAL_STATE["telegram_enabled"] = True; save_state(GLOBAL_STATE); send_to_telegram("✅ Telegram alerts enabled"); return
     if cmd == "/telegram_off":
-        GLOBAL_STATE["telegram_enabled"] = False
-        save_state(GLOBAL_STATE)
-        send_to_telegram("🛑 Telegram alerts disabled")
-        return
+        GLOBAL_STATE["telegram_enabled"] = False; save_state(GLOBAL_STATE); send_to_telegram("🛑 Telegram alerts disabled"); return
     if cmd == "/kill_on":
-        GLOBAL_STATE["kill_switch"] = True
-        save_state(GLOBAL_STATE)
-        send_to_telegram("🛑 Kill switch enabled")
-        return
+        GLOBAL_STATE["kill_switch"] = True; save_state(GLOBAL_STATE); send_to_telegram("🛑 Kill switch enabled"); return
     if cmd == "/kill_off":
-        GLOBAL_STATE["kill_switch"] = False
-        save_state(GLOBAL_STATE)
-        send_to_telegram("✅ Kill switch disabled")
-        return
+        GLOBAL_STATE["kill_switch"] = False; save_state(GLOBAL_STATE); send_to_telegram("✅ Kill switch disabled"); return
     if cmd == "/pause_on":
-        GLOBAL_STATE["bot_paused"] = True
-        save_state(GLOBAL_STATE)
-        send_to_telegram("⏸️ Bot paused")
-        return
+        GLOBAL_STATE["bot_paused"] = True; save_state(GLOBAL_STATE); send_to_telegram("⏸️ Bot paused"); return
     if cmd == "/pause_off":
-        GLOBAL_STATE["bot_paused"] = False
-        save_state(GLOBAL_STATE)
-        send_to_telegram("▶️ Bot resumed")
-        return
+        GLOBAL_STATE["bot_paused"] = False; save_state(GLOBAL_STATE); send_to_telegram("▶️ Bot resumed"); return
     if cmd == "/sync":
-        sync_live_positions_from_alpaca()
-        send_to_telegram("🔄 Alpaca sync complete")
-        return
+        sync_live_positions_from_alpaca(); reconcile_order_fills_into_positions(); send_to_telegram("🔄 Sync complete"); return
+    if cmd == "/recon":
+        report = build_boot_reconciliation_report(); send_to_telegram(build_reconciliation_message(report)); return
+    if cmd == "/recon_clear":
+        clear_reconciliation_block(); send_to_telegram("✅ Reconciliation block cleared"); return
     if cmd == "/cancel_orders":
         if not alpaca_ready():
-            send_to_telegram("❌ Alpaca not configured")
-            return
+            send_to_telegram("❌ Alpaca not configured"); return
         resp = alpaca_delete("/v2/orders")
-        if resp.status_code in (200, 204, 207):
-            send_to_telegram("✅ Cancel all orders sent")
-        else:
-            send_to_telegram(f"❌ Cancel all orders failed | {resp.status_code}")
+        send_to_telegram("✅ Cancel all orders sent" if resp.status_code in (200, 204, 207) else f"❌ Cancel all orders failed | {resp.status_code}")
         return
     if cmd == "/close_all":
-        close_all_open_positions()
-        return
+        close_all_open_positions(); return
     if cmd == "/heartbeat":
-        send_heartbeat(force=True)
-        return
+        send_heartbeat(force=True); return
     if cmd == "/test":
-        run_startup_tests()
-        send_to_telegram("🧪 Test alerts triggered")
-        return
+        run_startup_tests(); send_to_telegram("🧪 Test alerts triggered"); return
 
 
 def process_telegram_updates():
@@ -1776,18 +1901,15 @@ def process_telegram_updates():
     for update in updates:
         update_id = safe_int(update.get("update_id", 0), 0)
         max_update_id = max(max_update_id, update_id)
-        message = update.get("message", {}) or {}
-        text = message.get("text", "")
-        if not text:
-            continue
-        debug(f"Telegram command: {text}")
-        handle_telegram_command(text)
+        text = (update.get("message", {}) or {}).get("text", "")
+        if text:
+            handle_telegram_command(text)
     GLOBAL_STATE["last_telegram_update_id"] = max_update_id
     save_state(GLOBAL_STATE)
 
 
 # =========================================================
-# HEARTBEAT + TESTS
+# HEARTBEAT + TESTS + FALLBACK
 # =========================================================
 def send_heartbeat(force: bool = False):
     if not ENABLE_HEARTBEAT:
@@ -1801,7 +1923,6 @@ def send_heartbeat(force: bool = False):
 
 
 def run_startup_tests():
-    log("🚀 Running startup tests...")
     ts = now_ts()
     if ENABLE_DISCORD:
         send_to_discord(DISCORD_AI_WEBHOOK, f"🧪 TEST ALERT\nAI webhook live\n⏰ {ts}", "AI")
@@ -1812,15 +1933,11 @@ def run_startup_tests():
     if ENABLE_ALPACA and alpaca_ready():
         acct = alpaca_get_account()
         if acct:
-            msg = f"🧪 ALPACA CHECK OK\nStatus: {acct.get('status', 'unknown')}\nBuying Power: {acct.get('buying_power', 'N/A')}\nOptions Buying Power: {acct.get('options_buying_power', 'N/A')}\nAccount Blocked: {acct.get('account_blocked', 'N/A')}\n⏰ {ts}"
-            send_to_telegram(msg)
+            send_to_telegram(f"🧪 ALPACA CHECK OK\nStatus: {acct.get('status', 'unknown')}\nBuying Power: {acct.get('buying_power', 'N/A')}\nOptions BP: {acct.get('options_buying_power', 'N/A')}\n⏰ {ts}")
         else:
             send_to_telegram(f"❌ ALPACA CHECK FAILED\n⏰ {ts}")
 
 
-# =========================================================
-# FALLBACK SIGNAL
-# =========================================================
 def fallback_signal() -> Dict[str, Any]:
     return normalize_signal({
         "ticker": "QQQ",
@@ -1846,31 +1963,43 @@ def fallback_signal() -> Dict[str, Any]:
 
 
 # =========================================================
-# BOOT
+# BOOT + LOOP
 # =========================================================
 def boot():
-    global GLOBAL_STATE, GLOBAL_POSITIONS
+    global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON
     GLOBAL_STATE = load_state()
     GLOBAL_POSITIONS = load_positions()
+    GLOBAL_ORDERS = load_orders()
+    GLOBAL_RECON = load_recon()
+
     log(f"🔥 {BOT_NAME} booting...")
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
     save_state(GLOBAL_STATE)
     save_positions(GLOBAL_POSITIONS)
-    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+    save_orders(GLOBAL_ORDERS)
+    save_recon(GLOBAL_RECON)
     debug_file_lookup(SIGNAL_FILE)
+
     if RUN_TEST_ON_START:
         run_startup_tests()
+
+    if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+        startup_reconcile_and_gate()
+
     send_heartbeat(force=True)
 
 
-# =========================================================
-# LOOP
-# =========================================================
+def runtime_housekeeping():
+    sync_live_positions_from_alpaca()
+    reconcile_order_fills_into_positions()
+    manage_open_positions(None)
+
+
 def main_loop():
     boot()
+
     if not file_exists(SIGNAL_FILE):
         log(f"❌ No signal file found on boot: {SIGNAL_FILE}")
-        log(f"❌ Absolute boot path checked: {os.path.abspath(SIGNAL_FILE)}")
-        debug_file_lookup(SIGNAL_FILE)
         debug("Routing fallback test signal once.")
         sig = fallback_signal()
         handle_new_signal(sig)
@@ -1883,8 +2012,9 @@ def main_loop():
                 live_signal = load_live_signal()
                 if live_signal:
                     handle_new_signal(live_signal)
-            sync_live_positions_from_alpaca()
-            manage_open_positions(live_signal)
+            runtime_housekeeping()
+            if live_signal:
+                manage_open_positions(live_signal)
             send_heartbeat(force=False)
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
@@ -1898,13 +2028,9 @@ def main_loop():
 
 def run_once():
     boot()
-    sig = load_live_signal()
-    if sig is None:
-        log("No live signal found. Using fallback once.")
-        sig = fallback_signal()
+    sig = load_live_signal() or fallback_signal()
     handle_new_signal(sig)
-    sync_live_positions_from_alpaca()
-    manage_open_positions(sig)
+    runtime_housekeeping()
     process_telegram_updates()
     send_heartbeat(force=False)
 
