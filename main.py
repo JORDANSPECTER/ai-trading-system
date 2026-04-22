@@ -13,7 +13,7 @@ import requests
 # =========================================================
 # UNBIASED TRADES ELITE ENGINE
 # FULL MAIN.PY
-# DISCORD + TELEGRAM + SIGNAL PARSER + PAPER + ALPACA
+# DISCORD + TELEGRAM + SIGNAL PARSER + FILE DEBUG + PAPER + ALPACA
 # =========================================================
 
 
@@ -53,7 +53,6 @@ ENABLE_ALPACA = os.getenv("ENABLE_ALPACA", "false").lower() == "true"
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
-ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").strip()
 ALPACA_ORDER_TIMEOUT = int(os.getenv("ALPACA_ORDER_TIMEOUT", "20"))
 ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "true"
 
@@ -159,6 +158,36 @@ def signal_hash(signal: Dict[str, Any]) -> str:
         return str(abs(hash(key)))
     except Exception:
         return str(epoch())
+
+
+def debug_file_lookup(path: str):
+    try:
+        cwd = os.getcwd()
+        abs_path = os.path.abspath(path)
+
+        log("📁 FILE DEBUG MODE")
+        log(f"Working directory: {cwd}")
+        log(f"Requested SIGNAL_FILE: {path}")
+        log(f"Absolute SIGNAL_FILE path: {abs_path}")
+        log(f"Exists?: {os.path.exists(path)}")
+        log(f"Absolute exists?: {os.path.exists(abs_path)}")
+
+        try:
+            root_files = os.listdir(cwd)
+            log(f"Files in working directory: {root_files}")
+        except Exception as inner_e:
+            log(f"❌ Could not list working directory files: {inner_e}")
+
+        repo_guess = "/opt/render/project/src"
+        if os.path.exists(repo_guess):
+            try:
+                repo_files = os.listdir(repo_guess)
+                log(f"Files in /opt/render/project/src: {repo_files}")
+            except Exception as inner_e:
+                log(f"❌ Could not list /opt/render/project/src: {inner_e}")
+
+    except Exception as e:
+        log(f"❌ debug_file_lookup failed: {e}")
 
 
 # =========================================================
@@ -327,12 +356,6 @@ def alpaca_delete(path: str):
     return r
 
 
-def alpaca_patch(path: str, payload: Dict[str, Any]):
-    url = f"{ALPACA_BASE_URL}{path}"
-    r = requests.patch(url, headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
-    return r
-
-
 def alpaca_get_account() -> Optional[Dict[str, Any]]:
     if not alpaca_ready():
         return None
@@ -374,74 +397,6 @@ def alpaca_get_open_position(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def alpaca_list_orders(status: str = "open", limit: int = 50) -> List[Dict[str, Any]]:
-    if not alpaca_ready():
-        return []
-    try:
-        r = alpaca_get("/v2/orders", params={"status": status, "limit": limit})
-        if r.status_code == 200:
-            data = r.json()
-            return data if isinstance(data, list) else []
-        log(f"❌ Alpaca list orders failed | {r.status_code} | {r.text}")
-        return []
-    except Exception as e:
-        log(f"❌ Alpaca list orders exception: {e}")
-        return []
-
-
-def alpaca_cancel_order(order_id: str) -> bool:
-    if not alpaca_ready() or not order_id:
-        return False
-    try:
-        r = alpaca_delete(f"/v2/orders/{order_id}")
-        if r.status_code in (200, 204):
-            log(f"✅ Alpaca order canceled {order_id}")
-            return True
-        log(f"❌ Alpaca cancel failed | {r.status_code} | {r.text}")
-        return False
-    except Exception as e:
-        log(f"❌ Alpaca cancel exception: {e}")
-        return False
-
-
-def alpaca_cancel_all_orders() -> bool:
-    if not alpaca_ready():
-        return False
-    try:
-        r = alpaca_delete("/v2/orders")
-        if r.status_code in (200, 207, 204):
-            log("✅ Alpaca cancel all orders requested")
-            return True
-        log(f"❌ Alpaca cancel all failed | {r.status_code} | {r.text}")
-        return False
-    except Exception as e:
-        log(f"❌ Alpaca cancel all exception: {e}")
-        return False
-
-
-def build_alpaca_order_payload(
-    symbol: str,
-    qty: int,
-    side: str,
-    order_type: str = "market",
-    tif: str = "day",
-    limit_price: Optional[float] = None,
-    client_order_id: Optional[str] = None
-) -> Dict[str, Any]:
-    payload = {
-        "symbol": symbol,
-        "qty": str(int(qty)),
-        "side": side,
-        "type": order_type,
-        "time_in_force": tif,
-    }
-    if client_order_id:
-        payload["client_order_id"] = client_order_id
-    if order_type == "limit" and limit_price is not None:
-        payload["limit_price"] = str(limit_price)
-    return payload
-
-
 def alpaca_submit_order(
     symbol: str,
     qty: int,
@@ -455,15 +410,19 @@ def alpaca_submit_order(
         log("❌ Alpaca not configured")
         return None
 
-    payload = build_alpaca_order_payload(
-        symbol=symbol,
-        qty=qty,
-        side=side,
-        order_type=order_type,
-        tif=tif,
-        limit_price=limit_price,
-        client_order_id=client_order_id
-    )
+    payload = {
+        "symbol": symbol,
+        "qty": str(int(qty)),
+        "side": side,
+        "type": order_type,
+        "time_in_force": tif
+    }
+
+    if client_order_id:
+        payload["client_order_id"] = client_order_id
+
+    if order_type == "limit" and limit_price is not None:
+        payload["limit_price"] = str(limit_price)
 
     try:
         r = alpaca_post("/v2/orders", payload)
@@ -479,9 +438,6 @@ def alpaca_submit_order(
 
 
 def alpaca_close_position_market(symbol: str, qty: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """
-    For options, we use a sell market order for the option contract symbol.
-    """
     position = alpaca_get_open_position(symbol)
     if not position:
         log(f"❌ No Alpaca open position found for {symbol}")
@@ -563,13 +519,11 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["timestamp"] = safe_int(signal.get("timestamp", epoch()), epoch())
     signal["source"] = str(signal.get("source", "signal_file"))
 
-    # live execution fields
     signal["qty"] = safe_int(signal.get("qty", DEFAULT_LIVE_QTY), DEFAULT_LIVE_QTY)
     signal["use_limit_entry"] = bool(signal.get("use_limit_entry", False))
     signal["limit_entry_price"] = safe_float(signal.get("limit_entry_price", signal["entry_contract"]))
     signal["asset_class"] = str(signal.get("asset_class", "option")).lower().strip()
 
-    # actual tradable symbol
     signal["symbol"] = str(signal.get("symbol", signal.get("contract_symbol", signal["ticker"]))).strip()
 
     signal["signal_id"] = str(signal.get("signal_id", signal_hash(signal)))
@@ -584,23 +538,35 @@ def is_signal_fresh(signal: Dict[str, Any]) -> bool:
 
 
 def load_live_signal() -> Optional[Dict[str, Any]]:
-    if not SIGNAL_FILE or not file_exists(SIGNAL_FILE):
+    debug_file_lookup(SIGNAL_FILE)
+
+    if not SIGNAL_FILE:
+        log("❌ SIGNAL_FILE env var is empty")
+        return None
+
+    if not file_exists(SIGNAL_FILE):
+        log(f"❌ SIGNAL_FILE not found: {SIGNAL_FILE}")
+        log(f"❌ Absolute path checked: {os.path.abspath(SIGNAL_FILE)}")
         return None
 
     try:
         with open(SIGNAL_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
 
+        log(f"✅ Loaded signal from {SIGNAL_FILE}")
+
         if not isinstance(raw, dict):
-            log("❌ signal.json is not a JSON object")
+            log("❌ signal file is not a JSON object")
             return None
 
         signal = normalize_signal(raw)
+
         if not is_signal_fresh(signal):
-            debug("Signal skipped: stale")
+            log("❌ Signal skipped: stale timestamp")
             return None
 
         return signal
+
     except Exception as e:
         log(f"❌ Failed loading signal file: {e}")
         return None
@@ -1047,7 +1013,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
 
         update_position_market_price(position, live_price)
 
-        # TP1
         if not position["tp1_hit"] and live_price >= position["tp1_price"]:
             qty1 = max(1, math.floor(position["qty_total"] * position["scale1_pct"]))
             qty1 = min(qty1, position["qty_open"])
@@ -1071,7 +1036,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
-        # TP2
         if not position["tp2_hit"] and live_price >= position["tp2_price"]:
             qty2 = max(1, math.floor(position["qty_total"] * position["scale2_pct"]))
             qty2 = min(qty2, position["qty_open"])
@@ -1091,7 +1055,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
-        # trailing stop
         entry_price = safe_float(position.get("entry_price", 0), 0)
         highest_price = safe_float(position.get("highest_price", live_price), live_price)
         trail_pct = safe_float(position.get("trail_pct", DEFAULT_TRAIL_PCT), DEFAULT_TRAIL_PCT)
@@ -1103,7 +1066,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
             if trailed_stop > position["stop_price"]:
                 position["stop_price"] = round(trailed_stop, 4)
 
-        # stop hit
         if live_price <= position["stop_price"]:
             if position["mode"] == "LIVE":
                 live_close_position(position, "STOP HIT / trailing stop")
@@ -1111,12 +1073,8 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                 finalize_close_position(position, live_price, "STOP HIT / trailing stop")
             continue
 
-        # all scaled out
         if position["qty_open"] <= 0:
-            if position["mode"] == "LIVE":
-                finalize_close_position(position, live_price, "All size scaled out")
-            else:
-                finalize_close_position(position, live_price, "All size scaled out")
+            finalize_close_position(position, live_price, "All size scaled out")
             continue
 
     save_positions(GLOBAL_POSITIONS)
@@ -1180,9 +1138,6 @@ def handle_new_signal(signal: Dict[str, Any]):
     GLOBAL_STATE["signal_count"] = safe_int(GLOBAL_STATE.get("signal_count", 0), 0) + 1
     save_state(GLOBAL_STATE)
 
-    # Entry logic:
-    # If Alpaca enabled => live entry
-    # else if paper enabled => paper entry
     if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA:
         open_live_position(signal)
     elif GLOBAL_STATE.get("paper_enabled", True):
@@ -1339,8 +1294,11 @@ def handle_telegram_command(text: str):
         return
 
     if cmd == "/cancel_orders":
-        ok = alpaca_cancel_all_orders()
-        send_to_telegram("✅ Cancel all orders sent" if ok else "❌ Cancel all orders failed")
+        ok = alpaca_delete("/v2/orders")
+        if ok.status_code in (200, 204, 207):
+            send_to_telegram("✅ Cancel all orders sent")
+        else:
+            send_to_telegram("❌ Cancel all orders failed")
         return
 
     if cmd == "/close_all":
@@ -1467,6 +1425,8 @@ def boot():
     save_state(GLOBAL_STATE)
     save_positions(GLOBAL_POSITIONS)
 
+    debug_file_lookup(SIGNAL_FILE)
+
     if RUN_TEST_ON_START:
         run_startup_tests()
 
@@ -1480,7 +1440,10 @@ def main_loop():
     boot()
 
     if not file_exists(SIGNAL_FILE):
-        debug("No signal file found on boot. Routing fallback test signal once.")
+        log(f"❌ No signal file found on boot: {SIGNAL_FILE}")
+        log(f"❌ Absolute boot path checked: {os.path.abspath(SIGNAL_FILE)}")
+        debug_file_lookup(SIGNAL_FILE)
+        debug("Routing fallback test signal once.")
         sig = fallback_signal()
         handle_new_signal(sig)
 
