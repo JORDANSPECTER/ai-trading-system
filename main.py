@@ -18,6 +18,7 @@ import requests
 # + PAPER + ALPACA + RISK POLICY + POSITION SIZING
 # + PRE-TRADE VALIDATOR + PORTFOLIO RISK MANAGER
 # + REGIME ENGINE
+# + LIVE OPTIONS MODE UPDATE
 # =========================================================
 
 
@@ -59,6 +60,10 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
 ALPACA_ORDER_TIMEOUT = int(os.getenv("ALPACA_ORDER_TIMEOUT", "20"))
 ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "true"
+ALPACA_ENABLE_OPTIONS = os.getenv("ALPACA_ENABLE_OPTIONS", "true").lower() == "true"
+ALPACA_LIVE_OPTIONS_APPROVED = os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", "false").lower() == "true"
+USE_ALPACA_OPTIONS_BUYING_POWER = os.getenv("USE_ALPACA_OPTIONS_BUYING_POWER", "true").lower() == "true"
+LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
 
 # =========================
 # SIGNAL / EXECUTION DEFAULTS
@@ -300,7 +305,8 @@ def default_state() -> Dict[str, Any]:
         "consecutive_losses": 0,
         "last_trade_day": current_trade_day(),
         "kill_switch": False,
-        "bot_paused": False
+        "bot_paused": False,
+        "last_mode": "LIVE" if LIVE_MODE else "PAPER"
     }
 
 
@@ -355,6 +361,18 @@ def get_account_equity() -> float:
     return max(PAPER_ACCOUNT_EQUITY, 1.0)
 
 
+def get_options_buying_power() -> float:
+    if ENABLE_ALPACA and GLOBAL_STATE and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() and USE_ALPACA_OPTIONS_BUYING_POWER:
+        acct = alpaca_get_account()
+        if acct:
+            obp = safe_float(acct.get("options_buying_power", 0), 0)
+            if obp > 0:
+                return obp
+            buying_power = safe_float(acct.get("buying_power", 0), 0)
+            return max(buying_power, 0)
+    return get_account_equity()
+
+
 def estimate_unit_risk(signal: Dict[str, Any]) -> float:
     entry = safe_float(signal.get("entry_contract", 0), 0)
     stop = safe_float(signal.get("stop_contract", 0), 0)
@@ -367,6 +385,12 @@ def estimate_trade_risk_dollars(signal: Dict[str, Any]) -> float:
     qty = max(1, safe_int(signal.get("qty", 1), 1))
     unit_risk = estimate_unit_risk(signal)
     return qty * unit_risk * 100.0
+
+
+def estimate_trade_notional_dollars(signal: Dict[str, Any]) -> float:
+    qty = max(1, safe_int(signal.get("qty", 1), 1))
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    return qty * entry * 100.0
 
 
 def estimate_open_position_risk_dollars(position: Dict[str, Any]) -> float:
@@ -612,6 +636,12 @@ def size_signal_by_stop(signal: Dict[str, Any]) -> Dict[str, Any]:
     if USE_SIGNAL_QTY_AS_MAX and signal_qty_hint > 0 and final_size > signal_qty_hint:
         final_size = signal_qty_hint
         adjustments.append("capped_by_signal_qty_hint")
+    options_bp = get_options_buying_power()
+    est_notional = final_size * entry * 100.0
+    if options_bp > 0 and est_notional > options_bp:
+        bp_cap_qty = math.floor(options_bp / max(entry * 100.0, 1.0))
+        final_size = max(0, min(final_size, bp_cap_qty))
+        adjustments.append("capped_by_options_buying_power")
     if final_size < MIN_POSITION_QTY:
         final_size = 0
         adjustments.append("below_min_position_qty")
@@ -688,6 +718,74 @@ def validate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     approved = len(reasons) == 0
     return {"approved": approved, "stage": "pretrade_validator", "reject_reasons": reasons, "reward_to_risk": round(best_rr, 4), "unit_risk": round(unit_risk, 4)}
+
+
+# =========================================================
+# RISK POLICY MANAGER
+# =========================================================
+def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
+    reasons = []
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+
+    if GLOBAL_STATE.get("kill_switch", False):
+        reasons.append("kill_switch_active")
+    if GLOBAL_STATE.get("bot_paused", False):
+        reasons.append("bot_paused")
+    if not GLOBAL_STATE.get("engine_enabled", True):
+        reasons.append("engine_disabled")
+
+    open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+    open_count = len(open_positions)
+    if open_count >= MAX_OPEN_POSITIONS:
+        reasons.append("max_open_positions_hit")
+
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    same_ticker_count = sum(1 for p in open_positions if str(p.get("ticker", "")).upper().strip() == ticker)
+    if same_ticker_count >= MAX_SAME_TICKER_POSITIONS:
+        reasons.append("max_same_ticker_positions_hit")
+
+    trade_risk_dollars = estimate_trade_risk_dollars(signal)
+    equity = get_account_equity()
+    risk_per_trade_pct = trade_risk_dollars / equity if equity > 0 else 0.0
+    if risk_per_trade_pct > MAX_RISK_PER_TRADE_PCT:
+        reasons.append("risk_per_trade_limit_hit")
+
+    current_daily_loss_pct = abs(min(safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0), 0.0))
+    if current_daily_loss_pct >= MAX_DAILY_LOSS_PCT:
+        reasons.append("max_daily_loss_hit")
+
+    current_heat = portfolio_heat_pct()
+    projected_heat = current_heat + risk_per_trade_pct
+    if current_heat >= MAX_PORTFOLIO_HEAT_PCT:
+        reasons.append("portfolio_heat_limit_hit")
+    if projected_heat > MAX_PORTFOLIO_HEAT_PCT:
+        reasons.append("projected_heat_limit_hit")
+
+    consecutive_losses = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0)
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+        reasons.append("max_consecutive_losses_hit")
+
+    notional = estimate_trade_notional_dollars(signal)
+    options_bp = get_options_buying_power()
+    if options_bp > 0 and notional > options_bp:
+        reasons.append("insufficient_options_buying_power")
+
+    approved = len(reasons) == 0
+    return {
+        "approved": approved,
+        "stage": "risk_policy",
+        "reject_reasons": reasons,
+        "risk_per_trade_pct": round(risk_per_trade_pct, 6),
+        "portfolio_heat_pct": round(current_heat, 6),
+        "projected_heat_pct": round(projected_heat, 6),
+        "daily_realized_pnl_pct": round(safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0), 6),
+        "consecutive_losses": consecutive_losses,
+        "trade_risk_dollars": round(trade_risk_dollars, 2),
+        "options_buying_power": round(options_bp, 2),
+        "notional_dollars": round(notional, 2),
+        "same_ticker_count": same_ticker_count,
+        "open_positions": open_count,
+    }
 
 
 # =========================================================
@@ -943,7 +1041,9 @@ def build_risk_block_message(signal: Dict[str, Any], risk_decision: Dict[str, An
         f"🚫 SIGNAL BLOCKED\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nReasons: {reasons}\n"
         f"Risk/Trade %: {round(risk_decision.get('risk_per_trade_pct', 0.0) * 100, 3)}\n"
         f"Portfolio Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0) * 100, 3)}\n"
-        f"Projected Heat %: {round(risk_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n⏰ {now_ts()}"
+        f"Projected Heat %: {round(risk_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n"
+        f"Options BP: {risk_decision.get('options_buying_power', 0.0)}\n"
+        f"Notional: {risk_decision.get('notional_dollars', 0.0)}\n⏰ {now_ts()}"
     )
 
 
@@ -1215,6 +1315,22 @@ def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # LIVE ALPACA EXECUTION
 # =========================================================
 def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
+    if not GLOBAL_STATE.get("alpaca_enabled", False):
+        log("❌ LIVE BLOCKED: alpaca mode disabled")
+        return False
+    if not ENABLE_ALPACA:
+        log("❌ LIVE BLOCKED: ENABLE_ALPACA=false")
+        return False
+    if not LIVE_MODE and GLOBAL_STATE.get("paper_enabled", True):
+        log("❌ LIVE BLOCKED: engine still in paper mode")
+        return False
+    if signal.get("asset_class") == "option":
+        if not ALPACA_ENABLE_OPTIONS:
+            log("❌ LIVE BLOCKED: ALPACA_ENABLE_OPTIONS=false")
+            return False
+        if not ALPACA_LIVE_OPTIONS_APPROVED:
+            log("❌ LIVE BLOCKED: ALPACA_LIVE_OPTIONS_APPROVED=false")
+            return False
     if REQUIRE_OPTION_SYMBOL and signal.get("asset_class") == "option":
         if signal["symbol"] == signal["ticker"]:
             log("❌ LIVE BLOCKED: option signal missing actual option contract symbol")
@@ -1222,16 +1338,15 @@ def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
     if signal["qty"] <= 0:
         log("❌ LIVE BLOCKED: qty invalid")
         return False
+    notional = estimate_trade_notional_dollars(signal)
+    options_bp = get_options_buying_power()
+    if options_bp > 0 and notional > options_bp:
+        log("❌ LIVE BLOCKED: not enough options buying power")
+        return False
     return True
 
 
 def submit_live_entry(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not GLOBAL_STATE.get("alpaca_enabled", False):
-        debug("Alpaca disabled in state")
-        return None
-    if not ENABLE_ALPACA:
-        debug("Alpaca disabled by env")
-        return None
     if not ALLOW_LIVE_BUYS:
         log("❌ LIVE BUY BLOCKED: ALLOW_LIVE_BUYS=false")
         return None
@@ -1425,6 +1540,12 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not GLOBAL_STATE.get("engine_enabled", True):
         debug("Engine disabled; signal ignored")
         return
+    if GLOBAL_STATE.get("kill_switch", False):
+        debug("Kill switch active; signal ignored")
+        return
+    if GLOBAL_STATE.get("bot_paused", False):
+        debug("Bot paused; signal ignored")
+        return
     if not should_route_signal(signal):
         manage_open_positions(signal)
         return
@@ -1479,7 +1600,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     GLOBAL_STATE["signal_count"] = safe_int(GLOBAL_STATE.get("signal_count", 0), 0) + 1
     save_state(GLOBAL_STATE)
 
-    if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA:
+    if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True):
         open_live_position(sized_signal)
     elif GLOBAL_STATE.get("paper_enabled", True):
         open_paper_position(sized_signal)
@@ -1556,16 +1677,20 @@ def handle_telegram_command(text: str):
         return
     if cmd == "/paper_on":
         GLOBAL_STATE["paper_enabled"] = True
+        GLOBAL_STATE["last_mode"] = "PAPER"
         save_state(GLOBAL_STATE)
         send_to_telegram("✅ Paper mode enabled")
         return
     if cmd == "/paper_off":
         GLOBAL_STATE["paper_enabled"] = False
+        GLOBAL_STATE["last_mode"] = "LIVE"
         save_state(GLOBAL_STATE)
         send_to_telegram("🛑 Paper mode disabled")
         return
     if cmd == "/alpaca_on":
         GLOBAL_STATE["alpaca_enabled"] = True
+        GLOBAL_STATE["paper_enabled"] = False
+        GLOBAL_STATE["last_mode"] = "LIVE"
         save_state(GLOBAL_STATE)
         send_to_telegram("✅ Alpaca mode enabled")
         return
@@ -1687,7 +1812,7 @@ def run_startup_tests():
     if ENABLE_ALPACA and alpaca_ready():
         acct = alpaca_get_account()
         if acct:
-            msg = f"🧪 ALPACA CHECK OK\nStatus: {acct.get('status', 'unknown')}\nBuying Power: {acct.get('buying_power', 'N/A')}\nAccount Blocked: {acct.get('account_blocked', 'N/A')}\n⏰ {ts}"
+            msg = f"🧪 ALPACA CHECK OK\nStatus: {acct.get('status', 'unknown')}\nBuying Power: {acct.get('buying_power', 'N/A')}\nOptions Buying Power: {acct.get('options_buying_power', 'N/A')}\nAccount Blocked: {acct.get('account_blocked', 'N/A')}\n⏰ {ts}"
             send_to_telegram(msg)
         else:
             send_to_telegram(f"❌ ALPACA CHECK FAILED\n⏰ {ts}")
