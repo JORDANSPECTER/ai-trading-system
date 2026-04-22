@@ -4,6 +4,7 @@ import json
 import time
 import math
 import traceback
+from copy import deepcopy
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -14,7 +15,8 @@ import requests
 # UNBIASED TRADES ELITE ENGINE
 # FULL MAIN.PY
 # DISCORD + TELEGRAM + SIGNAL PARSER + FILE DEBUG
-# + PAPER + ALPACA + RISK POLICY LAYER
+# + PAPER + ALPACA + RISK POLICY + POSITION SIZING
+# + PRE-TRADE VALIDATOR
 # =========================================================
 
 
@@ -87,6 +89,27 @@ MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 
 PAPER_ACCOUNT_EQUITY = float(os.getenv("PAPER_ACCOUNT_EQUITY", "25000"))
 LIVE_ACCOUNT_EQUITY_FALLBACK = float(os.getenv("LIVE_ACCOUNT_EQUITY_FALLBACK", "25000"))
+
+# =========================
+# POSITION SIZING
+# =========================
+MIN_POSITION_QTY = int(os.getenv("MIN_POSITION_QTY", "1"))
+MAX_POSITION_QTY = int(os.getenv("MAX_POSITION_QTY", "10"))
+USE_SIGNAL_QTY_AS_MAX = os.getenv("USE_SIGNAL_QTY_AS_MAX", "false").lower() == "true"
+
+CONFIDENCE_MULT_A_PLUS = float(os.getenv("CONFIDENCE_MULT_A_PLUS", "1.00"))
+CONFIDENCE_MULT_A = float(os.getenv("CONFIDENCE_MULT_A", "1.00"))
+CONFIDENCE_MULT_B = float(os.getenv("CONFIDENCE_MULT_B", "0.70"))
+CONFIDENCE_MULT_C = float(os.getenv("CONFIDENCE_MULT_C", "0.40"))
+
+# =========================
+# PRE-TRADE VALIDATOR
+# =========================
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "1.2"))
+REJECT_DUPLICATE_OPEN_SYMBOL = os.getenv("REJECT_DUPLICATE_OPEN_SYMBOL", "true").lower() == "true"
+ENFORCE_NO_TRADE_WINDOW = os.getenv("ENFORCE_NO_TRADE_WINDOW", "false").lower() == "true"
+NO_TRADE_START_HHMM = os.getenv("NO_TRADE_START_HHMM", "09:30").strip()
+NO_TRADE_END_HHMM = os.getenv("NO_TRADE_END_HHMM", "09:33").strip()
 
 
 # =========================================================
@@ -175,6 +198,26 @@ def signal_hash(signal: Dict[str, Any]) -> str:
 
 def current_trade_day() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def current_hhmm() -> str:
+    return datetime.now().strftime("%H:%M")
+
+
+def hhmm_to_minutes(hhmm: str) -> int:
+    parts = hhmm.split(":")
+    if len(parts) != 2:
+        return 0
+    return int(parts[0]) * 60 + int(parts[1])
+
+
+def is_now_in_no_trade_window() -> bool:
+    if not ENFORCE_NO_TRADE_WINDOW:
+        return False
+    now_m = hhmm_to_minutes(current_hhmm())
+    start_m = hhmm_to_minutes(NO_TRADE_START_HHMM)
+    end_m = hhmm_to_minutes(NO_TRADE_END_HHMM)
+    return start_m <= now_m <= end_m
 
 
 def debug_file_lookup(path: str):
@@ -516,7 +559,7 @@ def estimate_unit_risk(signal: Dict[str, Any]) -> float:
 def estimate_trade_risk_dollars(signal: Dict[str, Any]) -> float:
     qty = max(1, safe_int(signal.get("qty", 1), 1))
     unit_risk = estimate_unit_risk(signal)
-    return qty * unit_risk * 100.0  # options multiplier
+    return qty * unit_risk * 100.0
 
 
 def estimate_open_position_risk_dollars(position: Dict[str, Any]) -> float:
@@ -610,6 +653,157 @@ def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================================
+# POSITION SIZER
+# =========================================================
+def confidence_size_multiplier(confidence: str) -> float:
+    c = str(confidence).upper().strip()
+    if c == "A+":
+        return CONFIDENCE_MULT_A_PLUS
+    if c == "A":
+        return CONFIDENCE_MULT_A
+    if c == "B":
+        return CONFIDENCE_MULT_B
+    return CONFIDENCE_MULT_C
+
+
+def size_signal_by_stop(signal: Dict[str, Any]) -> Dict[str, Any]:
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    stop = safe_float(signal.get("stop_contract", 0), 0)
+    unit_risk = max(entry - stop, 0.0)
+
+    if entry <= 0 or stop <= 0 or unit_risk <= 0:
+        return {
+            "approved": False,
+            "reject_reasons": ["invalid_entry_or_stop_for_sizing"],
+            "risk_dollars": 0.0,
+            "unit_risk": unit_risk,
+            "unit_risk_dollars": 0.0,
+            "raw_size": 0,
+            "final_size": 0,
+            "adjustments": []
+        }
+
+    equity = get_account_equity()
+    confidence_mult = confidence_size_multiplier(signal.get("confidence", "C"))
+    base_risk_dollars = equity * MAX_RISK_PER_TRADE_PCT
+    adjusted_risk_dollars = base_risk_dollars * confidence_mult
+
+    unit_risk_dollars = unit_risk * 100.0
+    raw_size = math.floor(adjusted_risk_dollars / unit_risk_dollars) if unit_risk_dollars > 0 else 0
+
+    adjustments = []
+    final_size = raw_size
+
+    if final_size > MAX_POSITION_QTY:
+        final_size = MAX_POSITION_QTY
+        adjustments.append("capped_by_max_position_qty")
+
+    signal_qty_hint = safe_int(signal.get("qty", 0), 0)
+    if USE_SIGNAL_QTY_AS_MAX and signal_qty_hint > 0 and final_size > signal_qty_hint:
+        final_size = signal_qty_hint
+        adjustments.append("capped_by_signal_qty_hint")
+
+    if final_size < MIN_POSITION_QTY:
+        final_size = 0
+        adjustments.append("below_min_position_qty")
+
+    return {
+        "approved": final_size >= MIN_POSITION_QTY,
+        "reject_reasons": [] if final_size >= MIN_POSITION_QTY else ["sized_qty_below_minimum"],
+        "risk_dollars": round(adjusted_risk_dollars, 2),
+        "unit_risk": round(unit_risk, 4),
+        "unit_risk_dollars": round(unit_risk_dollars, 2),
+        "raw_size": int(raw_size),
+        "final_size": int(final_size),
+        "confidence_multiplier": confidence_mult,
+        "adjustments": adjustments
+    }
+
+
+def apply_size_decision_to_signal(signal: Dict[str, Any], size_decision: Dict[str, Any]) -> Dict[str, Any]:
+    sized_signal = deepcopy(signal)
+    sized_signal["qty"] = int(size_decision["final_size"])
+    sized_signal["size_decision"] = size_decision
+    return sized_signal
+
+
+# =========================================================
+# PRE-TRADE VALIDATOR
+# =========================================================
+def validate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    reasons = []
+
+    required_fields = [
+        "ticker",
+        "symbol",
+        "direction",
+        "confidence",
+        "entry_contract",
+        "stop_contract",
+        "tp1_contract",
+        "timestamp"
+    ]
+
+    for field in required_fields:
+        value = signal.get(field)
+        if value is None or value == "":
+            reasons.append(f"missing_{field}")
+
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    stop = safe_float(signal.get("stop_contract", 0), 0)
+    tp1 = safe_float(signal.get("tp1_contract", 0), 0)
+    tp2 = safe_float(signal.get("tp2_contract", 0), 0)
+
+    if entry <= 0:
+        reasons.append("invalid_entry_contract")
+
+    if stop <= 0:
+        reasons.append("invalid_stop_contract")
+
+    if entry > 0 and stop > 0 and stop >= entry:
+        reasons.append("stop_not_below_entry")
+
+    if not is_signal_fresh(signal):
+        reasons.append("stale_signal")
+
+    unit_risk = max(entry - stop, 0.0)
+    if unit_risk <= 0:
+        reasons.append("invalid_unit_risk")
+
+    rr_candidates = []
+    if tp1 > entry and unit_risk > 0:
+        rr_candidates.append((tp1 - entry) / unit_risk)
+    if tp2 > entry and unit_risk > 0:
+        rr_candidates.append((tp2 - entry) / unit_risk)
+
+    best_rr = max(rr_candidates) if rr_candidates else 0.0
+    if best_rr < MIN_RR_RATIO:
+        reasons.append("reward_to_risk_too_low")
+
+    if REQUIRE_OPTION_SYMBOL and signal.get("asset_class") == "option":
+        if signal.get("symbol") == signal.get("ticker"):
+            reasons.append("missing_full_option_symbol")
+
+    if REJECT_DUPLICATE_OPEN_SYMBOL:
+        open_symbols = {p.get("symbol") for p in GLOBAL_POSITIONS.get("open_positions", [])}
+        if signal.get("symbol") in open_symbols:
+            reasons.append("duplicate_open_symbol")
+
+    if is_now_in_no_trade_window():
+        reasons.append("inside_no_trade_window")
+
+    approved = len(reasons) == 0
+
+    return {
+        "approved": approved,
+        "stage": "pretrade_validator",
+        "reject_reasons": reasons,
+        "reward_to_risk": round(best_rr, 4),
+        "unit_risk": round(unit_risk, 4)
+    }
+
+
+# =========================================================
 # SIGNAL NORMALIZATION
 # =========================================================
 def normalize_confidence(conf) -> str:
@@ -666,6 +860,7 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["source"] = str(signal.get("source", "signal_file"))
 
     signal["qty"] = safe_int(signal.get("qty", DEFAULT_LIVE_QTY), DEFAULT_LIVE_QTY)
+    signal["qty_hint"] = safe_int(signal.get("qty_hint", signal["qty"]), signal["qty"])
     signal["use_limit_entry"] = bool(signal.get("use_limit_entry", False))
     signal["limit_entry_price"] = safe_float(signal.get("limit_entry_price", signal["entry_contract"]))
     signal["asset_class"] = str(signal.get("asset_class", "option")).lower().strip()
@@ -736,6 +931,15 @@ def signal_file_changed(state: Dict[str, Any]) -> bool:
 # MESSAGES
 # =========================================================
 def build_ai_reasoning_message(signal: Dict[str, Any]) -> str:
+    size_text = ""
+    size_decision = signal.get("size_decision")
+    if isinstance(size_decision, dict):
+        size_text = (
+            f"\nSized Qty: {signal.get('qty', 'N/A')}"
+            f"\nRisk Dollars: {size_decision.get('risk_dollars', 'N/A')}"
+            f"\nUnit Risk: {size_decision.get('unit_risk', 'N/A')}"
+        )
+
     return (
         f"🧠 AI REASONING ALERT\n"
         f"Ticker: {signal['ticker']}\n"
@@ -747,7 +951,8 @@ def build_ai_reasoning_message(signal: Dict[str, Any]) -> str:
         f"Bias: {signal['bias']}\n"
         f"Timeframe: {signal['timeframe']}\n"
         f"Trigger: {signal['trigger']}\n"
-        f"Source: {signal['source']}\n\n"
+        f"Source: {signal['source']}"
+        f"{size_text}\n\n"
         f"Reasoning:\n{signal['reason']}\n\n"
         f"⏰ {now_ts()}"
     )
@@ -767,6 +972,8 @@ def build_free_message(signal: Dict[str, Any]) -> str:
 
 def build_premium_message(signal: Dict[str, Any]) -> str:
     title = "💎 PREMIUM A SETUP" if signal["confidence"] in {"A", "A+"} else "⚠️ PREMIUM WATCH ALERT"
+    size_line = f"Qty: {signal.get('qty', 'N/A')}\n"
+
     return (
         f"{title}\n"
         f"Ticker: {signal['ticker']}\n"
@@ -774,6 +981,7 @@ def build_premium_message(signal: Dict[str, Any]) -> str:
         f"Direction: {signal['direction']}\n"
         f"Underlying Price: {signal['price']}\n"
         f"Contract Entry: {signal['entry_contract']}\n"
+        f"{size_line}"
         f"Confidence: {signal['confidence']}\n"
         f"Entry: {signal['entry']}\n"
         f"Stop: {signal['stop']}\n"
@@ -791,6 +999,7 @@ def build_telegram_signal_message(signal: Dict[str, Any]) -> str:
         f"Tradable Symbol: {signal['symbol']}\n"
         f"Underlying: {signal['price']}\n"
         f"Contract: {signal['entry_contract']}\n"
+        f"Qty: {signal.get('qty', 'N/A')}\n"
         f"Trigger: {signal['trigger']}\n"
         f"Reason: {signal['public_reason']}\n"
         f"⏰ {now_ts()}"
@@ -872,6 +1081,36 @@ def build_risk_block_message(signal: Dict[str, Any], risk_decision: Dict[str, An
         f"Risk/Trade %: {round(risk_decision.get('risk_per_trade_pct', 0.0) * 100, 3)}\n"
         f"Portfolio Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0) * 100, 3)}\n"
         f"Projected Heat %: {round(risk_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n"
+        f"⏰ {now_ts()}"
+    )
+
+
+def build_size_block_message(signal: Dict[str, Any], size_decision: Dict[str, Any]) -> str:
+    reasons = ", ".join(size_decision.get("reject_reasons", [])) or "unknown"
+    adjustments = ", ".join(size_decision.get("adjustments", [])) or "none"
+    return (
+        f"🚫 SIZING BLOCKED SIGNAL\n"
+        f"Ticker: {signal['ticker']}\n"
+        f"Symbol: {signal['symbol']}\n"
+        f"Reasons: {reasons}\n"
+        f"Risk Dollars: {size_decision.get('risk_dollars', 0.0)}\n"
+        f"Unit Risk: {size_decision.get('unit_risk', 0.0)}\n"
+        f"Raw Size: {size_decision.get('raw_size', 0)}\n"
+        f"Final Size: {size_decision.get('final_size', 0)}\n"
+        f"Adjustments: {adjustments}\n"
+        f"⏰ {now_ts()}"
+    )
+
+
+def build_validation_block_message(signal: Dict[str, Any], validation_decision: Dict[str, Any]) -> str:
+    reasons = ", ".join(validation_decision.get("reject_reasons", [])) or "unknown"
+    return (
+        f"🚫 VALIDATION BLOCKED SIGNAL\n"
+        f"Ticker: {signal.get('ticker', 'N/A')}\n"
+        f"Symbol: {signal.get('symbol', 'N/A')}\n"
+        f"Reasons: {reasons}\n"
+        f"Reward/Risk: {validation_decision.get('reward_to_risk', 0.0)}\n"
+        f"Unit Risk: {validation_decision.get('unit_risk', 0.0)}\n"
         f"⏰ {now_ts()}"
     )
 
@@ -1182,7 +1421,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
 
         update_position_market_price(position, live_price)
 
-        # TP1
         if not position["tp1_hit"] and live_price >= position["tp1_price"]:
             qty1 = max(1, math.floor(position["qty_total"] * position["scale1_pct"]))
             qty1 = min(qty1, position["qty_open"])
@@ -1206,7 +1444,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
-        # TP2
         if not position["tp2_hit"] and live_price >= position["tp2_price"]:
             qty2 = max(1, math.floor(position["qty_total"] * position["scale2_pct"]))
             qty2 = min(qty2, position["qty_open"])
@@ -1226,7 +1463,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
-        # trailing stop
         entry_price = safe_float(position.get("entry_price", 0), 0)
         highest_price = safe_float(position.get("highest_price", live_price), live_price)
         trail_pct = safe_float(position.get("trail_pct", DEFAULT_TRAIL_PCT), DEFAULT_TRAIL_PCT)
@@ -1238,7 +1474,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
             if trailed_stop > position["stop_price"]:
                 position["stop_price"] = round(trailed_stop, 4)
 
-        # stop hit
         if live_price <= position["stop_price"]:
             if position["mode"] == "LIVE":
                 live_close_position(position, "STOP HIT / trailing stop")
@@ -1246,7 +1481,6 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                 finalize_close_position(position, live_price, "STOP HIT / trailing stop")
             continue
 
-        # all scaled out
         if position["qty_open"] <= 0:
             finalize_close_position(position, live_price, "All size scaled out")
             continue
@@ -1305,16 +1539,36 @@ def handle_new_signal(signal: Dict[str, Any]):
         manage_open_positions(signal)
         return
 
-    risk_decision = evaluate_risk_policy(signal)
+    # STEP 3: pre-trade validator
+    validation_decision = validate_signal(signal)
+    if not validation_decision["approved"]:
+        log(f"🚫 VALIDATION BLOCKED SIGNAL: {validation_decision['reject_reasons']}")
+        validation_msg = build_validation_block_message(signal, validation_decision)
+        send_to_discord(DISCORD_AI_WEBHOOK, validation_msg, "AI")
+        send_to_telegram(validation_msg)
+        return
 
+    # STEP 2: position sizing by stop distance
+    size_decision = size_signal_by_stop(signal)
+    if not size_decision["approved"]:
+        log(f"🚫 SIZING BLOCKED SIGNAL: {size_decision['reject_reasons']}")
+        size_block_msg = build_size_block_message(signal, size_decision)
+        send_to_discord(DISCORD_AI_WEBHOOK, size_block_msg, "AI")
+        send_to_telegram(size_block_msg)
+        return
+
+    sized_signal = apply_size_decision_to_signal(signal, size_decision)
+
+    # STEP 1: risk veto on sized signal
+    risk_decision = evaluate_risk_policy(sized_signal)
     if not risk_decision["approved"]:
         log(f"🚫 RISK BLOCKED SIGNAL: {risk_decision['reject_reasons']}")
-        reject_msg = build_risk_block_message(signal, risk_decision)
+        reject_msg = build_risk_block_message(sized_signal, risk_decision)
         send_to_discord(DISCORD_AI_WEBHOOK, reject_msg, "AI")
         send_to_telegram(reject_msg)
         return
 
-    route_signal(signal, GLOBAL_STATE)
+    route_signal(sized_signal, GLOBAL_STATE)
 
     GLOBAL_STATE["last_signal_hash"] = signal_hash(signal)
     GLOBAL_STATE["last_signal_time"] = epoch()
@@ -1322,11 +1576,11 @@ def handle_new_signal(signal: Dict[str, Any]):
     save_state(GLOBAL_STATE)
 
     if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA:
-        open_live_position(signal)
+        open_live_position(sized_signal)
     elif GLOBAL_STATE.get("paper_enabled", True):
-        open_paper_position(signal)
+        open_paper_position(sized_signal)
 
-    manage_open_positions(signal)
+    manage_open_positions(sized_signal)
 
 
 # =========================================================
