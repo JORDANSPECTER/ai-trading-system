@@ -13,7 +13,8 @@ import requests
 # =========================================================
 # UNBIASED TRADES ELITE ENGINE
 # FULL MAIN.PY
-# DISCORD + TELEGRAM + SIGNAL PARSER + FILE DEBUG + PAPER + ALPACA
+# DISCORD + TELEGRAM + SIGNAL PARSER + FILE DEBUG
+# + PAPER + ALPACA + RISK POLICY LAYER
 # =========================================================
 
 
@@ -56,24 +57,36 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 ALPACA_ORDER_TIMEOUT = int(os.getenv("ALPACA_ORDER_TIMEOUT", "20"))
 ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "true"
 
-# Signal freshness
+# =========================
+# SIGNAL / EXECUTION DEFAULTS
+# =========================
 MAX_SIGNAL_AGE_SECONDS = int(os.getenv("MAX_SIGNAL_AGE_SECONDS", "180"))
 
-# Default sizing
 DEFAULT_PAPER_QTY = int(os.getenv("DEFAULT_PAPER_QTY", "1"))
 DEFAULT_LIVE_QTY = int(os.getenv("DEFAULT_LIVE_QTY", "1"))
 DEFAULT_RISK_PER_TRADE = float(os.getenv("DEFAULT_RISK_PER_TRADE", "1.0"))
 
-# Scale / trailing
 DEFAULT_SCALE1_PCT = float(os.getenv("DEFAULT_SCALE1_PCT", "0.50"))
 DEFAULT_SCALE2_PCT = float(os.getenv("DEFAULT_SCALE2_PCT", "0.25"))
 DEFAULT_TRAIL_PCT = float(os.getenv("DEFAULT_TRAIL_PCT", "0.20"))
 DEFAULT_BREAK_EVEN_AFTER_TP1 = os.getenv("DEFAULT_BREAK_EVEN_AFTER_TP1", "true").lower() == "true"
 
-# Safety
 ALLOW_LIVE_BUYS = os.getenv("ALLOW_LIVE_BUYS", "false").lower() == "true"
 ALLOW_LIVE_SELLS = os.getenv("ALLOW_LIVE_SELLS", "true").lower() == "true"
 REQUIRE_OPTION_SYMBOL = os.getenv("REQUIRE_OPTION_SYMBOL", "true").lower() == "true"
+
+# =========================
+# RISK LIMITS
+# =========================
+MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.005"))     # 0.5%
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.02"))               # 2.0%
+MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("MAX_PORTFOLIO_HEAT_PCT", "0.03"))       # 3.0%
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+MAX_SAME_TICKER_POSITIONS = int(os.getenv("MAX_SAME_TICKER_POSITIONS", "1"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+
+PAPER_ACCOUNT_EQUITY = float(os.getenv("PAPER_ACCOUNT_EQUITY", "25000"))
+LIVE_ACCOUNT_EQUITY_FALLBACK = float(os.getenv("LIVE_ACCOUNT_EQUITY_FALLBACK", "25000"))
 
 
 # =========================================================
@@ -160,6 +173,10 @@ def signal_hash(signal: Dict[str, Any]) -> str:
         return str(epoch())
 
 
+def current_trade_day() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def debug_file_lookup(path: str):
     try:
         cwd = os.getcwd()
@@ -209,7 +226,14 @@ def default_state() -> Dict[str, Any]:
         "paper_trade_count": 0,
         "live_trade_count": 0,
         "boot_time": epoch(),
-        "notes": ""
+        "notes": "",
+
+        # risk tracking
+        "daily_realized_pnl_pct": 0.0,
+        "consecutive_losses": 0,
+        "last_trade_day": current_trade_day(),
+        "kill_switch": False,
+        "bot_paused": False
     }
 
 
@@ -340,20 +364,17 @@ def alpaca_headers() -> Dict[str, str]:
 
 def alpaca_get(path: str, params: Optional[Dict[str, Any]] = None):
     url = f"{ALPACA_BASE_URL}{path}"
-    r = requests.get(url, headers=alpaca_headers(), params=params or {}, timeout=ALPACA_ORDER_TIMEOUT)
-    return r
+    return requests.get(url, headers=alpaca_headers(), params=params or {}, timeout=ALPACA_ORDER_TIMEOUT)
 
 
 def alpaca_post(path: str, payload: Dict[str, Any]):
     url = f"{ALPACA_BASE_URL}{path}"
-    r = requests.post(url, headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
-    return r
+    return requests.post(url, headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
 
 
 def alpaca_delete(path: str):
     url = f"{ALPACA_BASE_URL}{path}"
-    r = requests.delete(url, headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
-    return r
+    return requests.delete(url, headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
 
 
 def alpaca_get_account() -> Optional[Dict[str, Any]]:
@@ -464,6 +485,131 @@ def alpaca_close_position_market(symbol: str, qty: Optional[int] = None) -> Opti
 
 
 # =========================================================
+# RISK HELPERS
+# =========================================================
+def reset_daily_risk_counters_if_needed(state: Dict[str, Any]):
+    today = current_trade_day()
+    if state.get("last_trade_day") != today:
+        state["daily_realized_pnl_pct"] = 0.0
+        state["consecutive_losses"] = 0
+        state["last_trade_day"] = today
+        save_state(state)
+
+
+def get_account_equity() -> float:
+    if ENABLE_ALPACA and GLOBAL_STATE and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+        acct = alpaca_get_account()
+        if acct:
+            equity = safe_float(acct.get("equity", LIVE_ACCOUNT_EQUITY_FALLBACK), LIVE_ACCOUNT_EQUITY_FALLBACK)
+            return max(equity, 1.0)
+    return max(PAPER_ACCOUNT_EQUITY, 1.0)
+
+
+def estimate_unit_risk(signal: Dict[str, Any]) -> float:
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    stop = safe_float(signal.get("stop_contract", 0), 0)
+    if entry <= 0 or stop <= 0:
+        return 0.0
+    return max(entry - stop, 0.0)
+
+
+def estimate_trade_risk_dollars(signal: Dict[str, Any]) -> float:
+    qty = max(1, safe_int(signal.get("qty", 1), 1))
+    unit_risk = estimate_unit_risk(signal)
+    return qty * unit_risk * 100.0  # options multiplier
+
+
+def estimate_open_position_risk_dollars(position: Dict[str, Any]) -> float:
+    qty_open = max(0, safe_int(position.get("qty_open", 0), 0))
+    entry = safe_float(position.get("entry_price", 0), 0)
+    stop = safe_float(position.get("stop_price", 0), 0)
+
+    if qty_open <= 0 or entry <= 0 or stop <= 0:
+        return 0.0
+
+    unit_risk = max(entry - stop, 0.0)
+    return qty_open * unit_risk * 100.0
+
+
+def portfolio_heat_pct() -> float:
+    equity = get_account_equity()
+    if equity <= 0:
+        return 0.0
+
+    total_open_risk = 0.0
+    for p in GLOBAL_POSITIONS.get("open_positions", []):
+        total_open_risk += estimate_open_position_risk_dollars(p)
+
+    return total_open_risk / equity
+
+
+def evaluate_risk_policy(signal: Dict[str, Any]) -> Dict[str, Any]:
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+
+    reasons = []
+
+    if GLOBAL_STATE.get("kill_switch", False):
+        reasons.append("kill_switch_active")
+
+    if GLOBAL_STATE.get("bot_paused", False):
+        reasons.append("bot_paused")
+
+    if not GLOBAL_STATE.get("engine_enabled", True):
+        reasons.append("engine_disabled")
+
+    open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
+        reasons.append("max_open_positions_hit")
+
+    same_ticker_count = sum(1 for p in open_positions if p.get("ticker") == signal.get("ticker"))
+    if same_ticker_count >= MAX_SAME_TICKER_POSITIONS:
+        reasons.append("same_ticker_exposure_limit_hit")
+
+    if GLOBAL_STATE.get("consecutive_losses", 0) >= MAX_CONSECUTIVE_LOSSES:
+        reasons.append("max_consecutive_losses_hit")
+
+    daily_realized_pnl_pct = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
+    if daily_realized_pnl_pct <= -MAX_DAILY_LOSS_PCT:
+        reasons.append("daily_loss_limit_hit")
+
+    unit_risk = estimate_unit_risk(signal)
+    if unit_risk <= 0:
+        reasons.append("invalid_stop_distance")
+
+    equity = get_account_equity()
+    proposed_trade_risk = estimate_trade_risk_dollars(signal)
+    proposed_trade_risk_pct = proposed_trade_risk / equity if equity > 0 else 0.0
+
+    if proposed_trade_risk_pct > MAX_RISK_PER_TRADE_PCT:
+        reasons.append("risk_per_trade_limit_hit")
+
+    current_heat = portfolio_heat_pct()
+    projected_heat = current_heat + proposed_trade_risk_pct
+
+    if projected_heat > MAX_PORTFOLIO_HEAT_PCT:
+        reasons.append("portfolio_heat_limit_hit")
+
+    approved = len(reasons) == 0
+
+    return {
+        "approved": approved,
+        "stage": "risk_policy",
+        "reject_reasons": reasons,
+        "risk_per_trade_pct": round(proposed_trade_risk_pct, 6),
+        "portfolio_heat_pct": round(current_heat, 6),
+        "projected_heat_pct": round(projected_heat, 6),
+        "max_allowed_heat_pct": MAX_PORTFOLIO_HEAT_PCT,
+        "lockout_active": (
+            GLOBAL_STATE.get("kill_switch", False)
+            or GLOBAL_STATE.get("bot_paused", False)
+            or GLOBAL_STATE.get("consecutive_losses", 0) >= MAX_CONSECUTIVE_LOSSES
+            or daily_realized_pnl_pct <= -MAX_DAILY_LOSS_PCT
+        )
+    }
+
+
+# =========================================================
 # SIGNAL NORMALIZATION
 # =========================================================
 def normalize_confidence(conf) -> str:
@@ -525,7 +671,6 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["asset_class"] = str(signal.get("asset_class", "option")).lower().strip()
 
     signal["symbol"] = str(signal.get("symbol", signal.get("contract_symbol", signal["ticker"]))).strip()
-
     signal["signal_id"] = str(signal.get("signal_id", signal_hash(signal)))
     return signal
 
@@ -665,8 +810,7 @@ def build_live_order_message(order: Dict[str, Any], side_note: str = "") -> str:
         f"Symbol: {symbol}\n"
         f"Side: {side}\n"
         f"Qty: {qty}\n"
-        f"Status: {status}"
-        f"{line2}\n"
+        f"Status: {status}{line2}\n"
         f"⏰ {now_ts()}"
     )
 
@@ -714,6 +858,20 @@ def build_position_close_message(position: Dict[str, Any], note: str) -> str:
         f"Exit: {position['exit_price']}\n"
         f"Realized PnL %: {round(position['realized_pnl_pct'], 2)}\n"
         f"Reason: {note}\n"
+        f"⏰ {now_ts()}"
+    )
+
+
+def build_risk_block_message(signal: Dict[str, Any], risk_decision: Dict[str, Any]) -> str:
+    reasons = ", ".join(risk_decision.get("reject_reasons", [])) or "unknown"
+    return (
+        f"🚫 SIGNAL BLOCKED\n"
+        f"Ticker: {signal['ticker']}\n"
+        f"Symbol: {signal['symbol']}\n"
+        f"Reasons: {reasons}\n"
+        f"Risk/Trade %: {round(risk_decision.get('risk_per_trade_pct', 0.0) * 100, 3)}\n"
+        f"Portfolio Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0) * 100, 3)}\n"
+        f"Projected Heat %: {round(risk_decision.get('projected_heat_pct', 0.0) * 100, 3)}\n"
         f"⏰ {now_ts()}"
     )
 
@@ -766,7 +924,7 @@ def make_local_position(signal: Dict[str, Any], mode: str, broker_order: Optiona
     order_id = broker_order.get("id") if broker_order else ""
     client_order_id = broker_order.get("client_order_id") if broker_order else ""
 
-    position = {
+    return {
         "id": next_position_id(GLOBAL_POSITIONS),
         "signal_id": signal["signal_id"],
         "mode": mode,
@@ -801,7 +959,6 @@ def make_local_position(signal: Dict[str, Any], mode: str, broker_order: Optiona
         "break_even_after_tp1": DEFAULT_BREAK_EVEN_AFTER_TP1,
         "notes": []
     }
-    return position
 
 
 def save_new_position(position: Dict[str, Any]):
@@ -837,6 +994,18 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     position["realized_pnl_pct"] = pct_change(position["entry_price"], position["exit_price"])
     position["notes"].append(note)
 
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+
+    realized_pct_decimal = position["realized_pnl_pct"] / 100.0
+    GLOBAL_STATE["daily_realized_pnl_pct"] = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0) + realized_pct_decimal
+
+    if position["realized_pnl_pct"] < 0:
+        GLOBAL_STATE["consecutive_losses"] = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) + 1
+    else:
+        GLOBAL_STATE["consecutive_losses"] = 0
+
+    save_state(GLOBAL_STATE)
+
     GLOBAL_POSITIONS["open_positions"] = [p for p in GLOBAL_POSITIONS["open_positions"] if p["id"] != position["id"]]
     GLOBAL_POSITIONS["closed_positions"].append(position)
     save_positions(GLOBAL_POSITIONS)
@@ -852,6 +1021,7 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
 def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     position = make_local_position(signal, mode="PAPER")
     save_new_position(position)
+
     GLOBAL_STATE["paper_trade_count"] = safe_int(GLOBAL_STATE.get("paper_trade_count", 0), 0) + 1
     save_state(GLOBAL_STATE)
 
@@ -896,7 +1066,6 @@ def submit_live_entry(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     side = "buy"
     qty = signal["qty"]
     symbol = signal["symbol"]
-
     client_order_id = f"ub-entry-{symbol}-{epoch()}"
 
     if signal.get("use_limit_entry", False):
@@ -1013,6 +1182,7 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
 
         update_position_market_price(position, live_price)
 
+        # TP1
         if not position["tp1_hit"] and live_price >= position["tp1_price"]:
             qty1 = max(1, math.floor(position["qty_total"] * position["scale1_pct"]))
             qty1 = min(qty1, position["qty_open"])
@@ -1036,6 +1206,7 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
+        # TP2
         if not position["tp2_hit"] and live_price >= position["tp2_price"]:
             qty2 = max(1, math.floor(position["qty_total"] * position["scale2_pct"]))
             qty2 = min(qty2, position["qty_open"])
@@ -1055,6 +1226,7 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
+        # trailing stop
         entry_price = safe_float(position.get("entry_price", 0), 0)
         highest_price = safe_float(position.get("highest_price", live_price), live_price)
         trail_pct = safe_float(position.get("trail_pct", DEFAULT_TRAIL_PCT), DEFAULT_TRAIL_PCT)
@@ -1066,6 +1238,7 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
             if trailed_stop > position["stop_price"]:
                 position["stop_price"] = round(trailed_stop, 4)
 
+        # stop hit
         if live_price <= position["stop_price"]:
             if position["mode"] == "LIVE":
                 live_close_position(position, "STOP HIT / trailing stop")
@@ -1073,6 +1246,7 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
                 finalize_close_position(position, live_price, "STOP HIT / trailing stop")
             continue
 
+        # all scaled out
         if position["qty_open"] <= 0:
             finalize_close_position(position, live_price, "All size scaled out")
             continue
@@ -1131,6 +1305,15 @@ def handle_new_signal(signal: Dict[str, Any]):
         manage_open_positions(signal)
         return
 
+    risk_decision = evaluate_risk_policy(signal)
+
+    if not risk_decision["approved"]:
+        log(f"🚫 RISK BLOCKED SIGNAL: {risk_decision['reject_reasons']}")
+        reject_msg = build_risk_block_message(signal, risk_decision)
+        send_to_discord(DISCORD_AI_WEBHOOK, reject_msg, "AI")
+        send_to_telegram(reject_msg)
+        return
+
     route_signal(signal, GLOBAL_STATE)
 
     GLOBAL_STATE["last_signal_hash"] = signal_hash(signal)
@@ -1157,6 +1340,11 @@ def build_status_text() -> str:
         f"Discord Enabled: {GLOBAL_STATE['discord_enabled']}\n"
         f"Telegram Enabled: {GLOBAL_STATE['telegram_enabled']}\n"
         f"Alpaca Enabled: {GLOBAL_STATE['alpaca_enabled']}\n"
+        f"Kill Switch: {GLOBAL_STATE.get('kill_switch', False)}\n"
+        f"Bot Paused: {GLOBAL_STATE.get('bot_paused', False)}\n"
+        f"Daily Realized PnL %: {round(safe_float(GLOBAL_STATE.get('daily_realized_pnl_pct', 0.0), 0.0) * 100, 2)}\n"
+        f"Consecutive Losses: {GLOBAL_STATE.get('consecutive_losses', 0)}\n"
+        f"Portfolio Heat %: {round(portfolio_heat_pct() * 100, 2)}\n"
         f"Signals Routed: {GLOBAL_STATE['signal_count']}\n"
         f"Paper Trades: {GLOBAL_STATE['paper_trade_count']}\n"
         f"Live Trades: {GLOBAL_STATE['live_trade_count']}\n"
@@ -1212,6 +1400,10 @@ def handle_telegram_command(text: str):
             "/discord_off\n"
             "/telegram_on\n"
             "/telegram_off\n"
+            "/kill_on\n"
+            "/kill_off\n"
+            "/pause_on\n"
+            "/pause_off\n"
             "/test\n"
             "/heartbeat\n"
             "/sync\n"
@@ -1288,17 +1480,44 @@ def handle_telegram_command(text: str):
         send_to_telegram("🛑 Telegram alerts disabled")
         return
 
+    if cmd == "/kill_on":
+        GLOBAL_STATE["kill_switch"] = True
+        save_state(GLOBAL_STATE)
+        send_to_telegram("🛑 Kill switch enabled")
+        return
+
+    if cmd == "/kill_off":
+        GLOBAL_STATE["kill_switch"] = False
+        save_state(GLOBAL_STATE)
+        send_to_telegram("✅ Kill switch disabled")
+        return
+
+    if cmd == "/pause_on":
+        GLOBAL_STATE["bot_paused"] = True
+        save_state(GLOBAL_STATE)
+        send_to_telegram("⏸️ Bot paused")
+        return
+
+    if cmd == "/pause_off":
+        GLOBAL_STATE["bot_paused"] = False
+        save_state(GLOBAL_STATE)
+        send_to_telegram("▶️ Bot resumed")
+        return
+
     if cmd == "/sync":
         sync_live_positions_from_alpaca()
         send_to_telegram("🔄 Alpaca sync complete")
         return
 
     if cmd == "/cancel_orders":
-        ok = alpaca_delete("/v2/orders")
-        if ok.status_code in (200, 204, 207):
+        if not alpaca_ready():
+            send_to_telegram("❌ Alpaca not configured")
+            return
+        resp = alpaca_delete("/v2/orders")
+        if resp.status_code in (200, 204, 207):
             send_to_telegram("✅ Cancel all orders sent")
         else:
-            send_to_telegram("❌ Cancel all orders failed")
+            send_to_telegram(f"❌ Cancel all orders failed | {resp.status_code}")
         return
 
     if cmd == "/close_all":
@@ -1425,6 +1644,7 @@ def boot():
     save_state(GLOBAL_STATE)
     save_positions(GLOBAL_POSITIONS)
 
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
     debug_file_lookup(SIGNAL_FILE)
 
     if RUN_TEST_ON_START:
