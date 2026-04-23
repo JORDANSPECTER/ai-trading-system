@@ -13,6 +13,19 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 # =========================================================
+# MACRO BRIDGE IMPORTS
+# Safe import so main engine still runs even if macro_bridge fails
+# =========================================================
+try:
+    from macro_bridge import build_macro_bridge_snapshot, load_last_macro_snapshot
+    MACRO_BRIDGE_AVAILABLE = True
+except Exception as macro_import_error:
+    MACRO_BRIDGE_AVAILABLE = False
+    build_macro_bridge_snapshot = None
+    load_last_macro_snapshot = None
+    print(f"[MACRO IMPORT WARNING] macro_bridge unavailable: {macro_import_error}", flush=True)
+
+# =========================================================
 # UNBIASED TRADES ELITE ENGINE - HARDENED MAIN.PY
 # Added:
 # - Atomic JSON writes + backup recovery
@@ -20,6 +33,7 @@ import requests
 # - Order lifecycle store
 # - Startup reconciliation and safety block
 # - Partial fill / fill-aware local updates
+# - Macro bridge integration
 # - Clearer trust boundaries:
 #     broker = live truth
 #     local files = cache + audit log
@@ -55,6 +69,13 @@ ENABLE_PAPER_EXECUTION = os.getenv("ENABLE_PAPER_EXECUTION", "true").lower() == 
 ENABLE_DISCORD = os.getenv("ENABLE_DISCORD", "true").lower() == "true"
 ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "true").lower() == "true"
 ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
+
+# MACRO BRIDGE
+ENABLE_MACRO_BRIDGE = os.getenv("ENABLE_MACRO_BRIDGE", "true").lower() == "true"
+MACRO_REFRESH_SECONDS = int(os.getenv("MACRO_REFRESH_SECONDS", "300"))
+MACRO_SEND_TO_AI = os.getenv("MACRO_SEND_TO_AI", "true").lower() == "true"
+MACRO_SEND_TO_TELEGRAM = os.getenv("MACRO_SEND_TO_TELEGRAM", "false").lower() == "true"
+MACRO_SEND_ON_BOOT = os.getenv("MACRO_SEND_ON_BOOT", "true").lower() == "true"
 
 # ALPACA
 ENABLE_ALPACA = os.getenv("ENABLE_ALPACA", "false").lower() == "true"
@@ -140,6 +161,7 @@ GLOBAL_STATE = None
 GLOBAL_POSITIONS = None
 GLOBAL_ORDERS = None
 GLOBAL_RECON = None
+GLOBAL_MACRO = None
 
 
 # =========================================================
@@ -355,6 +377,16 @@ def default_recon() -> Dict[str, Any]:
     }
 
 
+def default_macro_store() -> Dict[str, Any]:
+    return {
+        "last_refresh_time": 0,
+        "last_snapshot": {},
+        "last_voice_script": "",
+        "last_macro_state": {},
+        "last_error": "",
+    }
+
+
 def safe_merge(default_obj: Dict[str, Any], loaded: Dict[str, Any]) -> Dict[str, Any]:
     merged = deepcopy(default_obj)
     if isinstance(loaded, dict):
@@ -402,6 +434,19 @@ def save_recon(recon: Dict[str, Any]):
     save_json_file(RECON_FILE, recon)
 
 
+def load_macro_store() -> Dict[str, Any]:
+    global GLOBAL_MACRO
+    if GLOBAL_MACRO is None or not isinstance(GLOBAL_MACRO, dict):
+        GLOBAL_MACRO = default_macro_store()
+    return GLOBAL_MACRO
+
+
+def save_macro_store():
+    global GLOBAL_MACRO
+    if GLOBAL_MACRO is None:
+        GLOBAL_MACRO = default_macro_store()
+
+
 # =========================================================
 # STATE HELPERS
 # =========================================================
@@ -432,6 +477,121 @@ def set_reconciliation_block(reason: str):
     GLOBAL_STATE["reconciliation_required"] = True
     GLOBAL_STATE["reconciliation_block_reason"] = reason
     save_state(GLOBAL_STATE)
+
+
+# =========================================================
+# MACRO BRIDGE HELPERS
+# =========================================================
+def get_macro_state_summary_text(macro_state: Dict[str, Any]) -> str:
+    if not macro_state:
+        return "No macro state available."
+
+    drivers = macro_state.get("drivers", []) or []
+    watch_items = macro_state.get("watch_items", []) or []
+    events = macro_state.get("todays_high_impact_events", []) or []
+
+    driver_text = ", ".join(drivers[:5]).replace("_", " ") if drivers else "none"
+    watch_text = ", ".join(watch_items[:5]).replace("_", " ") if watch_items else "none"
+    event_text = ", ".join(events[:5]) if events else "none"
+
+    return (
+        f"Risk State: {macro_state.get('risk_state', 'unknown')}\n"
+        f"Macro Bias: {macro_state.get('macro_bias', 'unknown')}\n"
+        f"Volatility State: {macro_state.get('volatility_state', 'unknown')}\n"
+        f"Confidence: {macro_state.get('confidence', 'N/A')}\n"
+        f"Drivers: {driver_text}\n"
+        f"Watch Items: {watch_text}\n"
+        f"High Impact Events: {event_text}"
+    )
+
+
+def build_macro_message(snapshot: Dict[str, Any]) -> str:
+    if not snapshot:
+        return f"🌎 MACRO UPDATE\nNo macro snapshot available.\n⏰ {now_ts()}"
+
+    macro_state = snapshot.get("macro_state", {}) or {}
+    voice_script = snapshot.get("voice_script", "") or ""
+    summary = get_macro_state_summary_text(macro_state)
+
+    return (
+        f"🌎 MACRO BRIDGE UPDATE\n"
+        f"{summary}\n\n"
+        f"Voice Script:\n{voice_script}\n\n"
+        f"⏰ {now_ts()}"
+    )
+
+
+def refresh_macro_bridge(force: bool = False, send_alerts: bool = False) -> Optional[Dict[str, Any]]:
+    global GLOBAL_MACRO
+
+    macro_store = load_macro_store()
+
+    if not ENABLE_MACRO_BRIDGE:
+        return macro_store.get("last_snapshot", {})
+
+    if not MACRO_BRIDGE_AVAILABLE or build_macro_bridge_snapshot is None:
+        macro_store["last_error"] = "macro_bridge import unavailable"
+        save_macro_store()
+        return macro_store.get("last_snapshot", {})
+
+    last_refresh = safe_int(macro_store.get("last_refresh_time", 0), 0)
+    if not force and (epoch() - last_refresh) < MACRO_REFRESH_SECONDS:
+        return macro_store.get("last_snapshot", {})
+
+    try:
+        snapshot = build_macro_bridge_snapshot()
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+
+        macro_store["last_refresh_time"] = epoch()
+        macro_store["last_snapshot"] = snapshot
+        macro_store["last_voice_script"] = snapshot.get("voice_script", "")
+        macro_store["last_macro_state"] = snapshot.get("macro_state", {})
+        macro_store["last_error"] = ""
+        save_macro_store()
+
+        if send_alerts:
+            msg = build_macro_message(snapshot)
+            if MACRO_SEND_TO_AI:
+                send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            if MACRO_SEND_TO_TELEGRAM:
+                send_to_telegram(msg)
+
+        return snapshot
+
+    except Exception as e:
+        macro_store["last_error"] = str(e)
+        save_macro_store()
+        log(f"❌ Macro bridge refresh failed: {e}")
+
+        try:
+            if MACRO_BRIDGE_AVAILABLE and load_last_macro_snapshot:
+                cached = load_last_macro_snapshot()
+                if isinstance(cached, dict) and cached:
+                    macro_store["last_snapshot"] = cached
+                    macro_store["last_voice_script"] = cached.get("voice_script", "")
+                    macro_store["last_macro_state"] = cached.get("macro_state", {})
+                    save_macro_store()
+                    return cached
+        except Exception:
+            pass
+
+        return macro_store.get("last_snapshot", {})
+
+
+def get_latest_macro_snapshot() -> Dict[str, Any]:
+    macro_store = load_macro_store()
+    return macro_store.get("last_snapshot", {}) or {}
+
+
+def get_latest_macro_state() -> Dict[str, Any]:
+    macro_store = load_macro_store()
+    return macro_store.get("last_macro_state", {}) or {}
+
+
+def get_latest_macro_voice_script() -> str:
+    macro_store = load_macro_store()
+    return str(macro_store.get("last_voice_script", "") or "")
 
 
 # =========================================================
@@ -1163,11 +1323,24 @@ def build_ai_reasoning_message(signal: Dict[str, Any]) -> str:
     size_decision = signal.get("size_decision", {}) if isinstance(signal.get("size_decision"), dict) else {}
     regime_text = f"\nRegime: {signal.get('regime')}\nRegime Score: {signal.get('regime_score', 'N/A')}" if signal.get("regime") else ""
     size_text = f"\nSized Qty: {signal.get('qty', 'N/A')}\nRisk Dollars: {size_decision.get('risk_dollars', 'N/A')}\nUnit Risk: {size_decision.get('unit_risk', 'N/A')}" if size_decision else ""
+
+    macro_state = get_latest_macro_state()
+    macro_text = ""
+    if macro_state:
+        macro_text = (
+            f"\n\nMacro Context:"
+            f"\nRisk State: {macro_state.get('risk_state', 'unknown')}"
+            f"\nMacro Bias: {macro_state.get('macro_bias', 'unknown')}"
+            f"\nVolatility State: {macro_state.get('volatility_state', 'unknown')}"
+            f"\nMacro Drivers: {', '.join(macro_state.get('drivers', [])[:5]).replace('_', ' ') if macro_state.get('drivers') else 'none'}"
+        )
+
     return (
         f"🧠 AI REASONING ALERT\nTicker: {signal['ticker']}\nSymbol: {signal['symbol']}\nDirection: {signal['direction']}\n"
         f"Underlying Price: {signal['price']}\nContract Price: {signal['contract_price']}\nConfidence: {signal['confidence']}\n"
         f"Bias: {signal['bias']}\nTimeframe: {signal['timeframe']}\nTrigger: {signal['trigger']}\nSource: {signal['source']}"
-        f"{regime_text}{size_text}\n\nReasoning:\n{signal['reason']}\n\n⏰ {now_ts()}"
+        f"{regime_text}{size_text}\n\nReasoning:\n{signal['reason']}"
+        f"{macro_text}\n\n⏰ {now_ts()}"
     )
 
 
@@ -1551,7 +1724,6 @@ def sync_live_positions_from_alpaca():
         else:
             log(f"⚠️ Broker has open position not in local state: {symbol}")
 
-    # any local live positions missing at broker are suspicious; handled by startup/runtime recon
     save_positions(GLOBAL_POSITIONS)
 
 
@@ -1784,6 +1956,15 @@ def handle_new_signal(signal: Dict[str, Any]):
 # TELEGRAM COMMANDS
 # =========================================================
 def build_status_text() -> str:
+    macro_state = get_latest_macro_state()
+    macro_line = "No macro snapshot loaded"
+    if macro_state:
+        macro_line = (
+            f"{macro_state.get('risk_state', 'unknown')} | "
+            f"{macro_state.get('macro_bias', 'unknown')} | "
+            f"vol={macro_state.get('volatility_state', 'unknown')}"
+        )
+
     return (
         f"🤖 {BOT_NAME} STATUS\nEngine Enabled: {GLOBAL_STATE['engine_enabled']}\nPaper Enabled: {GLOBAL_STATE['paper_enabled']}\n"
         f"Discord Enabled: {GLOBAL_STATE['discord_enabled']}\nTelegram Enabled: {GLOBAL_STATE['telegram_enabled']}\n"
@@ -1793,7 +1974,9 @@ def build_status_text() -> str:
         f"Consecutive Losses: {GLOBAL_STATE.get('consecutive_losses', 0)}\nPortfolio Heat %: {round(portfolio_heat_pct() * 100, 2)}\n"
         f"Signals Routed: {GLOBAL_STATE['signal_count']}\nPaper Trades: {GLOBAL_STATE['paper_trade_count']}\nLive Trades: {GLOBAL_STATE['live_trade_count']}\n"
         f"Open Positions: {len(GLOBAL_POSITIONS['open_positions'])}\nClosed Positions: {len(GLOBAL_POSITIONS['closed_positions'])}\n"
-        f"Tracked Orders: {len(GLOBAL_ORDERS['orders'])}\n⏰ {now_ts()}"
+        f"Tracked Orders: {len(GLOBAL_ORDERS['orders'])}\n"
+        f"Macro: {macro_line}\n"
+        f"⏰ {now_ts()}"
     )
 
 
@@ -1834,7 +2017,7 @@ def close_all_open_positions():
 def handle_telegram_command(text: str):
     cmd = parse_command(text)
     if cmd in {"/start", "/help", "help"}:
-        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n")
+        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n/macro\n/macro_push\n")
         return
     if cmd == "/status":
         send_to_telegram(build_status_text()); return
@@ -1886,6 +2069,14 @@ def handle_telegram_command(text: str):
         close_all_open_positions(); return
     if cmd == "/heartbeat":
         send_heartbeat(force=True); return
+    if cmd == "/macro":
+        snapshot = refresh_macro_bridge(force=True, send_alerts=False)
+        send_to_telegram(build_macro_message(snapshot))
+        return
+    if cmd == "/macro_push":
+        refresh_macro_bridge(force=True, send_alerts=True)
+        send_to_telegram("✅ Macro bridge refreshed and pushed")
+        return
     if cmd == "/test":
         run_startup_tests(); send_to_telegram("🧪 Test alerts triggered"); return
 
@@ -1917,7 +2108,11 @@ def send_heartbeat(force: bool = False):
     last = safe_int(GLOBAL_STATE.get("last_heartbeat_time", 0), 0)
     minutes_since = (epoch() - last) / 60 if last > 0 else 99999
     if force or minutes_since >= HEARTBEAT_MINUTES:
-        send_to_telegram(build_status_text())
+        heartbeat_text = build_status_text()
+        voice_script = get_latest_macro_voice_script()
+        if voice_script:
+            heartbeat_text += f"\n\nLatest Macro Voice:\n{voice_script}"
+        send_to_telegram(heartbeat_text)
         GLOBAL_STATE["last_heartbeat_time"] = epoch()
         save_state(GLOBAL_STATE)
 
@@ -1966,11 +2161,12 @@ def fallback_signal() -> Dict[str, Any]:
 # BOOT + LOOP
 # =========================================================
 def boot():
-    global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON
+    global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON, GLOBAL_MACRO
     GLOBAL_STATE = load_state()
     GLOBAL_POSITIONS = load_positions()
     GLOBAL_ORDERS = load_orders()
     GLOBAL_RECON = load_recon()
+    GLOBAL_MACRO = default_macro_store()
 
     log(f"🔥 {BOT_NAME} booting...")
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
@@ -1978,6 +2174,7 @@ def boot():
     save_positions(GLOBAL_POSITIONS)
     save_orders(GLOBAL_ORDERS)
     save_recon(GLOBAL_RECON)
+    save_macro_store()
     debug_file_lookup(SIGNAL_FILE)
 
     if RUN_TEST_ON_START:
@@ -1986,10 +2183,14 @@ def boot():
     if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
         startup_reconcile_and_gate()
 
+    if ENABLE_MACRO_BRIDGE:
+        refresh_macro_bridge(force=True, send_alerts=MACRO_SEND_ON_BOOT)
+
     send_heartbeat(force=True)
 
 
 def runtime_housekeeping():
+    refresh_macro_bridge(force=False, send_alerts=False)
     sync_live_positions_from_alpaca()
     reconcile_order_fills_into_positions()
     manage_open_positions(None)
