@@ -63,6 +63,7 @@ STATE_FILE = os.getenv("STATE_FILE", "engine_state.json").strip()
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json").strip()
 ORDERS_FILE = os.getenv("ORDERS_FILE", "orders.json").strip()
 RECON_FILE = os.getenv("RECON_FILE", "reconciliation.json").strip()
+MACRO_FILE = os.getenv("MACRO_FILE", "macro_store.json").strip()
 
 ENABLE_TELEGRAM_COMMANDS = os.getenv("ENABLE_TELEGRAM_COMMANDS", "true").lower() == "true"
 ENABLE_PAPER_EXECUTION = os.getenv("ENABLE_PAPER_EXECUTION", "true").lower() == "true"
@@ -162,6 +163,11 @@ GLOBAL_POSITIONS = None
 GLOBAL_ORDERS = None
 GLOBAL_RECON = None
 GLOBAL_MACRO = None
+DIRTY_STATE = False
+DIRTY_POSITIONS = False
+DIRTY_ORDERS = False
+DIRTY_RECON = False
+DIRTY_MACRO = False
 
 
 # =========================================================
@@ -327,6 +333,7 @@ def debug_file_lookup(path: str):
 # =========================================================
 def default_state() -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "engine_enabled": True,
         "paper_enabled": ENABLE_PAPER_EXECUTION,
         "discord_enabled": ENABLE_DISCORD,
@@ -356,6 +363,7 @@ def default_state() -> Dict[str, Any]:
 
 def default_positions() -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "open_positions": [],
         "closed_positions": [],
         "last_position_id": 0,
@@ -364,6 +372,7 @@ def default_positions() -> Dict[str, Any]:
 
 def default_orders() -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "orders": [],
         "last_local_order_id": 0,
     }
@@ -371,6 +380,7 @@ def default_orders() -> Dict[str, Any]:
 
 def default_recon() -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "last_boot_reconciliation_at": 0,
         "last_boot_report": {},
         "last_runtime_reconciliation_at": 0,
@@ -379,6 +389,7 @@ def default_recon() -> Dict[str, Any]:
 
 def default_macro_store() -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "last_refresh_time": 0,
         "last_snapshot": {},
         "last_voice_script": "",
@@ -399,7 +410,9 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]):
-    save_json_file(STATE_FILE, state)
+    global GLOBAL_STATE
+    GLOBAL_STATE = state
+    mark_state_dirty()
 
 
 def load_positions() -> Dict[str, Any]:
@@ -412,7 +425,9 @@ def load_positions() -> Dict[str, Any]:
 
 
 def save_positions(positions: Dict[str, Any]):
-    save_json_file(POSITIONS_FILE, positions)
+    global GLOBAL_POSITIONS
+    GLOBAL_POSITIONS = positions
+    mark_positions_dirty()
 
 
 def load_orders() -> Dict[str, Any]:
@@ -423,7 +438,9 @@ def load_orders() -> Dict[str, Any]:
 
 
 def save_orders(orders: Dict[str, Any]):
-    save_json_file(ORDERS_FILE, orders)
+    global GLOBAL_ORDERS
+    GLOBAL_ORDERS = orders
+    mark_orders_dirty()
 
 
 def load_recon() -> Dict[str, Any]:
@@ -431,21 +448,83 @@ def load_recon() -> Dict[str, Any]:
 
 
 def save_recon(recon: Dict[str, Any]):
-    save_json_file(RECON_FILE, recon)
+    global GLOBAL_RECON
+    GLOBAL_RECON = recon
+    mark_recon_dirty()
 
 
 def load_macro_store() -> Dict[str, Any]:
     global GLOBAL_MACRO
     if GLOBAL_MACRO is None or not isinstance(GLOBAL_MACRO, dict):
-        GLOBAL_MACRO = default_macro_store()
+        GLOBAL_MACRO = safe_merge(default_macro_store(), load_json_file(MACRO_FILE, default_macro_store()))
     return GLOBAL_MACRO
 
 
 def save_macro_store():
-    global GLOBAL_MACRO
+    global GLOBAL_MACRO, DIRTY_MACRO
     if GLOBAL_MACRO is None:
-        GLOBAL_MACRO = default_macro_store()
+        GLOBAL_MACRO = safe_merge(default_macro_store(), load_json_file(MACRO_FILE, default_macro_store()))
+    save_json_file(MACRO_FILE, GLOBAL_MACRO)
+    DIRTY_MACRO = False
 
+
+def ensure_globals_initialized():
+    global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON, GLOBAL_MACRO
+    if GLOBAL_STATE is None:
+        GLOBAL_STATE = load_state()
+    if GLOBAL_POSITIONS is None:
+        GLOBAL_POSITIONS = load_positions()
+    if GLOBAL_ORDERS is None:
+        GLOBAL_ORDERS = load_orders()
+    if GLOBAL_RECON is None:
+        GLOBAL_RECON = load_recon()
+    if GLOBAL_MACRO is None:
+        GLOBAL_MACRO = safe_merge(default_macro_store(), load_json_file(MACRO_FILE, default_macro_store()))
+
+
+def mark_state_dirty():
+    global DIRTY_STATE
+    DIRTY_STATE = True
+
+
+def mark_positions_dirty():
+    global DIRTY_POSITIONS
+    DIRTY_POSITIONS = True
+
+
+def mark_orders_dirty():
+    global DIRTY_ORDERS
+    DIRTY_ORDERS = True
+
+
+def mark_recon_dirty():
+    global DIRTY_RECON
+    DIRTY_RECON = True
+
+
+def mark_macro_dirty():
+    global DIRTY_MACRO
+    DIRTY_MACRO = True
+
+
+def flush_dirty_stores(force: bool = False):
+    global DIRTY_STATE, DIRTY_POSITIONS, DIRTY_ORDERS, DIRTY_RECON, DIRTY_MACRO
+    ensure_globals_initialized()
+    if force or DIRTY_STATE:
+        save_json_file(STATE_FILE, GLOBAL_STATE)
+        DIRTY_STATE = False
+    if force or DIRTY_POSITIONS:
+        save_json_file(POSITIONS_FILE, GLOBAL_POSITIONS)
+        DIRTY_POSITIONS = False
+    if force or DIRTY_ORDERS:
+        save_json_file(ORDERS_FILE, GLOBAL_ORDERS)
+        DIRTY_ORDERS = False
+    if force or DIRTY_RECON:
+        save_json_file(RECON_FILE, GLOBAL_RECON)
+        DIRTY_RECON = False
+    if force or DIRTY_MACRO:
+        save_json_file(MACRO_FILE, GLOBAL_MACRO)
+        DIRTY_MACRO = False
 
 # =========================================================
 # STATE HELPERS
@@ -468,12 +547,14 @@ def append_recent_signal_hash(state: Dict[str, Any], sig_hash: str, max_keep: in
 
 
 def clear_reconciliation_block():
+    ensure_globals_initialized()
     GLOBAL_STATE["reconciliation_required"] = False
     GLOBAL_STATE["reconciliation_block_reason"] = ""
     save_state(GLOBAL_STATE)
 
 
 def set_reconciliation_block(reason: str):
+    ensure_globals_initialized()
     GLOBAL_STATE["reconciliation_required"] = True
     GLOBAL_STATE["reconciliation_block_reason"] = reason
     save_state(GLOBAL_STATE)
@@ -531,6 +612,7 @@ def refresh_macro_bridge(force: bool = False, send_alerts: bool = False) -> Opti
 
     if not MACRO_BRIDGE_AVAILABLE or build_macro_bridge_snapshot is None:
         macro_store["last_error"] = "macro_bridge import unavailable"
+        mark_macro_dirty()
         save_macro_store()
         return macro_store.get("last_snapshot", {})
 
@@ -548,6 +630,7 @@ def refresh_macro_bridge(force: bool = False, send_alerts: bool = False) -> Opti
         macro_store["last_voice_script"] = snapshot.get("voice_script", "")
         macro_store["last_macro_state"] = snapshot.get("macro_state", {})
         macro_store["last_error"] = ""
+        mark_macro_dirty()
         save_macro_store()
 
         if send_alerts:
@@ -561,6 +644,7 @@ def refresh_macro_bridge(force: bool = False, send_alerts: bool = False) -> Opti
 
     except Exception as e:
         macro_store["last_error"] = str(e)
+        mark_macro_dirty()
         save_macro_store()
         log(f"❌ Macro bridge refresh failed: {e}")
 
@@ -571,6 +655,7 @@ def refresh_macro_bridge(force: bool = False, send_alerts: bool = False) -> Opti
                     macro_store["last_snapshot"] = cached
                     macro_store["last_voice_script"] = cached.get("voice_script", "")
                     macro_store["last_macro_state"] = cached.get("macro_state", {})
+                    mark_macro_dirty()
                     save_macro_store()
                     return cached
         except Exception:
@@ -865,6 +950,8 @@ def update_order_status(order_record: Dict[str, Any], status: str, note: Optiona
     order_record["updated_at"] = epoch()
     if status in {"filled", "canceled", "rejected", "expired"}:
         order_record["closed_at"] = epoch()
+    if status == "filled":
+        order_record["qty_remaining"] = 0
     if note:
         order_record.setdefault("notes", []).append(note)
     save_orders(GLOBAL_ORDERS)
@@ -1505,7 +1592,8 @@ def update_position_market_price(position: Dict[str, Any], new_price: float):
 
 
 def scale_out_local(position: Dict[str, Any], qty_to_close: int, fill_price: float, note: str) -> bool:
-    qty_to_close = int(max(0, min(qty_to_close, position["qty_open"])))
+    available_qty = max(0, safe_int(position.get("qty_open", 0), 0) - safe_int(position.get("pending_close_qty", 0), 0))
+    qty_to_close = int(max(0, min(qty_to_close, available_qty)))
     if qty_to_close <= 0:
         return False
     position["qty_open"] -= qty_to_close
@@ -1649,7 +1737,8 @@ def open_live_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bool:
     if not ALLOW_LIVE_SELLS:
         return False
-    qty_to_close = int(max(0, min(qty_to_close, position["qty_open"])))
+    available_qty = max(0, safe_int(position.get("qty_open", 0), 0) - safe_int(position.get("pending_close_qty", 0), 0))
+    qty_to_close = int(max(0, min(qty_to_close, available_qty)))
     if qty_to_close <= 0:
         return False
     signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", "")}
@@ -1673,7 +1762,7 @@ def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bo
 def live_close_position(position: Dict[str, Any], note: str) -> bool:
     if not ALLOW_LIVE_SELLS:
         return False
-    qty_open = safe_int(position.get("qty_open", 0), 0)
+    qty_open = max(0, safe_int(position.get("qty_open", 0), 0) - safe_int(position.get("pending_close_qty", 0), 0))
     if qty_open <= 0:
         return False
     signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", "")}
@@ -1698,6 +1787,7 @@ def live_close_position(position: Dict[str, Any], note: str) -> bool:
 # ORDER/POSITION RECONCILIATION
 # =========================================================
 def sync_live_positions_from_alpaca():
+    ensure_globals_initialized()
     if not ALPACA_SYNC_POSITIONS or not ENABLE_ALPACA or not GLOBAL_STATE.get("alpaca_enabled", False):
         return
     broker_positions = alpaca_list_positions()
@@ -1728,7 +1818,10 @@ def sync_live_positions_from_alpaca():
 
 
 def reconcile_order_fills_into_positions():
+    ensure_globals_initialized()
     refresh_open_order_states()
+    positions_changed = False
+    orders_changed = False
     for order in GLOBAL_ORDERS.get("orders", []):
         pid = safe_int(order.get("position_id", 0), 0)
         if pid <= 0:
@@ -1751,14 +1844,20 @@ def reconcile_order_fills_into_positions():
             position["pending_close_qty"] = max(0, safe_int(position.get("pending_close_qty", 0), 0) - delta_fill)
 
         order["applied_filled_qty"] = filled_qty
-        save_orders(GLOBAL_ORDERS)
-        save_positions(GLOBAL_POSITIONS)
+        orders_changed = True
+        positions_changed = True
 
         if status == "filled" and str(order.get("side", "")).lower() == "sell" and position.get("qty_open", 0) <= 0:
             finalize_close_position(position, avg_fill or position.get("last_price", 0), f"Order {order.get('local_order_id')} fully closed position")
+            positions_changed = True
+    if orders_changed:
+        save_orders(GLOBAL_ORDERS)
+    if positions_changed:
+        save_positions(GLOBAL_POSITIONS)
 
 
 def build_boot_reconciliation_report() -> Dict[str, Any]:
+    ensure_globals_initialized()
     broker_positions = alpaca_list_positions() if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() else []
     broker_orders = alpaca_list_orders(status="open") if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready() else []
     local_open_positions = GLOBAL_POSITIONS.get("open_positions", [])
@@ -2190,10 +2289,12 @@ def boot():
 
 
 def runtime_housekeeping():
+    ensure_globals_initialized()
     refresh_macro_bridge(force=False, send_alerts=False)
     sync_live_positions_from_alpaca()
     reconcile_order_fills_into_positions()
     manage_open_positions(None)
+    flush_dirty_stores(force=False)
 
 
 def main_loop():
@@ -2217,6 +2318,7 @@ def main_loop():
             if live_signal:
                 manage_open_positions(live_signal)
             send_heartbeat(force=False)
+            flush_dirty_stores(force=False)
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
             log("🛑 Manual stop")
@@ -2224,6 +2326,7 @@ def main_loop():
         except Exception as e:
             log(f"💥 Loop error: {e}")
             traceback.print_exc()
+            flush_dirty_stores(force=True)
             time.sleep(POLL_SECONDS)
 
 
