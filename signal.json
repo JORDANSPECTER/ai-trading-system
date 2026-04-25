@@ -1,11 +1,6 @@
 {
   "ticker": "QQQ",
-  "symbol": "QQQ240426C00380000",
   "direction": "CALL",
   "confidence": "A",
-  "entry_contract": 1.00,
-  "stop_contract": 0.70,
-  "tp1_contract": 1.30,
-  "tp2_contract": 1.60,
   "timestamp": 9999999999
 }
