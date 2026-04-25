@@ -177,6 +177,19 @@ SEND_PRICE_UPDATE_ALERTS = os.getenv("SEND_PRICE_UPDATE_ALERTS", "false").lower(
 PRICE_UPDATE_ALERT_SECONDS = int(os.getenv("PRICE_UPDATE_ALERT_SECONDS", "60"))
 
 # =========================================================
+# STEP 13 ADVANCED TRADE MANAGEMENT
+# =========================================================
+ENABLE_STEP13_ADVANCED_MANAGEMENT = os.getenv("ENABLE_STEP13_ADVANCED_MANAGEMENT", "true").lower() == "true"
+STEP13_BREAKEVEN_TRIGGER_PCT = float(os.getenv("STEP13_BREAKEVEN_TRIGGER_PCT", "0.15"))
+STEP13_SMART_TRAIL_TRIGGER_PCT = float(os.getenv("STEP13_SMART_TRAIL_TRIGGER_PCT", "0.25"))
+STEP13_SMART_TRAIL_LOCK_PCT = float(os.getenv("STEP13_SMART_TRAIL_LOCK_PCT", "0.92"))
+STEP13_AGGRESSIVE_TRAIL_TRIGGER_PCT = float(os.getenv("STEP13_AGGRESSIVE_TRAIL_TRIGGER_PCT", "0.40"))
+STEP13_AGGRESSIVE_TRAIL_LOCK_PCT = float(os.getenv("STEP13_AGGRESSIVE_TRAIL_LOCK_PCT", "0.95"))
+STEP13_TIME_EXIT_ENABLED = os.getenv("STEP13_TIME_EXIT_ENABLED", "true").lower() == "true"
+STEP13_MAX_HOLD_SECONDS = int(os.getenv("STEP13_MAX_HOLD_SECONDS", "900"))
+STEP13_STAGNANT_MOVE_PCT = float(os.getenv("STEP13_STAGNANT_MOVE_PCT", "0.05"))
+
+# =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
 ENABLE_ENTRY_LOCK = os.getenv("ENABLE_ENTRY_LOCK", "true").lower() == "true"
@@ -2579,6 +2592,85 @@ def send_position_management_update(position: Dict[str, Any], note: str):
 
 
 # =========================================================
+# STEP 13 ADVANCED TRADE MANAGEMENT
+# - Early break-even protection
+# - Smart trailing stop
+# - Aggressive profit lock
+# - Time-based dead-trade exit
+# =========================================================
+def step13_manage_advanced(position: Dict[str, Any], live_price: float) -> Tuple[bool, bool]:
+    """
+    Returns (changed, closed).
+
+    changed=True means position state changed and should be saved.
+    closed=True means position was finalized/removed from open positions.
+    """
+    if not ENABLE_STEP13_ADVANCED_MANAGEMENT:
+        return False, False
+
+    try:
+        entry_price = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+        if entry_price <= 0 or live_price <= 0:
+            return False, False
+
+        current_stop = safe_float(position.get("stop_price", 0), 0)
+        opened_at = safe_int(position.get("opened_at", position.get("open_time", epoch())), epoch())
+        move_pct_decimal = (live_price - entry_price) / entry_price
+        changed = False
+
+        # 1) Early break-even protection BEFORE TP1.
+        if move_pct_decimal >= STEP13_BREAKEVEN_TRIGGER_PCT and not position.get("step13_breakeven_set", False):
+            new_stop = max(current_stop, entry_price)
+            if new_stop > current_stop:
+                position["stop_price"] = round(new_stop, 4)
+                position["step13_breakeven_set"] = True
+                position.setdefault("notes", []).append(f"Step 13 breakeven set: {current_stop} -> {position['stop_price']}")
+                log(f"🛡️ STEP 13 BREAKEVEN SET | {position.get('symbol')} | stop={current_stop} -> {position['stop_price']}")
+                send_position_management_update(position, "STEP 13 BREAKEVEN SET")
+                changed = True
+
+        # 2) Smart trail after a clean move.
+        current_stop = safe_float(position.get("stop_price", 0), 0)
+        if move_pct_decimal >= STEP13_SMART_TRAIL_TRIGGER_PCT:
+            smart_stop = round(live_price * STEP13_SMART_TRAIL_LOCK_PCT, 4)
+            if smart_stop > current_stop:
+                old_stop = current_stop
+                position["stop_price"] = smart_stop
+                position.setdefault("notes", []).append(f"Step 13 smart trail: {old_stop} -> {smart_stop}")
+                debug(f"STEP 13 SMART TRAIL | {position.get('symbol')}: {old_stop} -> {smart_stop}")
+                changed = True
+
+        # 3) Aggressive profit lock after a larger move.
+        current_stop = safe_float(position.get("stop_price", 0), 0)
+        if move_pct_decimal >= STEP13_AGGRESSIVE_TRAIL_TRIGGER_PCT:
+            aggressive_stop = round(live_price * STEP13_AGGRESSIVE_TRAIL_LOCK_PCT, 4)
+            if aggressive_stop > current_stop:
+                old_stop = current_stop
+                position["stop_price"] = aggressive_stop
+                position.setdefault("notes", []).append(f"Step 13 aggressive trail: {old_stop} -> {aggressive_stop}")
+                log(f"🔒 STEP 13 AGGRESSIVE TRAIL | {position.get('symbol')} | stop={old_stop} -> {aggressive_stop}")
+                send_position_management_update(position, "STEP 13 AGGRESSIVE TRAIL")
+                changed = True
+
+        # 4) Dead-trade time exit: if it sits too long and barely moves, close it.
+        if STEP13_TIME_EXIT_ENABLED and opened_at > 0:
+            age_seconds = epoch() - opened_at
+            if age_seconds >= STEP13_MAX_HOLD_SECONDS and abs(move_pct_decimal) < STEP13_STAGNANT_MOVE_PCT:
+                if position.get("mode") == "LIVE":
+                    live_close_position(position, "STEP 13 TIME EXIT - stagnant trade")
+                else:
+                    finalize_close_position(position, live_price, "STEP 13 TIME EXIT - stagnant trade")
+                log(f"⏱️ STEP 13 TIME EXIT | {position.get('symbol')} | age={age_seconds}s | live={live_price}")
+                return True, True
+
+        return changed, False
+
+    except Exception as e:
+        log(f"❌ STEP 13 ERROR: {e}")
+        return False, False
+
+
+# =========================================================
 # STEP 12 TRADE MANAGEMENT MODE
 # Position-first management: TP1, TP2, breakeven, trailing stop, stop loss.
 # IMPORTANT: signal.json is for ENTRY only. Once a position is open, the loop
@@ -2636,6 +2728,14 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
 
         if position.get("mode") == "LIVE" and not position.get("entry_filled", False):
             debug(f"STEP 12 WAIT | live entry not filled yet for {symbol}")
+            continue
+
+        # STEP 13 runs before TP/stop checks so it can protect early, trail dynamically,
+        # or time-exit stagnant trades while keeping all Step 12 logic intact.
+        step13_changed, step13_closed = step13_manage_advanced(position, live_price)
+        if step13_changed:
+            changed = True
+        if step13_closed:
             continue
 
         # TP1: scale out 50% and move stop to breakeven.
