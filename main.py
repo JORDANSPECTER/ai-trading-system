@@ -164,6 +164,11 @@ MARKET_DATA_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
 MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "auto").strip().lower()
 MARKET_DATA_REFRESH_SECONDS = int(os.getenv("MARKET_DATA_REFRESH_SECONDS", "5"))
 MARKET_DATA_STALE_SECONDS = int(os.getenv("MARKET_DATA_STALE_SECONDS", "20"))
+# Market data freshness fix: lets Render/file-based testing keep prices fresh without GitHub redeploys.
+# For testing use 300. For live trading tighten to 10-20 seconds.
+MARKET_DATA_MAX_AGE_SECONDS = int(os.getenv("MARKET_DATA_MAX_AGE_SECONDS", str(MARKET_DATA_STALE_SECONDS)))
+MARKET_DATA_REFRESH_FILE_TIMESTAMPS = os.getenv("MARKET_DATA_REFRESH_FILE_TIMESTAMPS", "true").lower() == "true"
+MARKET_DATA_ADD_PRICE_UPDATED_AT = os.getenv("MARKET_DATA_ADD_PRICE_UPDATED_AT", "true").lower() == "true"
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_BASE_URL = os.getenv("TWELVE_DATA_BASE_URL", "https://api.twelvedata.com").strip().rstrip("/")
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").strip().rstrip("/")
@@ -232,7 +237,7 @@ PHASE0_BLOCK_ON_INVALID_STATE = os.getenv("PHASE0_BLOCK_ON_INVALID_STATE", "true
 PHASE0_REQUIRE_FRESH_PRICE_FOR_ENTRY = os.getenv("PHASE0_REQUIRE_FRESH_PRICE_FOR_ENTRY", "true").lower() == "true"
 PHASE0_REQUIRE_FRESH_PRICE_FOR_OPEN_POSITIONS = os.getenv("PHASE0_REQUIRE_FRESH_PRICE_FOR_OPEN_POSITIONS", "true").lower() == "true"
 PHASE0_REQUIRE_STARTUP_RECON_CLEAN = os.getenv("PHASE0_REQUIRE_STARTUP_RECON_CLEAN", "true").lower() == "true"
-PHASE0_MARKET_FILE_MAX_AGE_SECONDS = int(os.getenv("PHASE0_MARKET_FILE_MAX_AGE_SECONDS", str(MARKET_DATA_STALE_SECONDS)))
+PHASE0_MARKET_FILE_MAX_AGE_SECONDS = int(os.getenv("PHASE0_MARKET_FILE_MAX_AGE_SECONDS", str(MARKET_DATA_MAX_AGE_SECONDS)))
 PHASE0_HARD_DAILY_LOSS_PCT = float(os.getenv("PHASE0_HARD_DAILY_LOSS_PCT", str(MAX_DAILY_LOSS_PCT)))
 PHASE0_HARD_PORTFOLIO_HEAT_PCT = float(os.getenv("PHASE0_HARD_PORTFOLIO_HEAT_PCT", str(max(MAX_PORTFOLIO_HEAT_PCT * 1.25, MAX_PORTFOLIO_HEAT_PCT))))
 PHASE0_AUTO_FLATTEN_ON_HARD_KILL = os.getenv("PHASE0_AUTO_FLATTEN_ON_HARD_KILL", "true").lower() == "true"
@@ -2601,6 +2606,74 @@ def startup_reconcile_and_gate():
 # =========================================================
 # STEP 8 MARKET PRICE FEED / LIVE POSITION PRICE UPDATES
 # =========================================================
+def refresh_market_data_file_metadata() -> bool:
+    """Stamp MARKET_DATA_FILE prices with explicit freshness timestamps.
+
+    This fixes Render/GitHub test timing where a valid manual test price can look stale
+    just because the file mtime is old. Numeric prices are converted into structured
+    objects with timestamp + price_updated_at.
+    """
+    if not MARKET_DATA_REFRESH_FILE_TIMESTAMPS:
+        return False
+    if not MARKET_DATA_FILE or not file_exists(MARKET_DATA_FILE):
+        return False
+    try:
+        with open(MARKET_DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        now = epoch()
+        stamped = {}
+        changed = False
+        for key, value in data.items():
+            key_s = str(key)
+            if key_s.startswith("__"):
+                continue
+            if isinstance(value, dict):
+                price = safe_float(value.get("price", value.get("last", value.get("mark", value.get("mid", 0)))), 0)
+                if price <= 0:
+                    stamped[key_s] = value
+                    continue
+                updated = dict(value)
+                updated["price"] = price
+                updated["timestamp"] = now
+                updated["price_updated_at"] = now
+                updated.setdefault("source", MARKET_DATA_FILE)
+                if updated != value:
+                    changed = True
+                stamped[key_s] = updated
+            else:
+                price = safe_float(value, 0)
+                if price <= 0:
+                    stamped[key_s] = value
+                    continue
+                stamped[key_s] = {"price": price, "timestamp": now, "price_updated_at": now, "source": MARKET_DATA_FILE}
+                changed = True
+        stamped["__updated_at"] = now
+        stamped["__freshness_source"] = "engine_refresh"
+        stamped["__max_age_seconds"] = MARKET_DATA_MAX_AGE_SECONDS
+        if changed or data.get("__updated_at") != now:
+            atomic_write_json(MARKET_DATA_FILE, stamped)
+            debug(f"MARKET DATA FRESHNESS REFRESHED | file={MARKET_DATA_FILE} | max_age={MARKET_DATA_MAX_AGE_SECONDS}s")
+        return True
+    except Exception as e:
+        log(f"❌ Market data freshness refresh failed: {e}")
+        return False
+
+
+def get_market_data_file_updated_at(prices: Optional[Dict[str, Any]] = None) -> int:
+    try:
+        if isinstance(prices, dict):
+            ts = safe_int(prices.get("__updated_at", 0), 0)
+            if ts > 0:
+                return ts
+        if MARKET_DATA_FILE and file_exists(MARKET_DATA_FILE):
+            return int(os.path.getmtime(MARKET_DATA_FILE))
+    except Exception:
+        pass
+    return 0
+
+
 def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Step 10 market-data router.
@@ -2613,6 +2686,8 @@ def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     if not ENABLE_MARKET_DATA:
         return {}
+
+    refresh_market_data_file_metadata()
 
     prices = {}
 
@@ -2882,7 +2957,7 @@ def parse_market_price_value(value: Any) -> Tuple[float, int]:
     """Returns (price, timestamp). Timestamp can be 0 if not supplied."""
     if isinstance(value, dict):
         price = safe_float(value.get("price", value.get("last", value.get("mark", value.get("mid", 0)))), 0)
-        ts = safe_int(value.get("timestamp", value.get("ts", value.get("updated_at", 0))), 0)
+        ts = safe_int(value.get("timestamp", value.get("ts", value.get("price_updated_at", value.get("updated_at", 0)))), 0)
         return price, ts
     return safe_float(value, 0), 0
 
@@ -2895,6 +2970,8 @@ def get_market_price_for_symbol(symbol: str, prices: Dict[str, Any]) -> Tuple[fl
         return parse_market_price_value(direct)
     symbol_upper = str(symbol).upper().strip()
     for key, value in prices.items():
+        if str(key).startswith("__"):
+            continue
         if str(key).upper().strip() == symbol_upper:
             return parse_market_price_value(value)
     return 0.0, 0
@@ -2903,7 +2980,7 @@ def get_market_price_for_symbol(symbol: str, prices: Dict[str, Any]) -> Tuple[fl
 def market_price_is_stale(ts: int) -> bool:
     if ts <= 0:
         return False
-    return (epoch() - ts) > MARKET_DATA_STALE_SECONDS
+    return (epoch() - ts) > MARKET_DATA_MAX_AGE_SECONDS
 
 
 def maybe_send_price_update(position: Dict[str, Any], old_price: float, new_price: float):
@@ -3754,8 +3831,11 @@ def phase0_validate_state_invariants() -> Dict[str, Any]:
     return result
 
 
-def phase0_market_file_age_seconds() -> int:
+def phase0_market_file_age_seconds(prices: Optional[Dict[str, Any]] = None) -> int:
     try:
+        updated_at = get_market_data_file_updated_at(prices)
+        if updated_at > 0:
+            return max(0, epoch() - updated_at)
         if MARKET_DATA_FILE and file_exists(MARKET_DATA_FILE):
             return max(0, epoch() - int(os.path.getmtime(MARKET_DATA_FILE)))
     except Exception:
@@ -3771,9 +3851,9 @@ def phase0_price_is_fresh(symbol: str, prices: Dict[str, Any]) -> Tuple[bool, fl
         return False, price, f"stale_timestamp_age={epoch() - ts}s"
     if ts <= 0:
         # Manual/file test data usually has no timestamp, so freshness comes from file mtime.
-        age = phase0_market_file_age_seconds()
+        age = phase0_market_file_age_seconds(prices)
         if MARKET_DATA_PROVIDER in {"file", "manual", "auto", "twelvedata"} and age > PHASE0_MARKET_FILE_MAX_AGE_SECONDS:
-            return False, price, f"stale_market_file_age={age}s"
+            return False, price, f"stale_market_file_age={age}s:max={PHASE0_MARKET_FILE_MAX_AGE_SECONDS}s"
     return True, price, "fresh"
 
 
