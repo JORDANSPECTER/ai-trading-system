@@ -7016,6 +7016,55 @@ def paper_tpsl_alert(title: str, pos: Dict[str, Any]) -> None:
         debug(f"paper_tpsl_alert_error:{e}")
 
 
+
+# =========================================================
+# TP/SL LIVE PRICE RESOLVER FIX
+# Required by Step 15 / flatten / lifecycle checks.
+# Prevents NameError: get_live_price_for_position is not defined.
+# =========================================================
+def get_live_price_for_position(pos: Dict[str, Any], market_prices: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    try:
+        if not isinstance(pos, dict):
+            return None
+
+        if market_prices is None:
+            market_prices = load_json_file(MARKET_PRICES_FILE, {})
+
+        if not isinstance(market_prices, dict):
+            market_prices = {}
+
+        candidates = []
+        for key in ["symbol", "contract_symbol", "ticker"]:
+            value = str(pos.get(key, "")).strip()
+            if value and value not in candidates:
+                candidates.append(value)
+
+        # Try exact symbol/contract/ticker from market_prices.json
+        for symbol in candidates:
+            row = market_prices.get(symbol)
+            if isinstance(row, dict):
+                for price_key in ["price", "last", "mark", "bid", "ask"]:
+                    price = safe_float(row.get(price_key, 0), 0.0)
+                    if price > 0:
+                        return price
+            else:
+                price = safe_float(row, 0.0)
+                if price > 0:
+                    return price
+
+        # Try current price fields already stored on the position
+        for key in ["current_price", "last_price", "mark", "contract_price", "entry_price", "entry"]:
+            price = safe_float(pos.get(key, 0), 0.0)
+            if price > 0:
+                return price
+
+        return None
+    except Exception as e:
+        debug(f"get_live_price_for_position_error:{e}")
+        return None
+
+
+
 def paper_tpsl_manage_positions() -> Dict[str, Any]:
     """Manage all paper bridge open positions.
     - Stop loss closes full position
@@ -7162,6 +7211,26 @@ def runtime_housekeeping():
     update_positions_from_market_prices()
     manage_open_positions(None)
     flush_dirty_stores(force=False)
+
+
+
+def reset_kill_switch_for_testing():
+    """Manual helper: call only after reviewing risk state."""
+    try:
+        state = load_json_file(CONTROL_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        state["kill_switch"] = False
+        state["engine_locked"] = False
+        state["locked"] = False
+        state["last_reset_at"] = now_ts()
+        atomic_write_json(CONTROL_STATE_FILE, state)
+        debug("KILL SWITCH RESET FOR TESTING")
+        return True
+    except Exception as e:
+        debug(f"reset_kill_switch_error:{e}")
+        return False
+
 
 
 def main_loop():
