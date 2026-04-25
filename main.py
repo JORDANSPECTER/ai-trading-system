@@ -3043,6 +3043,9 @@ def step14_can_open_new_trade(signal: Optional[Dict[str, Any]] = None) -> Dict[s
         "daily_loss_limit_dollars": daily_loss_limit,
     }
 
+    if decision["approved"]:
+        debug(f"STEP 14 OK | open={open_count}/{STEP14_MAX_OPEN_TRADES} | daily_pnl={daily_pnl} | loss_limit=-{round(abs(daily_loss_limit), 2)}")
+
     if not decision["approved"]:
         extra = (
             f"Open Trades: {open_count}/{STEP14_MAX_OPEN_TRADES}\n"
@@ -3111,6 +3114,21 @@ def step14_global_risk_guard() -> bool:
 
     return False
 
+
+def step14_loop_enforcement() -> bool:
+    """Visible Step 14 loop check. Returns False only when risk guard stops the engine."""
+    ensure_globals_initialized()
+    if not ENABLE_STEP14_PORTFOLIO_RISK:
+        debug("STEP 14 DISABLED")
+        return True
+    if step14_global_risk_guard():
+        debug("STEP 14 LOOP BLOCK | global risk guard active")
+        return False
+    open_count = step14_open_trade_count()
+    daily_pnl = step14_daily_pnl_dollars()
+    daily_loss_limit = step14_daily_loss_limit_dollars()
+    debug(f"STEP 14 LOOP OK | open={open_count}/{STEP14_MAX_OPEN_TRADES} | daily_pnl={daily_pnl} | loss_limit=-{round(abs(daily_loss_limit), 2)}")
+    return True
 
 # =========================================================
 # SIGNAL HANDLER
@@ -3453,7 +3471,7 @@ def boot():
 def runtime_housekeeping():
     ensure_globals_initialized()
     # STEP 14: account-level emergency guard runs every loop.
-    if step14_global_risk_guard():
+    if not step14_loop_enforcement():
         flush_dirty_stores(force=True)
         return
     refresh_macro_bridge(force=False, send_alerts=False)
@@ -3486,7 +3504,7 @@ def main_loop():
             # =========================================================
             ensure_globals_initialized()
             # STEP 14: emergency guard before managing/opening anything.
-            if step14_global_risk_guard():
+            if not step14_loop_enforcement():
                 flush_dirty_stores(force=True)
                 time.sleep(POLL_SECONDS)
                 continue
