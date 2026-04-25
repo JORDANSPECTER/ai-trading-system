@@ -2637,7 +2637,8 @@ def step13_manage_advanced(position: Dict[str, Any], live_price: float) -> Tuple
                 old_stop = current_stop
                 position["stop_price"] = smart_stop
                 position.setdefault("notes", []).append(f"Step 13 smart trail: {old_stop} -> {smart_stop}")
-                debug(f"STEP 13 SMART TRAIL | {position.get('symbol')}: {old_stop} -> {smart_stop}")
+                log(f"📈 STEP 13 SMART TRAIL | {position.get('symbol')} | stop={old_stop} -> {smart_stop}")
+                send_position_management_update(position, "STEP 13 SMART TRAIL")
                 changed = True
 
         # 3) Aggressive profit lock after a larger move.
@@ -2732,6 +2733,7 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
 
         # STEP 13 runs before TP/stop checks so it can protect early, trail dynamically,
         # or time-exit stagnant trades while keeping all Step 12 logic intact.
+        debug(f"STEP 13 CHECK | id={position.get('id')} | {symbol} | live={live_price} | entry={entry_price} | stop={position.get('stop_price')} | tp1_hit={position.get('tp1_hit', False)}")
         step13_changed, step13_closed = step13_manage_advanced(position, live_price)
         if step13_changed:
             changed = True
