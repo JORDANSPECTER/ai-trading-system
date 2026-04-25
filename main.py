@@ -591,6 +591,43 @@ PHASE3_SUGGEST_ONLY = os.getenv("PHASE3_SUGGEST_ONLY", "false").lower() == "true
 PHASE3_ADAPTIVE_STATS_FILE = os.getenv("PHASE3_ADAPTIVE_STATS_FILE", "adaptive_setup_stats.json").strip()
 PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled_setups.json").strip()
 
+
+# =========================================================
+# PHASE 3.5 ENFORCEMENT LAYER
+# Locks adaptive learning into real trade enforcement.
+# This does NOT replace Phase 0/1/2 or Step 14/15. It sits between
+# adaptive intelligence and execution so weak, stale, duplicated,
+# over-risked, or chase signals cannot reach the order path.
+# =========================================================
+ENABLE_PHASE35_ENFORCEMENT = os.getenv("ENABLE_PHASE35_ENFORCEMENT", "true").lower() == "true"
+PHASE35_SEND_ALERTS = os.getenv("PHASE35_SEND_ALERTS", "true").lower() == "true"
+PHASE35_STRICT_MODE = os.getenv("PHASE35_STRICT_MODE", "true").lower() == "true"
+PHASE35_SUGGEST_ONLY = os.getenv("PHASE35_SUGGEST_ONLY", "false").lower() == "true"
+PHASE35_BLOCK_EXECUTION_ONLY = os.getenv("PHASE35_BLOCK_EXECUTION_ONLY", "false").lower() == "true"
+PHASE35_MIN_CONFIDENCE_TO_EXECUTE = os.getenv("PHASE35_MIN_CONFIDENCE_TO_EXECUTE", "A").upper().strip()
+PHASE35_MIN_CONFIDENCE_TO_PREMIUM = os.getenv("PHASE35_MIN_CONFIDENCE_TO_PREMIUM", "B").upper().strip()
+PHASE35_REQUIRE_PHASE3_APPROVAL = os.getenv("PHASE35_REQUIRE_PHASE3_APPROVAL", "true").lower() == "true"
+PHASE35_REQUIRE_ADAPTIVE_STATS_SYNC = os.getenv("PHASE35_REQUIRE_ADAPTIVE_STATS_SYNC", "true").lower() == "true"
+PHASE35_MAX_SIGNAL_AGE_SECONDS = int(os.getenv("PHASE35_MAX_SIGNAL_AGE_SECONDS", str(MAX_SIGNAL_AGE_SECONDS)))
+PHASE35_MAX_ENTRY_AGE_SECONDS = int(os.getenv("PHASE35_MAX_ENTRY_AGE_SECONDS", str(MAX_ENTRY_AGE_SECONDS)))
+PHASE35_ENFORCE_TRADING_WINDOWS = os.getenv("PHASE35_ENFORCE_TRADING_WINDOWS", "false").lower() == "true"
+PHASE35_OPEN_WINDOW_START = os.getenv("PHASE35_OPEN_WINDOW_START", "09:30").strip()
+PHASE35_OPEN_WINDOW_END = os.getenv("PHASE35_OPEN_WINDOW_END", "10:30").strip()
+PHASE35_POWER_WINDOW_START = os.getenv("PHASE35_POWER_WINDOW_START", "15:00").strip()
+PHASE35_POWER_WINDOW_END = os.getenv("PHASE35_POWER_WINDOW_END", "16:00").strip()
+PHASE35_ALLOW_MIDDAY = os.getenv("PHASE35_ALLOW_MIDDAY", "true").lower() == "true"
+PHASE35_SYMBOL_COOLDOWN_SECONDS = int(os.getenv("PHASE35_SYMBOL_COOLDOWN_SECONDS", "300"))
+PHASE35_SETUP_COOLDOWN_SECONDS = int(os.getenv("PHASE35_SETUP_COOLDOWN_SECONDS", "600"))
+PHASE35_MAX_DUPLICATE_SYMBOL_DIRECTION = int(os.getenv("PHASE35_MAX_DUPLICATE_SYMBOL_DIRECTION", str(MAX_SAME_TICKER_POSITIONS)))
+PHASE35_MIN_RR_RATIO = float(os.getenv("PHASE35_MIN_RR_RATIO", str(MIN_RR_RATIO)))
+PHASE35_MAX_DISTANCE_FROM_ENTRY_PCT = float(os.getenv("PHASE35_MAX_DISTANCE_FROM_ENTRY_PCT", str(MAX_ENTRY_SLIPPAGE_PCT)))
+PHASE35_MAX_DAILY_LOSS_DOLLARS = float(os.getenv("PHASE35_MAX_DAILY_LOSS_DOLLARS", "0"))
+PHASE35_MAX_DAILY_LOSS_PCT = float(os.getenv("PHASE35_MAX_DAILY_LOSS_PCT", str(MAX_DAILY_LOSS_PCT)))
+PHASE35_MAX_PROJECTED_HEAT_PCT = float(os.getenv("PHASE35_MAX_PROJECTED_HEAT_PCT", str(MAX_PROJECTED_PORTFOLIO_HEAT_PCT)))
+PHASE35_BLOCK_AFTER_CONSECUTIVE_LOSSES = int(os.getenv("PHASE35_BLOCK_AFTER_CONSECUTIVE_LOSSES", str(MAX_CONSECUTIVE_LOSSES)))
+PHASE35_USED_SIGNAL_MEMORY = int(os.getenv("PHASE35_USED_SIGNAL_MEMORY", "100"))
+PHASE35_ENFORCEMENT_FILE = os.getenv("PHASE35_ENFORCEMENT_FILE", "phase35_enforcement.json").strip()
+
 # =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
@@ -5189,6 +5226,293 @@ def hard_duplicate_entry_gate(signal: Dict[str, Any]) -> Dict[str, Any]:
     return {"approved": len(reasons) == 0, "reject_reasons": reasons, "symbol": symbol, "direction": direction}
 
 
+
+# =========================================================
+# PHASE 3.5 ENFORCEMENT HELPERS
+# =========================================================
+def phase35_confidence_rank(confidence: str) -> int:
+    c = str(confidence or "").upper().strip()
+    ranks = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1, "D": 0, "AVOID": -1, "BLOCK": -2}
+    return ranks.get(c, 0)
+
+
+def phase35_confidence_ok(actual: str, minimum: str) -> bool:
+    return phase35_confidence_rank(actual) >= phase35_confidence_rank(minimum)
+
+
+def phase35_state() -> Dict[str, Any]:
+    data = load_json_file(PHASE35_ENFORCEMENT_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("schema_version", 1)
+    data.setdefault("last_reset_day", current_trade_day())
+    data.setdefault("blocks_today", 0)
+    data.setdefault("approvals_today", 0)
+    data.setdefault("last_block", {})
+    data.setdefault("last_approval", {})
+    data.setdefault("last_signal_by_symbol", {})
+    data.setdefault("last_signal_by_setup", {})
+    data.setdefault("used_signal_hashes", [])
+    if data.get("last_reset_day") != current_trade_day():
+        data["last_reset_day"] = current_trade_day()
+        data["blocks_today"] = 0
+        data["approvals_today"] = 0
+        data["last_signal_by_symbol"] = {}
+        data["last_signal_by_setup"] = {}
+        data["used_signal_hashes"] = []
+    return data
+
+
+def phase35_save_state(data: Dict[str, Any]):
+    atomic_write_json(PHASE35_ENFORCEMENT_FILE, data)
+
+
+def phase35_in_time_window() -> bool:
+    if not PHASE35_ENFORCE_TRADING_WINDOWS:
+        return True
+    if PHASE35_ALLOW_MIDDAY:
+        return True
+    now_m = hhmm_to_minutes(current_hhmm())
+    open_ok = hhmm_to_minutes(PHASE35_OPEN_WINDOW_START) <= now_m <= hhmm_to_minutes(PHASE35_OPEN_WINDOW_END)
+    power_ok = hhmm_to_minutes(PHASE35_POWER_WINDOW_START) <= now_m <= hhmm_to_minutes(PHASE35_POWER_WINDOW_END)
+    return open_ok or power_ok
+
+
+def phase35_signal_age_seconds(signal: Dict[str, Any]) -> int:
+    ts = safe_int(signal.get("timestamp", signal.get("created_at", 0)), 0)
+    if ts <= 0:
+        return 0
+    if ts > 10_000_000_000:
+        ts = int(ts / 1000)
+    return max(0, epoch() - ts)
+
+
+def phase35_setup_key(signal: Dict[str, Any]) -> str:
+    ticker = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
+    direction = str(signal.get("direction", "UNKNOWN")).upper().strip()
+    setup = str(signal.get("setup") or signal.get("strategy") or signal.get("trigger") or "GENERIC").upper().strip().replace(" ", "_")
+    confidence = str(signal.get("confidence", "NA")).upper().strip()
+    return f"{ticker}:{direction}:{confidence}:{setup[:60]}"
+
+
+def phase35_duplicate_symbol_direction_count(signal: Dict[str, Any]) -> int:
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    symbol = str(signal.get("symbol", "")).upper().strip()
+    direction = str(signal.get("direction", "")).upper().strip()
+    count = 0
+    for p in GLOBAL_POSITIONS.get("open_positions", []):
+        p_ticker = str(p.get("ticker", "")).upper().strip()
+        p_symbol = str(p.get("symbol", "")).upper().strip()
+        p_direction = str(p.get("direction", "")).upper().strip()
+        same_name = (ticker and p_ticker == ticker) or (symbol and p_symbol == symbol)
+        if same_name and direction and p_direction == direction:
+            count += 1
+    return count
+
+
+def phase35_reward_to_risk(signal: Dict[str, Any]) -> float:
+    entry = safe_float(signal.get("entry_contract", signal.get("entry", 0)), 0)
+    stop = safe_float(signal.get("stop_contract", signal.get("stop", 0)), 0)
+    tp1 = safe_float(signal.get("tp1_contract", signal.get("target", 0)), 0)
+    tp2 = safe_float(signal.get("tp2_contract", 0), 0)
+    unit_risk = entry - stop
+    if entry <= 0 or stop <= 0 or unit_risk <= 0:
+        return 0.0
+    candidates = []
+    if tp1 > entry:
+        candidates.append((tp1 - entry) / unit_risk)
+    if tp2 > entry:
+        candidates.append((tp2 - entry) / unit_risk)
+    return max(candidates) if candidates else 0.0
+
+
+def phase35_daily_loss_dollars_limit() -> float:
+    if PHASE35_MAX_DAILY_LOSS_DOLLARS > 0:
+        return PHASE35_MAX_DAILY_LOSS_DOLLARS
+    return get_account_equity() * PHASE35_MAX_DAILY_LOSS_PCT
+
+
+def phase35_estimated_new_risk_dollars(signal: Dict[str, Any]) -> float:
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    stop = safe_float(signal.get("stop_contract", 0), 0)
+    qty = safe_int(signal.get("qty", 0), 0)
+    if entry <= 0 or stop <= 0 or qty <= 0:
+        sd = signal.get("size_decision", {}) if isinstance(signal.get("size_decision", {}), dict) else {}
+        return safe_float(sd.get("unit_risk_dollars", 0), 0) * max(safe_int(sd.get("final_size", qty), 0), 0)
+    return max(entry - stop, 0.0) * 100.0 * qty
+
+
+def phase35_projected_heat_pct(signal: Dict[str, Any]) -> float:
+    equity = max(get_account_equity(), 1.0)
+    return (portfolio_heat_dollars() + phase35_estimated_new_risk_dollars(signal)) / equity
+
+
+def phase35_block(title: str, signal: Dict[str, Any], reasons: List[str], extras: str = "") -> Dict[str, Any]:
+    data = phase35_state()
+    data["blocks_today"] = safe_int(data.get("blocks_today", 0), 0) + 1
+    data["last_block"] = {
+        "time": now_ts(),
+        "ticker": signal.get("ticker"),
+        "symbol": signal.get("symbol"),
+        "direction": signal.get("direction"),
+        "confidence": signal.get("confidence"),
+        "reasons": reasons,
+        "extras": extras,
+    }
+    phase35_save_state(data)
+    try:
+        intel_event("phase35_enforcement_block", {"reasons": reasons, "extras": extras}, signal=signal, stage="phase35_enforcement", decision="blocked")
+    except Exception:
+        pass
+    if PHASE35_SEND_ALERTS:
+        msg = build_block_message(title, signal, reasons, extras)
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+    return {"approved": False, "stage": "phase35_enforcement", "reject_reasons": reasons, "extras": extras}
+
+
+def phase35_approve(signal: Dict[str, Any], notes: Optional[List[str]] = None) -> Dict[str, Any]:
+    data = phase35_state()
+    data["approvals_today"] = safe_int(data.get("approvals_today", 0), 0) + 1
+    key = phase35_setup_key(signal)
+    sym = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
+    data.setdefault("last_signal_by_symbol", {})[sym] = epoch()
+    data.setdefault("last_signal_by_setup", {})[key] = epoch()
+    hashes = data.setdefault("used_signal_hashes", [])
+    hashes.append(signal_hash(signal))
+    data["used_signal_hashes"] = hashes[-PHASE35_USED_SIGNAL_MEMORY:]
+    data["last_approval"] = {
+        "time": now_ts(),
+        "ticker": signal.get("ticker"),
+        "symbol": signal.get("symbol"),
+        "direction": signal.get("direction"),
+        "confidence": signal.get("confidence"),
+        "setup_key": key,
+    }
+    phase35_save_state(data)
+    try:
+        intel_event("phase35_enforcement_approved", {"notes": notes or []}, signal=signal, stage="phase35_enforcement", decision="approved")
+    except Exception:
+        pass
+    return {"approved": True, "stage": "phase35_enforcement", "notes": notes or []}
+
+
+def phase35_enforcement_gate(signal: Dict[str, Any], phase3_decision: Optional[Dict[str, Any]] = None, size_decision: Optional[Dict[str, Any]] = None, stage: str = "pre_size") -> Dict[str, Any]:
+    if not ENABLE_PHASE35_ENFORCEMENT:
+        return {"approved": True, "stage": "phase35_enforcement", "notes": ["phase35_disabled"]}
+
+    ensure_globals_initialized()
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+    phase3_decision = phase3_decision or {}
+    size_decision = size_decision or {}
+    reasons = []
+    notes = []
+
+    if PHASE35_SUGGEST_ONLY:
+        notes.append("suggest_only_enabled")
+
+    if GLOBAL_STATE.get("kill_switch", False):
+        reasons.append("phase35_kill_switch_active")
+    if GLOBAL_STATE.get("bot_paused", False):
+        reasons.append("phase35_bot_paused")
+    if not GLOBAL_STATE.get("engine_enabled", True):
+        reasons.append("phase35_engine_disabled")
+    if GLOBAL_STATE.get("reconciliation_required", False):
+        reasons.append("phase35_reconciliation_required")
+    if not GLOBAL_STATE.get("allow_entries", True):
+        reasons.append("phase35_entries_not_allowed")
+
+    if PHASE35_REQUIRE_PHASE3_APPROVAL and phase3_decision and not phase3_decision.get("approved", True):
+        reasons.append("phase35_phase3_not_approved")
+
+    confidence = str(signal.get("confidence", "")).upper().strip()
+    if not phase35_confidence_ok(confidence, PHASE35_MIN_CONFIDENCE_TO_EXECUTE):
+        reasons.append(f"phase35_confidence_below_execute_min_{confidence}_lt_{PHASE35_MIN_CONFIDENCE_TO_EXECUTE}")
+
+    if not phase35_in_time_window():
+        reasons.append("phase35_outside_approved_trading_window")
+
+    age = phase35_signal_age_seconds(signal)
+    if age > PHASE35_MAX_SIGNAL_AGE_SECONDS:
+        reasons.append(f"phase35_stale_signal_{age}s")
+    if age > PHASE35_MAX_ENTRY_AGE_SECONDS:
+        reasons.append(f"phase35_entry_age_exceeded_{age}s")
+
+    rr = phase35_reward_to_risk(signal)
+    if rr < PHASE35_MIN_RR_RATIO:
+        reasons.append(f"phase35_rr_too_low_{round(rr, 2)}")
+
+    dupes = phase35_duplicate_symbol_direction_count(signal)
+    if dupes >= PHASE35_MAX_DUPLICATE_SYMBOL_DIRECTION:
+        reasons.append(f"phase35_duplicate_symbol_direction_cap_{dupes}")
+
+    data = phase35_state()
+    sig_hash = signal_hash(signal)
+    if sig_hash in data.get("used_signal_hashes", []):
+        reasons.append("phase35_signal_hash_already_used")
+
+    sym = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
+    last_sym = safe_int(data.get("last_signal_by_symbol", {}).get(sym, 0), 0)
+    if last_sym and epoch() - last_sym < PHASE35_SYMBOL_COOLDOWN_SECONDS:
+        reasons.append(f"phase35_symbol_cooldown_{epoch() - last_sym}s")
+
+    setup_key = phase35_setup_key(signal)
+    last_setup = safe_int(data.get("last_signal_by_setup", {}).get(setup_key, 0), 0)
+    if last_setup and epoch() - last_setup < PHASE35_SETUP_COOLDOWN_SECONDS:
+        reasons.append(f"phase35_setup_cooldown_{epoch() - last_setup}s")
+
+    daily_loss = stable_daily_pnl_dollars()
+    max_daily_loss = phase35_daily_loss_dollars_limit()
+    if daily_loss <= -abs(max_daily_loss):
+        reasons.append(f"phase35_daily_loss_lockout_{daily_loss}")
+
+    if safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) >= PHASE35_BLOCK_AFTER_CONSECUTIVE_LOSSES:
+        reasons.append(f"phase35_consecutive_loss_lockout_{GLOBAL_STATE.get('consecutive_losses')}")
+
+    if size_decision:
+        final_size = safe_int(size_decision.get("final_size", signal.get("qty", 0)), 0)
+        if final_size <= 0:
+            reasons.append("phase35_final_size_zero")
+        projected_heat = phase35_projected_heat_pct(signal)
+        if projected_heat > PHASE35_MAX_PROJECTED_HEAT_PCT:
+            reasons.append(f"phase35_projected_heat_too_high_{round(projected_heat * 100, 2)}pct")
+
+    live_price = 0.0
+    try:
+        symbol = str(signal.get("symbol", "")).strip()
+        if symbol:
+            prices = load_market_prices()
+            live_price, _ = get_market_price_for_symbol(symbol, prices)
+    except Exception:
+        live_price = 0.0
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    if live_price > 0 and entry > 0:
+        dist = abs(live_price - entry) / entry
+        if dist > PHASE35_MAX_DISTANCE_FROM_ENTRY_PCT:
+            reasons.append(f"phase35_you_are_chasing_distance_{round(dist * 100, 2)}pct")
+
+    if PHASE35_REQUIRE_ADAPTIVE_STATS_SYNC:
+        try:
+            stats_payload = phase3_write_adaptive_stats(force=False)
+            if ENABLE_INTELLIGENCE_PHASE3 and not isinstance(stats_payload, dict):
+                reasons.append("phase35_adaptive_stats_not_synced")
+        except Exception:
+            reasons.append("phase35_adaptive_stats_sync_error")
+
+    if reasons and not PHASE35_SUGGEST_ONLY:
+        extra = f"Stage: {stage} | RR: {round(rr, 2)} | Age: {age}s | Daily PnL: ${daily_loss}"
+        return phase35_block("PHASE 3.5 ENFORCEMENT BLOCKED SIGNAL", signal, reasons, extra)
+
+    if reasons and PHASE35_SUGGEST_ONLY:
+        msg = build_block_message("PHASE 3.5 WARNING ONLY", signal, reasons, f"Suggest-only mode. Stage: {stage}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
+        notes.extend(reasons)
+
+    notes.append(f"phase35_ok_stage_{stage}")
+    return phase35_approve(signal, notes)
+
 def handle_new_signal(signal: Dict[str, Any]):
     try:
         intel_event(
@@ -5286,6 +5610,17 @@ def handle_new_signal(signal: Dict[str, Any]):
         return
 
     adaptive_signal = phase3_decision.get("adjusted_signal", regime_signal)
+
+    # PHASE 3.5: enforcement gate after adaptive intelligence, before sizing.
+    phase35_pre_size_decision = phase35_enforcement_gate(
+        adaptive_signal,
+        phase3_decision=phase3_decision,
+        size_decision=None,
+        stage="pre_size",
+    )
+    if not phase35_pre_size_decision["approved"]:
+        return
+
     size_decision = size_signal_by_stop(adaptive_signal)
     size_decision = phase3_apply_size_multiplier_to_decision(size_decision, phase3_decision)
     if not size_decision["approved"]:
@@ -5296,6 +5631,18 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     sized_signal = apply_size_decision_to_signal(adaptive_signal, size_decision)
     sized_signal["phase3_decision"] = {k: v for k, v in phase3_decision.items() if k != "adjusted_signal"}
+
+    # PHASE 3.5: final enforcement gate after sizing, before risk/order path.
+    phase35_final_decision = phase35_enforcement_gate(
+        sized_signal,
+        phase3_decision=phase3_decision,
+        size_decision=size_decision,
+        stage="final_pre_risk",
+    )
+    if not phase35_final_decision["approved"]:
+        return
+    sized_signal["phase35_decision"] = phase35_final_decision
+
     risk_decision = evaluate_risk_policy(sized_signal)
     if not risk_decision["approved"]:
         msg = build_block_message("RISK BLOCKED SIGNAL", sized_signal, risk_decision["reject_reasons"], f"Risk %: {round(risk_decision.get('risk_per_trade_pct', 0.0)*100, 3)} | Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0)*100, 3)}")
