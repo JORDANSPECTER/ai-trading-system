@@ -238,6 +238,25 @@ def phase3_setup_key(signal_or_trade: Dict[str, Any]) -> str:
     return f"{ticker}_{direction}_{confidence}_{setup}"
 
 
+def phase3_infer_winner(trade: Dict[str, Any]) -> bool:
+    """Robust W/L detection for adaptive learning. Fixes losses not being counted."""
+    pnl = safe_float(trade.get("realized_pnl_pct", trade.get("pnl_pct", 0)), 0)
+    if abs(pnl) > 0:
+        return pnl > 0
+    explicit = trade.get("winner", None)
+    if isinstance(explicit, bool):
+        return explicit
+    entry = safe_float(trade.get("entry_price", trade.get("entry", 0)), 0)
+    exit_price = safe_float(trade.get("exit_price", trade.get("exit", trade.get("last_price", 0))), 0)
+    if entry > 0 and exit_price > 0:
+        return exit_price > entry
+    return False
+
+
+def phase3_trade_result_letter(trade: Dict[str, Any]) -> str:
+    return "W" if phase3_infer_winner(trade) else "L"
+
+
 def phase3_load_disabled_setups() -> Dict[str, Any]:
     data = load_json_file(PHASE3_DISABLED_SETUPS_FILE, {})
     return data if isinstance(data, dict) else {}
@@ -267,7 +286,7 @@ def phase3_compute_setup_stats() -> Dict[str, Any]:
         })
         pnl = safe_float(t.get("realized_pnl_pct", t.get("pnl_pct", 0)), 0)
         r_mult = safe_float(t.get("r_multiple", 0), 0)
-        winner = bool(t.get("winner", pnl > 0))
+        winner = phase3_infer_winner(t)
         bucket["trades"] += 1
         bucket["wins"] += 1 if winner else 0
         bucket["losses"] += 0 if winner else 1
@@ -312,7 +331,7 @@ def phase3_write_adaptive_stats(force: bool = False) -> Dict[str, Any]:
 
 # =========================================================
 # PHASE 3.5 LOCKED LEARNING HOOK
-# Guarantees adaptive_setup_stats.json updates on every final close.
+# Guarantees adaptive_setup_stats.json updates on every final close, including LOSSES.
 # =========================================================
 def phase35_locked_learning_hook(position: Dict[str, Any], close_reason: str = ""):
     if not ENABLE_INTELLIGENCE_PHASE3:
@@ -327,7 +346,7 @@ def phase35_locked_learning_hook(position: Dict[str, Any], close_reason: str = "
             return
         pnl = safe_float(story.get("realized_pnl_pct", 0), 0)
         r_mult = safe_float(story.get("r_multiple", 0), 0)
-        winner = bool(story.get("winner", pnl > 0))
+        winner = phase3_infer_winner(story)
         stats[setup_key] = {
             "setup_key": setup_key,
             "ticker": str(story.get("ticker", "UNKNOWN")).upper(),
@@ -2359,7 +2378,7 @@ def intel_trade_story_from_position(position: Dict[str, Any], close_reason: str 
         "highest_price": safe_float(position.get("highest_price", 0), 0),
         "lowest_price": safe_float(position.get("lowest_price", 0), 0),
         "realized_pnl_pct": round(realized_pct, 4),
-        "winner": realized_pct > 0,
+        "winner": phase3_infer_winner({"realized_pnl_pct": realized_pct, "entry_price": entry, "exit_price": exit_price}),
         "r_multiple": r_multiple,
         "time_in_trade_seconds": max(0, closed_at - opened_at) if opened_at else 0,
         "close_reason": close_reason,
@@ -4123,6 +4142,25 @@ def phase3_setup_key(signal_or_trade: Dict[str, Any]) -> str:
     return f"{ticker}_{direction}_{confidence}_{setup}"
 
 
+def phase3_infer_winner(trade: Dict[str, Any]) -> bool:
+    """Robust W/L detection for adaptive learning. Fixes losses not being counted."""
+    pnl = safe_float(trade.get("realized_pnl_pct", trade.get("pnl_pct", 0)), 0)
+    if abs(pnl) > 0:
+        return pnl > 0
+    explicit = trade.get("winner", None)
+    if isinstance(explicit, bool):
+        return explicit
+    entry = safe_float(trade.get("entry_price", trade.get("entry", 0)), 0)
+    exit_price = safe_float(trade.get("exit_price", trade.get("exit", trade.get("last_price", 0))), 0)
+    if entry > 0 and exit_price > 0:
+        return exit_price > entry
+    return False
+
+
+def phase3_trade_result_letter(trade: Dict[str, Any]) -> str:
+    return "W" if phase3_infer_winner(trade) else "L"
+
+
 def phase3_load_disabled_setups() -> Dict[str, Any]:
     data = load_json_file(PHASE3_DISABLED_SETUPS_FILE, {})
     return data if isinstance(data, dict) else {}
@@ -4152,7 +4190,7 @@ def phase3_compute_setup_stats() -> Dict[str, Any]:
         })
         pnl = safe_float(t.get("realized_pnl_pct", t.get("pnl_pct", 0)), 0)
         r_mult = safe_float(t.get("r_multiple", 0), 0)
-        winner = bool(t.get("winner", pnl > 0))
+        winner = phase3_infer_winner(t)
         bucket["trades"] += 1
         bucket["wins"] += 1 if winner else 0
         bucket["losses"] += 0 if winner else 1
