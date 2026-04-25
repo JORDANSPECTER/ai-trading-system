@@ -1,6 +1,11 @@
 {
   "ticker": "QQQ",
+  "symbol": "QQQ",
   "direction": "CALL",
   "confidence": "A",
-  "timestamp": 9999999996
+  "entry": 430,
+  "stop": 428.5,
+  "target": 433,
+  "setup": "vwap_reclaim",
+  "timestamp": 9999999999
 }
