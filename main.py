@@ -265,11 +265,12 @@ PHASE1_SEND_ALERTS = os.getenv("PHASE1_SEND_ALERTS", "true").lower() == "true"
 # and writes lightweight performance summaries without changing live rules.
 # =========================================================
 ENABLE_INTELLIGENCE_PHASE1 = os.getenv("ENABLE_INTELLIGENCE_PHASE1", "true").lower() == "true"
-INTEL_EVENT_LOG_FILE = os.getenv("INTEL_EVENT_LOG_FILE", "intel_events.jsonl").strip()
+INTEL_EVENT_LOG_FILE = os.getenv("INTEL_EVENT_LOG_FILE", "event_log.jsonl").strip()
 INTEL_TRADE_MEMORY_FILE = os.getenv("INTEL_TRADE_MEMORY_FILE", "trade_memory.jsonl").strip()
-INTEL_ANALYTICS_FILE = os.getenv("INTEL_ANALYTICS_FILE", "performance_analytics.json").strip()
+INTEL_ANALYTICS_FILE = os.getenv("INTEL_ANALYTICS_FILE", "performance_summary.json").strip()
 INTEL_SEND_CLOSED_TRADE_SUMMARY = os.getenv("INTEL_SEND_CLOSED_TRADE_SUMMARY", "true").lower() == "true"
 INTEL_REBUILD_ANALYTICS_ON_CLOSE = os.getenv("INTEL_REBUILD_ANALYTICS_ON_CLOSE", "true").lower() == "true"
+INTEL_ANALYTICS_REFRESH_SECONDS = int(os.getenv("INTEL_ANALYTICS_REFRESH_SECONDS", "60"))
 
 # =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
@@ -1912,6 +1913,16 @@ def route_signal(signal: Dict[str, Any], state: Dict[str, Any]):
         send_to_discord(DISCORD_PREMIUM_WEBHOOK, build_premium_message(signal), "PREMIUM")
     if state.get("telegram_enabled", True):
         send_to_telegram(build_telegram_signal_message(signal))
+    try:
+        intel_event(
+            "signal_routed",
+            {"discord_enabled": state.get("discord_enabled", True), "telegram_enabled": state.get("telegram_enabled", True)},
+            signal=signal,
+            stage="routing",
+            decision="routed",
+        )
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -2098,6 +2109,47 @@ def intel_write_analytics_snapshot(force: bool = False):
             debug(f"INTEL ANALYTICS WRITTEN | trades={analytics.get('trade_count')} win_rate={analytics.get('win_rate')}")
     except Exception as e:
         log(f"❌ INTEL analytics write failed: {e}")
+
+
+def intel_bootstrap(reason: str = "boot"):
+    """Guarantee Intelligence Phase 1 creates its files and records a visible boot event."""
+    if not ENABLE_INTELLIGENCE_PHASE1:
+        return
+    try:
+        for path in [INTEL_EVENT_LOG_FILE, INTEL_TRADE_MEMORY_FILE]:
+            if not file_exists(path):
+                open(path, "a", encoding="utf-8").close()
+        intel_event(
+            "intelligence_layer_active",
+            {
+                "reason": reason,
+                "event_log_file": INTEL_EVENT_LOG_FILE,
+                "trade_memory_file": INTEL_TRADE_MEMORY_FILE,
+                "analytics_file": INTEL_ANALYTICS_FILE,
+            },
+            stage="intelligence",
+            decision="active",
+        )
+        intel_write_analytics_snapshot(force=True)
+        debug(f"🧠 INTELLIGENCE LAYER ACTIVE | files={INTEL_EVENT_LOG_FILE},{INTEL_TRADE_MEMORY_FILE},{INTEL_ANALYTICS_FILE}")
+    except Exception as e:
+        log(f"❌ INTEL bootstrap failed: {e}")
+
+
+def intel_periodic_snapshot():
+    """Write analytics on a timer so performance_summary.json stays fresh."""
+    if not ENABLE_INTELLIGENCE_PHASE1:
+        return
+    try:
+        ensure_globals_initialized()
+        last_key = "intel_last_analytics_ts"
+        last = safe_int(GLOBAL_STATE.get(last_key, 0), 0) if isinstance(GLOBAL_STATE, dict) else 0
+        if (epoch() - last) >= INTEL_ANALYTICS_REFRESH_SECONDS:
+            intel_write_analytics_snapshot(force=False)
+            GLOBAL_STATE[last_key] = epoch()
+            save_state(GLOBAL_STATE)
+    except Exception as e:
+        log(f"❌ INTEL periodic snapshot failed: {e}")
 
 
 # =========================================================
@@ -4040,7 +4092,27 @@ def should_route_signal(signal: Dict[str, Any]) -> bool:
 
 
 def handle_new_signal(signal: Dict[str, Any]):
+    try:
+        intel_event(
+            "signal_received",
+            {
+                "source": signal.get("source", "signal_file"),
+                "entry_contract": signal.get("entry_contract"),
+                "stop_contract": signal.get("stop_contract"),
+                "tp1_contract": signal.get("tp1_contract"),
+                "tp2_contract": signal.get("tp2_contract"),
+            },
+            signal=signal,
+            stage="signal_ingest",
+            decision="received",
+        )
+    except Exception:
+        pass
     if not GLOBAL_STATE.get("engine_enabled", True) or GLOBAL_STATE.get("kill_switch", False) or GLOBAL_STATE.get("bot_paused", False):
+        try:
+            intel_event("signal_ignored", {"engine_enabled": GLOBAL_STATE.get("engine_enabled", True), "kill_switch": GLOBAL_STATE.get("kill_switch", False), "bot_paused": GLOBAL_STATE.get("bot_paused", False)}, signal=signal, stage="engine_state", decision="ignored")
+        except Exception:
+            pass
         return
     if GLOBAL_STATE.get("reconciliation_required", False):
         msg = f"🚫 NEW TRADE BLOCKED\nReason: {GLOBAL_STATE.get('reconciliation_block_reason', 'reconciliation required')}\n⏰ {now_ts()}"
@@ -4389,6 +4461,9 @@ def boot():
     save_macro_store()
     debug_file_lookup(SIGNAL_FILE)
 
+    # INTELLIGENCE PHASE 1: create event/memory/analytics files immediately on boot.
+    intel_bootstrap("boot")
+
     if RUN_TEST_ON_START:
         run_startup_tests()
 
@@ -4406,6 +4481,7 @@ def boot():
 
 def runtime_housekeeping():
     ensure_globals_initialized()
+    intel_periodic_snapshot()
     # STEP 15: global kill/flatten guard runs before every other task.
     if not step15_global_guard():
         flush_dirty_stores(force=True)
@@ -4442,6 +4518,7 @@ def main_loop():
 
     while True:
         try:
+            intel_periodic_snapshot()
             process_telegram_updates()
 
             # =========================================================
