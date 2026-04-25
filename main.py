@@ -676,6 +676,28 @@ ALLOW_DUPLICATE_SIGNALS = os.getenv("ALLOW_DUPLICATE_SIGNALS", "true").lower() =
 FORCE_EXECUTION_MODE = os.getenv("FORCE_EXECUTION_MODE", "true").lower() == "true"
 FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "true").lower() == "true"
 
+# =========================================================
+# FINAL ELITE EXECUTION ROUTING LAYER
+# Normal mode: respects routing/freshness.
+# Force mode: bypasses routing/freshness for pipeline testing.
+# =========================================================
+
+# =========================================================
+# PAPER BROKER BRIDGE + ANTI-SPAM EXECUTION GUARD
+# One valid signal = one paper order + one paper position.
+# Prevents Discord spam and repeated execution of the same signal.
+# =========================================================
+ENABLE_PAPER_BROKER_BRIDGE = os.getenv("ENABLE_PAPER_BROKER_BRIDGE", "true").lower() == "true"
+PAPER_BRIDGE_ONE_SHOT = os.getenv("PAPER_BRIDGE_ONE_SHOT", "true").lower() == "true"
+PAPER_BRIDGE_COOLDOWN_SECONDS = int(os.getenv("PAPER_BRIDGE_COOLDOWN_SECONDS", "60"))
+PAPER_BRIDGE_CLEAR_SIGNAL_AFTER_EXECUTION = os.getenv("PAPER_BRIDGE_CLEAR_SIGNAL_AFTER_EXECUTION", "true").lower() == "true"
+PAPER_BRIDGE_ALLOW_FORCE_EXECUTION = os.getenv("PAPER_BRIDGE_ALLOW_FORCE_EXECUTION", "true").lower() == "true"
+
+ENABLE_ELITE_EXECUTION_ROUTING = os.getenv("ENABLE_ELITE_EXECUTION_ROUTING", "true").lower() == "true"
+FORCE_BYPASS_SIGNAL_ROUTING = os.getenv("FORCE_BYPASS_SIGNAL_ROUTING", "true").lower() == "true"
+FORCE_TREAT_SIGNAL_AS_FRESH = os.getenv("FORCE_TREAT_SIGNAL_AS_FRESH", "true").lower() == "true"
+
+
 ENABLE_PHASE35_STRATEGY_LOCK = os.getenv("ENABLE_PHASE35_STRATEGY_LOCK", "true").lower() == "true"
 PHASE35_ALLOWED_GRADES = {x.strip().upper() for x in os.getenv("PHASE35_ALLOWED_GRADES", "A,A+").split(",") if x.strip()}
 PHASE35_ALLOWED_TRIGGERS = {x.strip().lower() for x in os.getenv("PHASE35_ALLOWED_TRIGGERS", "vwap_reclaim,break_and_hold,rejection").split(",") if x.strip()}
@@ -2389,6 +2411,10 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def is_signal_fresh(signal: Dict[str, Any]) -> bool:
+    if elite_force_fresh_enabled():
+        debug("🚨 FINAL ELITE ROUTING — BYPASSING is_signal_fresh")
+        return True
+
     ts = safe_int(signal.get("timestamp", 0), 0)
     return True if ts <= 0 else (epoch() - ts) <= MAX_SIGNAL_AGE_SECONDS
 
@@ -2415,8 +2441,11 @@ def load_active_signal_file() -> Optional[Dict[str, Any]]:
             return None
         signal = normalize_signal(raw)
         if not is_signal_fresh(signal):
-            log("❌ Signal skipped: stale timestamp")
-            return None
+            if elite_force_fresh_enabled():
+                debug("🚨 FINAL ELITE ROUTING — TREATING STALE SIGNAL AS FRESH")
+            else:
+                log("❌ Signal skipped: stale timestamp")
+                return None
         return signal
     except Exception as e:
         log(f"❌ Failed loading active signal file: {e}")
@@ -5517,7 +5546,48 @@ def phase2_reconciliation_guard() -> Dict[str, Any]:
 # =========================================================
 # SIGNAL HANDLER
 # =========================================================
+
+# =========================================================
+# FINAL ELITE EXECUTION ROUTING HELPERS
+# =========================================================
+def elite_force_routing_enabled() -> bool:
+    try:
+        return bool(ENABLE_ELITE_EXECUTION_ROUTING and FORCE_EXECUTION_MODE and FORCE_BYPASS_SIGNAL_ROUTING)
+    except Exception:
+        return False
+
+
+def elite_force_fresh_enabled() -> bool:
+    try:
+        return bool(ENABLE_ELITE_EXECUTION_ROUTING and FORCE_EXECUTION_MODE and FORCE_TREAT_SIGNAL_AS_FRESH)
+    except Exception:
+        return False
+
+
+def elite_routing_decision(signal: Dict[str, Any], original_ok: bool, reason: str = "") -> bool:
+    if original_ok:
+        return True
+    if elite_force_routing_enabled():
+        debug(f"🚨 FINAL ELITE ROUTING — FORCE BYPASS | reason={reason}")
+        return True
+    return False
+
+
+def elite_fresh_decision(signal: Dict[str, Any], original_ok: bool, reason: str = "") -> bool:
+    if original_ok:
+        return True
+    if elite_force_fresh_enabled():
+        debug(f"🚨 FINAL ELITE ROUTING — TREATING SIGNAL AS FRESH | reason={reason}")
+        return True
+    return False
+
+
+
 def should_route_signal(signal: Dict[str, Any]) -> bool:
+    if elite_force_routing_enabled():
+        debug("🚨 FINAL ELITE ROUTING — should_route_signal force exit")
+        return True
+
     new_hash = signal_hash(signal)
     if new_hash == GLOBAL_STATE.get("last_signal_hash", ""):
         return False
@@ -5853,11 +5923,7 @@ def phase35_strategy_execution_lock(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Hard strategy filter before any paper/live execution."""
     if FORCE_EXECUTION_MODE:
         log("🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK")
-        try:
-            send_to_discord(DISCORD_AI_WEBHOOK, "🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK", "AI")
-            send_to_telegram("🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK")
-        except Exception:
-            pass
+        # Anti-spam: keep force bypass in logs only. Paper bridge sends execution alert once.
         return {
             "approved": True,
             "stage": "phase35_strategy_lock",
@@ -6113,8 +6179,246 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         send_to_telegram(f"🚨 {err}")
         return None
 
+
+# =========================================================
+# PAPER BROKER BRIDGE + ANTI-SPAM HELPERS
+# =========================================================
+def paper_bridge_signal_hash(signal: Dict[str, Any]) -> str:
+    try:
+        return hashlib.sha256(json.dumps(signal, sort_keys=True, default=str).encode()).hexdigest()
+    except Exception:
+        return hashlib.sha256(str(signal).encode()).hexdigest()
+
+
+def paper_bridge_load_orders_store() -> Dict[str, Any]:
+    data = load_json_file(ORDERS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("schema_version", 2)
+    data.setdefault("orders", [])
+    data.setdefault("last_local_order_id", 0)
+    return data
+
+
+def paper_bridge_save_orders_store(data: Dict[str, Any]) -> None:
+    atomic_write_json(ORDERS_FILE, data)
+
+
+def paper_bridge_load_positions_store() -> Dict[str, Any]:
+    data = load_json_file(POSITIONS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("schema_version", 2)
+    data.setdefault("open_positions", [])
+    data.setdefault("closed_positions", [])
+    data.setdefault("last_position_id", 0)
+    return data
+
+
+def paper_bridge_save_positions_store(data: Dict[str, Any]) -> None:
+    atomic_write_json(POSITIONS_FILE, data)
+
+
+def paper_bridge_should_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
+    ensure_globals_initialized()
+    sig_hash = paper_bridge_signal_hash(signal)
+    current_time = epoch()
+
+    last_hash = str(GLOBAL_STATE.get("paper_bridge_last_executed_hash", ""))
+    last_time = safe_int(GLOBAL_STATE.get("paper_bridge_last_executed_time", 0), 0)
+
+    if PAPER_BRIDGE_ONE_SHOT and sig_hash == last_hash:
+        elapsed = current_time - last_time
+        if elapsed < PAPER_BRIDGE_COOLDOWN_SECONDS:
+            reason = f"paper_bridge_duplicate_cooldown:{elapsed}s_lt_{PAPER_BRIDGE_COOLDOWN_SECONDS}s"
+            debug(f"🛑 PAPER BRIDGE COOLDOWN BLOCK | {reason}")
+            return {"approved": False, "reason": reason, "hash": sig_hash}
+
+    return {"approved": True, "reason": "approved", "hash": sig_hash}
+
+
+def paper_bridge_mark_executed(sig_hash: str) -> None:
+    ensure_globals_initialized()
+    GLOBAL_STATE["paper_bridge_last_executed_hash"] = sig_hash
+    GLOBAL_STATE["paper_bridge_last_executed_time"] = epoch()
+    save_state(GLOBAL_STATE)
+
+
+def paper_bridge_extract_prices(signal: Dict[str, Any]) -> Dict[str, float]:
+    entry = safe_float(signal.get("entry_contract", signal.get("contract_price", signal.get("entry", 0))), 0.0)
+    stop = safe_float(signal.get("stop_contract", signal.get("stop", 0)), 0.0)
+    target = safe_float(signal.get("tp1_contract", signal.get("target", 0)), 0.0)
+    tp2 = safe_float(signal.get("tp2_contract", signal.get("target_2", target)), target)
+    return {"entry": entry, "stop": stop, "target": target, "tp2": tp2}
+
+
+def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
+    orders_store = paper_bridge_load_orders_store()
+    orders_store["last_local_order_id"] = safe_int(orders_store.get("last_local_order_id", 0), 0) + 1
+
+    prices = paper_bridge_extract_prices(signal)
+    qty = safe_int(signal.get("qty", signal.get("qty_hint", 1)), 1)
+    symbol = str(signal.get("symbol") or signal.get("contract_symbol") or signal.get("ticker") or "").strip()
+    ticker = str(signal.get("ticker") or signal.get("underlying") or symbol).upper().strip()
+    direction = normalize_direction(signal.get("direction", "CALL"))
+
+    order = {
+        "order_id": f"PAPER-{orders_store['last_local_order_id']}",
+        "broker": "paper_bridge",
+        "status": "created",
+        "created_at": now_ts(),
+        "timestamp": epoch(),
+        "ticker": ticker,
+        "symbol": symbol,
+        "contract_symbol": str(signal.get("contract_symbol", symbol)).strip(),
+        "asset_class": str(signal.get("asset_class", "option")).lower(),
+        "direction": direction,
+        "side": "BUY",
+        "qty": qty,
+        "entry": prices["entry"],
+        "stop": prices["stop"],
+        "target": prices["target"],
+        "tp2": prices["tp2"],
+        "grade": str(signal.get("grade", signal.get("confidence", ""))).upper(),
+        "confidence": str(signal.get("confidence", "")).upper(),
+        "setup": str(signal.get("setup", "")),
+        "trigger": str(signal.get("trigger", "")),
+        "source": str(signal.get("source", "signal_file")),
+        "raw_signal_hash": paper_bridge_signal_hash(signal),
+    }
+
+    orders_store["orders"].append(order)
+    paper_bridge_save_orders_store(orders_store)
+    debug(f"📄 PAPER ORDER CREATED | {order['order_id']} | {ticker} {direction} qty={qty}")
+    return order
+
+
+def paper_bridge_fill_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    order = deepcopy(order)
+    order["status"] = "filled"
+    order["filled_at"] = now_ts()
+    order["fill_price"] = safe_float(order.get("entry", 0), 0.0)
+
+    orders_store = paper_bridge_load_orders_store()
+    updated = False
+    for i, existing in enumerate(orders_store.get("orders", [])):
+        if existing.get("order_id") == order.get("order_id"):
+            orders_store["orders"][i] = order
+            updated = True
+            break
+    if not updated:
+        orders_store.setdefault("orders", []).append(order)
+    paper_bridge_save_orders_store(orders_store)
+
+    debug(f"✅ PAPER ORDER FILLED | {order['order_id']} | fill={order['fill_price']}")
+    return order
+
+
+def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
+    positions_store = paper_bridge_load_positions_store()
+    positions_store["last_position_id"] = safe_int(positions_store.get("last_position_id", 0), 0) + 1
+
+    entry = safe_float(order.get("fill_price", order.get("entry", 0)), 0.0)
+    stop = safe_float(order.get("stop", 0), 0.0)
+
+    position = {
+        "position_id": f"POS-{positions_store['last_position_id']}",
+        "order_id": order.get("order_id"),
+        "broker": "paper_bridge",
+        "status": "open",
+        "opened_at": now_ts(),
+        "timestamp": epoch(),
+        "ticker": order.get("ticker"),
+        "symbol": order.get("symbol"),
+        "contract_symbol": order.get("contract_symbol"),
+        "asset_class": order.get("asset_class", "option"),
+        "direction": order.get("direction"),
+        "qty": safe_int(order.get("qty", 1), 1),
+        "entry": entry,
+        "entry_price": entry,
+        "stop": stop,
+        "stop_price": stop,
+        "target": safe_float(order.get("target", 0), 0.0),
+        "tp2": safe_float(order.get("tp2", order.get("target", 0)), 0.0),
+        "grade": order.get("grade"),
+        "confidence": order.get("confidence"),
+        "setup": order.get("setup"),
+        "trigger": order.get("trigger"),
+        "risk_per_contract": round(abs(entry - stop) * 100, 2),
+        "unrealized_pnl": 0.0,
+        "realized_pnl": 0.0,
+    }
+
+    positions_store.setdefault("open_positions", []).append(position)
+    paper_bridge_save_positions_store(positions_store)
+    debug(f"📌 PAPER POSITION OPENED | {position['position_id']} | {position['ticker']} {position['direction']} qty={position['qty']}")
+    return position
+
+
+def paper_bridge_alert(order: Dict[str, Any], position: Dict[str, Any]) -> None:
+    msg = (
+        "✅ PAPER BROKER BRIDGE EXECUTED\n"
+        f"Ticker: {order.get('ticker')}\n"
+        f"Symbol: {order.get('symbol')}\n"
+        f"Direction: {order.get('direction')}\n"
+        f"Qty: {order.get('qty')}\n"
+        f"Entry: {order.get('entry')}\n"
+        f"Stop: {order.get('stop')}\n"
+        f"Target: {order.get('target')}\n"
+        f"Order: {order.get('order_id')}\n"
+        f"Position: {position.get('position_id')}"
+    )
+    try:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+    except Exception as e:
+        debug(f"paper_bridge_alert_error:{e}")
+
+
+def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_PAPER_BROKER_BRIDGE:
+        return {"executed": False, "reason": "paper_bridge_disabled"}
+
+    if FORCE_EXECUTION_MODE and not PAPER_BRIDGE_ALLOW_FORCE_EXECUTION:
+        return {"executed": False, "reason": "force_execution_not_allowed_by_paper_bridge"}
+
+    gate = paper_bridge_should_execute(signal)
+    if not gate.get("approved"):
+        return {"executed": False, "reason": gate.get("reason"), "hash": gate.get("hash")}
+
+    order = paper_bridge_create_order(signal)
+    filled = paper_bridge_fill_order(order)
+    position = paper_bridge_open_position(filled)
+
+    paper_bridge_mark_executed(gate.get("hash", ""))
+
+    if PAPER_BRIDGE_CLEAR_SIGNAL_AFTER_EXECUTION:
+        try:
+            atomic_write_json(SIGNAL_FILE, {})
+            debug(f"🧹 PAPER BRIDGE CLEARED SIGNAL FILE | {SIGNAL_FILE}")
+        except Exception as e:
+            debug(f"paper_bridge_clear_signal_error:{e}")
+
+    paper_bridge_alert(filled, position)
+
+    return {"executed": True, "reason": "paper_order_filled_position_opened", "order": filled, "position": position}
+
+
+
 def handle_new_signal(signal: Dict[str, Any]):
     debug(f"CONTROL FLAGS | force_execution={FORCE_EXECUTION_MODE} | allow_duplicates={ALLOW_DUPLICATE_SIGNALS}")
+
+    # =========================================================
+    # PAPER BROKER BRIDGE ROUTER
+    # In force/testing mode, this creates exactly one paper order
+    # and one paper position per signal hash/cooldown.
+    # =========================================================
+    if ENABLE_PAPER_BROKER_BRIDGE and FORCE_EXECUTION_MODE:
+        bridge_result = paper_broker_bridge_execute(signal)
+        debug(f"PAPER BROKER BRIDGE RESULT | executed={bridge_result.get('executed')} | reason={bridge_result.get('reason')}")
+        if bridge_result.get("executed"):
+            return
     try:
         intel_event(
             "signal_received",
@@ -6143,9 +6447,12 @@ def handle_new_signal(signal: Dict[str, Any]):
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
         return
     if not should_route_signal(signal):
-        debug("PHASE 3 NOT RUN | no fresh routable signal or position-management cycle only")
-        manage_open_positions(signal)
-        return
+        if elite_force_routing_enabled():
+            debug("🚨 FINAL ELITE ROUTING — BYPASSING SIGNAL ROUTING")
+        else:
+            debug("PHASE 3 NOT RUN | no fresh routable signal or position-management cycle only")
+            manage_open_positions(signal)
+            return
 
     duplicate_gate = hard_duplicate_entry_gate(signal)
     if not duplicate_gate["approved"]:
@@ -6641,6 +6948,7 @@ def main_loop():
         try:
             intel_periodic_snapshot()
             process_telegram_updates()
+            debug(f"FINAL ELITE ROUTING FLAGS | force={FORCE_EXECUTION_MODE} | bypass_routing={FORCE_BYPASS_SIGNAL_ROUTING} | treat_fresh={FORCE_TREAT_SIGNAL_AS_FRESH}")
 
             # =========================================================
             # PERSISTENT SIGNAL LISTENER
@@ -6652,7 +6960,7 @@ def main_loop():
                 if live_signal_poll:
                     live_hash = signal_hash(live_signal_poll)
                     last_hash = str(GLOBAL_STATE.get("last_signal_hash", ""))
-                    if live_hash != last_hash or ALLOW_DUPLICATE_SIGNALS:
+                    if live_hash != last_hash or ALLOW_DUPLICATE_SIGNALS or elite_force_routing_enabled():
                         if live_hash == last_hash and ALLOW_DUPLICATE_SIGNALS:
                             debug(f"⚠️ DUPLICATE SIGNAL ALLOWED | hash={live_hash[:12]}")
                         else:
