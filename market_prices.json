@@ -1,6 +1,5 @@
-cat > market_prices.json << 'EOF'
 {
   "SPY": { "price": 1.35 },
   "QQQ": { "price": 1.35 }
 }
-EOF
+
