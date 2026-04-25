@@ -749,6 +749,10 @@ def default_state() -> Dict[str, Any]:
         "boot_time": epoch(),
         "notes": "",
         "daily_realized_pnl_pct": 0.0,
+        "daily_realized_pnl_dollars": 0.0,
+        "daily_pnl_last_update": 0,
+        "allow_entries": True,
+        "hard_kill_reason": "",
         "consecutive_losses": 0,
         "last_trade_day": current_trade_day(),
         "kill_switch": False,
@@ -932,10 +936,61 @@ def reset_daily_risk_counters_if_needed(state: Dict[str, Any]):
     today = current_trade_day()
     if state.get("last_trade_day") != today:
         state["daily_realized_pnl_pct"] = 0.0
+        state["daily_realized_pnl_dollars"] = 0.0
+        state["daily_pnl_last_update"] = epoch()
         state["consecutive_losses"] = 0
         state["last_trade_day"] = today
         save_state(state)
 
+
+
+
+# =========================================================
+# FINAL PRE-3.5 PATCH: STABLE DAILY PNL PERSISTENCE
+# =========================================================
+def paper_pnl_dollars(entry_price: float, exit_price: float, qty: int, multiplier: float = 100.0) -> float:
+    entry = safe_float(entry_price, 0.0)
+    exitp = safe_float(exit_price, 0.0)
+    q = safe_int(qty, 0)
+    if entry <= 0 or exitp <= 0 or q <= 0:
+        return 0.0
+    return round((exitp - entry) * multiplier * q, 2)
+
+
+def update_daily_realized_pnl(delta_dollars: float = 0.0, delta_pct_decimal: float = 0.0, source: str = ""):
+    ensure_globals_initialized()
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+    old_dollars = safe_float(GLOBAL_STATE.get("daily_realized_pnl_dollars", 0.0), 0.0)
+    old_pct = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
+    delta_dollars = safe_float(delta_dollars, 0.0)
+    delta_pct_decimal = safe_float(delta_pct_decimal, 0.0)
+    new_dollars = round(old_dollars + delta_dollars, 2)
+    new_pct = round(old_pct + delta_pct_decimal, 8)
+    if delta_dollars == 0 and abs(new_dollars) < abs(old_dollars):
+        debug(f"PNL RESET IGNORED | old={old_dollars} new={new_dollars} source={source}")
+        new_dollars = old_dollars
+    if delta_pct_decimal == 0 and abs(new_pct) < abs(old_pct):
+        new_pct = old_pct
+    GLOBAL_STATE["daily_realized_pnl_dollars"] = new_dollars
+    GLOBAL_STATE["daily_realized_pnl_pct"] = new_pct
+    GLOBAL_STATE["daily_pnl_last_update"] = epoch()
+    save_state(GLOBAL_STATE)
+    debug(f"PNL PERSISTED | source={source} | delta=${round(delta_dollars,2)} | daily_pnl=${new_dollars} | daily_pct={round(new_pct*100,4)}%")
+
+
+def stable_daily_pnl_dollars() -> float:
+    ensure_globals_initialized()
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+    stored = safe_float(GLOBAL_STATE.get("daily_realized_pnl_dollars", 0.0), 0.0)
+    legacy_pct = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
+    legacy_dollars = round(normalize_pnl_value_to_decimal(legacy_pct) * get_account_equity(), 2) if legacy_pct else 0.0
+    chosen = stored if abs(stored) >= abs(legacy_dollars) else legacy_dollars
+    if abs(chosen) > abs(stored):
+        GLOBAL_STATE["daily_realized_pnl_dollars"] = chosen
+        GLOBAL_STATE["daily_pnl_last_update"] = epoch()
+        save_state(GLOBAL_STATE)
+        debug(f"PNL LEGACY SYNC | stored=${stored} legacy=${legacy_dollars} chosen=${chosen}")
+    return round(chosen, 2)
 
 def append_recent_signal_hash(state: Dict[str, Any], sig_hash: str, max_keep: int = 50):
     hashes = state.get("recent_signal_hashes", [])
@@ -2519,6 +2574,10 @@ def scale_out_local(position: Dict[str, Any], qty_to_close: int, fill_price: flo
     )
     if str(position.get("mode", "")).upper() == "PAPER":
         phase2_record_paper_order(position, side="sell", qty=qty_to_close, fill_price=fill_price, note=note)
+        basis = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+        scale_delta_dollars = paper_pnl_dollars(basis, fill_price, qty_to_close)
+        scale_delta_pct = pct_change(basis, fill_price) / 100.0 if basis > 0 else 0.0
+        update_daily_realized_pnl(scale_delta_dollars, scale_delta_pct, source=f"scale_out:{note}")
         phase2_post_fill_risk_snapshot("paper_scale_out")
     return True
 
@@ -2536,7 +2595,8 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
 
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
     realized_pct_decimal = position["realized_pnl_pct"] / 100.0
-    GLOBAL_STATE["daily_realized_pnl_pct"] = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0) + realized_pct_decimal
+    close_delta_dollars = paper_pnl_dollars(basis, position["exit_price"], pre_close_qty) if str(position.get("mode", "")).upper() == "PAPER" else round(realized_pct_decimal * get_account_equity(), 2)
+    update_daily_realized_pnl(close_delta_dollars, realized_pct_decimal, source=f"final_close:{note}")
     GLOBAL_STATE["consecutive_losses"] = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) + 1 if position["realized_pnl_pct"] < 0 else 0
     save_state(GLOBAL_STATE)
 
@@ -3721,12 +3781,8 @@ def normalize_pnl_value_to_decimal(raw_value: float) -> float:
 
 
 def step14_daily_pnl_dollars() -> float:
-    """Approximate daily realized PnL in dollars from normalized engine state."""
-    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
-    equity = get_account_equity()
-    pnl_raw = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
-    pnl_decimal = normalize_pnl_value_to_decimal(pnl_raw)
-    return round(pnl_decimal * equity, 2)
+    """Stable daily realized PnL in dollars. Never silently resets intraday."""
+    return stable_daily_pnl_dollars()
 
 
 def step14_open_trade_count() -> int:
@@ -3826,9 +3882,12 @@ def step14_global_risk_guard() -> bool:
     if daily_pnl <= -abs(daily_loss_limit):
         GLOBAL_STATE["kill_switch"] = True
         GLOBAL_STATE["bot_paused"] = True
+        GLOBAL_STATE["allow_entries"] = False
+        GLOBAL_STATE["hard_kill_reason"] = f"Daily PnL ${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}"
         GLOBAL_STATE["step14_daily_loss_shutdown_at"] = epoch()
         GLOBAL_STATE["step14_daily_loss_shutdown_reason"] = f"Daily PnL ${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}"
         save_state(GLOBAL_STATE)
+        debug(f"STEP 14 HARD LOSS LIMIT HIT | daily_pnl={daily_pnl} | limit=-{round(abs(daily_loss_limit),2)} | kill=True")
 
         step14_send_alert(
             "STEP 14 EMERGENCY STOP",
@@ -3976,6 +4035,12 @@ def step15_global_guard() -> bool:
     daily_loss_limit = step14_daily_loss_limit_dollars()
 
     if daily_pnl <= -abs(daily_loss_limit):
+        GLOBAL_STATE["kill_switch"] = True
+        GLOBAL_STATE["bot_paused"] = True
+        GLOBAL_STATE["allow_entries"] = False
+        GLOBAL_STATE["hard_kill_reason"] = f"daily_pnl ${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}"
+        save_state(GLOBAL_STATE)
+        debug(f"HARD LOSS LIMIT HIT | daily_pnl={daily_pnl} | limit=-{round(abs(daily_loss_limit),2)} | kill=True")
         hard_kill_engine(
             f"STEP 15 DAILY LOSS LIMIT HIT: daily_pnl=${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}",
             close_positions=STEP15_CLOSE_ALL_ON_KILL,
