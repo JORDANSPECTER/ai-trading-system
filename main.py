@@ -4435,6 +4435,22 @@ def step14_loop_enforcement() -> bool:
 # =========================================================
 # STEP 15 GLOBAL KILL SWITCH / FLATTEN ENGINE
 # =========================================================
+
+# =========================================================
+# STEP 15 MODE SAFE ACCESSOR
+# Prevents KeyError: 'mode' during flatten / close logic.
+# =========================================================
+def get_position_mode(pos: Dict[str, Any]) -> str:
+    try:
+        if not isinstance(pos, dict):
+            return "paper"
+        mode = str(pos.get("mode", "paper")).lower().strip()
+        return mode if mode else "paper"
+    except Exception:
+        return "paper"
+
+
+
 def step15_alert(title: str, body: str, force: bool = False):
     """Send emergency Step 15 alerts with simple cooldown protection."""
     ensure_globals_initialized()
@@ -5136,6 +5152,9 @@ def repair_position_schema_for_step15() -> Dict[str, Any]:
                 elif not isinstance(pos.get("notes"), list):
                     pos["notes"] = [str(pos.get("notes"))]
                     changed = True
+                if "mode" not in pos or not pos.get("mode"):
+                    pos["mode"] = "paper"
+                    changed = True
 
         result["open"] = len(data.get("open_positions", []))
         result["closed"] = len(data.get("closed_positions", []))
@@ -5148,6 +5167,49 @@ def repair_position_schema_for_step15() -> Dict[str, Any]:
         return result
     except Exception as e:
         debug(f"POSITION SCHEMA REPAIR ERROR: {e}")
+        return result
+
+
+
+
+def repair_position_mode_for_step15() -> Dict[str, Any]:
+    result = {"repaired": False, "open": 0, "closed": 0}
+    try:
+        data = load_json_file(POSITIONS_FILE, {})
+        if not isinstance(data, dict):
+            return result
+        changed = False
+        for bucket in ["open_positions", "closed_positions"]:
+            rows = data.get(bucket, [])
+            if not isinstance(rows, list):
+                continue
+            for pos in rows:
+                if not isinstance(pos, dict):
+                    continue
+                if "mode" not in pos or not pos.get("mode"):
+                    pos["mode"] = "paper"
+                    changed = True
+                if "id" not in pos or not pos.get("id"):
+                    pos["id"] = pos.get("position_id") or f"POS-{safe_int(data.get('last_position_id', 0), 0)}"
+                    changed = True
+                if "notes" not in pos or pos.get("notes") is None:
+                    pos["notes"] = []
+                    changed = True
+                if "qty_total" not in pos:
+                    pos["qty_total"] = safe_int(pos.get("qty", pos.get("qty_open", 1)), 1)
+                    changed = True
+                if "qty_open" not in pos:
+                    pos["qty_open"] = safe_int(pos.get("qty", pos.get("qty_total", 1)), 1) if str(pos.get("status", "open")).lower() == "open" else 0
+                    changed = True
+        result["open"] = len(data.get("open_positions", []))
+        result["closed"] = len(data.get("closed_positions", []))
+        if changed:
+            atomic_write_json(POSITIONS_FILE, data)
+            result["repaired"] = True
+            debug(f"POSITION MODE REPAIR OK | {result}")
+        return result
+    except Exception as e:
+        debug(f"POSITION MODE REPAIR ERROR: {e}")
         return result
 
 
@@ -6453,10 +6515,12 @@ def normalize_locked_position_schema(pos: Dict[str, Any]) -> Dict[str, Any]:
     fixed.update({
         "position_id": position_id,
         "id": position_id,
+        "broker": str(pos.get("broker", "paper_bridge")),
         "ticker": ticker,
         "symbol": symbol,
         "contract_symbol": str(pos.get("contract_symbol") or symbol).strip(),
         "asset_class": str(pos.get("asset_class", "option")).lower(),
+        "mode": str(pos.get("mode", "paper")).lower(),
         "direction": direction,
         "status": str(pos.get("status", "open")).lower(),
         "qty": qty,
@@ -6639,6 +6703,7 @@ def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
         "id": f"POS-{positions_store['last_position_id']}",
         "order_id": order.get("order_id"),
         "broker": "paper_bridge",
+        "mode": "paper",
         "status": "open",
         "opened_at": now_ts(),
         "timestamp": epoch(),
@@ -7022,7 +7087,7 @@ def parse_command(text: str) -> str:
 
 def close_all_open_positions():
     for position in list(GLOBAL_POSITIONS["open_positions"]):
-        if position["mode"] == "LIVE":
+        if get_position_mode(position) == "LIVE":
             live_close_position(position, "Manual close all")
         else:
             finalize_close_position(position, position["last_price"], "Manual close all")
@@ -7178,6 +7243,7 @@ def fallback_signal() -> Dict[str, Any]:
 # BOOT + LOOP
 # =========================================================
 def boot():
+    repair_position_mode_for_step15()
     repair_and_lock_positions_schema()
     repair_position_schema_for_step15()
     global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON, GLOBAL_MACRO
