@@ -1,3 +1,6 @@
+cat > market_prices.json << 'EOF'
 {
-  "QQQ260427C00664000": 1.30
+  "SPY": { "price": 1.35 },
+  "QQQ": { "price": 1.35 }
 }
+EOF
