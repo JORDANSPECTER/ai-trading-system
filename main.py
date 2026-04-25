@@ -225,6 +225,208 @@ STEP15_SEND_ALERTS = os.getenv("STEP15_SEND_ALERTS", "true").lower() == "true"
 STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "60"))
 
 
+
+# =========================================================
+# INTELLIGENCE PHASE 3: ADAPTIVE INTELLIGENCE
+# =========================================================
+def phase3_setup_key(signal_or_trade: Dict[str, Any]) -> str:
+    ticker = str(signal_or_trade.get("ticker", "UNKNOWN")).upper().strip()
+    direction = str(signal_or_trade.get("direction", "UNKNOWN")).upper().strip()
+    confidence = str(signal_or_trade.get("confidence", "NA")).upper().strip()
+    setup = str(signal_or_trade.get("setup") or signal_or_trade.get("strategy") or signal_or_trade.get("trigger") or "GENERIC").upper().strip()
+    setup = setup.replace(" ", "_")[:40]
+    return f"{ticker}_{direction}_{confidence}_{setup}"
+
+
+def phase3_load_disabled_setups() -> Dict[str, Any]:
+    data = load_json_file(PHASE3_DISABLED_SETUPS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def phase3_save_disabled_setups(data: Dict[str, Any]):
+    atomic_write_json(PHASE3_DISABLED_SETUPS_FILE, data)
+
+
+def phase3_compute_setup_stats() -> Dict[str, Any]:
+    trades = intel_load_trade_memory()
+    stats: Dict[str, Any] = {}
+    for t in trades:
+        key = phase3_setup_key(t)
+        bucket = stats.setdefault(key, {
+            "setup_key": key,
+            "ticker": str(t.get("ticker", "UNKNOWN")).upper(),
+            "direction": str(t.get("direction", "UNKNOWN")).upper(),
+            "confidence": str(t.get("confidence", "NA")).upper(),
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_r": 0.0,
+            "total_pnl_pct": 0.0,
+            "recent_results": [],
+            "last_trade_ts": 0,
+        })
+        pnl = safe_float(t.get("realized_pnl_pct", t.get("pnl_pct", 0)), 0)
+        r_mult = safe_float(t.get("r_multiple", 0), 0)
+        winner = bool(t.get("winner", pnl > 0))
+        bucket["trades"] += 1
+        bucket["wins"] += 1 if winner else 0
+        bucket["losses"] += 0 if winner else 1
+        bucket["total_r"] += r_mult
+        bucket["total_pnl_pct"] += pnl
+        bucket["recent_results"].append("W" if winner else "L")
+        bucket["recent_results"] = bucket["recent_results"][-PHASE3_DISABLE_LAST_N:]
+        bucket["last_trade_ts"] = max(safe_int(bucket.get("last_trade_ts", 0), 0), safe_int(t.get("closed_ts", t.get("timestamp", 0)), 0))
+
+    for key, bucket in stats.items():
+        total = max(safe_int(bucket.get("trades", 0), 0), 1)
+        bucket["win_rate"] = round(bucket.get("wins", 0) / total, 4)
+        bucket["avg_r"] = round(bucket.get("total_r", 0.0) / total, 4)
+        bucket["avg_pnl_pct"] = round(bucket.get("total_pnl_pct", 0.0) / total, 4)
+        recent = bucket.get("recent_results", [])[-PHASE3_DISABLE_LAST_N:]
+        bucket["recent_loss_count"] = sum(1 for x in recent if x == "L")
+    return stats
+
+
+def phase3_write_adaptive_stats(force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return {}
+    try:
+        stats = phase3_compute_setup_stats()
+        payload = {
+            "generated_at": now_ts(),
+            "min_trades_for_filter": PHASE3_MIN_TRADES_FOR_FILTER,
+            "setup_count": len(stats),
+            "stats": stats,
+            "disabled_setups": phase3_load_disabled_setups(),
+        }
+        atomic_write_json(PHASE3_ADAPTIVE_STATS_FILE, payload)
+        if force:
+            debug(f"PHASE 3 ADAPTIVE STATS WRITTEN | setups={len(stats)}")
+        return payload
+    except Exception as e:
+        log(f"❌ PHASE 3 stats write failed: {e}")
+        return {}
+
+
+def phase3_alert(title: str, body: str, force: bool = False):
+    if not PHASE3_SEND_ALERTS and not force:
+        return
+    msg = f"🧠 {title}\n{body}\n⏰ {now_ts()}"
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    send_to_telegram(msg)
+
+
+def phase3_downgrade_confidence(confidence: str) -> str:
+    c = str(confidence or "C").upper().strip()
+    if c == "A+":
+        return "A"
+    if c == "A":
+        return "B"
+    if c == "B":
+        return "C"
+    return c or "C"
+
+
+def phase3_evaluate_adaptive_intelligence(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Return an adaptive decision before sizing/execution.
+    Safe default: if not enough history, approve without changing behavior.
+    """
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return {"approved": True, "stage": "phase3_adaptive_intelligence", "reason": "disabled", "size_multiplier": 1.0, "adjusted_signal": deepcopy(signal), "stats": {}}
+
+    x = deepcopy(signal)
+    setup_key = phase3_setup_key(x)
+    stats_payload = phase3_write_adaptive_stats(force=False)
+    stats = (stats_payload.get("stats", {}) if isinstance(stats_payload, dict) else {}).get(setup_key, {})
+    disabled = phase3_load_disabled_setups()
+    reasons = []
+    actions = []
+    size_multiplier = 1.0
+
+    if setup_key in disabled:
+        reasons.append("setup_disabled_by_phase3")
+
+    trade_count = safe_int(stats.get("trades", 0), 0)
+    win_rate = safe_float(stats.get("win_rate", 0), 0)
+    avg_r = safe_float(stats.get("avg_r", 0), 0)
+    recent_losses = safe_int(stats.get("recent_loss_count", 0), 0)
+
+    if trade_count < PHASE3_MIN_TRADES_FOR_FILTER:
+        debug(f"PHASE 3 OBSERVE ONLY | {setup_key} | trades={trade_count}/{PHASE3_MIN_TRADES_FOR_FILTER}")
+        intel_event("phase3_observe_only", {"setup_key": setup_key, "trades": trade_count, "required": PHASE3_MIN_TRADES_FOR_FILTER}, signal=x, stage="phase3_adaptive", decision="observe_only")
+        return {"approved": True, "stage": "phase3_adaptive_intelligence", "reason": "insufficient_history", "setup_key": setup_key, "size_multiplier": 1.0, "adjusted_signal": x, "stats": stats, "actions": ["observe_only"]}
+
+    if win_rate < PHASE3_BLOCK_WINRATE_BELOW:
+        reasons.append("setup_win_rate_below_threshold")
+    if avg_r < PHASE3_BLOCK_AVG_R_BELOW:
+        reasons.append("setup_avg_r_below_threshold")
+    if recent_losses >= PHASE3_DISABLE_LOSSES_IN_LAST_N:
+        reasons.append("setup_recent_loss_cluster")
+        disabled[setup_key] = {"disabled_at": now_ts(), "reason": "recent_loss_cluster", "recent_losses": recent_losses, "last_n": PHASE3_DISABLE_LAST_N, "stats": stats}
+        phase3_save_disabled_setups(disabled)
+
+    if win_rate >= PHASE3_SIZE_UP_WINRATE and avg_r >= 0:
+        size_multiplier = PHASE3_SIZE_UP_MULT
+        actions.append("size_up")
+    elif win_rate < PHASE3_SIZE_DOWN_WINRATE:
+        size_multiplier = PHASE3_SIZE_DOWN_MULT
+        actions.append("size_down")
+
+    original_conf = str(x.get("confidence", "C")).upper().strip()
+    if original_conf in {"A+", "A"} and win_rate < PHASE3_CONFIDENCE_DOWNGRADE_WINRATE:
+        x["original_confidence"] = original_conf
+        x["confidence"] = phase3_downgrade_confidence(original_conf)
+        actions.append(f"confidence_downgrade_{original_conf}_to_{x['confidence']}")
+
+    decision = {
+        "approved": len(reasons) == 0 or PHASE3_SUGGEST_ONLY,
+        "suggest_only": PHASE3_SUGGEST_ONLY,
+        "stage": "phase3_adaptive_intelligence",
+        "setup_key": setup_key,
+        "reject_reasons": reasons,
+        "size_multiplier": size_multiplier,
+        "adjusted_signal": x,
+        "stats": stats,
+        "actions": actions,
+    }
+
+    intel_event("phase3_adaptive_decision", decision, signal=x, stage="phase3_adaptive", decision="approved" if decision["approved"] else "blocked")
+
+    if reasons:
+        body = f"Setup: {setup_key}\nReasons: {', '.join(reasons)}\nTrades: {trade_count} | Win Rate: {round(win_rate*100,1)}% | Avg R: {avg_r}\nSuggest Only: {PHASE3_SUGGEST_ONLY}"
+        phase3_alert("PHASE 3 SETUP BLOCK" if not PHASE3_SUGGEST_ONLY else "PHASE 3 SETUP WARNING", body)
+    else:
+        debug(f"PHASE 3 ADAPTIVE OK | {setup_key} | trades={trade_count} | win_rate={round(win_rate*100,1)}% | avg_r={avg_r} | size_mult={size_multiplier} | actions={actions}")
+
+    return decision
+
+
+def phase3_apply_size_multiplier_to_decision(size_decision: Dict[str, Any], phase3_decision: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return size_decision
+    try:
+        mult = safe_float(phase3_decision.get("size_multiplier", 1.0), 1.0)
+        if mult == 1.0:
+            return size_decision
+        x = deepcopy(size_decision)
+        original = safe_int(x.get("final_size", 0), 0)
+        adjusted = int(math.floor(original * mult)) if mult < 1 else int(math.ceil(original * mult))
+        adjusted = max(MIN_POSITION_QTY if original >= MIN_POSITION_QTY else 0, adjusted)
+        adjusted = min(MAX_POSITION_QTY, adjusted)
+        if original > 0 and adjusted <= 0:
+            adjusted = MIN_POSITION_QTY
+        x["phase3_original_final_size"] = original
+        x["phase3_size_multiplier"] = mult
+        x["final_size"] = adjusted
+        x.setdefault("adjustments", []).append(f"phase3_size_multiplier_{mult}")
+        x["approved"] = adjusted >= MIN_POSITION_QTY
+        if not x["approved"]:
+            x.setdefault("reject_reasons", []).append("phase3_adjusted_size_below_minimum")
+        return x
+    except Exception as e:
+        log(f"❌ PHASE 3 size multiplier failed: {e}")
+        return size_decision
+
 # =========================================================
 # PHASE 0 HARD SAFETY LAYER
 # - State invariants
@@ -295,6 +497,29 @@ INTEL_ANALYTICS_FILE = os.getenv("INTEL_ANALYTICS_FILE", "performance_summary.js
 INTEL_SEND_CLOSED_TRADE_SUMMARY = os.getenv("INTEL_SEND_CLOSED_TRADE_SUMMARY", "true").lower() == "true"
 INTEL_REBUILD_ANALYTICS_ON_CLOSE = os.getenv("INTEL_REBUILD_ANALYTICS_ON_CLOSE", "true").lower() == "true"
 INTEL_ANALYTICS_REFRESH_SECONDS = int(os.getenv("INTEL_ANALYTICS_REFRESH_SECONDS", "60"))
+
+# =========================================================
+# INTELLIGENCE PHASE 3: ADAPTIVE INTELLIGENCE
+# Uses closed-trade memory to score setup performance,
+# suggest confidence corrections, dynamically adjust size,
+# and block setups that have proven weak. Defaults are safe:
+# no blocking until minimum trade sample is reached.
+# =========================================================
+ENABLE_INTELLIGENCE_PHASE3 = os.getenv("ENABLE_INTELLIGENCE_PHASE3", "true").lower() == "true"
+PHASE3_MIN_TRADES_FOR_FILTER = int(os.getenv("PHASE3_MIN_TRADES_FOR_FILTER", "5"))
+PHASE3_BLOCK_WINRATE_BELOW = float(os.getenv("PHASE3_BLOCK_WINRATE_BELOW", "0.45"))
+PHASE3_BLOCK_AVG_R_BELOW = float(os.getenv("PHASE3_BLOCK_AVG_R_BELOW", "-0.10"))
+PHASE3_DISABLE_LOSSES_IN_LAST_N = int(os.getenv("PHASE3_DISABLE_LOSSES_IN_LAST_N", "7"))
+PHASE3_DISABLE_LAST_N = int(os.getenv("PHASE3_DISABLE_LAST_N", "10"))
+PHASE3_SIZE_UP_WINRATE = float(os.getenv("PHASE3_SIZE_UP_WINRATE", "0.65"))
+PHASE3_SIZE_DOWN_WINRATE = float(os.getenv("PHASE3_SIZE_DOWN_WINRATE", "0.50"))
+PHASE3_SIZE_UP_MULT = float(os.getenv("PHASE3_SIZE_UP_MULT", "1.25"))
+PHASE3_SIZE_DOWN_MULT = float(os.getenv("PHASE3_SIZE_DOWN_MULT", "0.60"))
+PHASE3_CONFIDENCE_DOWNGRADE_WINRATE = float(os.getenv("PHASE3_CONFIDENCE_DOWNGRADE_WINRATE", "0.50"))
+PHASE3_SEND_ALERTS = os.getenv("PHASE3_SEND_ALERTS", "true").lower() == "true"
+PHASE3_SUGGEST_ONLY = os.getenv("PHASE3_SUGGEST_ONLY", "false").lower() == "true"
+PHASE3_ADAPTIVE_STATS_FILE = os.getenv("PHASE3_ADAPTIVE_STATS_FILE", "adaptive_setup_stats.json").strip()
+PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled_setups.json").strip()
 
 # =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
@@ -2046,6 +2271,8 @@ def intel_record_closed_trade(position: Dict[str, Any], close_reason: str = ""):
         if INTEL_REBUILD_ANALYTICS_ON_CLOSE:
             analytics = intel_build_performance_analytics()
             atomic_write_json(INTEL_ANALYTICS_FILE, analytics)
+        if ENABLE_INTELLIGENCE_PHASE3:
+            phase3_write_adaptive_stats(force=True)
         if INTEL_SEND_CLOSED_TRADE_SUMMARY:
             msg = (
                 f"🧠 TRADE MEMORY SAVED\n"
@@ -2119,6 +2346,7 @@ def intel_build_performance_analytics() -> Dict[str, Any]:
         "by_direction": intel_group_stats(trades, "direction"),
         "by_confidence": intel_group_stats(trades, "confidence"),
         "by_close_reason": intel_group_stats(trades, "close_reason"),
+        "by_setup_key": intel_group_stats([{**t, "setup_key": phase3_setup_key(t)} for t in trades], "setup_key") if 'phase3_setup_key' in globals() else {},
         "recent_trades": trades[-10:],
     }
 
@@ -2155,7 +2383,9 @@ def intel_bootstrap(reason: str = "boot"):
             decision="active",
         )
         intel_write_analytics_snapshot(force=True)
-        debug(f"🧠 INTELLIGENCE LAYER ACTIVE | files={INTEL_EVENT_LOG_FILE},{INTEL_TRADE_MEMORY_FILE},{INTEL_ANALYTICS_FILE}")
+        if ENABLE_INTELLIGENCE_PHASE3:
+            phase3_write_adaptive_stats(force=True)
+        debug(f"🧠 INTELLIGENCE LAYER ACTIVE | files={INTEL_EVENT_LOG_FILE},{INTEL_TRADE_MEMORY_FILE},{INTEL_ANALYTICS_FILE},{PHASE3_ADAPTIVE_STATS_FILE}")
     except Exception as e:
         log(f"❌ INTEL bootstrap failed: {e}")
 
@@ -2170,6 +2400,8 @@ def intel_periodic_snapshot():
         last = safe_int(GLOBAL_STATE.get(last_key, 0), 0) if isinstance(GLOBAL_STATE, dict) else 0
         if (epoch() - last) >= INTEL_ANALYTICS_REFRESH_SECONDS:
             intel_write_analytics_snapshot(force=False)
+            if ENABLE_INTELLIGENCE_PHASE3:
+                phase3_write_adaptive_stats(force=False)
             GLOBAL_STATE[last_key] = epoch()
             save_state(GLOBAL_STATE)
     except Exception as e:
@@ -3746,6 +3978,208 @@ def step15_global_guard() -> bool:
     return True
 
 
+
+# =========================================================
+# INTELLIGENCE PHASE 3: ADAPTIVE INTELLIGENCE
+# =========================================================
+def phase3_setup_key(signal_or_trade: Dict[str, Any]) -> str:
+    ticker = str(signal_or_trade.get("ticker", "UNKNOWN")).upper().strip()
+    direction = str(signal_or_trade.get("direction", "UNKNOWN")).upper().strip()
+    confidence = str(signal_or_trade.get("confidence", "NA")).upper().strip()
+    setup = str(signal_or_trade.get("setup") or signal_or_trade.get("strategy") or signal_or_trade.get("trigger") or "GENERIC").upper().strip()
+    setup = setup.replace(" ", "_")[:40]
+    return f"{ticker}_{direction}_{confidence}_{setup}"
+
+
+def phase3_load_disabled_setups() -> Dict[str, Any]:
+    data = load_json_file(PHASE3_DISABLED_SETUPS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def phase3_save_disabled_setups(data: Dict[str, Any]):
+    atomic_write_json(PHASE3_DISABLED_SETUPS_FILE, data)
+
+
+def phase3_compute_setup_stats() -> Dict[str, Any]:
+    trades = intel_load_trade_memory()
+    stats: Dict[str, Any] = {}
+    for t in trades:
+        key = phase3_setup_key(t)
+        bucket = stats.setdefault(key, {
+            "setup_key": key,
+            "ticker": str(t.get("ticker", "UNKNOWN")).upper(),
+            "direction": str(t.get("direction", "UNKNOWN")).upper(),
+            "confidence": str(t.get("confidence", "NA")).upper(),
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_r": 0.0,
+            "total_pnl_pct": 0.0,
+            "recent_results": [],
+            "last_trade_ts": 0,
+        })
+        pnl = safe_float(t.get("realized_pnl_pct", t.get("pnl_pct", 0)), 0)
+        r_mult = safe_float(t.get("r_multiple", 0), 0)
+        winner = bool(t.get("winner", pnl > 0))
+        bucket["trades"] += 1
+        bucket["wins"] += 1 if winner else 0
+        bucket["losses"] += 0 if winner else 1
+        bucket["total_r"] += r_mult
+        bucket["total_pnl_pct"] += pnl
+        bucket["recent_results"].append("W" if winner else "L")
+        bucket["recent_results"] = bucket["recent_results"][-PHASE3_DISABLE_LAST_N:]
+        bucket["last_trade_ts"] = max(safe_int(bucket.get("last_trade_ts", 0), 0), safe_int(t.get("closed_ts", t.get("timestamp", 0)), 0))
+
+    for key, bucket in stats.items():
+        total = max(safe_int(bucket.get("trades", 0), 0), 1)
+        bucket["win_rate"] = round(bucket.get("wins", 0) / total, 4)
+        bucket["avg_r"] = round(bucket.get("total_r", 0.0) / total, 4)
+        bucket["avg_pnl_pct"] = round(bucket.get("total_pnl_pct", 0.0) / total, 4)
+        recent = bucket.get("recent_results", [])[-PHASE3_DISABLE_LAST_N:]
+        bucket["recent_loss_count"] = sum(1 for x in recent if x == "L")
+    return stats
+
+
+def phase3_write_adaptive_stats(force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return {}
+    try:
+        stats = phase3_compute_setup_stats()
+        payload = {
+            "generated_at": now_ts(),
+            "min_trades_for_filter": PHASE3_MIN_TRADES_FOR_FILTER,
+            "setup_count": len(stats),
+            "stats": stats,
+            "disabled_setups": phase3_load_disabled_setups(),
+        }
+        atomic_write_json(PHASE3_ADAPTIVE_STATS_FILE, payload)
+        if force:
+            debug(f"PHASE 3 ADAPTIVE STATS WRITTEN | setups={len(stats)}")
+        return payload
+    except Exception as e:
+        log(f"❌ PHASE 3 stats write failed: {e}")
+        return {}
+
+
+def phase3_alert(title: str, body: str, force: bool = False):
+    if not PHASE3_SEND_ALERTS and not force:
+        return
+    msg = f"🧠 {title}\n{body}\n⏰ {now_ts()}"
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    send_to_telegram(msg)
+
+
+def phase3_downgrade_confidence(confidence: str) -> str:
+    c = str(confidence or "C").upper().strip()
+    if c == "A+":
+        return "A"
+    if c == "A":
+        return "B"
+    if c == "B":
+        return "C"
+    return c or "C"
+
+
+def phase3_evaluate_adaptive_intelligence(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Return an adaptive decision before sizing/execution.
+    Safe default: if not enough history, approve without changing behavior.
+    """
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return {"approved": True, "stage": "phase3_adaptive_intelligence", "reason": "disabled", "size_multiplier": 1.0, "adjusted_signal": deepcopy(signal), "stats": {}}
+
+    x = deepcopy(signal)
+    setup_key = phase3_setup_key(x)
+    stats_payload = phase3_write_adaptive_stats(force=False)
+    stats = (stats_payload.get("stats", {}) if isinstance(stats_payload, dict) else {}).get(setup_key, {})
+    disabled = phase3_load_disabled_setups()
+    reasons = []
+    actions = []
+    size_multiplier = 1.0
+
+    if setup_key in disabled:
+        reasons.append("setup_disabled_by_phase3")
+
+    trade_count = safe_int(stats.get("trades", 0), 0)
+    win_rate = safe_float(stats.get("win_rate", 0), 0)
+    avg_r = safe_float(stats.get("avg_r", 0), 0)
+    recent_losses = safe_int(stats.get("recent_loss_count", 0), 0)
+
+    if trade_count < PHASE3_MIN_TRADES_FOR_FILTER:
+        debug(f"PHASE 3 OBSERVE ONLY | {setup_key} | trades={trade_count}/{PHASE3_MIN_TRADES_FOR_FILTER}")
+        intel_event("phase3_observe_only", {"setup_key": setup_key, "trades": trade_count, "required": PHASE3_MIN_TRADES_FOR_FILTER}, signal=x, stage="phase3_adaptive", decision="observe_only")
+        return {"approved": True, "stage": "phase3_adaptive_intelligence", "reason": "insufficient_history", "setup_key": setup_key, "size_multiplier": 1.0, "adjusted_signal": x, "stats": stats, "actions": ["observe_only"]}
+
+    if win_rate < PHASE3_BLOCK_WINRATE_BELOW:
+        reasons.append("setup_win_rate_below_threshold")
+    if avg_r < PHASE3_BLOCK_AVG_R_BELOW:
+        reasons.append("setup_avg_r_below_threshold")
+    if recent_losses >= PHASE3_DISABLE_LOSSES_IN_LAST_N:
+        reasons.append("setup_recent_loss_cluster")
+        disabled[setup_key] = {"disabled_at": now_ts(), "reason": "recent_loss_cluster", "recent_losses": recent_losses, "last_n": PHASE3_DISABLE_LAST_N, "stats": stats}
+        phase3_save_disabled_setups(disabled)
+
+    if win_rate >= PHASE3_SIZE_UP_WINRATE and avg_r >= 0:
+        size_multiplier = PHASE3_SIZE_UP_MULT
+        actions.append("size_up")
+    elif win_rate < PHASE3_SIZE_DOWN_WINRATE:
+        size_multiplier = PHASE3_SIZE_DOWN_MULT
+        actions.append("size_down")
+
+    original_conf = str(x.get("confidence", "C")).upper().strip()
+    if original_conf in {"A+", "A"} and win_rate < PHASE3_CONFIDENCE_DOWNGRADE_WINRATE:
+        x["original_confidence"] = original_conf
+        x["confidence"] = phase3_downgrade_confidence(original_conf)
+        actions.append(f"confidence_downgrade_{original_conf}_to_{x['confidence']}")
+
+    decision = {
+        "approved": len(reasons) == 0 or PHASE3_SUGGEST_ONLY,
+        "suggest_only": PHASE3_SUGGEST_ONLY,
+        "stage": "phase3_adaptive_intelligence",
+        "setup_key": setup_key,
+        "reject_reasons": reasons,
+        "size_multiplier": size_multiplier,
+        "adjusted_signal": x,
+        "stats": stats,
+        "actions": actions,
+    }
+
+    intel_event("phase3_adaptive_decision", decision, signal=x, stage="phase3_adaptive", decision="approved" if decision["approved"] else "blocked")
+
+    if reasons:
+        body = f"Setup: {setup_key}\nReasons: {', '.join(reasons)}\nTrades: {trade_count} | Win Rate: {round(win_rate*100,1)}% | Avg R: {avg_r}\nSuggest Only: {PHASE3_SUGGEST_ONLY}"
+        phase3_alert("PHASE 3 SETUP BLOCK" if not PHASE3_SUGGEST_ONLY else "PHASE 3 SETUP WARNING", body)
+    else:
+        debug(f"PHASE 3 ADAPTIVE OK | {setup_key} | trades={trade_count} | win_rate={round(win_rate*100,1)}% | avg_r={avg_r} | size_mult={size_multiplier} | actions={actions}")
+
+    return decision
+
+
+def phase3_apply_size_multiplier_to_decision(size_decision: Dict[str, Any], phase3_decision: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return size_decision
+    try:
+        mult = safe_float(phase3_decision.get("size_multiplier", 1.0), 1.0)
+        if mult == 1.0:
+            return size_decision
+        x = deepcopy(size_decision)
+        original = safe_int(x.get("final_size", 0), 0)
+        adjusted = int(math.floor(original * mult)) if mult < 1 else int(math.ceil(original * mult))
+        adjusted = max(MIN_POSITION_QTY if original >= MIN_POSITION_QTY else 0, adjusted)
+        adjusted = min(MAX_POSITION_QTY, adjusted)
+        if original > 0 and adjusted <= 0:
+            adjusted = MIN_POSITION_QTY
+        x["phase3_original_final_size"] = original
+        x["phase3_size_multiplier"] = mult
+        x["final_size"] = adjusted
+        x.setdefault("adjustments", []).append(f"phase3_size_multiplier_{mult}")
+        x["approved"] = adjusted >= MIN_POSITION_QTY
+        if not x["approved"]:
+            x.setdefault("reject_reasons", []).append("phase3_adjusted_size_below_minimum")
+        return x
+    except Exception as e:
+        log(f"❌ PHASE 3 size multiplier failed: {e}")
+        return size_decision
+
 # =========================================================
 # PHASE 0 HARD SAFETY LAYER
 # =========================================================
@@ -4550,14 +4984,28 @@ def handle_new_signal(signal: Dict[str, Any]):
         return
 
     regime_signal = apply_regime_to_signal(entry_locked_signal, regime_decision)
-    size_decision = size_signal_by_stop(regime_signal)
+
+    # PHASE 3: adaptive intelligence uses trade memory to block weak setups,
+    # downgrade confidence, and adjust size before risk sizing/execution.
+    phase3_decision = phase3_evaluate_adaptive_intelligence(regime_signal)
+    if not phase3_decision["approved"]:
+        msg = build_block_message("PHASE 3 ADAPTIVE BLOCKED SIGNAL", regime_signal, phase3_decision.get("reject_reasons", []), f"Setup: {phase3_decision.get('setup_key')} | Stats: {phase3_decision.get('stats', {})}")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+        return
+
+    adaptive_signal = phase3_decision.get("adjusted_signal", regime_signal)
+    size_decision = size_signal_by_stop(adaptive_signal)
+    size_decision = phase3_apply_size_multiplier_to_decision(size_decision, phase3_decision)
     if not size_decision["approved"]:
         msg = build_block_message("SIZING BLOCKED SIGNAL", regime_signal, size_decision["reject_reasons"], f"Raw Size: {size_decision.get('raw_size')} | Final Size: {size_decision.get('final_size')}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
         send_to_telegram(msg)
         return
 
-    sized_signal = apply_size_decision_to_signal(regime_signal, size_decision)
+    sized_signal = apply_size_decision_to_signal(adaptive_signal, size_decision)
+    sized_signal["phase3_decision"] = {k: v for k, v in phase3_decision.items() if k != "adjusted_signal"}
     risk_decision = evaluate_risk_policy(sized_signal)
     if not risk_decision["approved"]:
         msg = build_block_message("RISK BLOCKED SIGNAL", sized_signal, risk_decision["reject_reasons"], f"Risk %: {round(risk_decision.get('risk_per_trade_pct', 0.0)*100, 3)} | Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0)*100, 3)}")
