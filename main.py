@@ -6,6 +6,7 @@ import math
 import hashlib
 import tempfile
 import traceback
+import re
 from copy import deepcopy
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
@@ -1983,6 +1984,28 @@ def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
 
     if requested and MARKET_DATA_PROVIDER not in {"file", "manual", "off", "disabled"}:
         for sym in requested:
+            # IMPORTANT STEP 10 FIX:
+            # Option contracts like QQQ240426C00380000 should NOT be sent to stock quote endpoints.
+            # Most providers reject those compact option symbols. For contract pricing, keep using
+            # MARKET_DATA_FILE until a real options-chain/option-quote adapter is added. We can still
+            # fetch the underlying ticker for context/debug without overwriting the contract price.
+            underlying = get_underlying_from_option_symbol(sym)
+            if underlying:
+                if has_valid_file_price(prices, sym):
+                    debug(f"OPTION CONTRACT PRICE READ FROM FILE | {sym}: {get_market_price_for_symbol(sym, prices)[0]}")
+                else:
+                    debug(f"OPTION CONTRACT DETECTED | {sym}. No file contract price found. Skipping stock quote endpoints and fetching underlying {underlying} only.")
+
+                underlying_price = get_live_market_price(underlying)
+                if underlying_price > 0:
+                    prices[f"__UNDERLYING__:{sym}"] = {
+                        "price": underlying_price,
+                        "timestamp": epoch(),
+                        "source": f"{MARKET_DATA_PROVIDER}:underlying:{underlying}",
+                    }
+                    debug(f"UNDERLYING LIVE MARKET DATA READ | {underlying} for {sym}: {underlying_price}")
+                continue
+
             live_price = get_live_market_price(sym)
             if live_price > 0:
                 prices[sym] = {"price": live_price, "timestamp": epoch(), "source": MARKET_DATA_PROVIDER}
@@ -2011,6 +2034,48 @@ def cache_set_market_price(symbol: str, price: float, source: str):
         "timestamp": epoch(),
         "source": source,
     }
+
+
+def parse_occ_option_symbol(symbol: str) -> Dict[str, Any]:
+    """
+    Parses compact OCC-style option symbols like QQQ240426C00380000.
+    Returns metadata only. This does NOT mean the data vendor accepts that symbol.
+    """
+    raw = str(symbol or "").upper().strip()
+    match = re.match(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$", raw)
+    if not match:
+        return {}
+    underlying, yymmdd, option_type, strike_raw = match.groups()
+    try:
+        strike = int(strike_raw) / 1000.0
+    except Exception:
+        strike = 0.0
+    return {
+        "symbol": raw,
+        "underlying": underlying,
+        "expiry_yymmdd": yymmdd,
+        "option_type": "CALL" if option_type == "C" else "PUT",
+        "strike": strike,
+        "is_option_contract": True,
+    }
+
+
+def is_option_contract_symbol(symbol: str) -> bool:
+    return bool(parse_occ_option_symbol(symbol))
+
+
+def get_underlying_from_option_symbol(symbol: str) -> str:
+    parsed = parse_occ_option_symbol(symbol)
+    return str(parsed.get("underlying", "") or "").upper().strip()
+
+
+def has_valid_file_price(prices: Dict[str, Any], symbol: str) -> bool:
+    price, ts = get_market_price_for_symbol(symbol, prices)
+    if price <= 0:
+        return False
+    if ts > 0 and market_price_is_stale(ts):
+        return False
+    return True
 
 
 def extract_price_from_payload(payload: Any) -> float:
@@ -2119,9 +2184,17 @@ def fetch_alpaca_data_price(symbol: str) -> float:
 
 
 def get_live_market_price(symbol: str) -> float:
-    """Step 10 live price router with cache + provider fallback."""
-    symbol = str(symbol or "").strip()
+    """Step 10 live price router with cache + provider fallback.
+
+    Safety rule: this function prices equities/underlyings only. Compact OCC-style
+    option contracts are intentionally not sent to stock quote endpoints.
+    """
+    symbol = str(symbol or "").strip().upper()
     if not symbol:
+        return 0.0
+
+    if is_option_contract_symbol(symbol):
+        debug(f"Skipping live stock quote lookup for option contract symbol: {symbol}")
         return 0.0
 
     cached_price, _, cached_source = cache_get_market_price(symbol)
@@ -2225,7 +2298,7 @@ def update_positions_from_market_prices() -> int:
             price_source = "live" if isinstance(prices.get(symbol), dict) and prices.get(symbol, {}).get("source") else MARKET_DATA_FILE
             position["last_market_price_source"] = price_source
             updated += 1
-            log(f"📈 Updated position price from market file | {symbol}: {old_price} -> {new_price}")
+            log(f"📈 Updated position price | {symbol}: {old_price} -> {new_price} | source={price_source}")
             maybe_send_price_update(position, old_price, new_price)
     if updated > 0:
         save_positions(GLOBAL_POSITIONS)
