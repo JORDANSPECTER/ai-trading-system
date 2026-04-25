@@ -34,6 +34,7 @@ except Exception as macro_import_error:
 # - Startup reconciliation and safety block
 # - Partial fill / fill-aware local updates
 # - Macro bridge integration
+# - Step 9 Entry Lock / No Chasing system
 # - Clearer trust boundaries:
 #     broker = live truth
 #     local files = cache + audit log
@@ -168,6 +169,17 @@ AUTO_BREAKEVEN_ENABLED = os.getenv("AUTO_BREAKEVEN_ENABLED", "true").lower() == 
 TRAIL_ONLY_AFTER_TP1 = os.getenv("TRAIL_ONLY_AFTER_TP1", "false").lower() == "true"
 SEND_PRICE_UPDATE_ALERTS = os.getenv("SEND_PRICE_UPDATE_ALERTS", "false").lower() == "true"
 PRICE_UPDATE_ALERT_SECONDS = int(os.getenv("PRICE_UPDATE_ALERT_SECONDS", "60"))
+
+# =========================================================
+# STEP 9 ENTRY LOCK / NO CHASING SYSTEM
+# =========================================================
+ENABLE_ENTRY_LOCK = os.getenv("ENABLE_ENTRY_LOCK", "true").lower() == "true"
+MAX_ENTRY_AGE_SECONDS = int(os.getenv("MAX_ENTRY_AGE_SECONDS", "60"))
+MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.05"))
+REQUIRE_PRICE_FOR_ENTRY_LOCK = os.getenv("REQUIRE_PRICE_FOR_ENTRY_LOCK", "false").lower() == "true"
+REPRICE_ENTRY_TO_LIVE_PRICE = os.getenv("REPRICE_ENTRY_TO_LIVE_PRICE", "true").lower() == "true"
+ENTRY_LOCK_RR_CHECK = os.getenv("ENTRY_LOCK_RR_CHECK", "true").lower() == "true"
+MIN_LIVE_ENTRY_RR_RATIO = float(os.getenv("MIN_LIVE_ENTRY_RR_RATIO", str(MIN_RR_RATIO)))
 
 # GLOBALS
 # =========================================================
@@ -2099,6 +2111,91 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
     save_positions(GLOBAL_POSITIONS)
 
 
+
+# =========================================================
+# STEP 9 ENTRY LOCK / NO CHASING SYSTEM
+# =========================================================
+def evaluate_entry_lock(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Blocks late/chasing entries before the engine opens a paper/live position.
+    This protects the system from taking a signal after the option contract
+    has already moved too far away from the planned entry.
+    """
+    if not ENABLE_ENTRY_LOCK:
+        return {
+            "approved": True,
+            "stage": "entry_lock",
+            "reject_reasons": [],
+            "live_price": 0.0,
+            "max_allowed_entry": 0.0,
+            "signal_age_seconds": 0,
+            "reward_to_risk_at_live_price": 0.0,
+        }
+
+    reasons = []
+    entry = safe_float(signal.get("entry_contract", 0), 0)
+    stop = safe_float(signal.get("stop_contract", 0), 0)
+    tp1 = safe_float(signal.get("tp1_contract", 0), 0)
+    ts = safe_int(signal.get("timestamp", 0), 0)
+    signal_age = max(0, epoch() - ts) if ts > 0 else 0
+
+    if ts > 0 and signal_age > MAX_ENTRY_AGE_SECONDS:
+        reasons.append("entry_window_expired")
+
+    prices = load_market_prices()
+    live_price, price_ts = get_market_price_for_symbol(str(signal.get("symbol", "")), prices)
+
+    if price_ts > 0 and market_price_is_stale(price_ts):
+        reasons.append("live_price_stale")
+
+    if live_price <= 0:
+        if REQUIRE_PRICE_FOR_ENTRY_LOCK:
+            reasons.append("missing_live_price_for_entry_lock")
+        live_price = entry
+
+    if entry <= 0:
+        reasons.append("invalid_entry_for_entry_lock")
+
+    max_allowed_entry = entry * (1.0 + MAX_ENTRY_SLIPPAGE_PCT) if entry > 0 else 0.0
+    if entry > 0 and live_price > max_allowed_entry:
+        reasons.append("YOU_ARE_CHASING_live_price_above_allowed_entry")
+
+    rr_live = 0.0
+    live_unit_risk = max(live_price - stop, 0.0)
+    if ENTRY_LOCK_RR_CHECK:
+        if stop <= 0:
+            reasons.append("invalid_stop_for_live_entry")
+        elif stop >= live_price:
+            reasons.append("stop_not_below_live_entry")
+        elif tp1 <= live_price:
+            reasons.append("tp1_not_above_live_entry")
+        elif live_unit_risk > 0:
+            rr_live = (tp1 - live_price) / live_unit_risk
+            if rr_live < MIN_LIVE_ENTRY_RR_RATIO:
+                reasons.append("live_entry_reward_to_risk_too_low")
+
+    return {
+        "approved": len(reasons) == 0,
+        "stage": "entry_lock",
+        "reject_reasons": reasons,
+        "live_price": round(live_price, 4),
+        "max_allowed_entry": round(max_allowed_entry, 4),
+        "signal_age_seconds": signal_age,
+        "reward_to_risk_at_live_price": round(rr_live, 4),
+    }
+
+
+def apply_entry_lock_to_signal(signal: Dict[str, Any], entry_lock_decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Optionally reprices the signal to the live contract mark before sizing/execution."""
+    x = deepcopy(signal)
+    x["entry_lock_decision"] = entry_lock_decision
+    live_price = safe_float(entry_lock_decision.get("live_price", 0), 0)
+    if REPRICE_ENTRY_TO_LIVE_PRICE and live_price > 0:
+        x["entry_contract"] = live_price
+        x["contract_price"] = live_price
+        x["live_entry_price"] = live_price
+    return x
+
 # =========================================================
 # SIGNAL HANDLER
 # =========================================================
@@ -2131,14 +2228,29 @@ def handle_new_signal(signal: Dict[str, Any]):
         send_to_telegram(msg)
         return
 
-    regime_decision = evaluate_regime(signal)
+    entry_lock_decision = evaluate_entry_lock(signal)
+    if not entry_lock_decision["approved"]:
+        extras = (
+            f"Live Price: {entry_lock_decision.get('live_price')} | "
+            f"Max Allowed: {entry_lock_decision.get('max_allowed_entry')} | "
+            f"Signal Age: {entry_lock_decision.get('signal_age_seconds')}s | "
+            f"Live RR: {entry_lock_decision.get('reward_to_risk_at_live_price')}"
+        )
+        msg = build_block_message("ENTRY LOCK BLOCKED SIGNAL", signal, entry_lock_decision["reject_reasons"], extras)
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
+        return
+
+    entry_locked_signal = apply_entry_lock_to_signal(signal, entry_lock_decision)
+
+    regime_decision = evaluate_regime(entry_locked_signal)
     if not regime_decision["approved"]:
         msg = build_block_message("REGIME BLOCKED SIGNAL", signal, regime_decision["reject_reasons"], f"Regime: {regime_decision.get('regime')} | Score: {regime_decision.get('regime_score')}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
         send_to_telegram(msg)
         return
 
-    regime_signal = apply_regime_to_signal(signal, regime_decision)
+    regime_signal = apply_regime_to_signal(entry_locked_signal, regime_decision)
     size_decision = size_signal_by_stop(regime_signal)
     if not size_decision["approved"]:
         msg = build_block_message("SIZING BLOCKED SIGNAL", regime_signal, size_decision["reject_reasons"], f"Raw Size: {size_decision.get('raw_size')} | Final Size: {size_decision.get('final_size')}")
