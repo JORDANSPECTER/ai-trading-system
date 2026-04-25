@@ -497,6 +497,55 @@ def phase3_apply_size_multiplier_to_decision(size_decision: Dict[str, Any], phas
         log(f"❌ PHASE 3 size multiplier failed: {e}")
         return size_decision
 
+
+# =========================================================
+# HARD KILL ENGINE - REQUIRED BY PHASE 0 / STEP 15
+# =========================================================
+def hard_kill_engine(reason: str = "", close_positions: bool = True):
+    """Central emergency lock used by Phase 0, Step 14, and Step 15.
+    This locks new entries first, then attempts flattening.
+    """
+    ensure_globals_initialized()
+    reason = str(reason or "Hard kill activated").strip()
+
+    GLOBAL_STATE["kill_switch"] = True
+    GLOBAL_STATE["engine_enabled"] = False
+    GLOBAL_STATE["allow_entries"] = False
+    GLOBAL_STATE["hard_kill_reason"] = reason
+    GLOBAL_STATE["step15_global_kill"] = True
+    GLOBAL_STATE["step15_last_reason"] = reason
+    GLOBAL_STATE["step15_last_kill_time"] = epoch()
+    save_state(GLOBAL_STATE)
+
+    log(f"ð¨ HARD KILL ACTIVATED | {reason}")
+
+    closed = 0
+    if close_positions:
+        try:
+            if 'step15_close_all_open_positions' in globals():
+                closed = step15_close_all_open_positions(reason)
+            elif 'step14_close_all_open_positions' in globals():
+                step14_close_all_open_positions(reason)
+                closed = len(GLOBAL_POSITIONS.get("open_positions", []))
+        except Exception as e:
+            log(f"â HARD KILL flatten failed: {e}")
+
+    msg = (
+        f"ð¨ HARD KILL ACTIVATED\n"
+        f"Reason: {reason}\n"
+        f"Closed/flatten attempts: {closed}\n"
+        f"Engine Locked: {GLOBAL_STATE.get('kill_switch', True)}\n"
+        f"New trades blocked until manual reset.\n"
+        f"â° {now_ts()}"
+    )
+    try:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+    except Exception as e:
+        log(f"â HARD KILL alert failed: {e}")
+    return {"locked": True, "reason": reason, "closed_attempts": closed}
+
 # =========================================================
 # PHASE 0 HARD SAFETY LAYER
 # - State invariants
@@ -2733,6 +2782,72 @@ def recalc_position_from_fill(position: Dict[str, Any], fill_qty: int, fill_pric
     position["qty_open"] = max(position.get("qty_open", 0), position["filled_qty_total"] - position.get("qty_closed", 0))
 
 
+
+# =========================================================
+# PHASE 3.5 EXECUTION LAYER LOCK
+# Final hard stop directly inside paper/live execution functions.
+# This prevents any order creation if another path bypasses handle_new_signal().
+# =========================================================
+def phase35_execution_layer_gate(signal: Dict[str, Any], mode: str = "PAPER") -> Dict[str, Any]:
+    if not ENABLE_PHASE35_ENFORCEMENT:
+        return {"approved": True, "stage": "phase35_execution_layer", "notes": ["phase35_disabled"]}
+
+    ensure_globals_initialized()
+    mode = str(mode or "PAPER").upper().strip()
+
+    hard_reasons: List[str] = []
+    if GLOBAL_STATE.get("kill_switch", False):
+        hard_reasons.append("phase35_exec_kill_switch_active")
+    if GLOBAL_STATE.get("bot_paused", False):
+        hard_reasons.append("phase35_exec_bot_paused")
+    if not GLOBAL_STATE.get("engine_enabled", True):
+        hard_reasons.append("phase35_exec_engine_disabled")
+    if not GLOBAL_STATE.get("allow_entries", True):
+        hard_reasons.append("phase35_exec_entries_not_allowed")
+    if GLOBAL_STATE.get("reconciliation_required", False):
+        hard_reasons.append("phase35_exec_reconciliation_required")
+
+    if mode == "LIVE":
+        if not ENABLE_ALPACA:
+            hard_reasons.append("phase35_exec_live_enable_alpaca_false")
+        if not ALLOW_LIVE_BUYS:
+            hard_reasons.append("phase35_exec_live_buys_not_allowed")
+        if signal.get("asset_class") == "option" and not ALPACA_ENABLE_OPTIONS:
+            hard_reasons.append("phase35_exec_options_disabled")
+        if signal.get("asset_class") == "option" and not ALPACA_LIVE_OPTIONS_APPROVED:
+            hard_reasons.append("phase35_exec_options_not_live_approved")
+
+    normal_decision = phase35_enforcement_gate(
+        signal,
+        phase3_decision=signal.get("phase3_decision", {}) if isinstance(signal.get("phase3_decision", {}), dict) else {},
+        size_decision=signal.get("size_decision", {}) if isinstance(signal.get("size_decision", {}), dict) else {},
+        stage=f"execution_layer_{mode.lower()}",
+    )
+
+    if hard_reasons:
+        return phase35_block(
+            f"PHASE 3.5 EXECUTION LAYER BLOCK - {mode}",
+            signal,
+            hard_reasons,
+            "Final direct order gate blocked before any order or position could be created.",
+        )
+
+    if not normal_decision.get("approved", False):
+        return normal_decision
+
+    try:
+        intel_event(
+            "phase35_execution_layer_approved",
+            {"mode": mode, "notes": normal_decision.get("notes", [])},
+            signal=signal,
+            stage="phase35_execution_layer",
+            decision="approved",
+        )
+    except Exception:
+        pass
+
+    return {"approved": True, "stage": "phase35_execution_layer", "mode": mode, "notes": normal_decision.get("notes", [])}
+
 # =========================================================
 # EXECUTION
 # =========================================================
@@ -2765,6 +2880,10 @@ def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
 
 
 def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    phase35_exec_decision = phase35_execution_layer_gate(signal, mode="PAPER")
+    if not phase35_exec_decision.get("approved", False):
+        return None
+
     phase1_decision = phase1_validate_order_safety(
         signal,
         side="buy",
@@ -2791,6 +2910,10 @@ def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    phase35_exec_decision = phase35_execution_layer_gate(signal, mode="LIVE")
+    if not phase35_exec_decision.get("approved", False):
+        return None
+
     if not ALLOW_LIVE_BUYS:
         log("❌ LIVE BUY BLOCKED: ALLOW_LIVE_BUYS=false")
         return None
@@ -2845,6 +2968,10 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
 
 
 def open_live_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    phase35_exec_decision = phase35_execution_layer_gate(signal, mode="LIVE")
+    if not phase35_exec_decision.get("approved", False):
+        return None
+
     position = make_local_position(signal, mode="LIVE")
     save_new_position(position)
     order_record = submit_live_entry(signal, position)
@@ -5375,13 +5502,17 @@ def phase35_block(title: str, signal: Dict[str, Any], reasons: List[str], extras
 def phase35_approve(signal: Dict[str, Any], notes: Optional[List[str]] = None) -> Dict[str, Any]:
     data = phase35_state()
     data["approvals_today"] = safe_int(data.get("approvals_today", 0), 0) + 1
+    notes = notes or []
+    joined_notes = " ".join(str(x) for x in notes)
+    commit_execution = "phase35_ok_stage_execution_layer_" in joined_notes
     key = phase35_setup_key(signal)
     sym = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
-    data.setdefault("last_signal_by_symbol", {})[sym] = epoch()
-    data.setdefault("last_signal_by_setup", {})[key] = epoch()
-    hashes = data.setdefault("used_signal_hashes", [])
-    hashes.append(signal_hash(signal))
-    data["used_signal_hashes"] = hashes[-PHASE35_USED_SIGNAL_MEMORY:]
+    if commit_execution:
+        data.setdefault("last_signal_by_symbol", {})[sym] = epoch()
+        data.setdefault("last_signal_by_setup", {})[key] = epoch()
+        hashes = data.setdefault("used_signal_hashes", [])
+        hashes.append(signal_hash(signal))
+        data["used_signal_hashes"] = hashes[-PHASE35_USED_SIGNAL_MEMORY:]
     data["last_approval"] = {
         "time": now_ts(),
         "ticker": signal.get("ticker"),
@@ -5448,19 +5579,21 @@ def phase35_enforcement_gate(signal: Dict[str, Any], phase3_decision: Optional[D
         reasons.append(f"phase35_duplicate_symbol_direction_cap_{dupes}")
 
     data = phase35_state()
-    sig_hash = signal_hash(signal)
-    if sig_hash in data.get("used_signal_hashes", []):
-        reasons.append("phase35_signal_hash_already_used")
+    enforce_reuse_memory = str(stage).startswith("execution_layer")
+    if enforce_reuse_memory:
+        sig_hash = signal_hash(signal)
+        if sig_hash in data.get("used_signal_hashes", []):
+            reasons.append("phase35_signal_hash_already_used")
 
-    sym = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
-    last_sym = safe_int(data.get("last_signal_by_symbol", {}).get(sym, 0), 0)
-    if last_sym and epoch() - last_sym < PHASE35_SYMBOL_COOLDOWN_SECONDS:
-        reasons.append(f"phase35_symbol_cooldown_{epoch() - last_sym}s")
+        sym = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
+        last_sym = safe_int(data.get("last_signal_by_symbol", {}).get(sym, 0), 0)
+        if last_sym and epoch() - last_sym < PHASE35_SYMBOL_COOLDOWN_SECONDS:
+            reasons.append(f"phase35_symbol_cooldown_{epoch() - last_sym}s")
 
-    setup_key = phase35_setup_key(signal)
-    last_setup = safe_int(data.get("last_signal_by_setup", {}).get(setup_key, 0), 0)
-    if last_setup and epoch() - last_setup < PHASE35_SETUP_COOLDOWN_SECONDS:
-        reasons.append(f"phase35_setup_cooldown_{epoch() - last_setup}s")
+        setup_key = phase35_setup_key(signal)
+        last_setup = safe_int(data.get("last_signal_by_setup", {}).get(setup_key, 0), 0)
+        if last_setup and epoch() - last_setup < PHASE35_SETUP_COOLDOWN_SECONDS:
+            reasons.append(f"phase35_setup_cooldown_{epoch() - last_setup}s")
 
     daily_loss = stable_daily_pnl_dollars()
     max_daily_loss = phase35_daily_loss_dollars_limit()
