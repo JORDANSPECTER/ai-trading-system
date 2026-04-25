@@ -207,6 +207,19 @@ STEP14_EMERGENCY_STOP_ON_KILL = os.getenv("STEP14_EMERGENCY_STOP_ON_KILL", "true
 STEP14_SEND_ALERTS = os.getenv("STEP14_SEND_ALERTS", "true").lower() == "true"
 
 # =========================================================
+# STEP 15 GLOBAL KILL SWITCH / FLATTEN ENGINE
+# - Close all open positions when risk is breached
+# - Lock engine after emergency stop
+# - Telegram remote commands: /kill, /flatten, /unlock
+# =========================================================
+ENABLE_STEP15_GLOBAL_KILL_SWITCH = os.getenv("ENABLE_STEP15_GLOBAL_KILL_SWITCH", "true").lower() == "true"
+STEP15_CLOSE_ALL_ON_KILL = os.getenv("STEP15_CLOSE_ALL_ON_KILL", "true").lower() == "true"
+STEP15_LOCK_ENGINE_ON_KILL = os.getenv("STEP15_LOCK_ENGINE_ON_KILL", "true").lower() == "true"
+STEP15_REQUIRE_MANUAL_RESET = os.getenv("STEP15_REQUIRE_MANUAL_RESET", "true").lower() == "true"
+STEP15_SEND_ALERTS = os.getenv("STEP15_SEND_ALERTS", "true").lower() == "true"
+STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "60"))
+
+# =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
 ENABLE_ENTRY_LOCK = os.getenv("ENABLE_ENTRY_LOCK", "true").lower() == "true"
@@ -3131,6 +3144,139 @@ def step14_loop_enforcement() -> bool:
     return True
 
 # =========================================================
+# STEP 15 GLOBAL KILL SWITCH / FLATTEN ENGINE
+# =========================================================
+def step15_alert(title: str, body: str, force: bool = False):
+    """Send emergency Step 15 alerts with simple cooldown protection."""
+    ensure_globals_initialized()
+    now = epoch()
+    last_alert = safe_int(GLOBAL_STATE.get("step15_last_alert_time", 0), 0)
+    if not force and (now - last_alert) < STEP15_ALERT_COOLDOWN_SECONDS:
+        return
+    GLOBAL_STATE["step15_last_alert_time"] = now
+    save_state(GLOBAL_STATE)
+
+    msg = f"🚨 {title}\n{body}\n⏰ {now_ts()}"
+    log(msg.replace("\n", " | "))
+    if STEP15_SEND_ALERTS:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+
+
+def step15_close_all_open_positions(reason: str) -> int:
+    """Flatten all currently tracked positions. Returns number of close attempts."""
+    ensure_globals_initialized()
+    open_positions = list(GLOBAL_POSITIONS.get("open_positions", []))
+    if not open_positions:
+        debug(f"STEP 15 FLATTEN CHECK | no open positions | reason={reason}")
+        return 0
+
+    close_count = 0
+    for position in open_positions:
+        symbol = str(position.get("symbol", "")).strip()
+        try:
+            live_price = get_live_price_for_position(position)
+            if live_price and live_price > 0:
+                update_position_market_price(position, live_price)
+            exit_price = safe_float(position.get("last_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+
+            if position.get("mode") == "LIVE":
+                live_close_position(position, reason)
+            else:
+                finalize_close_position(position, exit_price, reason)
+            close_count += 1
+            log(f"🔥 STEP 15 FLATTENED | {symbol} | reason={reason} | exit={exit_price}")
+        except Exception as e:
+            log(f"❌ STEP 15 flatten error | {symbol}: {e}")
+
+    flush_dirty_stores(force=True)
+    return close_count
+
+
+def step15_activate_kill_switch(reason: str, close_positions: bool = True):
+    """Activate the hard lock. Optionally flatten all open positions."""
+    ensure_globals_initialized()
+    if not ENABLE_STEP15_GLOBAL_KILL_SWITCH:
+        return
+
+    already_active = bool(GLOBAL_STATE.get("step15_kill_active", False))
+    GLOBAL_STATE["step15_kill_active"] = True
+    GLOBAL_STATE["step15_locked"] = True
+    GLOBAL_STATE["step15_last_reason"] = reason
+    GLOBAL_STATE["step15_activated_at"] = epoch()
+    GLOBAL_STATE["kill_switch"] = True
+    GLOBAL_STATE["bot_paused"] = True
+    if STEP15_LOCK_ENGINE_ON_KILL:
+        GLOBAL_STATE["engine_enabled"] = False
+    save_state(GLOBAL_STATE)
+
+    closed = 0
+    if close_positions and STEP15_CLOSE_ALL_ON_KILL:
+        closed = step15_close_all_open_positions(reason)
+
+    if not already_active:
+        step15_alert(
+            "STEP 15 KILL SWITCH ACTIVATED",
+            f"Reason: {reason}\nClosed/flatten attempts: {closed}\nEngine Locked: {GLOBAL_STATE.get('engine_enabled') is False}\nNew trades blocked until manual reset.",
+            force=True,
+        )
+    else:
+        debug(f"STEP 15 KILL SWITCH STILL ACTIVE | reason={reason} | closed={closed}")
+
+
+def step15_flatten_only(reason: str = "Manual flatten"):
+    """Flatten positions without locking the entire engine."""
+    closed = step15_close_all_open_positions(reason)
+    step15_alert("STEP 15 FLATTEN SENT", f"Reason: {reason}\nClosed/flatten attempts: {closed}", force=True)
+
+
+def step15_reset_lock():
+    """Manual reset after a kill switch. Keeps risk counters intact."""
+    ensure_globals_initialized()
+    GLOBAL_STATE["step15_kill_active"] = False
+    GLOBAL_STATE["step15_locked"] = False
+    GLOBAL_STATE["step15_last_reason"] = ""
+    GLOBAL_STATE["kill_switch"] = False
+    GLOBAL_STATE["bot_paused"] = False
+    GLOBAL_STATE["engine_enabled"] = True
+    save_state(GLOBAL_STATE)
+    flush_dirty_stores(force=True)
+    step15_alert("STEP 15 RESET", "Kill switch cleared. Engine unlocked and ready for new signals.", force=True)
+
+
+def step15_global_guard() -> bool:
+    """Return True if engine can continue. Return False when Step 15 lock is active."""
+    ensure_globals_initialized()
+    if not ENABLE_STEP15_GLOBAL_KILL_SWITCH:
+        return True
+
+    daily_pnl = step14_daily_pnl_dollars()
+    daily_loss_limit = step14_daily_loss_limit_dollars()
+
+    # Hard daily loss tripwire: lock + flatten.
+    if daily_pnl <= -abs(daily_loss_limit):
+        step15_activate_kill_switch(
+            f"Daily loss limit hit: ${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}",
+            close_positions=True,
+        )
+        return False
+
+    # Manual or prior kill switch remains active until reset.
+    if GLOBAL_STATE.get("step15_kill_active", False) or GLOBAL_STATE.get("step15_locked", False) or GLOBAL_STATE.get("kill_switch", False):
+        if STEP15_CLOSE_ALL_ON_KILL:
+            step15_close_all_open_positions(GLOBAL_STATE.get("step15_last_reason", "Manual/global kill switch active"))
+        step15_alert(
+            "STEP 15 ENGINE LOCKED",
+            f"Reason: {GLOBAL_STATE.get('step15_last_reason', 'Kill switch active')}\nUse /unlock only after reviewing risk.",
+            force=False,
+        )
+        return False
+
+    debug(f"STEP 15 GUARD OK | daily_pnl={daily_pnl} | loss_limit=-{round(abs(daily_loss_limit), 2)} | kill=False")
+    return True
+
+# =========================================================
 # SIGNAL HANDLER
 # =========================================================
 def should_route_signal(signal: Dict[str, Any]) -> bool:
@@ -3296,7 +3442,7 @@ def close_all_open_positions():
 def handle_telegram_command(text: str):
     cmd = parse_command(text)
     if cmd in {"/start", "/help", "help"}:
-        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n/macro\n/macro_push\n")
+        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n/flatten\n/kill\n/unlock\n/macro\n/macro_push\n")
         return
     if cmd == "/status":
         send_to_telegram(build_status_text()); return
@@ -3324,10 +3470,10 @@ def handle_telegram_command(text: str):
         GLOBAL_STATE["telegram_enabled"] = True; save_state(GLOBAL_STATE); send_to_telegram("✅ Telegram alerts enabled"); return
     if cmd == "/telegram_off":
         GLOBAL_STATE["telegram_enabled"] = False; save_state(GLOBAL_STATE); send_to_telegram("🛑 Telegram alerts disabled"); return
-    if cmd == "/kill_on":
-        GLOBAL_STATE["kill_switch"] = True; save_state(GLOBAL_STATE); send_to_telegram("🛑 Kill switch enabled"); return
-    if cmd == "/kill_off":
-        GLOBAL_STATE["kill_switch"] = False; save_state(GLOBAL_STATE); send_to_telegram("✅ Kill switch disabled"); return
+    if cmd in {"/kill", "/kill_on"}:
+        step15_activate_kill_switch("Telegram manual kill command", close_positions=True); return
+    if cmd in {"/unlock", "/kill_off"}:
+        step15_reset_lock(); return
     if cmd == "/pause_on":
         GLOBAL_STATE["bot_paused"] = True; save_state(GLOBAL_STATE); send_to_telegram("⏸️ Bot paused"); return
     if cmd == "/pause_off":
@@ -3346,6 +3492,8 @@ def handle_telegram_command(text: str):
         return
     if cmd == "/close_all":
         close_all_open_positions(); return
+    if cmd == "/flatten":
+        step15_flatten_only("Telegram manual flatten command"); return
     if cmd == "/heartbeat":
         send_heartbeat(force=True); return
     if cmd == "/macro":
@@ -3470,6 +3618,10 @@ def boot():
 
 def runtime_housekeeping():
     ensure_globals_initialized()
+    # STEP 15: global kill/flatten guard runs before every other task.
+    if not step15_global_guard():
+        flush_dirty_stores(force=True)
+        return
     # STEP 14: account-level emergency guard runs every loop.
     if not step14_loop_enforcement():
         flush_dirty_stores(force=True)
@@ -3503,6 +3655,11 @@ def main_loop():
             # messages while TP1/TP2/trailing logic should be running.
             # =========================================================
             ensure_globals_initialized()
+            # STEP 15: hard global kill switch / flatten guard before managing or opening anything.
+            if not step15_global_guard():
+                flush_dirty_stores(force=True)
+                time.sleep(POLL_SECONDS)
+                continue
             # STEP 14: emergency guard before managing/opening anything.
             if not step14_loop_enforcement():
                 flush_dirty_stores(force=True)
