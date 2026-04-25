@@ -6449,6 +6449,22 @@ def runtime_housekeeping():
 def main_loop():
     boot()
 
+    # =========================================================
+    # FORCE STARTUP SIGNAL PICKUP
+    # Processes signal.json immediately on startup instead of
+    # waiting for file watcher / mtime logic.
+    # =========================================================
+    try:
+        startup_signal = load_active_signal_file()
+        if startup_signal:
+            debug("FORCE STARTUP SIGNAL PICKUP")
+            handle_new_signal(startup_signal)
+            clear_active_signal_file()
+            debug(f"FORCE STARTUP SIGNAL CLEARED | file={SIGNAL_FILE}")
+    except Exception as startup_signal_error:
+        log(f"❌ FORCE STARTUP SIGNAL PICKUP ERROR: {startup_signal_error}")
+        log(traceback.format_exc())
+
     if not file_exists(SIGNAL_FILE):
         log(f"❌ No signal file found on boot: {SIGNAL_FILE}")
         debug("Routing fallback test signal once.")
