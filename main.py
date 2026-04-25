@@ -3712,12 +3712,21 @@ def step14_daily_loss_limit_dollars() -> float:
     return max(get_account_equity() * STEP14_MAX_DAILY_LOSS_PCT, 1.0)
 
 
+def normalize_pnl_value_to_decimal(raw_value: float) -> float:
+    """Normalize stored PnL into decimal form. Supports 0.30 and 30.0 as +30%."""
+    val = safe_float(raw_value, 0.0)
+    if abs(val) > 1.0:
+        return val / 100.0
+    return val
+
+
 def step14_daily_pnl_dollars() -> float:
-    """Approximate daily realized PnL in dollars from engine state."""
+    """Approximate daily realized PnL in dollars from normalized engine state."""
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
     equity = get_account_equity()
-    pnl_pct_decimal = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
-    return round(pnl_pct_decimal * equity, 2)
+    pnl_raw = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
+    pnl_decimal = normalize_pnl_value_to_decimal(pnl_raw)
+    return round(pnl_decimal * equity, 2)
 
 
 def step14_open_trade_count() -> int:
@@ -3753,6 +3762,8 @@ def step14_can_open_new_trade(signal: Optional[Dict[str, Any]] = None) -> Dict[s
 
     if GLOBAL_STATE.get("kill_switch", False):
         reasons.append("step14_kill_switch_active")
+    if GLOBAL_STATE.get("allow_entries", True) is False:
+        reasons.append("entries_disabled_by_hard_kill")
 
     decision = {
         "approved": len(reasons) == 0,
@@ -3948,6 +3959,8 @@ def step15_reset_lock():
     GLOBAL_STATE["kill_switch"] = False
     GLOBAL_STATE["bot_paused"] = False
     GLOBAL_STATE["engine_enabled"] = True
+    GLOBAL_STATE["allow_entries"] = True
+    GLOBAL_STATE["hard_kill_reason"] = ""
     save_state(GLOBAL_STATE)
     flush_dirty_stores(force=True)
     step15_alert("STEP 15 RESET", "Kill switch cleared. Engine unlocked and ready for new signals.", force=True)
@@ -3962,15 +3975,13 @@ def step15_global_guard() -> bool:
     daily_pnl = step14_daily_pnl_dollars()
     daily_loss_limit = step14_daily_loss_limit_dollars()
 
-    # Hard daily loss tripwire: lock + flatten.
     if daily_pnl <= -abs(daily_loss_limit):
-        step15_activate_kill_switch(
-            f"Daily loss limit hit: ${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}",
-            close_positions=True,
+        hard_kill_engine(
+            f"STEP 15 DAILY LOSS LIMIT HIT: daily_pnl=${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}",
+            close_positions=STEP15_CLOSE_ALL_ON_KILL,
         )
         return False
 
-    # Manual or prior kill switch remains active until reset.
     if GLOBAL_STATE.get("step15_kill_active", False) or GLOBAL_STATE.get("step15_locked", False) or GLOBAL_STATE.get("kill_switch", False):
         if STEP15_CLOSE_ALL_ON_KILL:
             step15_close_all_open_positions(GLOBAL_STATE.get("step15_last_reason", "Manual/global kill switch active"))
@@ -3979,11 +3990,11 @@ def step15_global_guard() -> bool:
             f"Reason: {GLOBAL_STATE.get('step15_last_reason', 'Kill switch active')}\nUse /unlock only after reviewing risk.",
             force=False,
         )
+        debug(f"STEP 15 ENGINE LOCKED | daily_pnl={daily_pnl} | loss_limit=-{round(abs(daily_loss_limit), 2)} | kill=True")
         return False
 
     debug(f"STEP 15 GUARD OK | daily_pnl={daily_pnl} | loss_limit=-{round(abs(daily_loss_limit), 2)} | kill=False")
     return True
-
 
 
 # =========================================================
@@ -4411,6 +4422,7 @@ def phase0_hard_risk_kill_check() -> bool:
     if reasons:
         reason = "; ".join(reasons)
         phase0_block_engine(reason, flatten=PHASE0_AUTO_FLATTEN_ON_HARD_KILL)
+        hard_kill_engine(f"PHASE 0 HARD RISK KILL: {reason}", close_positions=PHASE0_AUTO_FLATTEN_ON_HARD_KILL)
         return False
     debug(f"PHASE 0 HARD RISK OK | daily_pnl={daily_pnl} | heat={round(heat*100, 3)}%")
     return True
