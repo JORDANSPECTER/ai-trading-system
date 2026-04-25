@@ -3647,10 +3647,14 @@ def open_position_if_missing(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]
     ensure_globals_initialized()
     symbol = str(signal.get("symbol", "")).strip()
 
-    for p in GLOBAL_POSITIONS.get("open_positions", []):
-        if str(p.get("symbol", "")).strip() == symbol and str(p.get("status", "OPEN")).upper() == "OPEN":
-            debug(f"ENTRY TRIGGER SKIPPED: existing open position already found for {symbol}")
-            return p
+    duplicate_gate = hard_duplicate_entry_gate(signal)
+    if not duplicate_gate["approved"]:
+        msg = build_block_message("HARD DUPLICATE CAP SKIPPED OPEN", signal, duplicate_gate["reject_reasons"], "open_position_if_missing refused to create a stacked position.")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+        debug(f"ENTRY TRIGGER SKIPPED BY HARD DUPLICATE CAP | symbol={symbol} | reasons={duplicate_gate['reject_reasons']}")
+        return None
 
     # In live mode, only open live if Alpaca is explicitly enabled and paper is off.
     if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True):
@@ -4919,6 +4923,108 @@ def should_route_signal(signal: Dict[str, Any]) -> bool:
     return True
 
 
+# =========================================================
+# HARD DUPLICATE POSITION CAP
+# Blocks stacking from BOTH positions.json and open_trades.json.
+# This prevents the same symbol + direction from doubling qty
+# when a signal repeats or the loop sees the same setup again.
+# =========================================================
+def _active_status(value: Any) -> bool:
+    s = str(value or "OPEN").upper().strip()
+    return s not in {"CLOSED", "CLOSE", "FILLED_CLOSED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DONE"}
+
+
+def _record_symbol_direction(record: Dict[str, Any]) -> Tuple[str, str]:
+    symbol = str(record.get("symbol") or record.get("contract_symbol") or record.get("option_symbol") or "").strip()
+    direction = str(record.get("direction") or record.get("trade_direction") or record.get("option_type") or "").upper().strip()
+    return symbol, direction
+
+
+def load_open_trades_records() -> List[Dict[str, Any]]:
+    data = load_json_file("open_trades.json", [])
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("open_trades", "open_positions", "positions", "trades"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def has_duplicate_open_position_anywhere(symbol: str, direction: str) -> Dict[str, Any]:
+    ensure_globals_initialized()
+    symbol = str(symbol or "").strip()
+    direction = str(direction or "").upper().strip()
+    reasons: List[str] = []
+
+    for p in GLOBAL_POSITIONS.get("open_positions", []):
+        if not isinstance(p, dict):
+            continue
+        p_symbol = str(p.get("symbol", "")).strip()
+        p_direction = str(p.get("direction", "")).upper().strip()
+        qty_open = safe_int(p.get("qty_open", p.get("remaining_qty", p.get("qty", 0))), 0)
+        if p_symbol == symbol and p_direction == direction and qty_open > 0 and _active_status(p.get("status", "OPEN")):
+            reasons.append(f"duplicate_open_position_positions_json:{symbol}:{direction}:qty={qty_open}")
+
+    for t in load_open_trades_records():
+        t_symbol, t_direction = _record_symbol_direction(t)
+        qty_open = safe_int(t.get("remaining_qty", t.get("qty_open", t.get("qty", 0))), 0)
+        if t_symbol == symbol and t_direction == direction and qty_open > 0 and _active_status(t.get("status", "OPEN")):
+            reasons.append(f"duplicate_open_position_open_trades_json:{symbol}:{direction}:qty={qty_open}")
+
+    active_order_statuses = {"created", "submitted", "accepted", "new", "pending_new", "partially_filled", "open"}
+    for o in GLOBAL_ORDERS.get("orders", []):
+        if not isinstance(o, dict):
+            continue
+        o_symbol = str(o.get("symbol", "")).strip()
+        o_status = str(o.get("status", "")).lower().strip()
+        o_side = str(o.get("side", "")).lower().strip()
+        if o_symbol == symbol and o_side == "buy" and o_status in active_order_statuses:
+            reasons.append(f"duplicate_active_buy_order:{symbol}:status={o_status}")
+
+    return {"approved": len(reasons) == 0, "reject_reasons": reasons}
+
+
+def signal_id_already_used(signal: Dict[str, Any]) -> bool:
+    ensure_globals_initialized()
+    signal_id = str(signal.get("signal_id", "")).strip() or signal_hash(signal)
+    used = GLOBAL_STATE.get("used_signal_ids", [])
+    return isinstance(used, list) and signal_id in used
+
+
+def remember_used_signal_id(signal: Dict[str, Any], max_keep: int = 200):
+    ensure_globals_initialized()
+    signal_id = str(signal.get("signal_id", "")).strip() or signal_hash(signal)
+    used = GLOBAL_STATE.get("used_signal_ids", [])
+    if not isinstance(used, list):
+        used = []
+    if signal_id not in used:
+        used.append(signal_id)
+    GLOBAL_STATE["used_signal_ids"] = used[-max_keep:]
+    save_state(GLOBAL_STATE)
+
+
+def hard_duplicate_entry_gate(signal: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(signal.get("symbol", "")).strip()
+    direction = str(signal.get("direction", "")).upper().strip()
+    reasons: List[str] = []
+
+    if not symbol:
+        reasons.append("missing_symbol_for_duplicate_gate")
+    if not direction:
+        reasons.append("missing_direction_for_duplicate_gate")
+    if signal_id_already_used(signal):
+        reasons.append("repeat_signal_id_blocked")
+    if symbol and direction:
+        reasons.extend(has_duplicate_open_position_anywhere(symbol, direction).get("reject_reasons", []))
+
+    if reasons:
+        debug(f"HARD DUPLICATE CAP BLOCK | symbol={symbol} | direction={direction} | reasons={reasons}")
+
+    return {"approved": len(reasons) == 0, "reject_reasons": reasons, "symbol": symbol, "direction": direction}
+
+
 def handle_new_signal(signal: Dict[str, Any]):
     try:
         intel_event(
@@ -4950,6 +5056,18 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not should_route_signal(signal):
         debug("PHASE 3 NOT RUN | no fresh routable signal or position-management cycle only")
         manage_open_positions(signal)
+        return
+
+    duplicate_gate = hard_duplicate_entry_gate(signal)
+    if not duplicate_gate["approved"]:
+        msg = build_block_message("HARD DUPLICATE CAP BLOCKED SIGNAL", signal, duplicate_gate["reject_reasons"], "Existing symbol/direction is already open or signal was already used.")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+        try:
+            intel_event("duplicate_entry_blocked", {"reasons": duplicate_gate["reject_reasons"]}, signal=signal, stage="hard_duplicate_cap", decision="blocked")
+        except Exception:
+            pass
         return
 
     # PHASE 0: catastrophic-loss safety gate before normal validation/risk.
@@ -5033,6 +5151,18 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not step14_decision["approved"]:
         return
 
+    duplicate_gate_final = hard_duplicate_entry_gate(sized_signal)
+    if not duplicate_gate_final["approved"]:
+        msg = build_block_message("HARD DUPLICATE CAP BLOCKED ENTRY", sized_signal, duplicate_gate_final["reject_reasons"], "Blocked at final pre-order gate.")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+        try:
+            intel_event("duplicate_entry_blocked", {"reasons": duplicate_gate_final["reject_reasons"]}, signal=sized_signal, stage="hard_duplicate_cap_final", decision="blocked")
+        except Exception:
+            pass
+        return
+
     # PHASE 1: final execution-safety guard before route/open.
     phase1_entry_decision = phase1_validate_order_safety(
         sized_signal,
@@ -5079,6 +5209,7 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     opened_position = open_position_if_missing(sized_signal)
     if opened_position:
+        remember_used_signal_id(sized_signal)
         debug(
             f"ENTRY EXECUTION CONFIRMED | symbol={opened_position.get('symbol')} | "
             f"mode={opened_position.get('mode')} | qty={opened_position.get('qty_open')} | "
