@@ -662,6 +662,19 @@ PHASE35_STRICT_MODE = os.getenv("PHASE35_STRICT_MODE", "true").lower() == "true"
 PHASE35_SUGGEST_ONLY = os.getenv("PHASE35_SUGGEST_ONLY", "false").lower() == "true"
 PHASE35_BLOCK_EXECUTION_ONLY = os.getenv("PHASE35_BLOCK_EXECUTION_ONLY", "false").lower() == "true"
 PHASE35_MIN_CONFIDENCE_TO_EXECUTE = os.getenv("PHASE35_MIN_CONFIDENCE_TO_EXECUTE", "A").upper().strip()
+
+# =========================================================
+# PHASE 3.5 STRATEGY EXECUTION LOCK
+# Only A/A+ setups from the UnBiased Trades playbook can execute.
+# =========================================================
+ENABLE_PHASE35_STRATEGY_LOCK = os.getenv("ENABLE_PHASE35_STRATEGY_LOCK", "true").lower() == "true"
+PHASE35_ALLOWED_GRADES = {x.strip().upper() for x in os.getenv("PHASE35_ALLOWED_GRADES", "A,A+").split(",") if x.strip()}
+PHASE35_ALLOWED_TRIGGERS = {x.strip().lower() for x in os.getenv("PHASE35_ALLOWED_TRIGGERS", "vwap_reclaim,break_and_hold,rejection").split(",") if x.strip()}
+PHASE35_ALLOWED_CONFIRMATIONS = {x.strip().lower() for x in os.getenv("PHASE35_ALLOWED_CONFIRMATIONS", "volume,retest,momentum").split(",") if x.strip()}
+PHASE35_BLOCK_CHOP = os.getenv("PHASE35_BLOCK_CHOP", "true").lower() == "true"
+PHASE35_ENFORCE_EDGE_WINDOWS = os.getenv("PHASE35_ENFORCE_EDGE_WINDOWS", "true").lower() == "true"
+PHASE35_ALLOW_TEST_SIGNAL_ANYTIME = os.getenv("PHASE35_ALLOW_TEST_SIGNAL_ANYTIME", "true").lower() == "true"
+
 PHASE35_MIN_CONFIDENCE_TO_PREMIUM = os.getenv("PHASE35_MIN_CONFIDENCE_TO_PREMIUM", "B").upper().strip()
 PHASE35_REQUIRE_PHASE3_APPROVAL = os.getenv("PHASE35_REQUIRE_PHASE3_APPROVAL", "true").lower() == "true"
 PHASE35_REQUIRE_ADAPTIVE_STATS_SYNC = os.getenv("PHASE35_REQUIRE_ADAPTIVE_STATS_SYNC", "true").lower() == "true"
@@ -2184,6 +2197,8 @@ def build_unbiased_signal(
     contract_price: float = 0,
     underlying_price: float = 0,
     qty: int = 1,
+    confirmation: str = "volume",
+    regime: str = "clean",
 ) -> Dict[str, Any]:
     ticker = str(ticker or "QQQ").upper().strip()
     direction = normalize_direction(direction)
@@ -2212,7 +2227,7 @@ def build_unbiased_signal(
 
     setup_clean = str(setup or "manual_setup").lower().strip().replace(" ", "_")
     bias = "Bullish" if direction == "CALL" else "Bearish"
-    trigger = setup_clean.replace("_", " ").title()
+    trigger = setup_clean
 
     signal = {
         "ticker": ticker,
@@ -2294,6 +2309,8 @@ def write_unbiased_test_signal() -> Dict[str, Any]:
         contract_price=1.35,
         qty=1,
         notes="Auto formatter test signal: VWAP reclaim with defined stop and target.",
+        confirmation="volume",
+        regime="clean",
     )
     write_auto_signal(sig)
     print(json.dumps(sig, indent=2))
@@ -5783,7 +5800,116 @@ def phase35_approve(signal: Dict[str, Any], notes: Optional[List[str]] = None) -
     return {"approved": True, "stage": "phase35_enforcement", "notes": notes or []}
 
 
+
+# =========================================================
+# PHASE 3.5 STRATEGY EXECUTION LOCK HELPERS
+# =========================================================
+def phase35_is_edge_window() -> bool:
+    """User edge windows: 9:30-10:30 ET and 3:00-4:00 ET."""
+    if not PHASE35_ENFORCE_EDGE_WINDOWS:
+        return True
+    try:
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            now = datetime.now()
+
+        hour = now.hour
+        minute = now.minute
+        in_morning = (hour == 9 and minute >= 30) or (hour == 10 and minute <= 30)
+        in_power_hour = (hour == 15)
+        return bool(in_morning or in_power_hour)
+    except Exception:
+        return False
+
+
+def phase35_strategy_execution_lock(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Hard strategy filter before any paper/live execution."""
+    if not ENABLE_PHASE35_STRATEGY_LOCK:
+        return {"approved": True, "stage": "phase35_strategy_lock", "reason": "disabled", "reject_reasons": []}
+
+    grade = str(signal.get("grade", signal.get("confidence", ""))).upper().strip()
+    confidence = str(signal.get("confidence", grade)).upper().strip()
+
+    trigger = str(
+        signal.get("trigger")
+        or signal.get("setup")
+        or signal.get("strategy")
+        or ""
+    ).lower().strip().replace(" ", "_")
+
+    confirmation = str(
+        signal.get("confirmation")
+        or signal.get("confirm")
+        or ""
+    ).lower().strip().replace(" ", "_")
+
+    regime = str(
+        signal.get("regime")
+        or signal.get("market_regime")
+        or "clean"
+    ).lower().strip()
+
+    source = str(signal.get("source", "")).lower().strip()
+    reject_reasons = []
+
+    if grade not in PHASE35_ALLOWED_GRADES and confidence not in PHASE35_ALLOWED_GRADES:
+        reject_reasons.append(f"non_a_setup:grade={grade}:confidence={confidence}")
+
+    if trigger not in PHASE35_ALLOWED_TRIGGERS:
+        reject_reasons.append(f"invalid_trigger:{trigger or 'missing'}")
+
+    if confirmation not in PHASE35_ALLOWED_CONFIRMATIONS:
+        reject_reasons.append(f"missing_or_invalid_confirmation:{confirmation or 'missing'}")
+
+    if PHASE35_ENFORCE_EDGE_WINDOWS:
+        test_bypass = PHASE35_ALLOW_TEST_SIGNAL_ANYTIME and source in {"auto_signal_formatter", "test", "manual_test"}
+        if not test_bypass and not phase35_is_edge_window():
+            reject_reasons.append("outside_edge_trading_window")
+
+    if PHASE35_BLOCK_CHOP and regime in {"chop", "choppy", "sideways", "range"}:
+        reject_reasons.append(f"choppy_regime:{regime}")
+
+    approved = len(reject_reasons) == 0
+
+    if approved:
+        debug(
+            f"PHASE 3.5 STRATEGY LOCK APPROVED | "
+            f"grade={grade} confidence={confidence} trigger={trigger} confirmation={confirmation} regime={regime}"
+        )
+    else:
+        msg = (
+            "🚫 PHASE 3.5 STRATEGY LOCK\n"
+            f"BLOCKED SIGNAL Ticker: {signal.get('ticker', signal.get('symbol'))}\n"
+            f"Reasons: {', '.join(reject_reasons)}"
+        )
+        log(msg.replace("\n", " | "))
+        try:
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_telegram(msg)
+        except Exception:
+            pass
+
+    return {
+        "approved": approved,
+        "stage": "phase35_strategy_lock",
+        "reject_reasons": reject_reasons,
+        "grade": grade,
+        "confidence": confidence,
+        "trigger": trigger,
+        "confirmation": confirmation,
+        "regime": regime,
+    }
+
+
+
 def phase35_enforcement_gate(signal: Dict[str, Any], phase3_decision: Optional[Dict[str, Any]] = None, size_decision: Optional[Dict[str, Any]] = None, stage: str = "pre_size") -> Dict[str, Any]:
+    # PHASE 3.5 STRATEGY LOCK GATE
+    strategy_lock = phase35_strategy_execution_lock(signal)
+    if not strategy_lock.get("approved", False):
+        return strategy_lock
+
     if not ENABLE_PHASE35_ENFORCEMENT:
         return {"approved": True, "stage": "phase35_enforcement", "notes": ["phase35_disabled"]}
 
