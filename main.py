@@ -219,6 +219,25 @@ STEP15_REQUIRE_MANUAL_RESET = os.getenv("STEP15_REQUIRE_MANUAL_RESET", "true").l
 STEP15_SEND_ALERTS = os.getenv("STEP15_SEND_ALERTS", "true").lower() == "true"
 STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "60"))
 
+
+# =========================================================
+# PHASE 0 HARD SAFETY LAYER
+# - State invariants
+# - Startup safety gate
+# - Fresh price requirements
+# - Hard daily loss / heat kill switch
+# =========================================================
+ENABLE_PHASE0_SAFETY = os.getenv("ENABLE_PHASE0_SAFETY", "true").lower() == "true"
+PHASE0_BLOCK_ON_INVALID_STATE = os.getenv("PHASE0_BLOCK_ON_INVALID_STATE", "true").lower() == "true"
+PHASE0_REQUIRE_FRESH_PRICE_FOR_ENTRY = os.getenv("PHASE0_REQUIRE_FRESH_PRICE_FOR_ENTRY", "true").lower() == "true"
+PHASE0_REQUIRE_FRESH_PRICE_FOR_OPEN_POSITIONS = os.getenv("PHASE0_REQUIRE_FRESH_PRICE_FOR_OPEN_POSITIONS", "true").lower() == "true"
+PHASE0_REQUIRE_STARTUP_RECON_CLEAN = os.getenv("PHASE0_REQUIRE_STARTUP_RECON_CLEAN", "true").lower() == "true"
+PHASE0_MARKET_FILE_MAX_AGE_SECONDS = int(os.getenv("PHASE0_MARKET_FILE_MAX_AGE_SECONDS", str(MARKET_DATA_STALE_SECONDS)))
+PHASE0_HARD_DAILY_LOSS_PCT = float(os.getenv("PHASE0_HARD_DAILY_LOSS_PCT", str(MAX_DAILY_LOSS_PCT)))
+PHASE0_HARD_PORTFOLIO_HEAT_PCT = float(os.getenv("PHASE0_HARD_PORTFOLIO_HEAT_PCT", str(max(MAX_PORTFOLIO_HEAT_PCT * 1.25, MAX_PORTFOLIO_HEAT_PCT))))
+PHASE0_AUTO_FLATTEN_ON_HARD_KILL = os.getenv("PHASE0_AUTO_FLATTEN_ON_HARD_KILL", "true").lower() == "true"
+PHASE0_SEND_ALERTS = os.getenv("PHASE0_SEND_ALERTS", "true").lower() == "true"
+
 # =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
@@ -3276,6 +3295,276 @@ def step15_global_guard() -> bool:
     debug(f"STEP 15 GUARD OK | daily_pnl={daily_pnl} | loss_limit=-{round(abs(daily_loss_limit), 2)} | kill=False")
     return True
 
+
+# =========================================================
+# PHASE 0 HARD SAFETY LAYER
+# =========================================================
+def phase0_alert(title: str, body: str, force: bool = False):
+    """Loud Phase 0 safety alert. Uses AI + premium + Telegram when enabled."""
+    msg = f"🧱 {title}\n{body}\n⏰ {now_ts()}"
+    log(msg.replace("\n", " | "))
+    if PHASE0_SEND_ALERTS:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+
+
+def phase0_block_engine(reason: str, flatten: bool = False):
+    """Hard safety block. Sets the same state flags used by recon and Step 15."""
+    ensure_globals_initialized()
+    GLOBAL_STATE["phase0_blocked"] = True
+    GLOBAL_STATE["phase0_block_reason"] = reason
+    GLOBAL_STATE["phase0_blocked_at"] = epoch()
+    GLOBAL_STATE["reconciliation_required"] = True
+    GLOBAL_STATE["reconciliation_block_reason"] = reason
+    GLOBAL_STATE["bot_paused"] = True
+    GLOBAL_STATE["kill_switch"] = True
+    save_state(GLOBAL_STATE)
+    phase0_alert("PHASE 0 HARD BLOCK", reason, force=True)
+    try:
+        if flatten and ENABLE_STEP15_GLOBAL_KILL_SWITCH:
+            step15_activate_kill_switch(f"PHASE 0 HARD BLOCK: {reason}", close_positions=PHASE0_AUTO_FLATTEN_ON_HARD_KILL)
+    except Exception as e:
+        log(f"❌ Phase 0 could not activate Step 15: {e}")
+
+
+def phase0_position_errors(position: Dict[str, Any], label: str) -> List[str]:
+    errors = []
+    pid = safe_int(position.get("id", 0), 0)
+    symbol = str(position.get("symbol", "")).strip()
+    qty_open = safe_int(position.get("qty_open", 0), 0)
+    qty_total = safe_int(position.get("qty_total", 0), 0)
+    qty_closed = safe_int(position.get("qty_closed", 0), 0)
+    entry = safe_float(position.get("entry_price", 0), 0)
+    last = safe_float(position.get("last_price", 0), 0)
+    stop = safe_float(position.get("stop_price", 0), 0)
+    status = str(position.get("status", "OPEN")).upper()
+    if pid <= 0:
+        errors.append(f"{label}: position id missing/invalid")
+    if not symbol:
+        errors.append(f"{label}: symbol missing for position id={pid}")
+    if qty_total < 0 or qty_open < 0 or qty_closed < 0:
+        errors.append(f"{label}: negative quantity for {symbol} id={pid}")
+    if status == "OPEN" and qty_open <= 0:
+        errors.append(f"{label}: open position has qty_open <= 0 for {symbol} id={pid}")
+    if entry <= 0:
+        errors.append(f"{label}: entry_price <= 0 for {symbol} id={pid}")
+    if last < 0:
+        errors.append(f"{label}: last_price < 0 for {symbol} id={pid}")
+    if stop < 0:
+        errors.append(f"{label}: stop_price < 0 for {symbol} id={pid}")
+    if qty_total > 0 and qty_open + qty_closed > qty_total:
+        errors.append(f"{label}: qty_open + qty_closed exceeds qty_total for {symbol} id={pid}")
+    return errors
+
+
+def phase0_validate_state_invariants() -> Dict[str, Any]:
+    """Validate local state before allowing trading. Bad state must be loud and blocking."""
+    ensure_globals_initialized()
+    errors = []
+
+    if not isinstance(GLOBAL_STATE, dict):
+        errors.append("GLOBAL_STATE is not a dict")
+    if not isinstance(GLOBAL_POSITIONS, dict):
+        errors.append("GLOBAL_POSITIONS is not a dict")
+    if not isinstance(GLOBAL_ORDERS, dict):
+        errors.append("GLOBAL_ORDERS is not a dict")
+    if not isinstance(GLOBAL_RECON, dict):
+        errors.append("GLOBAL_RECON is not a dict")
+
+    open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+    closed_positions = GLOBAL_POSITIONS.get("closed_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+    orders = GLOBAL_ORDERS.get("orders", []) if isinstance(GLOBAL_ORDERS, dict) else []
+
+    if not isinstance(open_positions, list):
+        errors.append("open_positions must be a list")
+        open_positions = []
+    if not isinstance(closed_positions, list):
+        errors.append("closed_positions must be a list")
+        closed_positions = []
+    if not isinstance(orders, list):
+        errors.append("orders must be a list")
+        orders = []
+
+    seen_open_ids = set()
+    for p in open_positions:
+        if not isinstance(p, dict):
+            errors.append("open_positions contains non-dict item")
+            continue
+        pid = safe_int(p.get("id", 0), 0)
+        if pid in seen_open_ids:
+            errors.append(f"duplicate open position id={pid}")
+        seen_open_ids.add(pid)
+        errors.extend(phase0_position_errors(p, "open"))
+
+    seen_order_ids = set()
+    for o in orders:
+        if not isinstance(o, dict):
+            errors.append("orders contains non-dict item")
+            continue
+        oid = safe_int(o.get("local_order_id", 0), 0)
+        if oid > 0:
+            if oid in seen_order_ids:
+                errors.append(f"duplicate local_order_id={oid}")
+            seen_order_ids.add(oid)
+        qty_req = safe_int(o.get("qty_requested", 0), 0)
+        qty_fill = safe_int(o.get("qty_filled", 0), 0)
+        if qty_req < 0 or qty_fill < 0:
+            errors.append(f"negative order quantity local_order_id={oid}")
+        if qty_req > 0 and qty_fill > qty_req:
+            errors.append(f"filled quantity exceeds requested local_order_id={oid}")
+
+    result = {"approved": len(errors) == 0, "errors": errors, "open_positions": len(open_positions), "orders": len(orders)}
+    if result["approved"]:
+        debug(f"PHASE 0 STATE OK | open={len(open_positions)} | orders={len(orders)}")
+    else:
+        log("🚫 PHASE 0 STATE INVALID | " + "; ".join(errors[:10]))
+    return result
+
+
+def phase0_market_file_age_seconds() -> int:
+    try:
+        if MARKET_DATA_FILE and file_exists(MARKET_DATA_FILE):
+            return max(0, epoch() - int(os.path.getmtime(MARKET_DATA_FILE)))
+    except Exception:
+        pass
+    return 999999
+
+
+def phase0_price_is_fresh(symbol: str, prices: Dict[str, Any]) -> Tuple[bool, float, str]:
+    price, ts = get_market_price_for_symbol(symbol, prices)
+    if price <= 0:
+        return False, price, "missing_or_zero_price"
+    if ts > 0 and market_price_is_stale(ts):
+        return False, price, f"stale_timestamp_age={epoch() - ts}s"
+    if ts <= 0:
+        # Manual/file test data usually has no timestamp, so freshness comes from file mtime.
+        age = phase0_market_file_age_seconds()
+        if MARKET_DATA_PROVIDER in {"file", "manual", "auto", "twelvedata"} and age > PHASE0_MARKET_FILE_MAX_AGE_SECONDS:
+            return False, price, f"stale_market_file_age={age}s"
+    return True, price, "fresh"
+
+
+def phase0_validate_fresh_prices_for_open_positions() -> Dict[str, Any]:
+    ensure_globals_initialized()
+    if not PHASE0_REQUIRE_FRESH_PRICE_FOR_OPEN_POSITIONS:
+        return {"approved": True, "reject_reasons": []}
+    open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+    symbols = [str(p.get("symbol", "")).strip() for p in open_positions if str(p.get("symbol", "")).strip()]
+    if not symbols:
+        return {"approved": True, "reject_reasons": []}
+    prices = load_market_prices(symbols)
+    reasons = []
+    for sym in symbols:
+        ok, price, reason = phase0_price_is_fresh(sym, prices)
+        if not ok:
+            reasons.append(f"open_position_price_not_fresh:{sym}:{reason}")
+    if reasons:
+        debug("PHASE 0 OPEN PRICE BLOCK | " + "; ".join(reasons[:5]))
+    else:
+        debug(f"PHASE 0 OPEN PRICES OK | symbols={len(symbols)}")
+    return {"approved": len(reasons) == 0, "reject_reasons": reasons}
+
+
+def phase0_validate_fresh_price_for_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not PHASE0_REQUIRE_FRESH_PRICE_FOR_ENTRY:
+        return {"approved": True, "reject_reasons": []}
+    symbol = str(signal.get("symbol", "")).strip()
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    symbols = []
+    if symbol:
+        symbols.append(symbol)
+    if ticker and ticker not in symbols:
+        symbols.append(ticker)
+    prices = load_market_prices(symbols)
+    reasons = []
+    if symbol:
+        ok, price, reason = phase0_price_is_fresh(symbol, prices)
+        if not ok:
+            reasons.append(f"entry_symbol_price_not_fresh:{symbol}:{reason}")
+    if ticker:
+        # Underlying may be live-provider based; missing underlying is a block only if live price was required/available.
+        underlying_price = safe_float(signal.get("price", 0), 0)
+        if underlying_price <= 0:
+            # Try cached/live one last time.
+            underlying_price = get_live_market_price(ticker)
+        if underlying_price <= 0:
+            reasons.append(f"underlying_price_not_fresh:{ticker}:missing_or_zero_price")
+    if reasons:
+        debug("PHASE 0 ENTRY PRICE BLOCK | " + "; ".join(reasons[:5]))
+    else:
+        debug(f"PHASE 0 ENTRY PRICES OK | symbol={symbol} | ticker={ticker}")
+    return {"approved": len(reasons) == 0, "reject_reasons": reasons}
+
+
+def phase0_hard_risk_kill_check() -> bool:
+    """Return True when safe. Return False when hard daily loss/heat kill is active."""
+    ensure_globals_initialized()
+    if not ENABLE_PHASE0_SAFETY:
+        return True
+    daily_pnl = step14_daily_pnl_dollars()
+    equity = get_account_equity()
+    hard_daily_loss_dollars = max(equity * PHASE0_HARD_DAILY_LOSS_PCT, 1.0)
+    heat = portfolio_heat_pct()
+    reasons = []
+    if daily_pnl <= -abs(hard_daily_loss_dollars):
+        reasons.append(f"hard_daily_loss_hit:${daily_pnl} <= -${round(abs(hard_daily_loss_dollars), 2)}")
+    if heat >= PHASE0_HARD_PORTFOLIO_HEAT_PCT:
+        reasons.append(f"hard_portfolio_heat_hit:{round(heat*100, 3)}% >= {round(PHASE0_HARD_PORTFOLIO_HEAT_PCT*100, 3)}%")
+    if reasons:
+        reason = "; ".join(reasons)
+        phase0_block_engine(reason, flatten=PHASE0_AUTO_FLATTEN_ON_HARD_KILL)
+        return False
+    debug(f"PHASE 0 HARD RISK OK | daily_pnl={daily_pnl} | heat={round(heat*100, 3)}%")
+    return True
+
+
+def phase0_pretrade_safety_gate(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Final catastrophic-loss gate before normal validator/risk checks."""
+    ensure_globals_initialized()
+    if not ENABLE_PHASE0_SAFETY:
+        return {"approved": True, "reject_reasons": []}
+    reasons = []
+    if GLOBAL_STATE.get("phase0_blocked", False):
+        reasons.append(f"phase0_blocked:{GLOBAL_STATE.get('phase0_block_reason', '')}")
+    state_check = phase0_validate_state_invariants()
+    if not state_check["approved"]:
+        reasons.extend([f"state_invariant:{e}" for e in state_check["errors"][:5]])
+    open_price_check = phase0_validate_fresh_prices_for_open_positions()
+    if not open_price_check["approved"]:
+        reasons.extend(open_price_check["reject_reasons"])
+    entry_price_check = phase0_validate_fresh_price_for_signal(signal)
+    if not entry_price_check["approved"]:
+        reasons.extend(entry_price_check["reject_reasons"])
+    if not phase0_hard_risk_kill_check():
+        reasons.append("phase0_hard_risk_kill_active")
+    return {"approved": len(reasons) == 0, "reject_reasons": reasons, "stage": "phase0_pretrade_safety"}
+
+
+def phase0_startup_safety_gate():
+    """Run once on boot. Bad local state or bad broker reconciliation blocks trading hard."""
+    ensure_globals_initialized()
+    if not ENABLE_PHASE0_SAFETY:
+        return
+    state_check = phase0_validate_state_invariants()
+    if not state_check["approved"] and PHASE0_BLOCK_ON_INVALID_STATE:
+        phase0_block_engine("State invariant failure on startup: " + "; ".join(state_check["errors"][:8]), flatten=False)
+        return
+    if PHASE0_REQUIRE_STARTUP_RECON_CLEAN and ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+        report = build_boot_reconciliation_report()
+        msg = build_reconciliation_message(report)
+        send_to_telegram(msg)
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        if not report.get("safe_to_trade", False):
+            reason = "; ".join(report.get("mismatches", [])[:8]) or "startup reconciliation mismatch"
+            set_reconciliation_block(reason)
+            phase0_block_engine("Startup reconciliation failed: " + reason, flatten=False)
+            return
+        clear_reconciliation_block()
+        debug("PHASE 0 STARTUP RECON OK")
+    phase0_hard_risk_kill_check()
+    debug("PHASE 0 STARTUP SAFETY GATE PASSED")
+
 # =========================================================
 # SIGNAL HANDLER
 # =========================================================
@@ -3299,6 +3588,15 @@ def handle_new_signal(signal: Dict[str, Any]):
         return
     if not should_route_signal(signal):
         manage_open_positions(signal)
+        return
+
+    # PHASE 0: catastrophic-loss safety gate before normal validation/risk.
+    phase0_decision = phase0_pretrade_safety_gate(signal)
+    if not phase0_decision["approved"]:
+        msg = build_block_message("PHASE 0 BLOCKED SIGNAL", signal, phase0_decision["reject_reasons"], "Fresh price / state / hard risk gate failed.")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
         return
 
     validation_decision = validate_signal(signal)
@@ -3607,7 +3905,10 @@ def boot():
     if RUN_TEST_ON_START:
         run_startup_tests()
 
-    if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+    # PHASE 0: hard startup safety gate. This validates local state and makes
+    # startup reconciliation decisive before any new trade can be opened.
+    phase0_startup_safety_gate()
+    if (not ENABLE_PHASE0_SAFETY) and ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
         startup_reconcile_and_gate()
 
     if ENABLE_MACRO_BRIDGE:
@@ -3620,6 +3921,15 @@ def runtime_housekeeping():
     ensure_globals_initialized()
     # STEP 15: global kill/flatten guard runs before every other task.
     if not step15_global_guard():
+        flush_dirty_stores(force=True)
+        return
+    # PHASE 0: hard daily loss / heat kill switch and stale open-position price gate.
+    if not phase0_hard_risk_kill_check():
+        flush_dirty_stores(force=True)
+        return
+    open_price_gate = phase0_validate_fresh_prices_for_open_positions()
+    if not open_price_gate["approved"]:
+        phase0_alert("PHASE 0 OPEN POSITION PRICE BLOCK", ", ".join(open_price_gate["reject_reasons"][:8]), force=False)
         flush_dirty_stores(force=True)
         return
     # STEP 14: account-level emergency guard runs every loop.
