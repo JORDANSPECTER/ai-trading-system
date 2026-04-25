@@ -160,8 +160,13 @@ MAX_ORDER_STALE_SECONDS = int(os.getenv("MAX_ORDER_STALE_SECONDS", "120"))
 # MARKET DATA / STEP 8 LIVE PRICE MANAGEMENT
 ENABLE_MARKET_DATA = os.getenv("ENABLE_MARKET_DATA", "true").lower() == "true"
 MARKET_DATA_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
+MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "auto").strip().lower()
 MARKET_DATA_REFRESH_SECONDS = int(os.getenv("MARKET_DATA_REFRESH_SECONDS", "5"))
 MARKET_DATA_STALE_SECONDS = int(os.getenv("MARKET_DATA_STALE_SECONDS", "20"))
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TWELVE_DATA_BASE_URL = os.getenv("TWELVE_DATA_BASE_URL", "https://api.twelvedata.com").strip().rstrip("/")
+ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").strip().rstrip("/")
+LIVE_PRICE_CACHE_SECONDS = int(os.getenv("LIVE_PRICE_CACHE_SECONDS", str(MARKET_DATA_REFRESH_SECONDS)))
 AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
 AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
 AUTO_TRAILING_STOP_ENABLED = os.getenv("AUTO_TRAILING_STOP_ENABLED", "true").lower() == "true"
@@ -193,6 +198,7 @@ DIRTY_POSITIONS = False
 DIRTY_ORDERS = False
 DIRTY_RECON = False
 DIRTY_MACRO = False
+MARKET_PRICE_CACHE = {}
 
 
 # =========================================================
@@ -1937,27 +1943,210 @@ def startup_reconcile_and_gate():
 # =========================================================
 # STEP 8 MARKET PRICE FEED / LIVE POSITION PRICE UPDATES
 # =========================================================
-def load_market_prices() -> Dict[str, Any]:
-    """Reads MARKET_DATA_FILE every loop."""
+def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Step 10 market-data router.
+
+    Priority:
+    1) Live provider if configured/available (Twelve Data or Alpaca Data)
+    2) MARKET_DATA_FILE fallback for testing/manual override
+
+    This keeps Step 8 + Step 9 working even when a live provider fails.
+    """
     if not ENABLE_MARKET_DATA:
         return {}
-    if not MARKET_DATA_FILE:
-        return {}
-    if not file_exists(MARKET_DATA_FILE):
-        debug(f"MARKET_DATA_FILE not found yet: {MARKET_DATA_FILE}")
-        return {}
-    try:
-        with open(MARKET_DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            log(f"❌ MARKET_DATA_FILE must contain a JSON object: {MARKET_DATA_FILE}")
-            return {}
-        debug(f"MARKET DATA READ from {MARKET_DATA_FILE}: {data}")
-        return data
-    except Exception as e:
-        log(f"❌ Failed reading market data file {MARKET_DATA_FILE}: {e}")
-        return {}
 
+    prices = {}
+
+    # 1) File fallback/manual override still supported.
+    if MARKET_DATA_FILE and file_exists(MARKET_DATA_FILE):
+        try:
+            with open(MARKET_DATA_FILE, "r", encoding="utf-8") as f:
+                file_data = json.load(f)
+            if isinstance(file_data, dict):
+                prices.update(file_data)
+                debug(f"MARKET DATA FILE READ from {MARKET_DATA_FILE}: {file_data}")
+            else:
+                log(f"❌ MARKET_DATA_FILE must contain a JSON object: {MARKET_DATA_FILE}")
+        except Exception as e:
+            log(f"❌ Failed reading market data file {MARKET_DATA_FILE}: {e}")
+    elif MARKET_DATA_FILE:
+        debug(f"MARKET_DATA_FILE not found yet: {MARKET_DATA_FILE}")
+
+    # 2) Live fetch for requested symbols. Live values overwrite file values.
+    requested = []
+    if symbols:
+        for s in symbols:
+            sym = str(s or "").strip()
+            if sym and sym not in requested:
+                requested.append(sym)
+
+    if requested and MARKET_DATA_PROVIDER not in {"file", "manual", "off", "disabled"}:
+        for sym in requested:
+            live_price = get_live_market_price(sym)
+            if live_price > 0:
+                prices[sym] = {"price": live_price, "timestamp": epoch(), "source": MARKET_DATA_PROVIDER}
+                debug(f"LIVE MARKET DATA READ | {sym}: {live_price}")
+
+    return prices
+
+
+def cache_get_market_price(symbol: str) -> Tuple[float, int, str]:
+    item = MARKET_PRICE_CACHE.get(str(symbol).upper().strip(), {})
+    if not isinstance(item, dict):
+        return 0.0, 0, ""
+    price = safe_float(item.get("price", 0), 0)
+    ts = safe_int(item.get("timestamp", 0), 0)
+    source = str(item.get("source", ""))
+    if price > 0 and ts > 0 and (epoch() - ts) <= LIVE_PRICE_CACHE_SECONDS:
+        return price, ts, source
+    return 0.0, 0, ""
+
+
+def cache_set_market_price(symbol: str, price: float, source: str):
+    if not symbol or price <= 0:
+        return
+    MARKET_PRICE_CACHE[str(symbol).upper().strip()] = {
+        "price": round(float(price), 6),
+        "timestamp": epoch(),
+        "source": source,
+    }
+
+
+def extract_price_from_payload(payload: Any) -> float:
+    """Flexible parser for Twelve Data / Alpaca / generic quote payloads."""
+    if not isinstance(payload, dict):
+        return 0.0
+
+    for container_key in ("quotes", "snapshots", "data"):
+        container = payload.get(container_key)
+        if isinstance(container, dict) and container:
+            for _, inner in container.items():
+                p = extract_price_from_payload(inner)
+                if p > 0:
+                    return p
+
+    for list_key in ("results", "bars", "trades"):
+        values = payload.get(list_key)
+        if isinstance(values, list) and values:
+            p = extract_price_from_payload(values[0])
+            if p > 0:
+                return p
+
+    for key in ("price", "last", "mark", "mid", "close", "c", "last_price", "ask_price", "bid_price", "ap", "bp", "p"):
+        p = safe_float(payload.get(key), 0)
+        if p > 0:
+            return p
+
+    for key in ("latestQuote", "latest_quote", "quote", "latestTrade", "latest_trade", "trade"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            bid = safe_float(nested.get("bp", nested.get("bid_price", nested.get("bid", 0))), 0)
+            ask = safe_float(nested.get("ap", nested.get("ask_price", nested.get("ask", 0))), 0)
+            if bid > 0 and ask > 0:
+                return round((bid + ask) / 2.0, 6)
+            p = extract_price_from_payload(nested)
+            if p > 0:
+                return p
+
+    return 0.0
+
+
+def fetch_twelve_data_price(symbol: str) -> float:
+    """Fetches a quote/price from Twelve Data. Falls back safely if unsupported."""
+    if not TWELVE_DATA_API_KEY or not symbol:
+        return 0.0
+    try:
+        r = requests.get(
+            f"{TWELVE_DATA_BASE_URL}/quote",
+            params={"symbol": symbol, "apikey": TWELVE_DATA_API_KEY},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            debug(f"Twelve Data quote failed for {symbol}: {r.status_code} {r.text[:200]}")
+            return 0.0
+        data = r.json()
+        if isinstance(data, dict) and data.get("status") == "error":
+            debug(f"Twelve Data returned error for {symbol}: {data}")
+            return 0.0
+        return extract_price_from_payload(data)
+    except Exception as e:
+        debug(f"Twelve Data exception for {symbol}: {e}")
+        return 0.0
+
+
+def alpaca_data_headers() -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def fetch_alpaca_data_price(symbol: str) -> float:
+    """
+    Attempts Alpaca Data price fetch with flexible endpoint fallbacks.
+    If your Alpaca plan/endpoint does not support options data, this returns 0
+    and the engine falls back to Twelve Data or market_prices.json.
+    """
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY or not ALPACA_DATA_BASE_URL or not symbol:
+        return 0.0
+
+    candidate_requests = [
+        ("/v1beta1/options/quotes/latest", {"symbols": symbol}),
+        (f"/v1beta1/options/snapshots/{symbol}", {}),
+        ("/v2/stocks/quotes/latest", {"symbols": symbol}),
+        (f"/v2/stocks/{symbol}/quotes/latest", {}),
+    ]
+
+    for path, params in candidate_requests:
+        try:
+            r = requests.get(
+                f"{ALPACA_DATA_BASE_URL}{path}",
+                headers=alpaca_data_headers(),
+                params=params,
+                timeout=10,
+            )
+            if r.status_code != 200:
+                debug(f"Alpaca data failed {path} for {symbol}: {r.status_code} {r.text[:200]}")
+                continue
+            price = extract_price_from_payload(r.json())
+            if price > 0:
+                return price
+        except Exception as e:
+            debug(f"Alpaca data exception {path} for {symbol}: {e}")
+    return 0.0
+
+
+def get_live_market_price(symbol: str) -> float:
+    """Step 10 live price router with cache + provider fallback."""
+    symbol = str(symbol or "").strip()
+    if not symbol:
+        return 0.0
+
+    cached_price, _, cached_source = cache_get_market_price(symbol)
+    if cached_price > 0:
+        debug(f"Using cached live price for {symbol}: {cached_price} from {cached_source}")
+        return cached_price
+
+    if MARKET_DATA_PROVIDER == "auto":
+        providers = ["alpaca", "twelvedata"]
+    elif MARKET_DATA_PROVIDER in {"alpaca", "twelvedata"}:
+        providers = [MARKET_DATA_PROVIDER]
+    else:
+        return 0.0
+
+    for provider in providers:
+        price = 0.0
+        if provider == "alpaca":
+            price = fetch_alpaca_data_price(symbol)
+        elif provider == "twelvedata":
+            price = fetch_twelve_data_price(symbol)
+        if price > 0:
+            cache_set_market_price(symbol, price, provider)
+            return price
+
+    return 0.0
 
 def parse_market_price_value(value: Any) -> Tuple[float, int]:
     """Returns (price, timestamp). Timestamp can be 0 if not supplied."""
@@ -2012,7 +2201,8 @@ def update_positions_from_market_prices() -> int:
     open_positions = GLOBAL_POSITIONS.get("open_positions", [])
     if not open_positions:
         return 0
-    prices = load_market_prices()
+    symbols = [str(p.get("symbol", "")).strip() for p in open_positions if str(p.get("symbol", "")).strip()]
+    prices = load_market_prices(symbols)
     if not prices:
         debug("No market prices loaded; open positions were not repriced")
         return 0
@@ -2032,7 +2222,8 @@ def update_positions_from_market_prices() -> int:
         if old_price != new_price:
             update_position_market_price(position, new_price)
             position["last_market_price_update_at"] = epoch()
-            position["last_market_price_source"] = MARKET_DATA_FILE
+            price_source = "live" if isinstance(prices.get(symbol), dict) and prices.get(symbol, {}).get("source") else MARKET_DATA_FILE
+            position["last_market_price_source"] = price_source
             updated += 1
             log(f"📈 Updated position price from market file | {symbol}: {old_price} -> {new_price}")
             maybe_send_price_update(position, old_price, new_price)
@@ -2142,8 +2333,9 @@ def evaluate_entry_lock(signal: Dict[str, Any]) -> Dict[str, Any]:
     if ts > 0 and signal_age > MAX_ENTRY_AGE_SECONDS:
         reasons.append("entry_window_expired")
 
-    prices = load_market_prices()
-    live_price, price_ts = get_market_price_for_symbol(str(signal.get("symbol", "")), prices)
+    signal_symbol = str(signal.get("symbol", "")).strip()
+    prices = load_market_prices([signal_symbol] if signal_symbol else None)
+    live_price, price_ts = get_market_price_for_symbol(signal_symbol, prices)
 
     if price_ts > 0 and market_price_is_stale(price_ts):
         reasons.append("live_price_stale")
