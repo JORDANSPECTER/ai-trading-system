@@ -2724,6 +2724,71 @@ def apply_entry_lock_to_signal(signal: Dict[str, Any], entry_lock_decision: Dict
         x["live_entry_price"] = live_price
     return x
 
+
+
+def open_position_if_missing(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    HARD ENTRY TRIGGER FIX.
+
+    This guarantees that once a signal passes validation, entry lock, regime,
+    sizing, risk policy, and portfolio risk, the engine actually creates
+    a paper/live position. It also prevents duplicate opens for the same
+    locked contract symbol.
+    """
+    ensure_globals_initialized()
+    symbol = str(signal.get("symbol", "")).strip()
+
+    for p in GLOBAL_POSITIONS.get("open_positions", []):
+        if str(p.get("symbol", "")).strip() == symbol and str(p.get("status", "OPEN")).upper() == "OPEN":
+            debug(f"ENTRY TRIGGER SKIPPED: existing open position already found for {symbol}")
+            return p
+
+    # In live mode, only open live if Alpaca is explicitly enabled and paper is off.
+    if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True):
+        position = open_live_position(signal)
+        if position:
+            log(f"✅ LIVE POSITION OPENED BY ENTRY TRIGGER | {symbol} | qty={position.get('qty_open')} | entry={position.get('entry_price')}")
+        else:
+            msg = build_block_message(
+                "ENTRY PASSED BUT LIVE OPEN FAILED",
+                signal,
+                ["open_live_position_returned_none"],
+                "Check Alpaca permissions, ALLOW_LIVE_BUYS, and broker response."
+            )
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_telegram(msg)
+        return position
+
+    # Default safe mode: paper execution.
+    if GLOBAL_STATE.get("paper_enabled", True):
+        position = open_paper_position(signal)
+        if position:
+            log(f"✅ PAPER POSITION OPENED BY ENTRY TRIGGER | {symbol} | qty={position.get('qty_open')} | entry={position.get('entry_price')}")
+            # Extra AI-channel confirmation so it is impossible to miss in testing.
+            send_to_discord(DISCORD_AI_WEBHOOK, build_position_open_message(position), "AI")
+        else:
+            msg = build_block_message(
+                "ENTRY PASSED BUT PAPER OPEN FAILED",
+                signal,
+                ["open_paper_position_returned_none"],
+                "Paper mode was enabled but no position object was created."
+            )
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_telegram(msg)
+        return position
+
+    msg = build_block_message(
+        "ENTRY PASSED BUT NO EXECUTION MODE ENABLED",
+        signal,
+        ["paper_disabled_and_alpaca_not_active"],
+        "Turn on /paper_on or enable Alpaca live mode intentionally."
+    )
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    send_to_telegram(msg)
+    log("❌ ENTRY PASSED BUT NO EXECUTION MODE ENABLED")
+    return None
+
+
 # =========================================================
 # SIGNAL HANDLER
 # =========================================================
@@ -2809,10 +2874,13 @@ def handle_new_signal(signal: Dict[str, Any]):
     append_recent_signal_hash(GLOBAL_STATE, sig_hash)
     save_state(GLOBAL_STATE)
 
-    if GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True):
-        open_live_position(sized_signal)
-    elif GLOBAL_STATE.get("paper_enabled", True):
-        open_paper_position(sized_signal)
+    opened_position = open_position_if_missing(sized_signal)
+    if opened_position:
+        debug(
+            f"ENTRY EXECUTION CONFIRMED | symbol={opened_position.get('symbol')} | "
+            f"mode={opened_position.get('mode')} | qty={opened_position.get('qty_open')} | "
+            f"entry={opened_position.get('entry_price')}"
+        )
 
     manage_open_positions(sized_signal)
 
