@@ -265,6 +265,25 @@ PHASE1_SOFT_HALT_ON_RATE_LIMIT = os.getenv("PHASE1_SOFT_HALT_ON_RATE_LIMIT", "tr
 PHASE1_SEND_ALERTS = os.getenv("PHASE1_SEND_ALERTS", "true").lower() == "true"
 
 # =========================================================
+# PHASE 2 EXECUTION RELIABILITY LAYER
+# - Order lifecycle integrity
+# - Duplicate active-order suppression
+# - Fill timeout / cancel / recovery
+# - Broker/local reconciliation guard
+# - Post-fill risk snapshots
+# =========================================================
+ENABLE_PHASE2_EXECUTION_RELIABILITY = os.getenv("ENABLE_PHASE2_EXECUTION_RELIABILITY", "true").lower() == "true"
+PHASE2_MAX_ACTIVE_ORDERS = int(os.getenv("PHASE2_MAX_ACTIVE_ORDERS", "5"))
+PHASE2_MAX_ACTIVE_ORDERS_PER_SYMBOL = int(os.getenv("PHASE2_MAX_ACTIVE_ORDERS_PER_SYMBOL", "1"))
+PHASE2_DUPLICATE_ORDER_WINDOW_SECONDS = int(os.getenv("PHASE2_DUPLICATE_ORDER_WINDOW_SECONDS", "60"))
+PHASE2_MAX_ORDER_WAIT_SECONDS = int(os.getenv("PHASE2_MAX_ORDER_WAIT_SECONDS", "20"))
+PHASE2_CANCEL_STALE_LIVE_ORDERS = os.getenv("PHASE2_CANCEL_STALE_LIVE_ORDERS", "true").lower() == "true"
+PHASE2_BLOCK_ON_REJECTED_ORDER = os.getenv("PHASE2_BLOCK_ON_REJECTED_ORDER", "true").lower() == "true"
+PHASE2_BLOCK_ON_RECON_MISMATCH = os.getenv("PHASE2_BLOCK_ON_RECON_MISMATCH", "true").lower() == "true"
+PHASE2_REQUIRE_BROKER_FOR_LIVE = os.getenv("PHASE2_REQUIRE_BROKER_FOR_LIVE", "true").lower() == "true"
+PHASE2_SEND_ALERTS = os.getenv("PHASE2_SEND_ALERTS", "true").lower() == "true"
+
+# =========================================================
 # INTELLIGENCE PHASE 1: TRADE MEMORY + PERFORMANCE ANALYTICS
 # Records every major decision as structured JSONL, builds trade stories,
 # and writes lightweight performance summaries without changing live rules.
@@ -2263,10 +2282,14 @@ def scale_out_local(position: Dict[str, Any], qty_to_close: int, fill_price: flo
         stage="trade_management",
         decision="scaled",
     )
+    if str(position.get("mode", "")).upper() == "PAPER":
+        phase2_record_paper_order(position, side="sell", qty=qty_to_close, fill_price=fill_price, note=note)
+        phase2_post_fill_risk_snapshot("paper_scale_out")
     return True
 
 
 def finalize_close_position(position: Dict[str, Any], exit_price: float, note: str):
+    pre_close_qty = max(0, safe_int(position.get("qty_open", 0), 0))
     position["status"] = "CLOSED"
     position["exit_price"] = round(exit_price, 4)
     position["closed_at"] = epoch()
@@ -2282,9 +2305,12 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     GLOBAL_STATE["consecutive_losses"] = safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0) + 1 if position["realized_pnl_pct"] < 0 else 0
     save_state(GLOBAL_STATE)
 
+    if str(position.get("mode", "")).upper() == "PAPER" and pre_close_qty > 0:
+        phase2_record_paper_order(position, side="sell", qty=pre_close_qty, fill_price=position["exit_price"], note=note)
     GLOBAL_POSITIONS["open_positions"] = [p for p in GLOBAL_POSITIONS["open_positions"] if p["id"] != position["id"]]
     GLOBAL_POSITIONS["closed_positions"].append(position)
     save_positions(GLOBAL_POSITIONS)
+    phase2_post_fill_risk_snapshot("position_closed")
     intel_record_closed_trade(position, note)
 
     msg = build_position_close_message(position, note)
@@ -2348,9 +2374,14 @@ def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     )
     if not phase1_decision["approved"]:
         return None
+    phase2_decision = phase2_validate_order_integrity(signal, side="buy", qty=safe_int(signal.get("qty", 0), 0), mode="PAPER")
+    if not phase2_decision["approved"]:
+        return None
     phase1_record_order_attempt("buy", str(signal.get("symbol", "")), safe_int(signal.get("qty", 0), 0))
     position = make_local_position(signal, mode="PAPER")
     save_new_position(position)
+    phase2_record_paper_order(position, side="buy", qty=safe_int(position.get("qty_open", 0), 0), fill_price=safe_float(position.get("entry_price", 0), 0), note="paper entry filled")
+    phase2_post_fill_risk_snapshot("paper_entry_open")
     GLOBAL_STATE["paper_trade_count"] = safe_int(GLOBAL_STATE.get("paper_trade_count", 0), 0) + 1
     save_state(GLOBAL_STATE)
     msg = build_position_open_message(position)
@@ -2374,6 +2405,9 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
         mode="LIVE",
     )
     if not phase1_decision["approved"]:
+        return None
+    phase2_decision = phase2_validate_order_integrity(signal, side="buy", qty=safe_int(signal.get("qty", 0), 0), mode="LIVE")
+    if not phase2_decision["approved"]:
         return None
     phase1_record_order_attempt("buy", str(signal.get("symbol", "")), safe_int(signal.get("qty", 0), 0))
 
@@ -2406,6 +2440,7 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
     msg = build_live_order_message(order_record, "LIVE ENTRY SUBMITTED")
     send_to_telegram(msg)
     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    phase2_post_fill_risk_snapshot("live_entry_submitted")
     return order_record
 
 
@@ -2430,6 +2465,9 @@ def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bo
     signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", ""), "entry_price": position.get("last_price", position.get("entry_price", 0))}
     phase1_decision = phase1_validate_order_safety(signal_stub, side="sell", qty=qty_to_close, planned_price=safe_float(position.get("last_price", 0), 0), mode="LIVE")
     if not phase1_decision["approved"]:
+        return False
+    phase2_decision = phase2_validate_order_integrity(signal_stub, side="sell", qty=qty_to_close, mode="LIVE")
+    if not phase2_decision["approved"]:
         return False
     phase1_record_order_attempt("sell", str(position.get("symbol", "")), qty_to_close)
     order_record = make_order_record(signal_stub, side="sell", qty=qty_to_close, mode="LIVE", order_type="market")
@@ -2458,6 +2496,9 @@ def live_close_position(position: Dict[str, Any], note: str) -> bool:
     signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", ""), "entry_price": position.get("last_price", position.get("entry_price", 0))}
     phase1_decision = phase1_validate_order_safety(signal_stub, side="sell", qty=qty_open, planned_price=safe_float(position.get("last_price", 0), 0), mode="LIVE")
     if not phase1_decision["approved"]:
+        return False
+    phase2_decision = phase2_validate_order_integrity(signal_stub, side="sell", qty=qty_open, mode="LIVE")
+    if not phase2_decision["approved"]:
         return False
     phase1_record_order_attempt("sell", str(position.get("symbol", "")), qty_open)
     order_record = make_order_record(signal_stub, side="sell", qty=qty_open, mode="LIVE", order_type="market")
@@ -4158,6 +4199,273 @@ def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty:
 
     return decision
 
+
+# =========================================================
+# PHASE 2 EXECUTION RELIABILITY LAYER
+# =========================================================
+def phase2_alert(title: str, details: str, force: bool = False):
+    if not ENABLE_PHASE2_EXECUTION_RELIABILITY:
+        return
+    if not PHASE2_SEND_ALERTS and not force:
+        return
+    msg = f"🧱 {title}\n{details}\n⏰ {now_ts()}"
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_telegram(msg)
+
+
+def phase2_order_terminal_statuses() -> set:
+    return {"filled", "canceled", "cancelled", "rejected", "expired", "done_for_day", "closed"}
+
+
+def phase2_is_order_active(order: Dict[str, Any]) -> bool:
+    status = str(order.get("status", "")).lower().strip()
+    if not status:
+        return True
+    return status not in phase2_order_terminal_statuses()
+
+
+def phase2_active_orders(symbol: Optional[str] = None, side: Optional[str] = None) -> List[Dict[str, Any]]:
+    ensure_globals_initialized()
+    orders = GLOBAL_ORDERS.get("orders", []) if isinstance(GLOBAL_ORDERS, dict) else []
+    out = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        if not phase2_is_order_active(o):
+            continue
+        if symbol and str(o.get("symbol", "")).strip() != str(symbol).strip():
+            continue
+        if side and str(o.get("side", "")).lower().strip() != str(side).lower().strip():
+            continue
+        out.append(o)
+    return out
+
+
+def phase2_recent_duplicate_orders(symbol: str, side: str, window_seconds: int = PHASE2_DUPLICATE_ORDER_WINDOW_SECONDS) -> List[Dict[str, Any]]:
+    ensure_globals_initialized()
+    now = epoch()
+    recent = []
+    for o in GLOBAL_ORDERS.get("orders", []):
+        if not isinstance(o, dict):
+            continue
+        if str(o.get("symbol", "")).strip() != str(symbol).strip():
+            continue
+        if str(o.get("side", "")).lower().strip() != str(side).lower().strip():
+            continue
+        created = safe_int(o.get("created_at", 0), 0)
+        if created > 0 and now - created <= window_seconds and phase2_is_order_active(o):
+            recent.append(o)
+    return recent
+
+
+def phase2_set_execution_lock(reason: str):
+    ensure_globals_initialized()
+    GLOBAL_STATE["phase2_execution_lock"] = True
+    GLOBAL_STATE["phase2_execution_lock_reason"] = reason
+    GLOBAL_STATE["bot_paused"] = True
+    save_state(GLOBAL_STATE)
+    phase2_alert("PHASE 2 EXECUTION LOCK", reason, force=True)
+
+
+def phase2_clear_execution_lock(reason: str = "manual/system clear"):
+    ensure_globals_initialized()
+    GLOBAL_STATE["phase2_execution_lock"] = False
+    GLOBAL_STATE["phase2_execution_lock_reason"] = ""
+    save_state(GLOBAL_STATE)
+    phase2_alert("PHASE 2 EXECUTION LOCK CLEARED", reason, force=True)
+
+
+def phase2_validate_order_integrity(signal_or_stub: Dict[str, Any], side: str, qty: int, mode: str = "PAPER") -> Dict[str, Any]:
+    """Pre-submit guard: duplicate suppression + active order caps + live broker readiness."""
+    if not ENABLE_PHASE2_EXECUTION_RELIABILITY:
+        return {"approved": True, "reject_reasons": [], "stage": "phase2_execution_reliability"}
+
+    ensure_globals_initialized()
+    reasons = []
+    symbol = str(signal_or_stub.get("symbol", "")).strip()
+    side = str(side or "").lower().strip()
+    qty = safe_int(qty, 0)
+    mode = str(mode or "PAPER").upper().strip()
+
+    if GLOBAL_STATE.get("phase2_execution_lock", False):
+        reasons.append("phase2_execution_lock_active")
+    if not symbol:
+        reasons.append("missing_symbol")
+    if qty <= 0:
+        reasons.append("invalid_qty")
+
+    all_active = phase2_active_orders()
+    symbol_active = phase2_active_orders(symbol=symbol) if symbol else []
+    same_side_recent = phase2_recent_duplicate_orders(symbol, side) if symbol and side else []
+
+    if len(all_active) >= PHASE2_MAX_ACTIVE_ORDERS:
+        reasons.append("max_active_orders_hit")
+    if len(symbol_active) >= PHASE2_MAX_ACTIVE_ORDERS_PER_SYMBOL:
+        reasons.append("max_active_orders_per_symbol_hit")
+    if same_side_recent:
+        reasons.append("duplicate_active_order_window_hit")
+
+    if mode == "LIVE" and PHASE2_REQUIRE_BROKER_FOR_LIVE:
+        if not (ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready()):
+            reasons.append("live_broker_not_ready")
+
+    approved = len(reasons) == 0
+    decision = {
+        "approved": approved,
+        "stage": "phase2_execution_reliability",
+        "reject_reasons": reasons,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "mode": mode,
+        "active_orders": len(all_active),
+        "symbol_active_orders": len(symbol_active),
+        "recent_duplicates": len(same_side_recent),
+    }
+
+    if approved:
+        debug(f"PHASE 2 ORDER INTEGRITY OK | {side.upper()} {symbol} qty={qty} mode={mode} active={len(all_active)}")
+    else:
+        details = (
+            f"Symbol: {symbol} | Side: {side} | Qty: {qty} | Mode: {mode}\n"
+            f"Reasons: {', '.join(reasons)}\n"
+            f"Active Orders: {len(all_active)} | Symbol Active: {len(symbol_active)} | Recent Duplicates: {len(same_side_recent)}"
+        )
+        phase2_alert("PHASE 2 ORDER INTEGRITY BLOCK", details)
+        try:
+            intel_event("phase2_order_integrity_block", decision, signal=signal_or_stub, stage="phase2_execution", decision="blocked")
+        except Exception:
+            pass
+    return decision
+
+
+def phase2_record_paper_order(position: Dict[str, Any], side: str, qty: int, fill_price: float, note: str) -> Dict[str, Any]:
+    """Create a filled order lifecycle record for paper-mode actions so the order layer sees the full trade story."""
+    ensure_globals_initialized()
+    signal_stub = {
+        "signal_id": position.get("signal_id", ""),
+        "ticker": position.get("ticker", ""),
+        "symbol": position.get("symbol", ""),
+        "entry_price": fill_price,
+    }
+    order = make_order_record(signal_stub, side=side, qty=qty, mode="PAPER", order_type="market")
+    order["position_id"] = position.get("id")
+    order["broker_order_id"] = f"paper-{side}-{position.get('symbol')}-{epoch()}-{order.get('local_order_id')}"
+    order["status"] = "filled"
+    order["qty_filled"] = int(qty)
+    order["qty_remaining"] = 0
+    order["avg_fill_price"] = round(safe_float(fill_price, 0), 4)
+    order["closed_at"] = epoch()
+    order.setdefault("notes", []).append(note)
+    save_order_record(order)
+    debug(f"PHASE 2 PAPER ORDER FILLED | {side.upper()} {position.get('symbol')} qty={qty} fill={fill_price} pos_id={position.get('id')}")
+    try:
+        intel_event("order_filled", {"side": side, "qty": qty, "fill_price": fill_price, "note": note, "order": order}, position=position, stage="phase2_order_lifecycle", decision="filled")
+    except Exception:
+        pass
+    return order
+
+
+def phase2_sync_order_lifecycle() -> Dict[str, Any]:
+    """Refresh live order snapshots and handle stale/rejected orders. Called every loop."""
+    if not ENABLE_PHASE2_EXECUTION_RELIABILITY:
+        return {"active": 0, "changed": False, "stale": 0, "rejected": 0}
+
+    ensure_globals_initialized()
+    changed = False
+    stale_count = 0
+    rejected_count = 0
+
+    if ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+        try:
+            refresh_open_order_states()
+        except Exception as e:
+            phase2_alert("PHASE 2 ORDER REFRESH ERROR", str(e))
+
+    now = epoch()
+    for order in GLOBAL_ORDERS.get("orders", []):
+        if not isinstance(order, dict) or not phase2_is_order_active(order):
+            continue
+        status = str(order.get("status", "")).lower().strip()
+        mode = str(order.get("mode", "")).upper().strip()
+        age = now - safe_int(order.get("created_at", now), now)
+
+        if status in {"rejected", "expired"}:
+            rejected_count += 1
+            if PHASE2_BLOCK_ON_REJECTED_ORDER:
+                phase2_set_execution_lock(f"Order rejected/expired: local_id={order.get('local_order_id')} symbol={order.get('symbol')} status={status}")
+            continue
+
+        if age > PHASE2_MAX_ORDER_WAIT_SECONDS and status not in phase2_order_terminal_statuses():
+            stale_count += 1
+            order.setdefault("notes", []).append(f"Phase2 stale order age={age}s")
+            order["updated_at"] = now
+            changed = True
+            msg = f"local_id={order.get('local_order_id')} symbol={order.get('symbol')} status={status} age={age}s"
+            phase2_alert("PHASE 2 STALE ORDER", msg)
+            if mode == "LIVE" and PHASE2_CANCEL_STALE_LIVE_ORDERS and order.get("broker_order_id") and alpaca_ready():
+                try:
+                    resp = alpaca_delete(f"/v2/orders/{order.get('broker_order_id')}")
+                    if resp.status_code in (200, 204):
+                        update_order_status(order, "canceled", "Phase2 stale order canceled")
+                    else:
+                        order.setdefault("notes", []).append(f"Cancel failed: {resp.status_code} {resp.text[:200]}")
+                except Exception as e:
+                    order.setdefault("notes", []).append(f"Cancel exception: {e}")
+
+    if changed:
+        save_orders(GLOBAL_ORDERS)
+
+    active = len(phase2_active_orders())
+    debug(f"PHASE 2 ORDER LIFECYCLE OK | active_orders={active} | stale={stale_count} | rejected={rejected_count}")
+    return {"active": active, "changed": changed, "stale": stale_count, "rejected": rejected_count}
+
+
+def phase2_post_fill_risk_snapshot(context: str = "post_fill") -> Dict[str, Any]:
+    ensure_globals_initialized()
+    snapshot = {
+        "context": context,
+        "open_positions": len(GLOBAL_POSITIONS.get("open_positions", [])),
+        "active_orders": len(phase2_active_orders()),
+        "portfolio_heat_pct": round(portfolio_heat_pct(), 6),
+        "daily_realized_pnl_pct": round(safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0), 6),
+        "consecutive_losses": safe_int(GLOBAL_STATE.get("consecutive_losses", 0), 0),
+        "timestamp": epoch(),
+    }
+    debug(
+        f"PHASE 2 RISK SNAPSHOT | {context} | open={snapshot['open_positions']} | "
+        f"active_orders={snapshot['active_orders']} | heat={round(snapshot['portfolio_heat_pct']*100, 2)}% | "
+        f"daily_pnl={round(snapshot['daily_realized_pnl_pct']*100, 2)}%"
+    )
+    try:
+        intel_event("phase2_risk_snapshot", snapshot, stage="phase2_execution", decision="snapshot")
+    except Exception:
+        pass
+    return snapshot
+
+
+def phase2_reconciliation_guard() -> Dict[str, Any]:
+    """Broker/local truth check. In paper mode this is informational; in live mode it can lock the engine."""
+    if not ENABLE_PHASE2_EXECUTION_RELIABILITY:
+        return {"approved": True, "reject_reasons": []}
+    ensure_globals_initialized()
+    reasons = []
+    live_positions = [p for p in GLOBAL_POSITIONS.get("open_positions", []) if str(p.get("mode", "")).upper() == "LIVE"]
+    if live_positions and ENABLE_ALPACA and GLOBAL_STATE.get("alpaca_enabled", False) and alpaca_ready():
+        broker_positions = alpaca_list_positions()
+        broker_symbols = {str(p.get("symbol", "")).strip() for p in broker_positions if str(p.get("symbol", "")).strip()}
+        for p in live_positions:
+            if p.get("symbol") not in broker_symbols and safe_int(p.get("pending_close_qty", 0), 0) <= 0:
+                reasons.append(f"live_local_position_missing_at_broker:{p.get('symbol')}")
+    if reasons and PHASE2_BLOCK_ON_RECON_MISMATCH:
+        phase2_set_execution_lock("; ".join(reasons))
+    if reasons:
+        phase2_alert("PHASE 2 RECON MISMATCH", "\n".join(reasons), force=True)
+    else:
+        debug("PHASE 2 RECON OK")
+    return {"approved": len(reasons) == 0, "reject_reasons": reasons}
+
 # =========================================================
 # SIGNAL HANDLER
 # =========================================================
@@ -4280,6 +4588,16 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not phase1_entry_decision["approved"]:
         return
 
+    # PHASE 2: order-lifecycle integrity guard before any paper/live order is created.
+    phase2_entry_decision = phase2_validate_order_integrity(
+        sized_signal,
+        side="buy",
+        qty=safe_int(sized_signal.get("qty", 0), 0),
+        mode="LIVE" if (GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True)) else "PAPER",
+    )
+    if not phase2_entry_decision["approved"]:
+        return
+
     intel_event(
         "signal_approved",
         {
@@ -4379,7 +4697,7 @@ def close_all_open_positions():
 def handle_telegram_command(text: str):
     cmd = parse_command(text)
     if cmd in {"/start", "/help", "help"}:
-        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n/flatten\n/kill\n/unlock\n/macro\n/macro_push\n")
+        send_to_telegram("📘 COMMANDS\n/status\n/positions\n/orders\n/engine_on\n/engine_off\n/paper_on\n/paper_off\n/alpaca_on\n/alpaca_off\n/discord_on\n/discord_off\n/telegram_on\n/telegram_off\n/kill_on\n/kill_off\n/pause_on\n/pause_off\n/test\n/heartbeat\n/sync\n/recon\n/recon_clear\n/cancel_orders\n/close_all\n/flatten\n/kill\n/unlock\n/phase2_unlock\n/macro\n/macro_push\n")
         return
     if cmd == "/status":
         send_to_telegram(build_status_text()); return
@@ -4566,6 +4884,10 @@ def runtime_housekeeping():
     if not step15_global_guard():
         flush_dirty_stores(force=True)
         return
+    # PHASE 2: order lifecycle/reconciliation integrity runs every loop before risk decisions.
+    phase2_sync_order_lifecycle()
+    phase2_reconciliation_guard()
+
     # PHASE 0: hard daily loss / heat kill switch and stale open-position price gate.
     if not phase0_hard_risk_kill_check():
         flush_dirty_stores(force=True)
@@ -4619,6 +4941,9 @@ def main_loop():
                 flush_dirty_stores(force=True)
                 time.sleep(POLL_SECONDS)
                 continue
+            # PHASE 2: keep order lifecycle and broker/local truth synchronized every loop.
+            phase2_sync_order_lifecycle()
+            phase2_reconciliation_guard()
             open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
             if open_positions:
                 update_positions_from_market_prices()
