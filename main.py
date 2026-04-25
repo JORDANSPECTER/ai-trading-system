@@ -693,6 +693,16 @@ FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "
 # PAPER POSITION LIFECYCLE: TP / SL / AUTO CLOSE
 # Manages paper positions created by the paper broker bridge.
 # =========================================================
+
+# =========================================================
+# LOCKED POSITION SCHEMA + DUPLICATE POSITION CAP
+# Prevents Step 15 schema crashes and prevents duplicate stacking.
+# =========================================================
+ENABLE_POSITION_SCHEMA_LOCK = os.getenv("ENABLE_POSITION_SCHEMA_LOCK", "true").lower() == "true"
+ENABLE_HARD_DUPLICATE_POSITION_CAP = os.getenv("ENABLE_HARD_DUPLICATE_POSITION_CAP", "true").lower() == "true"
+MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION = int(os.getenv("MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION", "1"))
+MAX_OPEN_POSITIONS_TOTAL = int(os.getenv("MAX_OPEN_POSITIONS_TOTAL", "3"))
+
 ENABLE_PAPER_TPSL_LIFECYCLE = os.getenv("ENABLE_PAPER_TPSL_LIFECYCLE", "true").lower() == "true"
 PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK = os.getenv("PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK", "true").lower() == "true"
 PAPER_TPSL_ALERTS_ENABLED = os.getenv("PAPER_TPSL_ALERTS_ENABLED", "true").lower() == "true"
@@ -6396,7 +6406,228 @@ def paper_bridge_fill_order(order: Dict[str, Any]) -> Dict[str, Any]:
     return order
 
 
+
+# =========================================================
+# LOCKED POSITION SCHEMA + DUPLICATE POSITION CAP HELPERS
+# =========================================================
+def locked_position_symbol(pos: Dict[str, Any]) -> str:
+    return str(pos.get("symbol") or pos.get("contract_symbol") or pos.get("ticker") or "").strip()
+
+
+def locked_position_ticker(pos: Dict[str, Any]) -> str:
+    return str(pos.get("ticker") or pos.get("underlying") or locked_position_symbol(pos)).upper().strip()
+
+
+def locked_position_direction(pos: Dict[str, Any]) -> str:
+    return normalize_direction(pos.get("direction", "CALL"))
+
+
+def normalize_locked_position_schema(pos: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(pos, dict):
+        pos = {}
+
+    position_id = str(pos.get("position_id") or pos.get("id") or "").strip()
+    if not position_id or position_id in ("0", "POS-0", "None", "null"):
+        position_id = "POS-UNKNOWN"
+
+    qty = safe_int(pos.get("qty_open", pos.get("qty_total", pos.get("qty", 1))), 1)
+    qty_total = safe_int(pos.get("qty_total", pos.get("qty", qty)), qty)
+    qty_open = safe_int(pos.get("qty_open", pos.get("qty", qty)), qty)
+
+    entry = safe_float(pos.get("entry_price", pos.get("entry", 0)), 0.0)
+    stop = safe_float(pos.get("stop_price", pos.get("stop", 0)), 0.0)
+    target = safe_float(pos.get("target", pos.get("tp1", pos.get("tp1_contract", 0))), 0.0)
+    tp2 = safe_float(pos.get("tp2", pos.get("target_2", pos.get("tp2_contract", target))), target)
+
+    notes = pos.get("notes", [])
+    if notes is None:
+        notes = []
+    elif not isinstance(notes, list):
+        notes = [str(notes)]
+
+    ticker = locked_position_ticker(pos)
+    symbol = locked_position_symbol(pos) or ticker
+    direction = locked_position_direction(pos)
+
+    fixed = deepcopy(pos)
+    fixed.update({
+        "position_id": position_id,
+        "id": position_id,
+        "ticker": ticker,
+        "symbol": symbol,
+        "contract_symbol": str(pos.get("contract_symbol") or symbol).strip(),
+        "asset_class": str(pos.get("asset_class", "option")).lower(),
+        "direction": direction,
+        "status": str(pos.get("status", "open")).lower(),
+        "qty": qty,
+        "qty_total": qty_total,
+        "qty_open": qty_open if str(pos.get("status", "open")).lower() == "open" else 0,
+        "entry": entry,
+        "entry_price": entry,
+        "stop": stop,
+        "stop_price": stop,
+        "target": target,
+        "tp1": target,
+        "tp2": tp2,
+        "notes": notes,
+        "unrealized_pnl": safe_float(pos.get("unrealized_pnl", 0), 0.0),
+        "realized_pnl": safe_float(pos.get("realized_pnl", 0), 0.0),
+    })
+
+    if not fixed.get("opened_at"):
+        fixed["opened_at"] = now_ts()
+
+    if "risk_per_contract" not in fixed:
+        fixed["risk_per_contract"] = round(abs(entry - stop) * 100, 2) if entry > 0 and stop > 0 else 0.0
+
+    return fixed
+
+
+def repair_and_lock_positions_schema() -> Dict[str, Any]:
+    result = {"repaired": False, "open": 0, "closed": 0, "removed_duplicates": 0}
+    if not ENABLE_POSITION_SCHEMA_LOCK:
+        return result
+
+    try:
+        data = load_json_file(POSITIONS_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+
+        data.setdefault("schema_version", 2)
+        data.setdefault("open_positions", [])
+        data.setdefault("closed_positions", [])
+        data.setdefault("last_position_id", safe_int(data.get("last_position_id", 0), 0))
+
+        changed = False
+        normalized_open = []
+        normalized_closed = []
+        seen_keys = {}
+
+        for pos in data.get("open_positions", []):
+            if not isinstance(pos, dict):
+                changed = True
+                continue
+
+            fixed = normalize_locked_position_schema(pos)
+
+            if str(fixed.get("position_id")) in ("", "0", "POS-0", "None", "null", "POS-UNKNOWN"):
+                data["last_position_id"] = safe_int(data.get("last_position_id", 0), 0) + 1
+                new_pid = f"POS-{data['last_position_id']}"
+                fixed["position_id"] = new_pid
+                fixed["id"] = new_pid
+                changed = True
+
+            key = (fixed.get("ticker"), fixed.get("direction"))
+            count = seen_keys.get(key, 0)
+
+            if ENABLE_HARD_DUPLICATE_POSITION_CAP and count >= MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION:
+                fixed["status"] = "closed"
+                fixed["qty_open"] = 0
+                fixed["close_reason"] = "DUPLICATE_POSITION_CAP_REPAIR"
+                fixed["closed_at"] = now_ts()
+                normalized_closed.append(fixed)
+                result["removed_duplicates"] += 1
+                changed = True
+                continue
+
+            seen_keys[key] = count + 1
+            normalized_open.append(fixed)
+            if fixed != pos:
+                changed = True
+
+        for pos in data.get("closed_positions", []):
+            if isinstance(pos, dict):
+                fixed = normalize_locked_position_schema(pos)
+                fixed["status"] = "closed"
+                fixed["qty_open"] = 0
+                normalized_closed.append(fixed)
+                if fixed != pos:
+                    changed = True
+            else:
+                changed = True
+
+        data["open_positions"] = normalized_open
+        data["closed_positions"] = normalized_closed
+        result["open"] = len(normalized_open)
+        result["closed"] = len(normalized_closed)
+
+        if changed:
+            atomic_write_json(POSITIONS_FILE, data)
+            result["repaired"] = True
+            debug(f"POSITION SCHEMA LOCK REPAIR OK | {result}")
+
+        return result
+    except Exception as e:
+        debug(f"POSITION SCHEMA LOCK REPAIR ERROR: {e}")
+        return result
+
+
+def duplicate_position_cap_allows(signal_or_order: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_HARD_DUPLICATE_POSITION_CAP:
+        return {"approved": True, "reason": "duplicate_cap_disabled"}
+
+    try:
+        data = load_json_file(POSITIONS_FILE, {})
+        open_positions = data.get("open_positions", []) if isinstance(data, dict) else []
+        if not isinstance(open_positions, list):
+            open_positions = []
+
+        ticker = str(signal_or_order.get("ticker") or signal_or_order.get("underlying") or "").upper().strip()
+        direction = normalize_direction(signal_or_order.get("direction", "CALL"))
+        if not ticker:
+            symbol = str(signal_or_order.get("symbol") or signal_or_order.get("contract_symbol") or "").upper().strip()
+            ticker = symbol[:3] if symbol else ""
+
+        total_open = 0
+        same_key = 0
+
+        for pos in open_positions:
+            if not isinstance(pos, dict):
+                continue
+            fixed = normalize_locked_position_schema(pos)
+            if fixed.get("status") != "open":
+                continue
+            if safe_int(fixed.get("qty_open", fixed.get("qty", 0)), 0) <= 0:
+                continue
+            total_open += 1
+            if fixed.get("ticker") == ticker and fixed.get("direction") == direction:
+                same_key += 1
+
+        if total_open >= MAX_OPEN_POSITIONS_TOTAL:
+            return {"approved": False, "reason": f"max_total_open_positions:{total_open}>={MAX_OPEN_POSITIONS_TOTAL}"}
+
+        if same_key >= MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION:
+            return {"approved": False, "reason": f"duplicate_position_cap:{ticker}_{direction}:{same_key}>={MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION}"}
+
+        return {"approved": True, "reason": "duplicate_cap_passed"}
+
+    except Exception as e:
+        return {"approved": False, "reason": f"duplicate_cap_error:{e}"}
+
+
+def reset_bad_positions_for_testing():
+    try:
+        data = {
+            "schema_version": 2,
+            "open_positions": [],
+            "closed_positions": [],
+            "last_position_id": 0,
+        }
+        atomic_write_json(POSITIONS_FILE, data)
+        debug("RESET BAD POSITIONS FOR TESTING OK")
+        return True
+    except Exception as e:
+        debug(f"RESET BAD POSITIONS ERROR: {e}")
+        return False
+
+
+
 def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
+    cap = duplicate_position_cap_allows(order)
+    if not cap.get("approved"):
+        debug(f"🛑 DUPLICATE POSITION CAP BLOCK | {cap.get('reason')}")
+        raise RuntimeError(f"duplicate_position_cap_block:{cap.get('reason')}")
+
     positions_store = paper_bridge_load_positions_store()
     positions_store["last_position_id"] = safe_int(positions_store.get("last_position_id", 0), 0) + 1
 
@@ -6405,6 +6636,7 @@ def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
 
     position = {
         "position_id": f"POS-{positions_store['last_position_id']}",
+        "id": f"POS-{positions_store['last_position_id']}",
         "order_id": order.get("order_id"),
         "broker": "paper_bridge",
         "status": "open",
@@ -6416,11 +6648,14 @@ def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
         "asset_class": order.get("asset_class", "option"),
         "direction": order.get("direction"),
         "qty": safe_int(order.get("qty", 1), 1),
+        "qty_total": safe_int(order.get("qty", 1), 1),
+        "qty_open": safe_int(order.get("qty", 1), 1),
         "entry": entry,
         "entry_price": entry,
         "stop": stop,
         "stop_price": stop,
         "target": safe_float(order.get("target", 0), 0.0),
+        "tp1": safe_float(order.get("target", 0), 0.0),
         "tp2": safe_float(order.get("tp2", order.get("target", 0)), 0.0),
         "grade": order.get("grade"),
         "confidence": order.get("confidence"),
@@ -6431,6 +6666,7 @@ def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
         "realized_pnl": 0.0,
     }
 
+    position = normalize_locked_position_schema(position)
     positions_store.setdefault("open_positions", []).append(position)
     paper_bridge_save_positions_store(positions_store)
     debug(f"📌 PAPER POSITION OPENED | {position['position_id']} | {position['ticker']} {position['direction']} qty={position['qty']}")
@@ -6471,7 +6707,14 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     order = paper_bridge_create_order(signal)
     filled = paper_bridge_fill_order(order)
-    position = paper_bridge_open_position(filled)
+    try:
+        position = paper_bridge_open_position(filled)
+    except Exception as e:
+        reason = str(e)
+        if "duplicate_position_cap_block" in reason:
+            debug(f"🛑 PAPER BRIDGE DUPLICATE CAP BLOCKED | {reason}")
+            return {"executed": False, "reason": "paper_bridge_duplicate_cap_blocked", "error": reason, "order": filled}
+        raise
 
     paper_bridge_mark_executed(gate.get("hash", ""))
 
@@ -6935,6 +7178,7 @@ def fallback_signal() -> Dict[str, Any]:
 # BOOT + LOOP
 # =========================================================
 def boot():
+    repair_and_lock_positions_schema()
     repair_position_schema_for_step15()
     global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON, GLOBAL_MACRO
     GLOBAL_STATE = load_state()
