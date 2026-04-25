@@ -260,6 +260,18 @@ PHASE1_SOFT_HALT_ON_RATE_LIMIT = os.getenv("PHASE1_SOFT_HALT_ON_RATE_LIMIT", "tr
 PHASE1_SEND_ALERTS = os.getenv("PHASE1_SEND_ALERTS", "true").lower() == "true"
 
 # =========================================================
+# INTELLIGENCE PHASE 1: TRADE MEMORY + PERFORMANCE ANALYTICS
+# Records every major decision as structured JSONL, builds trade stories,
+# and writes lightweight performance summaries without changing live rules.
+# =========================================================
+ENABLE_INTELLIGENCE_PHASE1 = os.getenv("ENABLE_INTELLIGENCE_PHASE1", "true").lower() == "true"
+INTEL_EVENT_LOG_FILE = os.getenv("INTEL_EVENT_LOG_FILE", "intel_events.jsonl").strip()
+INTEL_TRADE_MEMORY_FILE = os.getenv("INTEL_TRADE_MEMORY_FILE", "trade_memory.jsonl").strip()
+INTEL_ANALYTICS_FILE = os.getenv("INTEL_ANALYTICS_FILE", "performance_analytics.json").strip()
+INTEL_SEND_CLOSED_TRADE_SUMMARY = os.getenv("INTEL_SEND_CLOSED_TRADE_SUMMARY", "true").lower() == "true"
+INTEL_REBUILD_ANALYTICS_ON_CLOSE = os.getenv("INTEL_REBUILD_ANALYTICS_ON_CLOSE", "true").lower() == "true"
+
+# =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
 ENABLE_ENTRY_LOCK = os.getenv("ENABLE_ENTRY_LOCK", "true").lower() == "true"
@@ -1874,6 +1886,16 @@ def build_block_message(title: str, signal: Dict[str, Any], reasons: List[str], 
     if extras:
         msg += f"\n{extras}"
     msg += f"\n⏰ {now_ts()}"
+    try:
+        intel_event(
+            "signal_rejected",
+            {"title": title, "reasons": reasons, "extras": extras or ""},
+            signal=signal,
+            stage=title.lower().replace(" ", "_"),
+            decision="rejected",
+        )
+    except Exception:
+        pass
     return msg
 
 
@@ -1890,6 +1912,192 @@ def route_signal(signal: Dict[str, Any], state: Dict[str, Any]):
         send_to_discord(DISCORD_PREMIUM_WEBHOOK, build_premium_message(signal), "PREMIUM")
     if state.get("telegram_enabled", True):
         send_to_telegram(build_telegram_signal_message(signal))
+
+
+# =========================================================
+# INTELLIGENCE PHASE 1: TRADE MEMORY + PERFORMANCE ANALYTICS
+# =========================================================
+def intel_append_jsonl(path: str, record: Dict[str, Any]) -> bool:
+    if not ENABLE_INTELLIGENCE_PHASE1:
+        return False
+    try:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+        return True
+    except Exception as e:
+        log(f"❌ INTEL append failed for {path}: {e}")
+        return False
+
+
+def intel_event(event_type: str, payload: Optional[Dict[str, Any]] = None, *, signal: Optional[Dict[str, Any]] = None, position: Optional[Dict[str, Any]] = None, stage: str = "engine", decision: str = "info"):
+    if not ENABLE_INTELLIGENCE_PHASE1:
+        return
+    try:
+        payload = payload or {}
+        record = {
+            "ts": epoch(),
+            "time": now_ts(),
+            "event_type": event_type,
+            "stage": stage,
+            "decision": decision,
+            "payload": payload,
+        }
+        if signal:
+            record["signal_id"] = signal.get("signal_id", "")
+            record["ticker"] = signal.get("ticker", "")
+            record["symbol"] = signal.get("symbol", "")
+            record["direction"] = signal.get("direction", "")
+            record["confidence"] = signal.get("confidence", "")
+            record["regime"] = signal.get("regime", signal.get("market_regime", ""))
+        if position:
+            record["position_id"] = position.get("id", "")
+            record["signal_id"] = record.get("signal_id") or position.get("signal_id", "")
+            record["ticker"] = record.get("ticker") or position.get("ticker", "")
+            record["symbol"] = record.get("symbol") or position.get("symbol", "")
+            record["direction"] = record.get("direction") or position.get("direction", "")
+            record["confidence"] = record.get("confidence") or position.get("confidence", "")
+        intel_append_jsonl(INTEL_EVENT_LOG_FILE, record)
+    except Exception as e:
+        log(f"❌ INTEL event failed: {e}")
+
+
+def intel_trade_story_from_position(position: Dict[str, Any], close_reason: str = "") -> Dict[str, Any]:
+    entry = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+    exit_price = safe_float(position.get("exit_price", position.get("last_price", 0)), 0)
+    realized_pct = safe_float(position.get("realized_pnl_pct", 0), 0)
+    opened_at = safe_int(position.get("opened_at", 0), 0)
+    closed_at = safe_int(position.get("closed_at", epoch()), epoch())
+    risk_per_contract = max(entry - safe_float(position.get("original_stop_price", position.get("stop_price", 0)), 0), 0)
+    r_multiple = 0.0
+    if risk_per_contract > 0:
+        r_multiple = round((exit_price - entry) / risk_per_contract, 4)
+    return {
+        "closed_time": now_ts(),
+        "closed_ts": closed_at,
+        "position_id": position.get("id"),
+        "signal_id": position.get("signal_id", ""),
+        "ticker": position.get("ticker", ""),
+        "symbol": position.get("symbol", ""),
+        "direction": position.get("direction", ""),
+        "confidence": position.get("confidence", ""),
+        "mode": position.get("mode", ""),
+        "qty_total": safe_int(position.get("qty_total", 0), 0),
+        "entry_price": round(entry, 4),
+        "exit_price": round(exit_price, 4),
+        "original_stop_price": safe_float(position.get("original_stop_price", 0), 0),
+        "final_stop_price": safe_float(position.get("stop_price", 0), 0),
+        "tp1_hit": bool(position.get("tp1_hit", False)),
+        "tp2_hit": bool(position.get("tp2_hit", False)),
+        "highest_price": safe_float(position.get("highest_price", 0), 0),
+        "lowest_price": safe_float(position.get("lowest_price", 0), 0),
+        "realized_pnl_pct": round(realized_pct, 4),
+        "winner": realized_pct > 0,
+        "r_multiple": r_multiple,
+        "time_in_trade_seconds": max(0, closed_at - opened_at) if opened_at else 0,
+        "close_reason": close_reason,
+        "notes": position.get("notes", []),
+    }
+
+
+def intel_record_closed_trade(position: Dict[str, Any], close_reason: str = ""):
+    if not ENABLE_INTELLIGENCE_PHASE1:
+        return
+    try:
+        story = intel_trade_story_from_position(position, close_reason)
+        intel_append_jsonl(INTEL_TRADE_MEMORY_FILE, story)
+        intel_event("trade_closed", story, position=position, stage="trade_memory", decision="closed")
+        if INTEL_REBUILD_ANALYTICS_ON_CLOSE:
+            analytics = intel_build_performance_analytics()
+            atomic_write_json(INTEL_ANALYTICS_FILE, analytics)
+        if INTEL_SEND_CLOSED_TRADE_SUMMARY:
+            msg = (
+                f"🧠 TRADE MEMORY SAVED\n"
+                f"{story['ticker']} {story['direction']} | {story['confidence']}\n"
+                f"Symbol: {story['symbol']}\n"
+                f"PnL %: {story['realized_pnl_pct']} | R: {story['r_multiple']}\n"
+                f"Reason: {close_reason}\n"
+                f"Time In Trade: {story['time_in_trade_seconds']}s"
+            )
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    except Exception as e:
+        log(f"❌ INTEL closed-trade record failed: {e}")
+
+
+def intel_load_trade_memory() -> List[Dict[str, Any]]:
+    rows = []
+    try:
+        if not file_exists(INTEL_TRADE_MEMORY_FILE):
+            return rows
+        with open(INTEL_TRADE_MEMORY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception as e:
+        log(f"❌ INTEL load memory failed: {e}")
+    return rows
+
+
+def intel_group_stats(trades: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for t in trades:
+        val = str(t.get(key, "UNKNOWN") or "UNKNOWN")
+        grouped.setdefault(val, []).append(t)
+    out = {}
+    for val, items in grouped.items():
+        n = len(items)
+        wins = sum(1 for x in items if x.get("winner"))
+        avg_pnl = sum(safe_float(x.get("realized_pnl_pct", 0), 0) for x in items) / n if n else 0
+        avg_r = sum(safe_float(x.get("r_multiple", 0), 0) for x in items) / n if n else 0
+        out[val] = {
+            "trades": n,
+            "wins": wins,
+            "losses": n - wins,
+            "win_rate": round(wins / n, 4) if n else 0,
+            "avg_pnl_pct": round(avg_pnl, 4),
+            "avg_r": round(avg_r, 4),
+        }
+    return out
+
+
+def intel_build_performance_analytics() -> Dict[str, Any]:
+    trades = intel_load_trade_memory()
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("winner"))
+    total_r = sum(safe_float(t.get("r_multiple", 0), 0) for t in trades)
+    total_pnl = sum(safe_float(t.get("realized_pnl_pct", 0), 0) for t in trades)
+    return {
+        "generated_at": now_ts(),
+        "trade_count": total,
+        "wins": wins,
+        "losses": total - wins,
+        "win_rate": round(wins / total, 4) if total else 0,
+        "avg_r": round(total_r / total, 4) if total else 0,
+        "avg_pnl_pct": round(total_pnl / total, 4) if total else 0,
+        "by_ticker": intel_group_stats(trades, "ticker"),
+        "by_direction": intel_group_stats(trades, "direction"),
+        "by_confidence": intel_group_stats(trades, "confidence"),
+        "by_close_reason": intel_group_stats(trades, "close_reason"),
+        "recent_trades": trades[-10:],
+    }
+
+
+def intel_write_analytics_snapshot(force: bool = False):
+    if not ENABLE_INTELLIGENCE_PHASE1:
+        return
+    try:
+        analytics = intel_build_performance_analytics()
+        atomic_write_json(INTEL_ANALYTICS_FILE, analytics)
+        if force:
+            debug(f"INTEL ANALYTICS WRITTEN | trades={analytics.get('trade_count')} win_rate={analytics.get('win_rate')}")
+    except Exception as e:
+        log(f"❌ INTEL analytics write failed: {e}")
 
 
 # =========================================================
@@ -1950,6 +2158,20 @@ def make_local_position(signal: Dict[str, Any], mode: str) -> Dict[str, Any]:
 def save_new_position(position: Dict[str, Any]):
     GLOBAL_POSITIONS["open_positions"].append(position)
     save_positions(GLOBAL_POSITIONS)
+    intel_event(
+        "position_opened",
+        {
+            "entry_price": position.get("entry_price"),
+            "stop_price": position.get("stop_price"),
+            "tp1_price": position.get("tp1_price"),
+            "tp2_price": position.get("tp2_price"),
+            "qty_open": position.get("qty_open"),
+            "mode": position.get("mode"),
+        },
+        position=position,
+        stage="execution",
+        decision="opened",
+    )
 
 
 def get_open_position_by_id(position_id: int) -> Optional[Dict[str, Any]]:
@@ -1977,6 +2199,13 @@ def scale_out_local(position: Dict[str, Any], qty_to_close: int, fill_price: flo
     position["qty_open"] -= qty_to_close
     position["qty_closed"] += qty_to_close
     position["notes"].append(f"{note} | qty={qty_to_close} @ {fill_price}")
+    intel_event(
+        "position_scaled",
+        {"note": note, "qty_closed_now": qty_to_close, "fill_price": fill_price, "qty_open_after": position.get("qty_open")},
+        position=position,
+        stage="trade_management",
+        decision="scaled",
+    )
     return True
 
 
@@ -1999,6 +2228,7 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     GLOBAL_POSITIONS["open_positions"] = [p for p in GLOBAL_POSITIONS["open_positions"] if p["id"] != position["id"]]
     GLOBAL_POSITIONS["closed_positions"].append(position)
     save_positions(GLOBAL_POSITIONS)
+    intel_record_closed_trade(position, note)
 
     msg = build_position_close_message(position, note)
     send_to_telegram(msg)
@@ -3898,6 +4128,21 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not phase1_entry_decision["approved"]:
         return
 
+    intel_event(
+        "signal_approved",
+        {
+            "qty": sized_signal.get("qty"),
+            "entry_contract": sized_signal.get("entry_contract"),
+            "stop_contract": sized_signal.get("stop_contract"),
+            "tp1_contract": sized_signal.get("tp1_contract"),
+            "tp2_contract": sized_signal.get("tp2_contract"),
+            "regime": sized_signal.get("regime"),
+            "size_decision": sized_signal.get("size_decision", {}),
+        },
+        signal=sized_signal,
+        stage="approval_pipeline",
+        decision="approved",
+    )
     route_signal(sized_signal, GLOBAL_STATE)
     sig_hash = signal_hash(signal)
     GLOBAL_STATE["last_signal_hash"] = sig_hash
