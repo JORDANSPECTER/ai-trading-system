@@ -6455,7 +6455,7 @@ def main_loop():
     # waiting for file watcher / mtime logic.
     # =========================================================
     try:
-        startup_signal = load_active_signal_file()
+        startup_signal = load_live_signal()
         if startup_signal:
             debug("FORCE STARTUP SIGNAL PICKUP")
             handle_new_signal(startup_signal)
