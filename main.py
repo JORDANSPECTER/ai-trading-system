@@ -239,6 +239,27 @@ PHASE0_AUTO_FLATTEN_ON_HARD_KILL = os.getenv("PHASE0_AUTO_FLATTEN_ON_HARD_KILL",
 PHASE0_SEND_ALERTS = os.getenv("PHASE0_SEND_ALERTS", "true").lower() == "true"
 
 # =========================================================
+# PHASE 1 EXECUTION SAFETY LAYER
+# - Slippage guard
+# - Bid/ask spread guard
+# - Max qty / notional / risk per order
+# - Order rate caps
+# =========================================================
+ENABLE_PHASE1_EXECUTION_SAFETY = os.getenv("ENABLE_PHASE1_EXECUTION_SAFETY", "true").lower() == "true"
+PHASE1_MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("PHASE1_MAX_ENTRY_SLIPPAGE_PCT", "0.08"))
+PHASE1_MAX_EXIT_SLIPPAGE_PCT = float(os.getenv("PHASE1_MAX_EXIT_SLIPPAGE_PCT", "0.15"))
+PHASE1_MAX_SPREAD_PCT = float(os.getenv("PHASE1_MAX_SPREAD_PCT", "0.20"))
+PHASE1_REQUIRE_BID_ASK_FOR_LIVE = os.getenv("PHASE1_REQUIRE_BID_ASK_FOR_LIVE", "false").lower() == "true"
+PHASE1_MAX_QTY_PER_ORDER = int(os.getenv("PHASE1_MAX_QTY_PER_ORDER", str(MAX_POSITION_QTY)))
+PHASE1_MAX_DOLLARS_PER_ORDER = float(os.getenv("PHASE1_MAX_DOLLARS_PER_ORDER", "750"))
+PHASE1_MAX_RISK_DOLLARS_PER_ORDER = float(os.getenv("PHASE1_MAX_RISK_DOLLARS_PER_ORDER", "250"))
+PHASE1_MAX_ORDERS_PER_MINUTE = int(os.getenv("PHASE1_MAX_ORDERS_PER_MINUTE", "4"))
+PHASE1_MAX_ORDERS_PER_HOUR = int(os.getenv("PHASE1_MAX_ORDERS_PER_HOUR", "20"))
+PHASE1_MAX_ORDERS_PER_DAY = int(os.getenv("PHASE1_MAX_ORDERS_PER_DAY", "40"))
+PHASE1_SOFT_HALT_ON_RATE_LIMIT = os.getenv("PHASE1_SOFT_HALT_ON_RATE_LIMIT", "true").lower() == "true"
+PHASE1_SEND_ALERTS = os.getenv("PHASE1_SEND_ALERTS", "true").lower() == "true"
+
+# =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
 ENABLE_ENTRY_LOCK = os.getenv("ENABLE_ENTRY_LOCK", "true").lower() == "true"
@@ -2031,6 +2052,16 @@ def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
 
 
 def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    phase1_decision = phase1_validate_order_safety(
+        signal,
+        side="buy",
+        qty=safe_int(signal.get("qty", 0), 0),
+        planned_price=safe_float(signal.get("entry_contract", 0), 0),
+        mode="PAPER",
+    )
+    if not phase1_decision["approved"]:
+        return None
+    phase1_record_order_attempt("buy", str(signal.get("symbol", "")), safe_int(signal.get("qty", 0), 0))
     position = make_local_position(signal, mode="PAPER")
     save_new_position(position)
     GLOBAL_STATE["paper_trade_count"] = safe_int(GLOBAL_STATE.get("paper_trade_count", 0), 0) + 1
@@ -2047,6 +2078,17 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
         return None
     if not validate_live_signal_for_alpaca(signal):
         return None
+
+    phase1_decision = phase1_validate_order_safety(
+        signal,
+        side="buy",
+        qty=safe_int(signal.get("qty", 0), 0),
+        planned_price=safe_float(signal.get("entry_contract", 0), 0),
+        mode="LIVE",
+    )
+    if not phase1_decision["approved"]:
+        return None
+    phase1_record_order_attempt("buy", str(signal.get("symbol", "")), safe_int(signal.get("qty", 0), 0))
 
     order_type = "limit" if signal.get("use_limit_entry", False) else "market"
     limit_price = safe_float(signal.get("limit_entry_price", 0), 0) if order_type == "limit" else None
@@ -2098,7 +2140,11 @@ def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bo
     qty_to_close = int(max(0, min(qty_to_close, available_qty)))
     if qty_to_close <= 0:
         return False
-    signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", "")}
+    signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", ""), "entry_price": position.get("last_price", position.get("entry_price", 0))}
+    phase1_decision = phase1_validate_order_safety(signal_stub, side="sell", qty=qty_to_close, planned_price=safe_float(position.get("last_price", 0), 0), mode="LIVE")
+    if not phase1_decision["approved"]:
+        return False
+    phase1_record_order_attempt("sell", str(position.get("symbol", "")), qty_to_close)
     order_record = make_order_record(signal_stub, side="sell", qty=qty_to_close, mode="LIVE", order_type="market")
     order_record["position_id"] = position["id"]
     save_order_record(order_record)
@@ -2122,7 +2168,11 @@ def live_close_position(position: Dict[str, Any], note: str) -> bool:
     qty_open = max(0, safe_int(position.get("qty_open", 0), 0) - safe_int(position.get("pending_close_qty", 0), 0))
     if qty_open <= 0:
         return False
-    signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", "")}
+    signal_stub = {"signal_id": position.get("signal_id", ""), "ticker": position.get("ticker", ""), "symbol": position.get("symbol", ""), "entry_price": position.get("last_price", position.get("entry_price", 0))}
+    phase1_decision = phase1_validate_order_safety(signal_stub, side="sell", qty=qty_open, planned_price=safe_float(position.get("last_price", 0), 0), mode="LIVE")
+    if not phase1_decision["approved"]:
+        return False
+    phase1_record_order_attempt("sell", str(position.get("symbol", "")), qty_open)
     order_record = make_order_record(signal_stub, side="sell", qty=qty_open, mode="LIVE", order_type="market")
     order_record["position_id"] = position["id"]
     save_order_record(order_record)
@@ -3566,6 +3616,187 @@ def phase0_startup_safety_gate():
     debug("PHASE 0 STARTUP SAFETY GATE PASSED")
 
 # =========================================================
+# PHASE 1 EXECUTION SAFETY LAYER
+# =========================================================
+def phase1_alert(title: str, body: str):
+    msg = f"🧯 {title}\n{body}\n⏰ {now_ts()}"
+    log(msg.replace("\n", " | "))
+    if PHASE1_SEND_ALERTS:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+
+
+def phase1_get_recent_order_times() -> List[int]:
+    ensure_globals_initialized()
+    times = GLOBAL_STATE.get("phase1_order_times", [])
+    if not isinstance(times, list):
+        times = []
+    now = epoch()
+    times = [safe_int(t, 0) for t in times if safe_int(t, 0) > 0 and now - safe_int(t, 0) <= 86400]
+    GLOBAL_STATE["phase1_order_times"] = times
+    return times
+
+
+def phase1_record_order_attempt(side: str, symbol: str, qty: int):
+    ensure_globals_initialized()
+    times = phase1_get_recent_order_times()
+    times.append(epoch())
+    GLOBAL_STATE["phase1_order_times"] = times[-500:]
+    save_state(GLOBAL_STATE)
+    debug(f"PHASE 1 ORDER ATTEMPT RECORDED | side={side} | symbol={symbol} | qty={qty}")
+
+
+def phase1_order_rate_counts() -> Dict[str, int]:
+    now = epoch()
+    times = phase1_get_recent_order_times()
+    return {
+        "minute": sum(1 for t in times if now - t <= 60),
+        "hour": sum(1 for t in times if now - t <= 3600),
+        "day": sum(1 for t in times if now - t <= 86400),
+    }
+
+
+def phase1_soft_halt(reason: str):
+    ensure_globals_initialized()
+    GLOBAL_STATE["phase1_soft_halt"] = True
+    GLOBAL_STATE["phase1_soft_halt_reason"] = reason
+    GLOBAL_STATE["phase1_last_block_at"] = epoch()
+    GLOBAL_STATE["bot_paused"] = True
+    save_state(GLOBAL_STATE)
+    phase1_alert("PHASE 1 SOFT HALT", reason)
+
+
+def phase1_get_bid_ask_from_prices(symbol: str, prices: Dict[str, Any]) -> Tuple[float, float]:
+    raw = prices.get(symbol) or prices.get(symbol.upper()) or prices.get(symbol.lower())
+    if isinstance(raw, dict):
+        bid = safe_float(raw.get("bid", raw.get("bid_price", 0)), 0)
+        ask = safe_float(raw.get("ask", raw.get("ask_price", 0)), 0)
+        return bid, ask
+    return 0.0, 0.0
+
+
+def phase1_spread_check(symbol: str, prices: Dict[str, Any], live_price: float, live_mode: bool) -> Dict[str, Any]:
+    bid, ask = phase1_get_bid_ask_from_prices(symbol, prices)
+    if bid <= 0 or ask <= 0:
+        if live_mode and PHASE1_REQUIRE_BID_ASK_FOR_LIVE:
+            return {"approved": False, "reason": "missing_bid_ask_for_live_order", "bid": bid, "ask": ask, "spread_pct": 0.0}
+        return {"approved": True, "reason": "bid_ask_not_available", "bid": bid, "ask": ask, "spread_pct": 0.0}
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return {"approved": False, "reason": "invalid_bid_ask_mid", "bid": bid, "ask": ask, "spread_pct": 0.0}
+    spread_pct = (ask - bid) / mid
+    if spread_pct > PHASE1_MAX_SPREAD_PCT:
+        return {"approved": False, "reason": "spread_too_wide", "bid": bid, "ask": ask, "spread_pct": round(spread_pct, 6)}
+    return {"approved": True, "reason": "spread_ok", "bid": bid, "ask": ask, "spread_pct": round(spread_pct, 6)}
+
+
+def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty: int, planned_price: float = 0.0, mode: str = "PAPER") -> Dict[str, Any]:
+    """Final Phase 1 safety guard before paper open or Alpaca order submit."""
+    if not ENABLE_PHASE1_EXECUTION_SAFETY:
+        return {"approved": True, "reject_reasons": [], "stage": "phase1_execution_safety"}
+
+    ensure_globals_initialized()
+    reasons = []
+    side = str(side or "").lower().strip()
+    symbol = str(signal_or_stub.get("symbol", "")).strip()
+    ticker = str(signal_or_stub.get("ticker", "")).upper().strip()
+    qty = safe_int(qty, 0)
+    entry = safe_float(signal_or_stub.get("entry_contract", signal_or_stub.get("entry_price", planned_price)), planned_price)
+    stop = safe_float(signal_or_stub.get("stop_contract", signal_or_stub.get("stop_price", 0)), 0)
+    planned_price = safe_float(planned_price, entry)
+
+    if GLOBAL_STATE.get("phase1_soft_halt", False):
+        reasons.append("phase1_soft_halt_active")
+    if not symbol:
+        reasons.append("missing_order_symbol")
+    if qty <= 0:
+        reasons.append("invalid_order_qty")
+    if qty > PHASE1_MAX_QTY_PER_ORDER:
+        reasons.append("max_qty_per_order_hit")
+
+    counts = phase1_order_rate_counts()
+    if counts["minute"] >= PHASE1_MAX_ORDERS_PER_MINUTE:
+        reasons.append("max_orders_per_minute_hit")
+    if counts["hour"] >= PHASE1_MAX_ORDERS_PER_HOUR:
+        reasons.append("max_orders_per_hour_hit")
+    if counts["day"] >= PHASE1_MAX_ORDERS_PER_DAY:
+        reasons.append("max_orders_per_day_hit")
+
+    symbols_to_load = [s for s in [symbol, ticker] if s]
+    prices = load_market_prices(symbols_to_load)
+    live_price, price_ts = get_market_price_for_symbol(symbol, prices)
+    if live_price <= 0:
+        reasons.append("missing_live_order_price")
+    elif price_ts > 0 and market_price_is_stale(price_ts):
+        reasons.append("stale_live_order_price")
+
+    slippage_pct = 0.0
+    ref_price = planned_price if planned_price > 0 else entry
+    if ref_price > 0 and live_price > 0:
+        if side == "buy":
+            slippage_pct = max(0.0, (live_price - ref_price) / ref_price)
+            if slippage_pct > PHASE1_MAX_ENTRY_SLIPPAGE_PCT:
+                reasons.append("entry_slippage_too_high")
+        elif side == "sell":
+            slippage_pct = max(0.0, (ref_price - live_price) / ref_price)
+            if slippage_pct > PHASE1_MAX_EXIT_SLIPPAGE_PCT:
+                reasons.append("exit_slippage_too_high")
+
+    notional = max(live_price, ref_price, 0.0) * max(qty, 0) * 100.0
+    if PHASE1_MAX_DOLLARS_PER_ORDER > 0 and notional > PHASE1_MAX_DOLLARS_PER_ORDER:
+        reasons.append("max_dollars_per_order_hit")
+
+    risk_dollars = 0.0
+    if side == "buy" and entry > 0 and stop > 0 and stop < entry:
+        risk_dollars = (entry - stop) * qty * 100.0
+        if PHASE1_MAX_RISK_DOLLARS_PER_ORDER > 0 and risk_dollars > PHASE1_MAX_RISK_DOLLARS_PER_ORDER:
+            reasons.append("max_risk_dollars_per_order_hit")
+
+    spread = phase1_spread_check(symbol, prices, live_price, mode.upper() == "LIVE")
+    if not spread["approved"]:
+        reasons.append(spread["reason"])
+
+    approved = len(reasons) == 0
+    decision = {
+        "approved": approved,
+        "stage": "phase1_execution_safety",
+        "reject_reasons": reasons,
+        "side": side,
+        "symbol": symbol,
+        "qty": qty,
+        "live_price": round(live_price, 4),
+        "planned_price": round(ref_price, 4),
+        "slippage_pct": round(slippage_pct, 6),
+        "notional_dollars": round(notional, 2),
+        "risk_dollars": round(risk_dollars, 2),
+        "order_counts": counts,
+        "spread": spread,
+    }
+
+    if approved:
+        debug(
+            f"PHASE 1 ORDER SAFETY OK | {side.upper()} {symbol} qty={qty} "
+            f"live={decision['live_price']} planned={decision['planned_price']} "
+            f"slip={round(decision['slippage_pct']*100,2)}% notional=${decision['notional_dollars']}"
+        )
+    else:
+        extras = (
+            f"Side: {side} | Symbol: {symbol} | Qty: {qty}\n"
+            f"Live: {decision['live_price']} | Planned: {decision['planned_price']} | Slippage %: {round(decision['slippage_pct']*100, 2)}\n"
+            f"Notional: ${decision['notional_dollars']} | Risk: ${decision['risk_dollars']}\n"
+            f"Counts: {counts}\nSpread: {spread}"
+        )
+        msg = build_block_message("PHASE 1 ORDER SAFETY BLOCK", signal_or_stub, reasons, extras)
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+        if PHASE1_SOFT_HALT_ON_RATE_LIMIT and any(r in reasons for r in ["max_orders_per_minute_hit", "max_orders_per_hour_hit", "max_orders_per_day_hit"]):
+            phase1_soft_halt(", ".join(reasons))
+
+    return decision
+
+# =========================================================
 # SIGNAL HANDLER
 # =========================================================
 def should_route_signal(signal: Dict[str, Any]) -> bool:
@@ -3654,6 +3885,17 @@ def handle_new_signal(signal: Dict[str, Any]):
     # STEP 14: final account-level portfolio guard before routing/execution.
     step14_decision = step14_can_open_new_trade(sized_signal)
     if not step14_decision["approved"]:
+        return
+
+    # PHASE 1: final execution-safety guard before route/open.
+    phase1_entry_decision = phase1_validate_order_safety(
+        sized_signal,
+        side="buy",
+        qty=safe_int(sized_signal.get("qty", 0), 0),
+        planned_price=safe_float(sized_signal.get("entry_contract", 0), 0),
+        mode="LIVE" if (GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True)) else "PAPER",
+    )
+    if not phase1_entry_decision["approved"]:
         return
 
     route_signal(sized_signal, GLOBAL_STATE)
