@@ -189,6 +189,23 @@ STEP13_TIME_EXIT_ENABLED = os.getenv("STEP13_TIME_EXIT_ENABLED", "true").lower()
 STEP13_MAX_HOLD_SECONDS = int(os.getenv("STEP13_MAX_HOLD_SECONDS", "900"))
 STEP13_STAGNANT_MOVE_PCT = float(os.getenv("STEP13_STAGNANT_MOVE_PCT", "0.05"))
 
+
+# =========================================================
+# STEP 14 PORTFOLIO RISK ENGINE
+# - Account-level risk guard
+# - Max concurrent open trades
+# - Daily loss kill switch
+# - Emergency close/shutdown
+# =========================================================
+ENABLE_STEP14_PORTFOLIO_RISK = os.getenv("ENABLE_STEP14_PORTFOLIO_RISK", "true").lower() == "true"
+STEP14_MAX_OPEN_TRADES = int(os.getenv("STEP14_MAX_OPEN_TRADES", str(MAX_OPEN_POSITIONS)))
+STEP14_MAX_DAILY_LOSS_PCT = float(os.getenv("STEP14_MAX_DAILY_LOSS_PCT", str(MAX_DAILY_LOSS_PCT)))
+STEP14_MAX_DAILY_LOSS_DOLLARS = float(os.getenv("STEP14_MAX_DAILY_LOSS_DOLLARS", "0"))
+STEP14_CLOSE_ALL_ON_DAILY_LOSS = os.getenv("STEP14_CLOSE_ALL_ON_DAILY_LOSS", "true").lower() == "true"
+STEP14_BLOCK_NEW_TRADES_ON_DAILY_LOSS = os.getenv("STEP14_BLOCK_NEW_TRADES_ON_DAILY_LOSS", "true").lower() == "true"
+STEP14_EMERGENCY_STOP_ON_KILL = os.getenv("STEP14_EMERGENCY_STOP_ON_KILL", "true").lower() == "true"
+STEP14_SEND_ALERTS = os.getenv("STEP14_SEND_ALERTS", "true").lower() == "true"
+
 # =========================================================
 # STEP 9 ENTRY LOCK / NO CHASING SYSTEM
 # =========================================================
@@ -2965,6 +2982,137 @@ def open_position_if_missing(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 # =========================================================
+# STEP 14 PORTFOLIO RISK ENGINE
+# =========================================================
+def step14_daily_loss_limit_dollars() -> float:
+    """Return the active daily loss limit in dollars."""
+    if STEP14_MAX_DAILY_LOSS_DOLLARS > 0:
+        return STEP14_MAX_DAILY_LOSS_DOLLARS
+    return max(get_account_equity() * STEP14_MAX_DAILY_LOSS_PCT, 1.0)
+
+
+def step14_daily_pnl_dollars() -> float:
+    """Approximate daily realized PnL in dollars from engine state."""
+    reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+    equity = get_account_equity()
+    pnl_pct_decimal = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
+    return round(pnl_pct_decimal * equity, 2)
+
+
+def step14_open_trade_count() -> int:
+    ensure_globals_initialized()
+    return len([p for p in GLOBAL_POSITIONS.get("open_positions", []) if str(p.get("status", "OPEN")).upper() == "OPEN"])
+
+
+def step14_send_alert(title: str, body: str):
+    msg = f"🛡️ {title}\n{body}\n⏰ {now_ts()}"
+    log(msg.replace("\n", " | "))
+    if STEP14_SEND_ALERTS:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+
+
+def step14_can_open_new_trade(signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Portfolio-level entry gate. Runs after normal signal/risk checks but before opening a position."""
+    ensure_globals_initialized()
+    if not ENABLE_STEP14_PORTFOLIO_RISK:
+        return {"approved": True, "reject_reasons": [], "stage": "step14_portfolio_risk"}
+
+    reasons = []
+    open_count = step14_open_trade_count()
+    daily_pnl = step14_daily_pnl_dollars()
+    daily_loss_limit = step14_daily_loss_limit_dollars()
+
+    if open_count >= STEP14_MAX_OPEN_TRADES:
+        reasons.append("step14_max_open_trades_reached")
+
+    if STEP14_BLOCK_NEW_TRADES_ON_DAILY_LOSS and daily_pnl <= -abs(daily_loss_limit):
+        reasons.append("step14_daily_loss_limit_hit")
+
+    if GLOBAL_STATE.get("kill_switch", False):
+        reasons.append("step14_kill_switch_active")
+
+    decision = {
+        "approved": len(reasons) == 0,
+        "reject_reasons": reasons,
+        "stage": "step14_portfolio_risk",
+        "open_trades": open_count,
+        "max_open_trades": STEP14_MAX_OPEN_TRADES,
+        "daily_pnl_dollars": daily_pnl,
+        "daily_loss_limit_dollars": daily_loss_limit,
+    }
+
+    if not decision["approved"]:
+        extra = (
+            f"Open Trades: {open_count}/{STEP14_MAX_OPEN_TRADES}\n"
+            f"Daily PnL: ${daily_pnl}\n"
+            f"Daily Loss Limit: -${round(abs(daily_loss_limit), 2)}"
+        )
+        if signal:
+            msg = build_block_message("STEP 14 PORTFOLIO RISK BLOCKED ENTRY", signal, reasons, extra)
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+            send_to_telegram(msg)
+        else:
+            step14_send_alert("STEP 14 PORTFOLIO RISK BLOCKED ENTRY", extra)
+
+    return decision
+
+
+def step14_close_all_open_positions(reason: str):
+    """Close every open position in paper/live mode when an account-level stop is hit."""
+    ensure_globals_initialized()
+    open_positions = list(GLOBAL_POSITIONS.get("open_positions", []))
+    if not open_positions:
+        return
+
+    for position in open_positions:
+        symbol = str(position.get("symbol", "")).strip()
+        live_price = safe_float(position.get("last_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+        try:
+            if position.get("mode") == "LIVE":
+                live_close_position(position, reason)
+            else:
+                finalize_close_position(position, live_price, reason)
+        except Exception as e:
+            log(f"❌ STEP 14 close-all error for {symbol}: {e}")
+
+
+def step14_global_risk_guard() -> bool:
+    """Return True when global risk stop is active and the loop should skip new work."""
+    ensure_globals_initialized()
+    if not ENABLE_STEP14_PORTFOLIO_RISK:
+        return False
+
+    daily_pnl = step14_daily_pnl_dollars()
+    daily_loss_limit = step14_daily_loss_limit_dollars()
+
+    if daily_pnl <= -abs(daily_loss_limit):
+        GLOBAL_STATE["kill_switch"] = True
+        GLOBAL_STATE["bot_paused"] = True
+        GLOBAL_STATE["step14_daily_loss_shutdown_at"] = epoch()
+        GLOBAL_STATE["step14_daily_loss_shutdown_reason"] = f"Daily PnL ${daily_pnl} <= -${round(abs(daily_loss_limit), 2)}"
+        save_state(GLOBAL_STATE)
+
+        step14_send_alert(
+            "STEP 14 EMERGENCY STOP",
+            f"Daily loss limit hit.\nDaily PnL: ${daily_pnl}\nLimit: -${round(abs(daily_loss_limit), 2)}\nNew trades blocked."
+        )
+
+        if STEP14_CLOSE_ALL_ON_DAILY_LOSS:
+            step14_close_all_open_positions("STEP 14 DAILY LOSS EMERGENCY STOP")
+        return True
+
+    if GLOBAL_STATE.get("kill_switch", False) and STEP14_EMERGENCY_STOP_ON_KILL:
+        if STEP14_CLOSE_ALL_ON_DAILY_LOSS:
+            step14_close_all_open_positions("STEP 14 KILL SWITCH EMERGENCY STOP")
+        return True
+
+    return False
+
+
+# =========================================================
 # SIGNAL HANDLER
 # =========================================================
 def should_route_signal(signal: Dict[str, Any]) -> bool:
@@ -3039,6 +3187,11 @@ def handle_new_signal(signal: Dict[str, Any]):
         msg = build_block_message("PORTFOLIO BLOCKED SIGNAL", sized_signal, portfolio_decision["reject_reasons"], f"Projected Heat %: {round(portfolio_decision.get('projected_heat_pct', 0.0)*100, 3)}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
         send_to_telegram(msg)
+        return
+
+    # STEP 14: final account-level portfolio guard before routing/execution.
+    step14_decision = step14_can_open_new_trade(sized_signal)
+    if not step14_decision["approved"]:
         return
 
     route_signal(sized_signal, GLOBAL_STATE)
@@ -3299,6 +3452,10 @@ def boot():
 
 def runtime_housekeeping():
     ensure_globals_initialized()
+    # STEP 14: account-level emergency guard runs every loop.
+    if step14_global_risk_guard():
+        flush_dirty_stores(force=True)
+        return
     refresh_macro_bridge(force=False, send_alerts=False)
     sync_live_positions_from_alpaca()
     reconcile_order_fills_into_positions()
@@ -3328,6 +3485,11 @@ def main_loop():
             # messages while TP1/TP2/trailing logic should be running.
             # =========================================================
             ensure_globals_initialized()
+            # STEP 14: emergency guard before managing/opening anything.
+            if step14_global_risk_guard():
+                flush_dirty_stores(force=True)
+                time.sleep(POLL_SECONDS)
+                continue
             open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
             if open_positions:
                 update_positions_from_market_prices()
