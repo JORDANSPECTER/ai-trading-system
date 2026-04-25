@@ -2263,6 +2263,14 @@ def build_unbiased_signal(
 
 def write_auto_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     atomic_write_json(SIGNAL_FILE, signal)
+    try:
+        ensure_globals_initialized()
+        GLOBAL_STATE["last_signal_hash"] = ""
+        GLOBAL_STATE["last_signal_file_mtime"] = 0
+        save_state(GLOBAL_STATE)
+        debug("AUTO SIGNAL TEST HASH RESET")
+    except Exception as e:
+        debug(f"AUTO SIGNAL HASH RESET SKIPPED | {e}")
     debug(
         f"AUTO SIGNAL WRITTEN | {signal.get('ticker')} "
         f"{signal.get('direction')} {signal.get('confidence')} -> {SIGNAL_FILE}"
@@ -2352,6 +2360,54 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
 def is_signal_fresh(signal: Dict[str, Any]) -> bool:
     ts = safe_int(signal.get("timestamp", 0), 0)
     return True if ts <= 0 else (epoch() - ts) <= MAX_SIGNAL_AGE_SECONDS
+
+
+
+# =========================================================
+# SIGNAL FILE ROUTING FIX
+# Reads SIGNAL_FILE by content hash instead of relying only on file mtime.
+# This fixes cases where signal.json exists but the loop never picks it up.
+# =========================================================
+def load_active_signal_file() -> Optional[Dict[str, Any]]:
+    debug_file_lookup(SIGNAL_FILE)
+    if not SIGNAL_FILE:
+        return None
+    if not file_exists(SIGNAL_FILE):
+        log(f"❌ SIGNAL_FILE not found: {SIGNAL_FILE}")
+        return None
+    try:
+        with open(SIGNAL_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, list) and raw:
+            raw = raw[0]
+        if not isinstance(raw, dict) or not raw:
+            return None
+        signal = normalize_signal(raw)
+        if not is_signal_fresh(signal):
+            log("❌ Signal skipped: stale timestamp")
+            return None
+        return signal
+    except Exception as e:
+        log(f"❌ Failed loading active signal file: {e}")
+        return None
+
+
+def clear_active_signal_file():
+    try:
+        atomic_write_json(SIGNAL_FILE, {})
+    except Exception as e:
+        log(f"❌ Failed clearing signal file: {e}")
+
+
+def active_signal_hash(signal: Dict[str, Any]) -> str:
+    try:
+        return signal_hash(signal)
+    except Exception:
+        try:
+            return sha256_text(json.dumps(signal, sort_keys=True, default=str))
+        except Exception:
+            return sha256_text(str(signal))
+
 
 
 def load_live_signal() -> Optional[Dict[str, Any]]:
@@ -6437,10 +6493,30 @@ def main_loop():
                 time.sleep(POLL_SECONDS)
                 continue
             live_signal = None
-            if signal_file_changed(GLOBAL_STATE):
-                live_signal = load_live_signal()
-                if live_signal:
+
+            # =========================================================
+            # SIGNAL FILE ROUTING FIX
+            # Pick up signal.json by content hash, not just mtime.
+            # After processing, clear signal.json so the same trade cannot
+            # repeatedly fire.
+            # =========================================================
+            live_signal = load_active_signal_file()
+            if live_signal:
+                sig_hash = active_signal_hash(live_signal)
+                last_hash = str(GLOBAL_STATE.get("last_signal_hash", ""))
+                if sig_hash != last_hash:
+                    debug(f"SIGNAL FILE PICKUP OK | file={SIGNAL_FILE} | hash={sig_hash[:12]}")
                     handle_new_signal(live_signal)
+                    GLOBAL_STATE["last_signal_hash"] = sig_hash
+                    GLOBAL_STATE["last_signal_time"] = epoch()
+                    GLOBAL_STATE["last_signal_file_mtime"] = int(os.path.getmtime(SIGNAL_FILE)) if file_exists(SIGNAL_FILE) else epoch()
+                    append_recent_signal_hash(GLOBAL_STATE, sig_hash)
+                    save_state(GLOBAL_STATE)
+                    clear_active_signal_file()
+                    debug(f"SIGNAL FILE CLEARED | file={SIGNAL_FILE}")
+                else:
+                    debug(f"SIGNAL FILE SKIPPED | duplicate hash={sig_hash[:12]}")
+
             runtime_housekeeping()
             if live_signal:
                 manage_open_positions(live_signal)
