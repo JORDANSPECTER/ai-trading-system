@@ -2156,6 +2156,134 @@ def auto_select_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
         x["auto_contract"] = {"selected": False, "reason": "could_not_select_strike", "ticker": ticker, "underlying_price": underlying_price}
         debug(f"AUTO CONTRACT NOT SELECTED | {ticker} | underlying={underlying_price}")
     return apply_contract_price_defaults(x)
+
+# =========================================================
+# UNBIASED AUTO SIGNAL FORMATTER
+# Turns your strategy idea into the exact signal.json structure
+# this engine needs for validation, Phase 3.5, sizing, and paper/live routing.
+# =========================================================
+def build_unbiased_signal(
+    ticker: str,
+    direction: str,
+    entry: float,
+    stop: float,
+    target: float,
+    setup: str,
+    confidence: str = "A",
+    key_level: float = 0,
+    vwap: float = 0,
+    notes: str = "",
+    contract_symbol: str = "",
+    contract_price: float = 0,
+    underlying_price: float = 0,
+    qty: int = 1,
+) -> Dict[str, Any]:
+    ticker = str(ticker or "QQQ").upper().strip()
+    direction = normalize_direction(direction)
+    confidence = normalize_confidence(confidence)
+
+    entry = safe_float(entry, 0.0)
+    stop = safe_float(stop, 0.0)
+    target = safe_float(target, 0.0)
+    key_level = safe_float(key_level, entry)
+    vwap = safe_float(vwap, entry)
+    underlying_price = safe_float(underlying_price, entry)
+
+    # This engine trades option contracts. If contract_price is not supplied,
+    # use the strategy entry as the contract entry so testing can still execute.
+    contract_price = safe_float(contract_price, entry)
+    entry_contract = contract_price
+    stop_contract = safe_float(stop, 0.0)
+    tp1_contract = safe_float(target, 0.0)
+
+    # Build a second target so trade management has a runner level.
+    if direction == "CALL":
+        tp2_contract = target + abs(target - entry_contract)
+    else:
+        tp2_contract = target + abs(target - entry_contract)
+    tp2_contract = round(max(tp1_contract, tp2_contract), 4)
+
+    setup_clean = str(setup or "manual_setup").lower().strip().replace(" ", "_")
+    bias = "Bullish" if direction == "CALL" else "Bearish"
+    trigger = setup_clean.replace("_", " ").title()
+
+    signal = {
+        "ticker": ticker,
+        "symbol": str(contract_symbol or ticker).strip(),
+        "contract_symbol": str(contract_symbol or "").strip(),
+        "asset_class": "option",
+        "direction": direction,
+        "confidence": confidence,
+        "grade": confidence,
+
+        # Underlying/context fields
+        "price": underlying_price,
+        "underlying_price": underlying_price,
+        "key_level": key_level,
+        "vwap": vwap,
+
+        # Human-readable plan fields
+        "entry": str(entry),
+        "stop": str(stop),
+        "target": str(target),
+        "target_1": str(target),
+        "target_2": str(tp2_contract),
+        "setup": setup_clean,
+        "strategy": setup_clean,
+        "trigger": trigger,
+        "bias": bias,
+        "timeframe": "5m / 15m",
+        "reason": notes or f"{ticker} {direction} {trigger} setup.",
+        "public_reason": notes or f"{ticker} {direction} setup forming at key level.",
+
+        # Contract execution fields used by validation/sizing/execution.
+        "contract_price": entry_contract,
+        "entry_contract": entry_contract,
+        "stop_contract": stop_contract,
+        "tp1_contract": tp1_contract,
+        "tp2_contract": tp2_contract,
+        "qty": safe_int(qty, 1),
+        "qty_hint": safe_int(qty, 1),
+
+        # Freshness / identity
+        "timestamp": epoch(),
+        "created_at": epoch(),
+        "source": "auto_signal_formatter",
+    }
+
+    return signal
+
+
+def write_auto_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    atomic_write_json(SIGNAL_FILE, signal)
+    debug(
+        f"AUTO SIGNAL WRITTEN | {signal.get('ticker')} "
+        f"{signal.get('direction')} {signal.get('confidence')} -> {SIGNAL_FILE}"
+    )
+    return signal
+
+
+def write_unbiased_test_signal() -> Dict[str, Any]:
+    sig = build_unbiased_signal(
+        ticker="QQQ",
+        direction="CALL",
+        entry=1.35,
+        stop=0.95,
+        target=1.75,
+        setup="vwap reclaim",
+        confidence="A",
+        key_level=430.00,
+        vwap=429.85,
+        underlying_price=430.00,
+        contract_symbol="QQQ260501C00430000",
+        contract_price=1.35,
+        qty=1,
+        notes="Auto formatter test signal: VWAP reclaim with defined stop and target.",
+    )
+    write_auto_signal(sig)
+    print(json.dumps(sig, indent=2))
+    return sig
+
 # SIGNAL NORMALIZATION
 # =========================================================
 def normalize_confidence(conf) -> str:
@@ -6222,6 +6350,11 @@ def run_once():
 # =========================================================
 if __name__ == "__main__":
     try:
+        if len(sys.argv) > 1 and sys.argv[1] in {"--auto-signal-test", "--test-signal"}:
+            ensure_globals_initialized()
+            write_unbiased_test_signal()
+            sys.exit(0)
+
         if RUN_LOOP:
             main_loop()
         else:
