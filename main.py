@@ -5647,6 +5647,26 @@ def phase35_estimated_new_risk_dollars(signal: Dict[str, Any]) -> float:
     return max(entry - stop, 0.0) * 100.0 * qty
 
 
+
+# =========================================================
+# PHASE 3.5 MISSING HELPER FIX: PORTFOLIO HEAT DOLLARS
+# Used by phase35_projected_heat_pct()
+# =========================================================
+def portfolio_heat_dollars() -> float:
+    ensure_globals_initialized()
+    total = 0.0
+
+    for p in GLOBAL_POSITIONS.get("open_positions", []):
+        qty = safe_int(p.get("qty", p.get("quantity", 0)), 0)
+        entry = safe_float(p.get("entry_price", p.get("entry", 0)), 0)
+        stop = safe_float(p.get("stop_price", p.get("stop", 0)), 0)
+
+        if qty > 0 and entry > 0 and stop > 0:
+            total += abs(entry - stop) * qty * 100
+
+    return round(total, 2)
+
+
 def phase35_projected_heat_pct(signal: Dict[str, Any]) -> float:
     equity = max(get_account_equity(), 1.0)
     return (portfolio_heat_dollars() + phase35_estimated_new_risk_dollars(signal)) / equity
