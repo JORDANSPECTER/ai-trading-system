@@ -5120,6 +5120,12 @@ def repair_position_schema_for_step15() -> Dict[str, Any]:
                     data["last_position_id"] = safe_int(data.get("last_position_id", 0), 0) + 1
                     pos["position_id"] = f"POS-{data['last_position_id']}"
                     changed = True
+                if "notes" not in pos or pos.get("notes") is None:
+                    pos["notes"] = []
+                    changed = True
+                elif not isinstance(pos.get("notes"), list):
+                    pos["notes"] = [str(pos.get("notes"))]
+                    changed = True
 
         result["open"] = len(data.get("open_positions", []))
         result["closed"] = len(data.get("closed_positions", []))
