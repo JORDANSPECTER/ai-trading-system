@@ -8,7 +8,7 @@ import tempfile
 import traceback
 import re
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
@@ -186,6 +186,24 @@ REQUIRE_PRICE_FOR_ENTRY_LOCK = os.getenv("REQUIRE_PRICE_FOR_ENTRY_LOCK", "false"
 REPRICE_ENTRY_TO_LIVE_PRICE = os.getenv("REPRICE_ENTRY_TO_LIVE_PRICE", "true").lower() == "true"
 ENTRY_LOCK_RR_CHECK = os.getenv("ENTRY_LOCK_RR_CHECK", "true").lower() == "true"
 MIN_LIVE_ENTRY_RR_RATIO = float(os.getenv("MIN_LIVE_ENTRY_RR_RATIO", str(MIN_RR_RATIO)))
+
+# =========================================================
+# STEP 11 AUTO CONTRACT SELECTION
+# =========================================================
+ENABLE_AUTO_CONTRACT_SELECTION = os.getenv("ENABLE_AUTO_CONTRACT_SELECTION", "true").lower() == "true"
+AUTO_CONTRACT_REQUIRE_UNDERLYING_PRICE = os.getenv("AUTO_CONTRACT_REQUIRE_UNDERLYING_PRICE", "false").lower() == "true"
+AUTO_CONTRACT_USE_LIVE_UNDERLYING = os.getenv("AUTO_CONTRACT_USE_LIVE_UNDERLYING", "true").lower() == "true"
+OPTION_EXPIRY_MODE = os.getenv("OPTION_EXPIRY_MODE", "0dte_or_next").strip().lower()
+OPTION_MAX_DAYS_OUT = int(os.getenv("OPTION_MAX_DAYS_OUT", "7"))
+OPTION_STRIKE_MODE = os.getenv("OPTION_STRIKE_MODE", "atm").strip().lower()
+OPTION_STRIKE_OFFSET = int(os.getenv("OPTION_STRIKE_OFFSET", "0"))
+OPTION_STRIKE_STEP_DEFAULT = float(os.getenv("OPTION_STRIKE_STEP_DEFAULT", "1"))
+OPTION_STRIKE_STEP_QQQ = float(os.getenv("OPTION_STRIKE_STEP_QQQ", "1"))
+OPTION_STRIKE_STEP_SPY = float(os.getenv("OPTION_STRIKE_STEP_SPY", "1"))
+OPTION_DEFAULT_CONTRACT_PRICE = float(os.getenv("OPTION_DEFAULT_CONTRACT_PRICE", "1.00"))
+OPTION_STOP_PCT = float(os.getenv("OPTION_STOP_PCT", "0.30"))
+OPTION_TP1_PCT = float(os.getenv("OPTION_TP1_PCT", "0.30"))
+OPTION_TP2_PCT = float(os.getenv("OPTION_TP2_PCT", "0.60"))
 
 # GLOBALS
 # =========================================================
@@ -1336,6 +1354,198 @@ def apply_regime_to_signal(signal: Dict[str, Any], regime_decision: Dict[str, An
     return x
 
 
+
+# =========================================================
+# STEP 11 AUTO CONTRACT SELECTION HELPERS
+# =========================================================
+def compact_occ_symbol(underlying: str, expiry_yyyymmdd: str, direction: str, strike: float) -> str:
+    """Builds compact OCC-style symbols used by this engine: QQQ240426C00380000."""
+    underlying = str(underlying or "").upper().strip()
+    exp = str(expiry_yyyymmdd or "").replace("-", "").strip()
+    if len(exp) == 8:
+        yymmdd = exp[2:]
+    else:
+        yymmdd = datetime.now().strftime("%y%m%d")
+    cp = "C" if normalize_direction(direction) == "CALL" else "P"
+    strike_int = int(round(float(strike) * 1000))
+    return f"{underlying}{yymmdd}{cp}{strike_int:08d}"
+
+
+def get_strike_step(ticker: str) -> float:
+    t = str(ticker or "").upper().strip()
+    if t == "QQQ":
+        return max(OPTION_STRIKE_STEP_QQQ, 0.01)
+    if t == "SPY":
+        return max(OPTION_STRIKE_STEP_SPY, 0.01)
+    return max(OPTION_STRIKE_STEP_DEFAULT, 0.01)
+
+
+def round_to_strike(price: float, step: float) -> float:
+    if price <= 0 or step <= 0:
+        return 0.0
+    return round(round(price / step) * step, 2)
+
+
+def choose_option_expiry() -> str:
+    """
+    Basic staged expiry selector.
+    - 0dte_or_next / 0dte: today if weekday, otherwise next weekday
+    - next_day: next weekday
+    - weekly: nearest Friday within OPTION_MAX_DAYS_OUT, else next weekday
+    This is intentionally simple until true chain/expiration-calendar logic is added.
+    """
+    today = datetime.now().date()
+
+    def next_weekday(d):
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d
+
+    mode = OPTION_EXPIRY_MODE
+    if mode in {"0dte", "0dte_or_next", "today"}:
+        return next_weekday(today).strftime("%Y%m%d")
+
+    if mode in {"next", "next_day", "1dte"}:
+        d = today + timedelta(days=1)
+        return next_weekday(d).strftime("%Y%m%d")
+
+    if mode in {"weekly", "friday"}:
+        for i in range(0, max(OPTION_MAX_DAYS_OUT, 1) + 1):
+            d = today + timedelta(days=i)
+            if d.weekday() == 4:
+                return d.strftime("%Y%m%d")
+        return next_weekday(today + timedelta(days=1)).strftime("%Y%m%d")
+
+    # Explicit date support: YYYYMMDD or YYYY-MM-DD
+    cleaned = mode.replace("-", "")
+    if len(cleaned) == 8 and cleaned.isdigit():
+        return cleaned
+
+    return next_weekday(today).strftime("%Y%m%d")
+
+
+def choose_option_strike(ticker: str, direction: str, underlying_price: float) -> float:
+    step = get_strike_step(ticker)
+    atm = round_to_strike(underlying_price, step)
+    if atm <= 0:
+        return 0.0
+
+    mode = OPTION_STRIKE_MODE
+    offset = OPTION_STRIKE_OFFSET
+
+    if mode in {"atm", "at_the_money"}:
+        offset = OPTION_STRIKE_OFFSET
+    elif mode in {"itm", "one_itm", "1itm"}:
+        offset = -1 if normalize_direction(direction) == "CALL" else 1
+    elif mode in {"otm", "one_otm", "1otm"}:
+        offset = 1 if normalize_direction(direction) == "CALL" else -1
+    elif mode.startswith("offset:"):
+        try:
+            offset = int(mode.split(":", 1)[1])
+        except Exception:
+            offset = OPTION_STRIKE_OFFSET
+
+    return round(atm + (offset * step), 2)
+
+
+def signal_needs_auto_contract(signal: Dict[str, Any]) -> bool:
+    if not ENABLE_AUTO_CONTRACT_SELECTION:
+        return False
+    if str(signal.get("asset_class", "option")).lower().strip() != "option":
+        return False
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    symbol = str(signal.get("symbol", "")).upper().strip()
+    if not symbol or symbol == ticker:
+        return True
+    if not is_option_contract_symbol(symbol):
+        return False
+    return False
+
+
+def apply_contract_price_defaults(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensures generated option signals have usable paper/simulation prices."""
+    x = deepcopy(signal)
+    entry = safe_float(x.get("entry_contract", 0), 0)
+    contract_price = safe_float(x.get("contract_price", 0), 0)
+    if entry <= 0 and contract_price > 0:
+        entry = contract_price
+    if entry <= 0:
+        entry = max(OPTION_DEFAULT_CONTRACT_PRICE, 0.01)
+    x["entry_contract"] = round(entry, 4)
+    x["contract_price"] = round(entry, 4)
+
+    if safe_float(x.get("stop_contract", 0), 0) <= 0:
+        x["stop_contract"] = round(max(entry * (1.0 - OPTION_STOP_PCT), 0.01), 4)
+    if safe_float(x.get("tp1_contract", 0), 0) <= 0:
+        x["tp1_contract"] = round(entry * (1.0 + OPTION_TP1_PCT), 4)
+    if safe_float(x.get("tp2_contract", 0), 0) <= 0:
+        x["tp2_contract"] = round(entry * (1.0 + OPTION_TP2_PCT), 4)
+    return x
+
+
+def auto_select_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Step 11 staged contract selector.
+    It builds a tradable compact option symbol from ticker + direction + live underlying price.
+    True options-chain liquidity selection comes next; this prevents manual symbol typing now.
+    """
+    x = deepcopy(signal)
+    x.setdefault("auto_contract", {})
+
+    if not signal_needs_auto_contract(x):
+        return apply_contract_price_defaults(x)
+
+    ticker = str(x.get("ticker", "")).upper().strip()
+    direction = normalize_direction(x.get("direction", "CALL"))
+    underlying_price = safe_float(x.get("price", 0), 0)
+
+    if AUTO_CONTRACT_USE_LIVE_UNDERLYING:
+        live_underlying = get_live_market_price(ticker)
+        if live_underlying > 0:
+            underlying_price = live_underlying
+            x["price"] = live_underlying
+
+    if underlying_price <= 0:
+        msg = "auto_contract_missing_underlying_price"
+        x["auto_contract"] = {"selected": False, "reason": msg, "ticker": ticker}
+        if AUTO_CONTRACT_REQUIRE_UNDERLYING_PRICE:
+            return x
+        # safe fallback for paper testing only
+        underlying_price = 0.0
+
+    expiry = choose_option_expiry()
+    strike = choose_option_strike(ticker, direction, underlying_price) if underlying_price > 0 else 0.0
+    if strike <= 0:
+        # last-resort fallback so paper testing still works; QQQ/SPY can be overwritten by signal price later
+        strike = safe_float(x.get("strike", 0), 0)
+    if strike <= 0:
+        strike = 0.0
+
+    if strike > 0:
+        selected_symbol = compact_occ_symbol(ticker, expiry, direction, strike)
+        x["symbol"] = selected_symbol
+        x["contract_symbol"] = selected_symbol
+        x["strike"] = strike
+        x["expiry"] = expiry
+        x["auto_contract"] = {
+            "selected": True,
+            "symbol": selected_symbol,
+            "underlying": ticker,
+            "underlying_price": round(underlying_price, 4),
+            "expiry": expiry,
+            "strike": strike,
+            "direction": direction,
+            "mode": OPTION_STRIKE_MODE,
+            "expiry_mode": OPTION_EXPIRY_MODE,
+            "note": "staged_selector_no_chain_liquidity_yet",
+        }
+        debug(f"AUTO CONTRACT SELECTED | {ticker} {direction} | underlying={underlying_price} | strike={strike} | expiry={expiry} | symbol={selected_symbol}")
+    else:
+        x["auto_contract"] = {"selected": False, "reason": "could_not_select_strike", "ticker": ticker, "underlying_price": underlying_price}
+        debug(f"AUTO CONTRACT NOT SELECTED | {ticker} | underlying={underlying_price}")
+
+    return apply_contract_price_defaults(x)
+
 # =========================================================
 # SIGNAL NORMALIZATION
 # =========================================================
@@ -1390,6 +1600,7 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["limit_entry_price"] = safe_float(signal.get("limit_entry_price", signal["entry_contract"]))
     signal["asset_class"] = str(signal.get("asset_class", "option")).lower().strip()
     signal["symbol"] = str(signal.get("symbol", signal.get("contract_symbol", signal["ticker"]))).strip()
+    signal = auto_select_option_contract(signal)
     signal["signal_id"] = str(signal.get("signal_id", signal_hash(signal)))
     return signal
 
