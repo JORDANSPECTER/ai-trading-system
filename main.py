@@ -308,6 +308,54 @@ def phase3_write_adaptive_stats(force: bool = False) -> Dict[str, Any]:
         return {}
 
 
+
+
+# =========================================================
+# PHASE 3.5 LOCKED LEARNING HOOK
+# Guarantees adaptive_setup_stats.json updates on every final close.
+# =========================================================
+def phase35_locked_learning_hook(position: Dict[str, Any], close_reason: str = ""):
+    if not ENABLE_INTELLIGENCE_PHASE3:
+        return
+    try:
+        story = intel_trade_story_from_position(position, close_reason)
+        setup_key = phase3_setup_key(story)
+        payload = phase3_write_adaptive_stats(force=True)
+        stats = payload.get("stats", {}) if isinstance(payload, dict) and isinstance(payload.get("stats", {}), dict) else {}
+        if setup_key in stats and safe_int(stats[setup_key].get("trades", 0), 0) > 0:
+            debug(f"PHASE 3.5 LEARNING CONFIRMED | {setup_key} | trades={stats[setup_key].get('trades')} | win_rate={stats[setup_key].get('win_rate')}")
+            return
+        pnl = safe_float(story.get("realized_pnl_pct", 0), 0)
+        r_mult = safe_float(story.get("r_multiple", 0), 0)
+        winner = bool(story.get("winner", pnl > 0))
+        stats[setup_key] = {
+            "setup_key": setup_key,
+            "ticker": str(story.get("ticker", "UNKNOWN")).upper(),
+            "direction": str(story.get("direction", "UNKNOWN")).upper(),
+            "confidence": str(story.get("confidence", "NA")).upper(),
+            "trades": 1,
+            "wins": 1 if winner else 0,
+            "losses": 0 if winner else 1,
+            "total_r": r_mult,
+            "total_pnl_pct": pnl,
+            "recent_results": ["W" if winner else "L"],
+            "recent_loss_count": 0 if winner else 1,
+            "win_rate": 1.0 if winner else 0.0,
+            "avg_r": r_mult,
+            "avg_pnl_pct": pnl,
+            "last_trade_ts": safe_int(story.get("closed_ts", epoch()), epoch()),
+        }
+        atomic_write_json(PHASE3_ADAPTIVE_STATS_FILE, {
+            "generated_at": now_ts(),
+            "min_trades_for_filter": PHASE3_MIN_TRADES_FOR_FILTER,
+            "setup_count": len(stats),
+            "stats": stats,
+            "disabled_setups": phase3_load_disabled_setups(),
+        })
+        debug(f"PHASE 3.5 LOCKED ADAPTIVE UPDATE | {setup_key} | trades=1 | win_rate={stats[setup_key]['win_rate']}")
+    except Exception as e:
+        log(f"❌ PHASE 3.5 locked learning hook failed: {e}")
+
 def phase3_alert(title: str, body: str, force: bool = False):
     if not PHASE3_SEND_ALERTS and not force:
         return
@@ -2607,6 +2655,7 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     save_positions(GLOBAL_POSITIONS)
     phase2_post_fill_risk_snapshot("position_closed")
     intel_record_closed_trade(position, note)
+    phase35_locked_learning_hook(position, note)
 
     msg = build_position_close_message(position, note)
     send_to_telegram(msg)
