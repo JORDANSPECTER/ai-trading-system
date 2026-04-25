@@ -565,6 +565,13 @@ PHASE0_HARD_PORTFOLIO_HEAT_PCT = float(os.getenv("PHASE0_HARD_PORTFOLIO_HEAT_PCT
 PHASE0_AUTO_FLATTEN_ON_HARD_KILL = os.getenv("PHASE0_AUTO_FLATTEN_ON_HARD_KILL", "true").lower() == "true"
 PHASE0_SEND_ALERTS = os.getenv("PHASE0_SEND_ALERTS", "true").lower() == "true"
 
+# PHASE 0 OPTION PRICE FALLBACK
+# Test/paper mode bridge: when option contract live price is missing, allow the engine
+# to use the signal entry/contract_price so paper orders can be validated and created.
+# Turn this false when a real options pricing feed is connected.
+ALLOW_FAKE_OPTION_PRICE = os.getenv("ALLOW_FAKE_OPTION_PRICE", "true").lower() == "true"
+FAKE_OPTION_PRICE_ONLY_IN_PAPER = os.getenv("FAKE_OPTION_PRICE_ONLY_IN_PAPER", "true").lower() == "true"
+
 # =========================================================
 # PHASE 1 EXECUTION SAFETY LAYER
 # - Slippage guard
@@ -4823,6 +4830,31 @@ def phase0_validate_fresh_prices_for_open_positions() -> Dict[str, Any]:
     return {"approved": len(reasons) == 0, "reject_reasons": reasons}
 
 
+def phase0_symbol_looks_like_option_contract(symbol: str) -> bool:
+    """Detect OCC-style option symbols like QQQ260501C00430000."""
+    s = str(symbol or "").upper().strip().replace(" ", "")
+    return bool(re.search(r"\d{6}[CP]\d{8}$", s))
+
+
+def phase0_get_signal_option_fallback_price(signal: Dict[str, Any]) -> float:
+    """Return the best signal-provided option price for paper/test validation."""
+    for key in ("entry_contract", "contract_price", "entry_price", "entry"):
+        price = safe_float(signal.get(key, 0), 0)
+        if price > 0:
+            return price
+    return 0.0
+
+
+def phase0_allow_fake_option_price_for_signal(signal: Dict[str, Any]) -> bool:
+    """Allow fallback pricing only for option-like paper/test signals unless configured otherwise."""
+    if not ALLOW_FAKE_OPTION_PRICE:
+        return False
+    if FAKE_OPTION_PRICE_ONLY_IN_PAPER and LIVE_MODE:
+        return False
+    symbol = str(signal.get("symbol", "") or signal.get("contract_symbol", "")).strip()
+    return phase0_symbol_looks_like_option_contract(symbol) or bool(signal.get("contract_symbol"))
+
+
 def phase0_validate_fresh_price_for_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not PHASE0_REQUIRE_FRESH_PRICE_FOR_ENTRY:
         return {"approved": True, "reject_reasons": []}
@@ -4838,13 +4870,26 @@ def phase0_validate_fresh_price_for_signal(signal: Dict[str, Any]) -> Dict[str, 
     if symbol:
         ok, price, reason = phase0_price_is_fresh(symbol, prices)
         if not ok:
-            reasons.append(f"entry_symbol_price_not_fresh:{symbol}:{reason}")
+            fallback_price = phase0_get_signal_option_fallback_price(signal)
+            if phase0_allow_fake_option_price_for_signal(signal) and fallback_price > 0:
+                signal["price"] = fallback_price
+                signal["entry_symbol_fallback_price"] = fallback_price
+                signal["entry_symbol_fallback_source"] = "signal_entry_option_price"
+                debug(
+                    "PHASE 0 OPTION PRICE FALLBACK OK | "
+                    f"symbol={symbol} | fallback_price={fallback_price} | reason={reason}"
+                )
+            else:
+                reasons.append(f"entry_symbol_price_not_fresh:{symbol}:{reason}")
     if ticker:
         # Underlying may be live-provider based; missing underlying is a block only if live price was required/available.
-        underlying_price = safe_float(signal.get("price", 0), 0)
-        if underlying_price <= 0:
+        underlying_price = safe_float(signal.get("underlying_price", signal.get("price", 0)), 0)
+        if underlying_price <= 0 or (symbol and symbol != ticker and phase0_symbol_looks_like_option_contract(symbol)):
             # Try cached/live one last time.
-            underlying_price = get_live_market_price(ticker)
+            live_underlying = get_live_market_price(ticker)
+            if live_underlying > 0:
+                underlying_price = live_underlying
+                signal["underlying_price"] = live_underlying
         if underlying_price <= 0:
             reasons.append(f"underlying_price_not_fresh:{ticker}:missing_or_zero_price")
     if reasons:
