@@ -1,11 +1,12 @@
 {
   "ticker": "QQQ",
-  "symbol": "QQQ",
+  "contract_symbol": "QQQ260501C00430000",
+  "asset_class": "option",
   "direction": "CALL",
   "confidence": "A",
-  "entry": 430,
-  "stop": 428.5,
-  "target": 433,
-  "setup": "vwap_reclaim",
-  "timestamp": 9999999999
+  "entry": 1.35,
+  "stop": 0.95,
+  "target": 1.75,
+  "qty": 1,
+  "timestamp": 1777122039
 }
