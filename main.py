@@ -3144,6 +3144,26 @@ def main_loop():
     while True:
         try:
             process_telegram_updates()
+
+            # =========================================================
+            # POSITION-FIRST LOOP GUARD
+            # If a trade is already open, do NOT keep re-processing
+            # signal.json as a new entry. Manage the active position first.
+            # This prevents repeated AUTO CONTRACT SELECTED / ENTRY LOCK
+            # messages while TP1/TP2/trailing logic should be running.
+            # =========================================================
+            ensure_globals_initialized()
+            open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+            if open_positions:
+                update_positions_from_market_prices()
+                manage_open_positions(None)
+                sync_live_positions_from_alpaca()
+                reconcile_order_fills_into_positions()
+                refresh_macro_bridge(force=False, send_alerts=False)
+                send_heartbeat(force=False)
+                flush_dirty_stores(force=False)
+                time.sleep(POLL_SECONDS)
+                continue
             live_signal = None
             if signal_file_changed(GLOBAL_STATE):
                 live_signal = load_live_signal()
