@@ -1,4 +1,4 @@
-cat > signal.json <<'EOF'
+
 {
   "ticker": "QQQ",
   "symbol": "QQQ260501C00430000",
@@ -24,4 +24,4 @@ cat > signal.json <<'EOF'
   "source": "manual_test",
   "timestamp": 1777123228
 }
-EOF
+
