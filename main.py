@@ -408,6 +408,7 @@ def default_state() -> Dict[str, Any]:
         "last_mode": "LIVE" if LIVE_MODE else "PAPER",
         "reconciliation_required": False,
         "reconciliation_block_reason": "",
+        "auto_contract_locks": {},
     }
 
 
@@ -1483,51 +1484,102 @@ def apply_contract_price_defaults(signal: Dict[str, Any]) -> Dict[str, Any]:
     return x
 
 
+def auto_contract_lock_key(signal: Dict[str, Any]) -> str:
+    """Stable key for one signal so contract selection happens once, then reuses the same contract."""
+    sid = str(signal.get("signal_id", "")).strip()
+    if sid:
+        return sid
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    direction = normalize_direction(signal.get("direction", "CALL"))
+    ts = str(signal.get("timestamp", "")).strip()
+    confidence = normalize_confidence(signal.get("confidence", "C"))
+    return sha256_text(f"{ticker}|{direction}|{confidence}|{ts}")
+
+
+def get_locked_auto_contract(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ensure_globals_initialized()
+    locks = GLOBAL_STATE.get("auto_contract_locks", {})
+    if not isinstance(locks, dict):
+        GLOBAL_STATE["auto_contract_locks"] = {}
+        save_state(GLOBAL_STATE)
+        return None
+    lock_key = auto_contract_lock_key(signal)
+    locked = locks.get(lock_key)
+    return locked if isinstance(locked, dict) else None
+
+
+def save_locked_auto_contract(signal: Dict[str, Any], contract: Dict[str, Any]):
+    ensure_globals_initialized()
+    locks = GLOBAL_STATE.get("auto_contract_locks", {})
+    if not isinstance(locks, dict):
+        locks = {}
+    lock_key = auto_contract_lock_key(signal)
+    locks[lock_key] = contract
+    if len(locks) > 50:
+        newest_keys = list(locks.keys())[-50:]
+        locks = {k: locks[k] for k in newest_keys if k in locks}
+    GLOBAL_STATE["auto_contract_locks"] = locks
+    save_state(GLOBAL_STATE)
+
+
+def apply_locked_contract_to_signal(signal: Dict[str, Any], locked: Dict[str, Any]) -> Dict[str, Any]:
+    x = deepcopy(signal)
+    selected_symbol = str(locked.get("symbol", "")).strip()
+    if selected_symbol:
+        x["symbol"] = selected_symbol
+        x["contract_symbol"] = selected_symbol
+    if locked.get("strike") is not None:
+        x["strike"] = locked.get("strike")
+    if locked.get("expiry") is not None:
+        x["expiry"] = locked.get("expiry")
+    x["symbol_locked"] = True
+    x["auto_contract"] = deepcopy(locked)
+    x["auto_contract"]["reused_locked_contract"] = True
+    debug(f"REUSING LOCKED CONTRACT | {x.get('ticker')} {x.get('direction')} | symbol={selected_symbol}")
+    return apply_contract_price_defaults(x)
+
+
 def auto_select_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Step 11 staged contract selector.
-    It builds a tradable compact option symbol from ticker + direction + live underlying price.
-    True options-chain liquidity selection comes next; this prevents manual symbol typing now.
+    Step 11 staged contract selector with contract lock.
+    It builds a tradable compact option symbol ONCE per signal, then reuses it every loop.
+    This prevents the selected strike/symbol from changing while a signal is active.
     """
     x = deepcopy(signal)
     x.setdefault("auto_contract", {})
-
     if not signal_needs_auto_contract(x):
         return apply_contract_price_defaults(x)
-
+    locked = get_locked_auto_contract(x)
+    if locked and locked.get("symbol"):
+        return apply_locked_contract_to_signal(x, locked)
     ticker = str(x.get("ticker", "")).upper().strip()
     direction = normalize_direction(x.get("direction", "CALL"))
     underlying_price = safe_float(x.get("price", 0), 0)
-
     if AUTO_CONTRACT_USE_LIVE_UNDERLYING:
         live_underlying = get_live_market_price(ticker)
         if live_underlying > 0:
             underlying_price = live_underlying
             x["price"] = live_underlying
-
     if underlying_price <= 0:
         msg = "auto_contract_missing_underlying_price"
         x["auto_contract"] = {"selected": False, "reason": msg, "ticker": ticker}
         if AUTO_CONTRACT_REQUIRE_UNDERLYING_PRICE:
             return x
-        # safe fallback for paper testing only
         underlying_price = 0.0
-
     expiry = choose_option_expiry()
     strike = choose_option_strike(ticker, direction, underlying_price) if underlying_price > 0 else 0.0
     if strike <= 0:
-        # last-resort fallback so paper testing still works; QQQ/SPY can be overwritten by signal price later
         strike = safe_float(x.get("strike", 0), 0)
     if strike <= 0:
         strike = 0.0
-
     if strike > 0:
         selected_symbol = compact_occ_symbol(ticker, expiry, direction, strike)
         x["symbol"] = selected_symbol
         x["contract_symbol"] = selected_symbol
         x["strike"] = strike
         x["expiry"] = expiry
-        x["auto_contract"] = {
+        x["symbol_locked"] = True
+        contract = {
             "selected": True,
             "symbol": selected_symbol,
             "underlying": ticker,
@@ -1537,16 +1589,16 @@ def auto_select_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
             "direction": direction,
             "mode": OPTION_STRIKE_MODE,
             "expiry_mode": OPTION_EXPIRY_MODE,
-            "note": "staged_selector_no_chain_liquidity_yet",
+            "note": "staged_selector_no_chain_liquidity_yet_locked_once_per_signal",
+            "locked_at": epoch(),
         }
-        debug(f"AUTO CONTRACT SELECTED | {ticker} {direction} | underlying={underlying_price} | strike={strike} | expiry={expiry} | symbol={selected_symbol}")
+        x["auto_contract"] = contract
+        save_locked_auto_contract(x, contract)
+        debug(f"AUTO CONTRACT SELECTED AND LOCKED | {ticker} {direction} | underlying={underlying_price} | strike={strike} | expiry={expiry} | symbol={selected_symbol}")
     else:
         x["auto_contract"] = {"selected": False, "reason": "could_not_select_strike", "ticker": ticker, "underlying_price": underlying_price}
         debug(f"AUTO CONTRACT NOT SELECTED | {ticker} | underlying={underlying_price}")
-
     return apply_contract_price_defaults(x)
-
-# =========================================================
 # SIGNAL NORMALIZATION
 # =========================================================
 def normalize_confidence(conf) -> str:
