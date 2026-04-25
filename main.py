@@ -156,6 +156,19 @@ MAX_ORDER_STALE_SECONDS = int(os.getenv("MAX_ORDER_STALE_SECONDS", "120"))
 
 
 # =========================================================
+# MARKET DATA / STEP 8 LIVE PRICE MANAGEMENT
+ENABLE_MARKET_DATA = os.getenv("ENABLE_MARKET_DATA", "true").lower() == "true"
+MARKET_DATA_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
+MARKET_DATA_REFRESH_SECONDS = int(os.getenv("MARKET_DATA_REFRESH_SECONDS", "5"))
+MARKET_DATA_STALE_SECONDS = int(os.getenv("MARKET_DATA_STALE_SECONDS", "20"))
+AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
+AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
+AUTO_TRAILING_STOP_ENABLED = os.getenv("AUTO_TRAILING_STOP_ENABLED", "true").lower() == "true"
+AUTO_BREAKEVEN_ENABLED = os.getenv("AUTO_BREAKEVEN_ENABLED", "true").lower() == "true"
+TRAIL_ONLY_AFTER_TP1 = os.getenv("TRAIL_ONLY_AFTER_TP1", "false").lower() == "true"
+SEND_PRICE_UPDATE_ALERTS = os.getenv("SEND_PRICE_UPDATE_ALERTS", "false").lower() == "true"
+PRICE_UPDATE_ALERT_SECONDS = int(os.getenv("PRICE_UPDATE_ALERT_SECONDS", "60"))
+
 # GLOBALS
 # =========================================================
 GLOBAL_STATE = None
@@ -1909,9 +1922,119 @@ def startup_reconcile_and_gate():
 
 
 # =========================================================
+# =========================================================
+# STEP 8 MARKET PRICE FEED / LIVE POSITION PRICE UPDATES
+# =========================================================
+def load_market_prices() -> Dict[str, Any]:
+    """Reads MARKET_DATA_FILE every loop."""
+    if not ENABLE_MARKET_DATA:
+        return {}
+    if not MARKET_DATA_FILE:
+        return {}
+    if not file_exists(MARKET_DATA_FILE):
+        debug(f"MARKET_DATA_FILE not found yet: {MARKET_DATA_FILE}")
+        return {}
+    try:
+        with open(MARKET_DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            log(f"❌ MARKET_DATA_FILE must contain a JSON object: {MARKET_DATA_FILE}")
+            return {}
+        debug(f"MARKET DATA READ from {MARKET_DATA_FILE}: {data}")
+        return data
+    except Exception as e:
+        log(f"❌ Failed reading market data file {MARKET_DATA_FILE}: {e}")
+        return {}
+
+
+def parse_market_price_value(value: Any) -> Tuple[float, int]:
+    """Returns (price, timestamp). Timestamp can be 0 if not supplied."""
+    if isinstance(value, dict):
+        price = safe_float(value.get("price", value.get("last", value.get("mark", value.get("mid", 0)))), 0)
+        ts = safe_int(value.get("timestamp", value.get("ts", value.get("updated_at", 0))), 0)
+        return price, ts
+    return safe_float(value, 0), 0
+
+
+def get_market_price_for_symbol(symbol: str, prices: Dict[str, Any]) -> Tuple[float, int]:
+    if not symbol or not isinstance(prices, dict):
+        return 0.0, 0
+    direct = prices.get(symbol)
+    if direct is not None:
+        return parse_market_price_value(direct)
+    symbol_upper = str(symbol).upper().strip()
+    for key, value in prices.items():
+        if str(key).upper().strip() == symbol_upper:
+            return parse_market_price_value(value)
+    return 0.0, 0
+
+
+def market_price_is_stale(ts: int) -> bool:
+    if ts <= 0:
+        return False
+    return (epoch() - ts) > MARKET_DATA_STALE_SECONDS
+
+
+def maybe_send_price_update(position: Dict[str, Any], old_price: float, new_price: float):
+    if not SEND_PRICE_UPDATE_ALERTS:
+        return
+    last_alert = safe_int(position.get("last_price_alert_at", 0), 0)
+    if (epoch() - last_alert) < PRICE_UPDATE_ALERT_SECONDS:
+        return
+    position["last_price_alert_at"] = epoch()
+    note = f"Price update: {old_price} -> {new_price}"
+    msg = build_position_update_message(position, note)
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    send_to_telegram(msg)
+
+
+def update_positions_from_market_prices() -> int:
+    """
+    Key Step 8 loop hook. Reads market_prices.json and updates open positions.
+    Then manage_open_positions() can trigger TP1, TP2, breakeven, trailing stop, and closes.
+    """
+    ensure_globals_initialized()
+    if not ENABLE_MARKET_DATA:
+        debug("Market data disabled; skipping update_positions_from_market_prices")
+        return 0
+    open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+    if not open_positions:
+        return 0
+    prices = load_market_prices()
+    if not prices:
+        debug("No market prices loaded; open positions were not repriced")
+        return 0
+    updated = 0
+    for position in open_positions:
+        symbol = str(position.get("symbol", "")).strip()
+        if not symbol:
+            continue
+        new_price, price_ts = get_market_price_for_symbol(symbol, prices)
+        if new_price <= 0:
+            debug(f"No valid market price found for open position symbol: {symbol}")
+            continue
+        if market_price_is_stale(price_ts):
+            debug(f"Market price stale for {symbol}; ts={price_ts}; current={epoch()}")
+            continue
+        old_price = safe_float(position.get("last_price", 0), 0)
+        if old_price != new_price:
+            update_position_market_price(position, new_price)
+            position["last_market_price_update_at"] = epoch()
+            position["last_market_price_source"] = MARKET_DATA_FILE
+            updated += 1
+            log(f"📈 Updated position price from market file | {symbol}: {old_price} -> {new_price}")
+            maybe_send_price_update(position, old_price, new_price)
+    if updated > 0:
+        save_positions(GLOBAL_POSITIONS)
+    return updated
+
+
 # POSITION MANAGEMENT
 # =========================================================
 def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
+    if not AUTO_MANAGE_POSITIONS:
+        debug("AUTO_MANAGE_POSITIONS disabled; skipping manage_open_positions")
+        return
     if not GLOBAL_POSITIONS["open_positions"]:
         return
 
@@ -1929,19 +2052,19 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
         if position["mode"] == "LIVE" and not position.get("entry_filled", False):
             continue
 
-        if not position["tp1_hit"] and live_price >= position["tp1_price"]:
+        if AUTO_TP_ENABLED and not position["tp1_hit"] and live_price >= position["tp1_price"]:
             qty1 = min(max(1, math.floor(position["qty_total"] * position["scale1_pct"])), position["qty_open"])
             if qty1 > 0:
                 ok = live_scale_out(position, qty1, "TP1 HIT - live scale-out") if position["mode"] == "LIVE" else scale_out_local(position, qty1, live_price, "TP1 HIT - paper scale-out")
                 if ok:
                     position["tp1_hit"] = True
-                    if position.get("break_even_after_tp1", False):
+                    if AUTO_BREAKEVEN_ENABLED and position.get("break_even_after_tp1", False):
                         position["stop_price"] = max(position["stop_price"], position.get("avg_fill_price", position["entry_price"]))
                     msg = build_position_update_message(position, "TP1 HIT")
                     send_to_telegram(msg)
                     send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
-        if not position["tp2_hit"] and live_price >= position["tp2_price"]:
+        if AUTO_TP_ENABLED and not position["tp2_hit"] and live_price >= position["tp2_price"]:
             qty2 = min(max(1, math.floor(position["qty_total"] * position["scale2_pct"])), position["qty_open"])
             if qty2 > 0:
                 ok = live_scale_out(position, qty2, "TP2 HIT - live scale-out") if position["mode"] == "LIVE" else scale_out_local(position, qty2, live_price, "TP2 HIT - paper scale-out")
@@ -1954,11 +2077,14 @@ def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
         entry_price = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
         highest_price = safe_float(position.get("highest_price", live_price), live_price)
         trail_pct = safe_float(position.get("trail_pct", DEFAULT_TRAIL_PCT), DEFAULT_TRAIL_PCT)
-        if highest_price > entry_price and trail_pct > 0:
+        trailing_allowed = AUTO_TRAILING_STOP_ENABLED and (not TRAIL_ONLY_AFTER_TP1 or position.get("tp1_hit", False))
+        if trailing_allowed and highest_price > entry_price and trail_pct > 0:
             profit_open = highest_price - entry_price
             trailed_stop = highest_price - (profit_open * trail_pct)
             if trailed_stop > position["stop_price"]:
+                old_stop = position["stop_price"]
                 position["stop_price"] = round(trailed_stop, 4)
+                debug(f"Trailing stop raised for {position.get('symbol')}: {old_stop} -> {position['stop_price']}")
 
         if live_price <= position["stop_price"]:
             if position["mode"] == "LIVE":
@@ -2293,6 +2419,7 @@ def runtime_housekeeping():
     refresh_macro_bridge(force=False, send_alerts=False)
     sync_live_positions_from_alpaca()
     reconcile_order_fills_into_positions()
+    update_positions_from_market_prices()
     manage_open_positions(None)
     flush_dirty_stores(force=False)
 
