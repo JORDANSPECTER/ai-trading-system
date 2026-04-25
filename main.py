@@ -6585,8 +6585,8 @@ def main_loop():
         if startup_signal:
             debug("FORCE STARTUP SIGNAL PICKUP")
             handle_new_signal(startup_signal)
-            clear_active_signal_file()
-            debug(f"FORCE STARTUP SIGNAL CLEARED | file={SIGNAL_FILE}")
+            # Signal persistence enabled: do NOT clear signal.json after startup pickup.
+            debug(f"FORCE STARTUP SIGNAL KEPT | file={SIGNAL_FILE}")
     except Exception as startup_signal_error:
         log(f"❌ FORCE STARTUP SIGNAL PICKUP ERROR: {startup_signal_error}")
         log(traceback.format_exc())
@@ -6601,6 +6601,30 @@ def main_loop():
         try:
             intel_periodic_snapshot()
             process_telegram_updates()
+
+            # =========================================================
+            # PERSISTENT SIGNAL LISTENER
+            # Checks signal.json every loop and keeps it in place.
+            # Duplicate protection still uses last_signal_hash.
+            # =========================================================
+            try:
+                live_signal_poll = load_live_signal()
+                if live_signal_poll:
+                    live_hash = signal_hash(live_signal_poll)
+                    last_hash = str(GLOBAL_STATE.get("last_signal_hash", ""))
+                    if live_hash != last_hash:
+                        debug(f"NEW SIGNAL DETECTED | file={SIGNAL_FILE} | hash={live_hash[:12]}")
+                        handle_new_signal(live_signal_poll)
+                        GLOBAL_STATE["last_signal_hash"] = live_hash
+                        GLOBAL_STATE["last_signal_time"] = epoch()
+                        GLOBAL_STATE["last_signal_file_mtime"] = int(os.path.getmtime(SIGNAL_FILE)) if file_exists(SIGNAL_FILE) else epoch()
+                        append_recent_signal_hash(GLOBAL_STATE, live_hash)
+                        save_state(GLOBAL_STATE)
+                        debug(f"SIGNAL PERSISTED AFTER PROCESSING | file={SIGNAL_FILE}")
+            except Exception as persistent_signal_error:
+                log(f"❌ PERSISTENT SIGNAL LISTENER ERROR: {persistent_signal_error}")
+                log(traceback.format_exc())
+
 
             # =========================================================
             # POSITION-FIRST LOOP GUARD
@@ -6654,8 +6678,8 @@ def main_loop():
                     GLOBAL_STATE["last_signal_file_mtime"] = int(os.path.getmtime(SIGNAL_FILE)) if file_exists(SIGNAL_FILE) else epoch()
                     append_recent_signal_hash(GLOBAL_STATE, sig_hash)
                     save_state(GLOBAL_STATE)
-                    clear_active_signal_file()
-                    debug(f"SIGNAL FILE CLEARED | file={SIGNAL_FILE}")
+                    # Signal persistence enabled: do NOT clear signal.json after loop pickup.
+                    debug(f"SIGNAL FILE KEPT | file={SIGNAL_FILE}")
                 else:
                     debug(f"SIGNAL FILE SKIPPED | duplicate hash={sig_hash[:12]}")
 
