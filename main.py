@@ -667,6 +667,15 @@ PHASE35_MIN_CONFIDENCE_TO_EXECUTE = os.getenv("PHASE35_MIN_CONFIDENCE_TO_EXECUTE
 # PHASE 3.5 STRATEGY EXECUTION LOCK
 # Only A/A+ setups from the UnBiased Trades playbook can execute.
 # =========================================================
+
+# =========================================================
+# PHASE 3.5 CONTROLLED OVERRIDE / FORCE EXECUTION MODE
+# Use for testing execution pipeline only. Keep false for live production.
+# =========================================================
+ALLOW_DUPLICATE_SIGNALS = os.getenv("ALLOW_DUPLICATE_SIGNALS", "true").lower() == "true"
+FORCE_EXECUTION_MODE = os.getenv("FORCE_EXECUTION_MODE", "true").lower() == "true"
+FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "true").lower() == "true"
+
 ENABLE_PHASE35_STRATEGY_LOCK = os.getenv("ENABLE_PHASE35_STRATEGY_LOCK", "true").lower() == "true"
 PHASE35_ALLOWED_GRADES = {x.strip().upper() for x in os.getenv("PHASE35_ALLOWED_GRADES", "A,A+").split(",") if x.strip()}
 PHASE35_ALLOWED_TRIGGERS = {x.strip().lower() for x in os.getenv("PHASE35_ALLOWED_TRIGGERS", "vwap_reclaim,break_and_hold,rejection").split(",") if x.strip()}
@@ -1134,6 +1143,11 @@ def paper_pnl_dollars(entry_price: float, exit_price: float, qty: int, multiplie
 def update_daily_realized_pnl(delta_dollars: float = 0.0, delta_pct_decimal: float = 0.0, source: str = ""):
     ensure_globals_initialized()
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
+    if FORCE_EXECUTION_MODE:
+        log("🚨 FORCE EXECUTION MODE ENABLED — PHASE 3.5 GATE OVERRIDE")
+        if not FORCE_EXECUTION_KEEP_RISK_GATES:
+            return {"approved": True, "stage": "phase35_enforcement", "notes": ["force_execution_all_gates_bypassed"], "reject_reasons": []}
+
     old_dollars = safe_float(GLOBAL_STATE.get("daily_realized_pnl_dollars", 0.0), 0.0)
     old_pct = safe_float(GLOBAL_STATE.get("daily_realized_pnl_pct", 0.0), 0.0)
     delta_dollars = safe_float(delta_dollars, 0.0)
@@ -5183,6 +5197,17 @@ def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty:
     if not spread["approved"]:
         reasons.append(spread["reason"])
 
+    if FORCE_EXECUTION_MODE and reasons:
+        hard_risk_terms = ("kill", "daily_loss", "drawdown", "reconciliation", "bot_paused", "engine_disabled", "entries_not_allowed")
+        hard_reasons = [r for r in reasons if any(term in str(r).lower() for term in hard_risk_terms)]
+        if FORCE_EXECUTION_KEEP_RISK_GATES and hard_reasons:
+            log(f"🚨 FORCE MODE ACTIVE BUT HARD RISK GATE HELD | reasons={hard_reasons}")
+            reasons = hard_reasons
+        else:
+            log(f"🚨 FORCE MODE OVERRIDE — BYPASSING PHASE 3.5 REASONS | original_reasons={reasons}")
+            reasons = []
+            notes.append("force_execution_mode_bypassed_phase35_reasons")
+
     approved = len(reasons) == 0
     decision = {
         "approved": approved,
@@ -5826,6 +5851,20 @@ def phase35_is_edge_window() -> bool:
 
 def phase35_strategy_execution_lock(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Hard strategy filter before any paper/live execution."""
+    if FORCE_EXECUTION_MODE:
+        log("🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK")
+        try:
+            send_to_discord(DISCORD_AI_WEBHOOK, "🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK", "AI")
+            send_to_telegram("🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK")
+        except Exception:
+            pass
+        return {
+            "approved": True,
+            "stage": "phase35_strategy_lock",
+            "reason": "force_execution_mode",
+            "reject_reasons": [],
+        }
+
     if not ENABLE_PHASE35_STRATEGY_LOCK:
         return {"approved": True, "stage": "phase35_strategy_lock", "reason": "disabled", "reject_reasons": []}
 
@@ -6075,6 +6114,7 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 def handle_new_signal(signal: Dict[str, Any]):
+    debug(f"CONTROL FLAGS | force_execution={FORCE_EXECUTION_MODE} | allow_duplicates={ALLOW_DUPLICATE_SIGNALS}")
     try:
         intel_event(
             "signal_received",
@@ -6612,10 +6652,16 @@ def main_loop():
                 if live_signal_poll:
                     live_hash = signal_hash(live_signal_poll)
                     last_hash = str(GLOBAL_STATE.get("last_signal_hash", ""))
-                    if live_hash != last_hash:
-                        debug(f"NEW SIGNAL DETECTED | file={SIGNAL_FILE} | hash={live_hash[:12]}")
+                    if live_hash != last_hash or ALLOW_DUPLICATE_SIGNALS:
+                        if live_hash == last_hash and ALLOW_DUPLICATE_SIGNALS:
+                            debug(f"⚠️ DUPLICATE SIGNAL ALLOWED | hash={live_hash[:12]}")
+                        else:
+                            debug(f"NEW SIGNAL DETECTED | file={SIGNAL_FILE} | hash={live_hash[:12]}")
                         handle_new_signal(live_signal_poll)
-                        GLOBAL_STATE["last_signal_hash"] = live_hash
+                        if not ALLOW_DUPLICATE_SIGNALS:
+                            GLOBAL_STATE["last_signal_hash"] = live_hash
+                        else:
+                            GLOBAL_STATE["last_signal_hash"] = ""
                         GLOBAL_STATE["last_signal_time"] = epoch()
                         GLOBAL_STATE["last_signal_file_mtime"] = int(os.path.getmtime(SIGNAL_FILE)) if file_exists(SIGNAL_FILE) else epoch()
                         append_recent_signal_hash(GLOBAL_STATE, live_hash)
@@ -6681,7 +6727,14 @@ def main_loop():
                     # Signal persistence enabled: do NOT clear signal.json after loop pickup.
                     debug(f"SIGNAL FILE KEPT | file={SIGNAL_FILE}")
                 else:
-                    debug(f"SIGNAL FILE SKIPPED | duplicate hash={sig_hash[:12]}")
+                    if ALLOW_DUPLICATE_SIGNALS:
+                        debug(f"⚠️ DUPLICATE SIGNAL ALLOWED | hash={sig_hash[:12]}")
+                        handle_new_signal(live_signal)
+                        GLOBAL_STATE["last_signal_hash"] = ""
+                        GLOBAL_STATE["last_signal_time"] = epoch()
+                        save_state(GLOBAL_STATE)
+                    else:
+                        debug(f"SIGNAL FILE SKIPPED | duplicate hash={sig_hash[:12]}")
 
             runtime_housekeeping()
             if live_signal:
