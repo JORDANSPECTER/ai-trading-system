@@ -2570,72 +2570,145 @@ def update_positions_from_market_prices() -> int:
 
 # POSITION MANAGEMENT
 # =========================================================
+def send_position_management_update(position: Dict[str, Any], note: str):
+    """Step 12 helper: send trade-management updates everywhere useful."""
+    msg = build_position_update_message(position, note)
+    send_to_telegram(msg)
+    send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+
+
+# =========================================================
+# STEP 12 TRADE MANAGEMENT MODE
+# Position-first management: TP1, TP2, breakeven, trailing stop, stop loss.
+# IMPORTANT: signal.json is for ENTRY only. Once a position is open, the loop
+# manages the position from live/file market prices and ignores fresh entries.
+# =========================================================
 def manage_open_positions(incoming_signal: Optional[Dict[str, Any]] = None):
+    ensure_globals_initialized()
+
     if not AUTO_MANAGE_POSITIONS:
         debug("AUTO_MANAGE_POSITIONS disabled; skipping manage_open_positions")
         return
-    if not GLOBAL_POSITIONS["open_positions"]:
+
+    open_positions = GLOBAL_POSITIONS.get("open_positions", [])
+    if not open_positions:
         return
 
-    for position in list(GLOBAL_POSITIONS["open_positions"]):
+    changed = False
+
+    for position in list(open_positions):
+        symbol = str(position.get("symbol", "")).strip()
+        if not symbol:
+            continue
+
         live_price = safe_float(position.get("last_price", 0), 0)
-        if incoming_signal and incoming_signal.get("symbol") == position.get("symbol"):
+
+        if incoming_signal and incoming_signal.get("symbol") == symbol:
             incoming_contract = safe_float(incoming_signal.get("contract_price", 0), 0)
             if incoming_contract > 0:
                 live_price = incoming_contract
+
         if live_price <= 0:
+            debug(f"STEP 12 SKIP | {symbol} has no live price yet")
             continue
 
         update_position_market_price(position, live_price)
 
-        if position["mode"] == "LIVE" and not position.get("entry_filled", False):
+        entry_price = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+        tp1_price = safe_float(position.get("tp1_price", 0), 0)
+        tp2_price = safe_float(position.get("tp2_price", 0), 0)
+        stop_price = safe_float(position.get("stop_price", 0), 0)
+        qty_open = safe_int(position.get("qty_open", 0), 0)
+        pnl_pct = safe_float(position.get("pnl_pct", 0), 0)
+
+        debug(
+            f"STEP 12 MANAGING | id={position.get('id')} | {symbol} | "
+            f"live={live_price} | entry={entry_price} | stop={stop_price} | "
+            f"tp1={tp1_price} | tp2={tp2_price} | qty_open={qty_open} | pnl={round(pnl_pct, 2)}%"
+        )
+
+        if qty_open <= 0:
+            if position.get("status") != "CLOSED":
+                finalize_close_position(position, live_price, "All size scaled out")
+                changed = True
             continue
 
-        if AUTO_TP_ENABLED and not position["tp1_hit"] and live_price >= position["tp1_price"]:
-            qty1 = min(max(1, math.floor(position["qty_total"] * position["scale1_pct"])), position["qty_open"])
+        if position.get("mode") == "LIVE" and not position.get("entry_filled", False):
+            debug(f"STEP 12 WAIT | live entry not filled yet for {symbol}")
+            continue
+
+        # TP1: scale out 50% and move stop to breakeven.
+        if AUTO_TP_ENABLED and not position.get("tp1_hit", False) and tp1_price > 0 and live_price >= tp1_price:
+            qty1 = min(
+                max(1, math.floor(safe_int(position.get("qty_total", 1), 1) * safe_float(position.get("scale1_pct", DEFAULT_SCALE1_PCT), DEFAULT_SCALE1_PCT))),
+                safe_int(position.get("qty_open", 0), 0)
+            )
             if qty1 > 0:
-                ok = live_scale_out(position, qty1, "TP1 HIT - live scale-out") if position["mode"] == "LIVE" else scale_out_local(position, qty1, live_price, "TP1 HIT - paper scale-out")
+                ok = live_scale_out(position, qty1, "TP1 HIT - live scale-out") if position.get("mode") == "LIVE" else scale_out_local(position, qty1, live_price, "TP1 HIT - paper scale-out")
                 if ok:
                     position["tp1_hit"] = True
+                    changed = True
                     if AUTO_BREAKEVEN_ENABLED and position.get("break_even_after_tp1", False):
-                        position["stop_price"] = max(position["stop_price"], position.get("avg_fill_price", position["entry_price"]))
-                    msg = build_position_update_message(position, "TP1 HIT")
-                    send_to_telegram(msg)
-                    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+                        old_stop = safe_float(position.get("stop_price", 0), 0)
+                        position["stop_price"] = max(old_stop, entry_price)
+                        position.setdefault("notes", []).append(f"Stop moved to breakeven after TP1: {old_stop} -> {position['stop_price']}")
+                    log(f"💰 STEP 12 TP1 HIT | {symbol} | live={live_price} | remaining_qty={position.get('qty_open')} | pnl={round(position.get('pnl_pct', 0), 2)}%")
+                    send_position_management_update(position, "TP1 HIT")
 
-        if AUTO_TP_ENABLED and not position["tp2_hit"] and live_price >= position["tp2_price"]:
-            qty2 = min(max(1, math.floor(position["qty_total"] * position["scale2_pct"])), position["qty_open"])
-            if qty2 > 0:
-                ok = live_scale_out(position, qty2, "TP2 HIT - live scale-out") if position["mode"] == "LIVE" else scale_out_local(position, qty2, live_price, "TP2 HIT - paper scale-out")
-                if ok:
+        # TP2: close ALL remaining size. This makes the test clean:
+        # 1.00 entry -> 1.30 TP1 -> 1.60 full close.
+        if AUTO_TP_ENABLED and not position.get("tp2_hit", False) and tp2_price > 0 and live_price >= tp2_price:
+            remaining = safe_int(position.get("qty_open", 0), 0)
+            if remaining > 0:
+                if position.get("mode") == "LIVE":
+                    ok = live_scale_out(position, remaining, "TP2 HIT - close remaining")
+                    if ok:
+                        position["tp2_hit"] = True
+                        log(f"🚀 STEP 12 TP2 HIT | {symbol} | live={live_price} | remaining sent to close={remaining}")
+                        send_position_management_update(position, "TP2 HIT - close remaining")
+                        changed = True
+                else:
                     position["tp2_hit"] = True
-                    msg = build_position_update_message(position, "TP2 HIT")
-                    send_to_telegram(msg)
-                    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+                    finalize_close_position(position, live_price, "TP2 HIT - paper full close")
+                    log(f"🚀 STEP 12 TP2 HIT / CLOSED | {symbol} | live={live_price}")
+                    changed = True
+                    continue
 
-        entry_price = safe_float(position.get("avg_fill_price", 0), 0) or safe_float(position.get("entry_price", 0), 0)
+        # Smart trailing stop after profit. Can be restricted to after TP1.
         highest_price = safe_float(position.get("highest_price", live_price), live_price)
         trail_pct = safe_float(position.get("trail_pct", DEFAULT_TRAIL_PCT), DEFAULT_TRAIL_PCT)
         trailing_allowed = AUTO_TRAILING_STOP_ENABLED and (not TRAIL_ONLY_AFTER_TP1 or position.get("tp1_hit", False))
         if trailing_allowed and highest_price > entry_price and trail_pct > 0:
             profit_open = highest_price - entry_price
-            trailed_stop = highest_price - (profit_open * trail_pct)
-            if trailed_stop > position["stop_price"]:
+            trailed_stop = round(highest_price - (profit_open * trail_pct), 4)
+            if trailed_stop > safe_float(position.get("stop_price", 0), 0):
                 old_stop = position["stop_price"]
-                position["stop_price"] = round(trailed_stop, 4)
-                debug(f"Trailing stop raised for {position.get('symbol')}: {old_stop} -> {position['stop_price']}")
+                position["stop_price"] = trailed_stop
+                position.setdefault("notes", []).append(f"Trailing stop raised: {old_stop} -> {trailed_stop}")
+                debug(f"STEP 12 TRAIL RAISED | {symbol}: {old_stop} -> {trailed_stop}")
+                changed = True
 
-        if live_price <= position["stop_price"]:
-            if position["mode"] == "LIVE":
+        # Stop loss / trailing stop close.
+        if live_price <= safe_float(position.get("stop_price", 0), 0):
+            if position.get("mode") == "LIVE":
                 live_close_position(position, "STOP HIT / trailing stop")
             else:
                 finalize_close_position(position, live_price, "STOP HIT / trailing stop")
+            log(f"🛑 STEP 12 STOP HIT | {symbol} | live={live_price}")
+            changed = True
             continue
 
-        if position["mode"] == "PAPER" and position["qty_open"] <= 0:
+        if position.get("mode") == "PAPER" and safe_int(position.get("qty_open", 0), 0) <= 0:
             finalize_close_position(position, live_price, "All size scaled out")
+            changed = True
+            continue
 
-    save_positions(GLOBAL_POSITIONS)
+    if changed:
+        save_positions(GLOBAL_POSITIONS)
+        flush_dirty_stores(force=False)
+    else:
+        save_positions(GLOBAL_POSITIONS)
 
 
 
