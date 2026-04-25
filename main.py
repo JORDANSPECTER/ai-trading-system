@@ -61,6 +61,7 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "30"))
 
 SIGNAL_FILE = os.getenv("SIGNAL_FILE", "signal.json").strip()
+MARKET_PRICES_FILE = os.getenv("MARKET_PRICES_FILE", "market_prices.json")
 STATE_FILE = os.getenv("STATE_FILE", "engine_state.json").strip()
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json").strip()
 ORDERS_FILE = os.getenv("ORDERS_FILE", "orders.json").strip()
@@ -5072,6 +5073,69 @@ def phase0_pretrade_safety_gate(signal: Dict[str, Any]) -> Dict[str, Any]:
     return {"approved": len(reasons) == 0, "reject_reasons": reasons, "stage": "phase0_pretrade_safety"}
 
 
+
+# =========================================================
+# POSITION SCHEMA REPAIR
+# Ensures older paper positions include qty_total / qty_open
+# so Step 15 and lifecycle checks do not lock the engine.
+# =========================================================
+def repair_position_schema_for_step15() -> Dict[str, Any]:
+    result = {"repaired": False, "open": 0, "closed": 0}
+    try:
+        data = load_json_file(POSITIONS_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("schema_version", 2)
+        data.setdefault("open_positions", [])
+        data.setdefault("closed_positions", [])
+        data.setdefault("last_position_id", safe_int(data.get("last_position_id", 0), 0))
+
+        changed = False
+
+        for bucket in ["open_positions", "closed_positions"]:
+            rows = data.get(bucket, [])
+            if not isinstance(rows, list):
+                data[bucket] = []
+                changed = True
+                continue
+
+            for pos in rows:
+                if not isinstance(pos, dict):
+                    continue
+
+                qty = safe_int(pos.get("qty_open", pos.get("qty_total", pos.get("qty", 1))), 1)
+                total = safe_int(pos.get("qty_total", pos.get("qty", qty)), qty)
+                open_qty = safe_int(pos.get("qty_open", pos.get("qty", qty)), qty)
+
+                if "qty" not in pos:
+                    pos["qty"] = qty
+                    changed = True
+                if "qty_total" not in pos:
+                    pos["qty_total"] = total
+                    changed = True
+                if "qty_open" not in pos:
+                    pos["qty_open"] = open_qty if str(pos.get("status", "open")).lower() == "open" else 0
+                    changed = True
+                if "position_id" not in pos or not pos.get("position_id"):
+                    data["last_position_id"] = safe_int(data.get("last_position_id", 0), 0) + 1
+                    pos["position_id"] = f"POS-{data['last_position_id']}"
+                    changed = True
+
+        result["open"] = len(data.get("open_positions", []))
+        result["closed"] = len(data.get("closed_positions", []))
+
+        if changed:
+            atomic_write_json(POSITIONS_FILE, data)
+            result["repaired"] = True
+            debug(f"POSITION SCHEMA REPAIR OK | {result}")
+
+        return result
+    except Exception as e:
+        debug(f"POSITION SCHEMA REPAIR ERROR: {e}")
+        return result
+
+
+
 def phase0_startup_safety_gate():
     """Run once on boot. Bad local state or bad broker reconciliation blocks trading hard."""
     ensure_globals_initialized()
@@ -6865,6 +6929,7 @@ def fallback_signal() -> Dict[str, Any]:
 # BOOT + LOOP
 # =========================================================
 def boot():
+    repair_position_schema_for_step15()
     global GLOBAL_STATE, GLOBAL_POSITIONS, GLOBAL_ORDERS, GLOBAL_RECON, GLOBAL_MACRO
     GLOBAL_STATE = load_state()
     GLOBAL_POSITIONS = load_positions()
