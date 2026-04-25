@@ -4094,7 +4094,11 @@ def open_position_if_missing(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]
         return position
 
     # Default safe mode: paper execution.
-    if GLOBAL_STATE.get("paper_enabled", True):
+    # Phase 3.5 execution-lock fix: allow paper execution when either
+    # the persisted state OR the environment toggle says paper execution is enabled.
+    if GLOBAL_STATE.get("paper_enabled", True) or ENABLE_PAPER_EXECUTION:
+        GLOBAL_STATE["paper_enabled"] = True
+        save_state(GLOBAL_STATE)
         position = open_paper_position(signal)
         if position:
             log(f"✅ PAPER POSITION OPENED BY ENTRY TRIGGER | {symbol} | qty={position.get('qty_open')} | entry={position.get('entry_price')}")
@@ -5775,6 +5779,54 @@ def phase35_enforcement_gate(signal: Dict[str, Any], phase3_decision: Optional[D
     notes.append(f"phase35_ok_stage_{stage}")
     return phase35_approve(signal, notes)
 
+def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    PHASE 3.5 EXECUTION ROUTER FIX.
+    Final bridge from approved signal to paper/live execution.
+    """
+    ensure_globals_initialized()
+    symbol = str(signal.get("symbol", signal.get("ticker", ""))).strip()
+    live_requested = bool(GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True))
+
+    try:
+        if live_requested:
+            debug(f"PHASE 3.5 EXECUTION ROUTER | attempting LIVE open | symbol={symbol}")
+            pos = open_live_position(signal)
+            if pos:
+                remember_used_signal_id(signal)
+                log(f"✅ PHASE 3.5 LIVE EXECUTION CONFIRMED | {symbol} | qty={pos.get('qty_open')} | entry={pos.get('entry_price')}")
+                return pos
+            msg = build_block_message("PHASE 3.5 EXECUTION ROUTER LIVE FAILED", signal, ["open_live_position_returned_none"], "Signal passed approval pipeline, but live order creation failed.")
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_telegram(msg)
+            return None
+
+        if ENABLE_PAPER_EXECUTION or GLOBAL_STATE.get("paper_enabled", True):
+            GLOBAL_STATE["paper_enabled"] = True
+            save_state(GLOBAL_STATE)
+            debug(f"PHASE 3.5 EXECUTION ROUTER | attempting PAPER open | symbol={symbol}")
+            pos = open_paper_position(signal)
+            if pos:
+                remember_used_signal_id(signal)
+                log(f"✅ PHASE 3.5 PAPER EXECUTION CONFIRMED | {symbol} | qty={pos.get('qty_open')} | entry={pos.get('entry_price')}")
+                send_to_discord(DISCORD_AI_WEBHOOK, build_position_open_message(pos), "AI")
+                return pos
+            msg = build_block_message("PHASE 3.5 EXECUTION ROUTER PAPER FAILED", signal, ["open_paper_position_returned_none"], "Signal passed approval pipeline, but paper position/order creation failed. Check Phase 1/2/3.5 execution-layer block alerts.")
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_telegram(msg)
+            return None
+
+        msg = build_block_message("PHASE 3.5 EXECUTION ROUTER BLOCKED", signal, ["no_execution_mode_enabled"], "ENABLE_PAPER_EXECUTION=false and live mode was not enabled.")
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
+        return None
+    except Exception as e:
+        err = f"PHASE 3.5 execution router exception: {e}"
+        log(f"❌ {err}")
+        send_to_discord(DISCORD_AI_WEBHOOK, f"🚨 {err}", "AI")
+        send_to_telegram(f"🚨 {err}")
+        return None
+
 def handle_new_signal(signal: Dict[str, Any]):
     try:
         intel_event(
@@ -5980,14 +6032,18 @@ def handle_new_signal(signal: Dict[str, Any]):
     append_recent_signal_hash(GLOBAL_STATE, sig_hash)
     save_state(GLOBAL_STATE)
 
-    opened_position = open_position_if_missing(sized_signal)
+    # PHASE 3.5 EXECUTION ROUTER FIX:
+    # After all validation/risk/portfolio/phase gates approve, this explicitly
+    # creates the paper/live order and local position.
+    opened_position = execute_approved_signal(sized_signal)
     if opened_position:
-        remember_used_signal_id(sized_signal)
         debug(
             f"ENTRY EXECUTION CONFIRMED | symbol={opened_position.get('symbol')} | "
             f"mode={opened_position.get('mode')} | qty={opened_position.get('qty_open')} | "
             f"entry={opened_position.get('entry_price')}"
         )
+    else:
+        debug("ENTRY EXECUTION NOT CREATED | approved signal did not produce an order/position")
 
     manage_open_positions(sized_signal)
 
