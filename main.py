@@ -336,6 +336,7 @@ def phase3_evaluate_adaptive_intelligence(signal: Dict[str, Any]) -> Dict[str, A
 
     x = deepcopy(signal)
     setup_key = phase3_setup_key(x)
+    debug(f"PHASE 3 ADAPTIVE CHECK | setup={setup_key} | ticker={x.get('ticker')} | direction={x.get('direction')} | confidence={x.get('confidence')}")
     stats_payload = phase3_write_adaptive_stats(force=False)
     stats = (stats_payload.get("stats", {}) if isinstance(stats_payload, dict) else {}).get(setup_key, {})
     disabled = phase3_load_disabled_setups()
@@ -353,6 +354,7 @@ def phase3_evaluate_adaptive_intelligence(signal: Dict[str, Any]) -> Dict[str, A
 
     if trade_count < PHASE3_MIN_TRADES_FOR_FILTER:
         debug(f"PHASE 3 OBSERVE ONLY | {setup_key} | trades={trade_count}/{PHASE3_MIN_TRADES_FOR_FILTER}")
+        debug("PHASE 3 SIZE MULTIPLIER | base=1.0 -> adjusted=1.0 | reason=observe_only")
         intel_event("phase3_observe_only", {"setup_key": setup_key, "trades": trade_count, "required": PHASE3_MIN_TRADES_FOR_FILTER}, signal=x, stage="phase3_adaptive", decision="observe_only")
         return {"approved": True, "stage": "phase3_adaptive_intelligence", "reason": "insufficient_history", "setup_key": setup_key, "size_multiplier": 1.0, "adjusted_signal": x, "stats": stats, "actions": ["observe_only"]}
 
@@ -417,6 +419,7 @@ def phase3_apply_size_multiplier_to_decision(size_decision: Dict[str, Any], phas
             adjusted = MIN_POSITION_QTY
         x["phase3_original_final_size"] = original
         x["phase3_size_multiplier"] = mult
+        debug(f"PHASE 3 SIZE MULTIPLIER | base={original} -> adjusted={adjusted} | mult={mult}")
         x["final_size"] = adjusted
         x.setdefault("adjustments", []).append(f"phase3_size_multiplier_{mult}")
         x["approved"] = adjusted >= MIN_POSITION_QTY
@@ -4089,6 +4092,7 @@ def phase3_evaluate_adaptive_intelligence(signal: Dict[str, Any]) -> Dict[str, A
 
     x = deepcopy(signal)
     setup_key = phase3_setup_key(x)
+    debug(f"PHASE 3 ADAPTIVE CHECK | setup={setup_key} | ticker={x.get('ticker')} | direction={x.get('direction')} | confidence={x.get('confidence')}")
     stats_payload = phase3_write_adaptive_stats(force=False)
     stats = (stats_payload.get("stats", {}) if isinstance(stats_payload, dict) else {}).get(setup_key, {})
     disabled = phase3_load_disabled_setups()
@@ -4106,6 +4110,7 @@ def phase3_evaluate_adaptive_intelligence(signal: Dict[str, Any]) -> Dict[str, A
 
     if trade_count < PHASE3_MIN_TRADES_FOR_FILTER:
         debug(f"PHASE 3 OBSERVE ONLY | {setup_key} | trades={trade_count}/{PHASE3_MIN_TRADES_FOR_FILTER}")
+        debug("PHASE 3 SIZE MULTIPLIER | base=1.0 -> adjusted=1.0 | reason=observe_only")
         intel_event("phase3_observe_only", {"setup_key": setup_key, "trades": trade_count, "required": PHASE3_MIN_TRADES_FOR_FILTER}, signal=x, stage="phase3_adaptive", decision="observe_only")
         return {"approved": True, "stage": "phase3_adaptive_intelligence", "reason": "insufficient_history", "setup_key": setup_key, "size_multiplier": 1.0, "adjusted_signal": x, "stats": stats, "actions": ["observe_only"]}
 
@@ -4170,6 +4175,7 @@ def phase3_apply_size_multiplier_to_decision(size_decision: Dict[str, Any], phas
             adjusted = MIN_POSITION_QTY
         x["phase3_original_final_size"] = original
         x["phase3_size_multiplier"] = mult
+        debug(f"PHASE 3 SIZE MULTIPLIER | base={original} -> adjusted={adjusted} | mult={mult}")
         x["final_size"] = adjusted
         x.setdefault("adjustments", []).append(f"phase3_size_multiplier_{mult}")
         x["approved"] = adjusted >= MIN_POSITION_QTY
@@ -4942,6 +4948,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
         return
     if not should_route_signal(signal):
+        debug("PHASE 3 NOT RUN | no fresh routable signal or position-management cycle only")
         manage_open_positions(signal)
         return
 
@@ -4987,6 +4994,7 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     # PHASE 3: adaptive intelligence uses trade memory to block weak setups,
     # downgrade confidence, and adjust size before risk sizing/execution.
+    debug(f"PHASE 3 PRE-ENTRY HOOK REACHED | ticker={regime_signal.get('ticker')} | direction={regime_signal.get('direction')} | confidence={regime_signal.get('confidence')}")
     phase3_decision = phase3_evaluate_adaptive_intelligence(regime_signal)
     if not phase3_decision["approved"]:
         msg = build_block_message("PHASE 3 ADAPTIVE BLOCKED SIGNAL", regime_signal, phase3_decision.get("reject_reasons", []), f"Setup: {phase3_decision.get('setup_key')} | Stats: {phase3_decision.get('stats', {})}")
