@@ -687,6 +687,18 @@ FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "
 # One valid signal = one paper order + one paper position.
 # Prevents Discord spam and repeated execution of the same signal.
 # =========================================================
+
+# =========================================================
+# PAPER POSITION LIFECYCLE: TP / SL / AUTO CLOSE
+# Manages paper positions created by the paper broker bridge.
+# =========================================================
+ENABLE_PAPER_TPSL_LIFECYCLE = os.getenv("ENABLE_PAPER_TPSL_LIFECYCLE", "true").lower() == "true"
+PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK = os.getenv("PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK", "true").lower() == "true"
+PAPER_TPSL_ALERTS_ENABLED = os.getenv("PAPER_TPSL_ALERTS_ENABLED", "true").lower() == "true"
+PAPER_TPSL_CLOSE_ON_TP2 = os.getenv("PAPER_TPSL_CLOSE_ON_TP2", "true").lower() == "true"
+PAPER_TPSL_SCALE_AT_TP1 = os.getenv("PAPER_TPSL_SCALE_AT_TP1", "true").lower() == "true"
+PAPER_TPSL_MOVE_STOP_TO_BREAKEVEN_ON_TP1 = os.getenv("PAPER_TPSL_MOVE_STOP_TO_BREAKEVEN_ON_TP1", "true").lower() == "true"
+
 ENABLE_PAPER_BROKER_BRIDGE = os.getenv("ENABLE_PAPER_BROKER_BRIDGE", "true").lower() == "true"
 PAPER_BRIDGE_ONE_SHOT = os.getenv("PAPER_BRIDGE_ONE_SHOT", "true").lower() == "true"
 PAPER_BRIDGE_COOLDOWN_SECONDS = int(os.getenv("PAPER_BRIDGE_COOLDOWN_SECONDS", "60"))
@@ -6887,6 +6899,235 @@ def boot():
     send_heartbeat(force=True)
 
 
+
+# =========================================================
+# PAPER POSITION LIFECYCLE: TP / SL / AUTO CLOSE HELPERS
+# =========================================================
+def paper_tpsl_load_positions() -> Dict[str, Any]:
+    data = load_json_file(POSITIONS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("schema_version", 2)
+    data.setdefault("open_positions", [])
+    data.setdefault("closed_positions", [])
+    data.setdefault("last_position_id", safe_int(data.get("last_position_id", 0), 0))
+    return data
+
+
+def paper_tpsl_save_positions(data: Dict[str, Any]) -> None:
+    atomic_write_json(POSITIONS_FILE, data)
+
+
+def paper_tpsl_position_symbol(pos: Dict[str, Any]) -> str:
+    return str(pos.get("symbol") or pos.get("contract_symbol") or pos.get("ticker") or "").strip()
+
+
+def paper_tpsl_get_price(pos: Dict[str, Any]) -> float:
+    """Resolve a current price for paper lifecycle.
+    For true option data, this uses market_prices.json if available.
+    For testing, it falls back to entry/current/target-compatible prices.
+    """
+    symbol = paper_tpsl_position_symbol(pos)
+    ticker = str(pos.get("ticker") or "").upper().strip()
+
+    # 1) Direct current price already on position
+    for key in ["current_price", "last_price", "mark", "contract_price"]:
+        value = safe_float(pos.get(key, 0), 0.0)
+        if value > 0:
+            return value
+
+    # 2) Read market_prices.json if available
+    try:
+        market = load_json_file(MARKET_PRICES_FILE, {})
+        if isinstance(market, dict):
+            candidates = []
+            if symbol:
+                candidates.append(symbol)
+            if ticker:
+                candidates.append(ticker)
+            for c in candidates:
+                row = market.get(c)
+                if isinstance(row, dict):
+                    price = safe_float(row.get("price", row.get("last", row.get("mark", 0))), 0.0)
+                    if price > 0:
+                        return price
+                elif isinstance(row, (int, float, str)):
+                    price = safe_float(row, 0.0)
+                    if price > 0:
+                        return price
+    except Exception:
+        pass
+
+    # 3) Testing fallback: use entry so position stays open unless user updates position/market price
+    if PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK:
+        return safe_float(pos.get("entry_price", pos.get("entry", 0)), 0.0)
+
+    return 0.0
+
+
+def paper_tpsl_direction_pnl(direction: str, entry: float, price: float, qty: int) -> float:
+    direction = normalize_direction(direction)
+    if direction == "PUT":
+        pnl_per_contract = entry - price
+    else:
+        pnl_per_contract = price - entry
+    return round(pnl_per_contract * max(qty, 1) * 100, 2)
+
+
+def paper_tpsl_close_position(pos: Dict[str, Any], exit_price: float, reason: str) -> Dict[str, Any]:
+    pos = deepcopy(pos)
+    qty = safe_int(pos.get("qty", 1), 1)
+    entry = safe_float(pos.get("entry_price", pos.get("entry", 0)), 0.0)
+    direction = str(pos.get("direction", "CALL"))
+    realized = paper_tpsl_direction_pnl(direction, entry, exit_price, qty)
+
+    pos["status"] = "closed"
+    pos["closed_at"] = now_ts()
+    pos["closed_timestamp"] = epoch()
+    pos["exit_price"] = exit_price
+    pos["close_reason"] = reason
+    pos["realized_pnl"] = realized
+    pos["unrealized_pnl"] = 0.0
+
+    return pos
+
+
+def paper_tpsl_alert(title: str, pos: Dict[str, Any]) -> None:
+    if not PAPER_TPSL_ALERTS_ENABLED:
+        return
+    msg = (
+        f"{title}\n"
+        f"Ticker: {pos.get('ticker')}\n"
+        f"Symbol: {pos.get('symbol')}\n"
+        f"Direction: {pos.get('direction')}\n"
+        f"Qty: {pos.get('qty')}\n"
+        f"Entry: {pos.get('entry_price', pos.get('entry'))}\n"
+        f"Stop: {pos.get('stop_price', pos.get('stop'))}\n"
+        f"Target: {pos.get('target')}\n"
+        f"TP2: {pos.get('tp2')}\n"
+        f"PnL: {pos.get('realized_pnl', pos.get('unrealized_pnl', 0))}\n"
+        f"Reason: {pos.get('close_reason', '')}"
+    )
+    try:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_telegram(msg)
+    except Exception as e:
+        debug(f"paper_tpsl_alert_error:{e}")
+
+
+def paper_tpsl_manage_positions() -> Dict[str, Any]:
+    """Manage all paper bridge open positions.
+    - Stop loss closes full position
+    - TP1 marks hit, optionally moves stop to breakeven
+    - TP2 closes full position
+    """
+    result = {"managed": False, "open_count": 0, "closed_count": 0, "events": []}
+
+    if not ENABLE_PAPER_TPSL_LIFECYCLE:
+        return result
+
+    store = paper_tpsl_load_positions()
+    open_positions = store.get("open_positions", [])
+    if not isinstance(open_positions, list) or not open_positions:
+        result["managed"] = True
+        return result
+
+    updated_open = []
+    closed = store.get("closed_positions", [])
+    if not isinstance(closed, list):
+        closed = []
+
+    for pos in open_positions:
+        if not isinstance(pos, dict):
+            continue
+
+        status = str(pos.get("status", "open")).lower()
+        if status != "open":
+            closed.append(pos)
+            continue
+
+        ticker = str(pos.get("ticker", "")).upper()
+        direction = normalize_direction(pos.get("direction", "CALL"))
+        qty = safe_int(pos.get("qty", 1), 1)
+        entry = safe_float(pos.get("entry_price", pos.get("entry", 0)), 0.0)
+        stop = safe_float(pos.get("stop_price", pos.get("stop", 0)), 0.0)
+        target = safe_float(pos.get("target", pos.get("tp1_contract", 0)), 0.0)
+        tp2 = safe_float(pos.get("tp2", pos.get("target_2", target)), target)
+        price = paper_tpsl_get_price(pos)
+
+        if entry <= 0 or price <= 0:
+            pos["lifecycle_warning"] = "missing_entry_or_price"
+            updated_open.append(pos)
+            continue
+
+        unrealized = paper_tpsl_direction_pnl(direction, entry, price, qty)
+        pos["current_price"] = price
+        pos["last_lifecycle_check"] = now_ts()
+        pos["unrealized_pnl"] = unrealized
+
+        # Direction-aware thresholds
+        if direction == "PUT":
+            stop_hit = stop > 0 and price >= stop
+            tp1_hit = target > 0 and price <= target
+            tp2_hit = tp2 > 0 and price <= tp2
+        else:
+            stop_hit = stop > 0 and price <= stop
+            tp1_hit = target > 0 and price >= target
+            tp2_hit = tp2 > 0 and price >= tp2
+
+        # STOP LOSS: full close
+        if stop_hit:
+            closed_pos = paper_tpsl_close_position(pos, price, "STOP_LOSS_HIT")
+            closed.append(closed_pos)
+            result["closed_count"] += 1
+            result["events"].append(f"STOP_LOSS_HIT:{ticker}")
+            debug(f"❌ PAPER STOP HIT | {ticker} | price={price} | pnl={closed_pos.get('realized_pnl')}")
+            paper_tpsl_alert("❌ PAPER STOP LOSS HIT", closed_pos)
+            continue
+
+        # TP1: mark hit and optionally move stop to breakeven
+        if tp1_hit and not pos.get("tp1_hit", False):
+            pos["tp1_hit"] = True
+            pos["tp1_hit_at"] = now_ts()
+            pos["tp1_hit_price"] = price
+            result["events"].append(f"TP1_HIT:{ticker}")
+            debug(f"🎯 PAPER TP1 HIT | {ticker} | price={price} | pnl={unrealized}")
+
+            if PAPER_TPSL_SCALE_AT_TP1:
+                pos["scaled_at_tp1"] = True
+                pos["remaining_qty_note"] = "paper_scale_marker_only"
+
+            if PAPER_TPSL_MOVE_STOP_TO_BREAKEVEN_ON_TP1:
+                pos["original_stop_price"] = stop
+                pos["stop_price"] = entry
+                pos["stop"] = entry
+                debug(f"🛡️ PAPER STOP MOVED TO BREAKEVEN | {ticker} | stop={entry}")
+
+            paper_tpsl_alert("🎯 PAPER TP1 HIT", pos)
+
+        # TP2: full close
+        if tp2_hit and PAPER_TPSL_CLOSE_ON_TP2:
+            closed_pos = paper_tpsl_close_position(pos, price, "TP2_HIT")
+            closed.append(closed_pos)
+            result["closed_count"] += 1
+            result["events"].append(f"TP2_HIT:{ticker}")
+            debug(f"🏆 PAPER TP2 HIT | {ticker} | price={price} | pnl={closed_pos.get('realized_pnl')}")
+            paper_tpsl_alert("🏆 PAPER TP2 HIT — POSITION CLOSED", closed_pos)
+            continue
+
+        updated_open.append(pos)
+
+    store["open_positions"] = updated_open
+    store["closed_positions"] = closed
+    paper_tpsl_save_positions(store)
+
+    result["managed"] = True
+    result["open_count"] = len(updated_open)
+    return result
+
+
+
 def runtime_housekeeping():
     ensure_globals_initialized()
     intel_periodic_snapshot()
@@ -6897,6 +7138,10 @@ def runtime_housekeeping():
     # PHASE 2: order lifecycle/reconciliation integrity runs every loop before risk decisions.
     phase2_sync_order_lifecycle()
     phase2_reconciliation_guard()
+    tpsl_result = paper_tpsl_manage_positions()
+    if tpsl_result.get("managed") and (tpsl_result.get("events") or tpsl_result.get("closed_count", 0) > 0):
+        debug(f"PAPER TP/SL LIFECYCLE RESULT | {tpsl_result}")
+
 
     # PHASE 0: hard daily loss / heat kill switch and stale open-position price gate.
     if not phase0_hard_risk_kill_check():
@@ -6948,6 +7193,11 @@ def main_loop():
         try:
             intel_periodic_snapshot()
             process_telegram_updates()
+            # PAPER TP/SL LOOP CHECK
+            tpsl_loop_result = paper_tpsl_manage_positions()
+            if tpsl_loop_result.get("events") or tpsl_loop_result.get("closed_count", 0) > 0:
+                debug(f"PAPER TP/SL LOOP RESULT | {tpsl_loop_result}")
+
             debug(f"FINAL ELITE ROUTING FLAGS | force={FORCE_EXECUTION_MODE} | bypass_routing={FORCE_BYPASS_SIGNAL_ROUTING} | treat_fresh={FORCE_TREAT_SIGNAL_AS_FRESH}")
 
             # =========================================================
