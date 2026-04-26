@@ -10324,6 +10324,22 @@ def maybe_send_free_daily_levels(force: bool = False) -> None:
             pass
 
 
+def free_daily_levels_top_loop_tick() -> None:
+    """
+    HARD TOP-LOOP HOOK:
+    This runs at the beginning of every engine cycle.
+    Cooldown/state inside maybe_send_free_daily_levels prevents spam.
+    """
+    try:
+        maybe_send_free_daily_levels(force=False)
+    except Exception as e:
+        try:
+            debug(f"FREE DAILY TOP LOOP FAILED | {e}")
+        except Exception:
+            pass
+
+
+
 def free_daily_levels_autoloop_tick() -> None:
     """
     Safe loop hook for automated free daily levels.
@@ -13637,6 +13653,14 @@ def cli_adaptive_rebuild_stats() -> None:
     stats = adaptive_rebuild_learning_stats()
     adaptive_write_json(ADAPTIVE_LEARNING_STATS_FILE, stats)
     print(json.dumps(stats, indent=2, default=str))
+
+
+
+# CLI helper:
+# python main.py --free-daily-now
+if "--free-daily-now" in sys.argv:
+    maybe_send_free_daily_levels(force=True)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
