@@ -698,6 +698,19 @@ FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "
 # LOCKED POSITION SCHEMA + DUPLICATE POSITION CAP
 # Prevents Step 15 schema crashes and prevents duplicate stacking.
 # =========================================================
+
+# =========================================================
+# FALLBACK TEST SIGNAL CONTROL
+# Default OFF so engine does not auto-create fake/test signals.
+# =========================================================
+ENABLE_FALLBACK_SIGNAL = os.getenv("ENABLE_FALLBACK_SIGNAL", "false").lower() == "true"
+AUTO_FALLBACK_SIGNAL = os.getenv("AUTO_FALLBACK_SIGNAL", "false").lower() == "true"
+ROUTE_FALLBACK_TEST_SIGNAL = os.getenv("ROUTE_FALLBACK_TEST_SIGNAL", "false").lower() == "true"
+
+def fallback_signal_enabled() -> bool:
+    return bool(ENABLE_FALLBACK_SIGNAL or AUTO_FALLBACK_SIGNAL or ROUTE_FALLBACK_TEST_SIGNAL)
+
+
 ENABLE_POSITION_SCHEMA_LOCK = os.getenv("ENABLE_POSITION_SCHEMA_LOCK", "true").lower() == "true"
 ENABLE_HARD_DUPLICATE_POSITION_CAP = os.getenv("ENABLE_HARD_DUPLICATE_POSITION_CAP", "true").lower() == "true"
 MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION = int(os.getenv("MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION", "1"))
@@ -6797,6 +6810,9 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_new_signal(signal: Dict[str, Any]):
+    if not signal:
+        debug("handle_new_signal skipped: empty signal")
+        return None
     debug(f"CONTROL FLAGS | force_execution={FORCE_EXECUTION_MODE} | allow_duplicates={ALLOW_DUPLICATE_SIGNALS}")
 
     # =========================================================
@@ -7635,9 +7651,20 @@ def main_loop():
 
     if not file_exists(SIGNAL_FILE):
         log(f"❌ No signal file found on boot: {SIGNAL_FILE}")
-        debug("Routing fallback test signal once.")
-        sig = fallback_signal()
-        handle_new_signal(sig)
+        if fallback_signal_enabled():
+            if fallback_signal_enabled():
+
+                debug("Routing fallback test signal once.")
+
+                sig = fallback_signal()
+
+                handle_new_signal(sig)
+
+            else:
+
+                debug("No signal file and fallback disabled — idle cycle.")
+        else:
+            debug("No signal file and fallback disabled — idle cycle.")
 
     while True:
         try:
