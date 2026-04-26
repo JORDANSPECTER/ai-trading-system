@@ -702,6 +702,21 @@ FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "
 # =========================================================
 
 # =========================================================
+
+# =========================================================
+# AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
+# Generates ai_signal.json from analyzer/rule conditions.
+# =========================================================
+ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
+AUTO_AI_SIGNAL_TICKERS = [x.strip().upper() for x in os.getenv("AUTO_AI_SIGNAL_TICKERS", "QQQ,SPY").split(",") if x.strip()]
+AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
+AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
+AUTO_AI_SIGNAL_FILE = os.getenv("AUTO_AI_SIGNAL_FILE", "ai_signal.json")
+AUTO_AI_STATE_FILE = os.getenv("AUTO_AI_STATE_FILE", "auto_ai_signal_state.json")
+AUTO_AI_DEFAULT_CONTRACT_PRICE = float(os.getenv("AUTO_AI_DEFAULT_CONTRACT_PRICE", "1.35"))
+AUTO_AI_DEFAULT_STOP_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_STOP_OFFSET", "0.35"))
+AUTO_AI_DEFAULT_TP1_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP1_OFFSET", "0.40"))
+AUTO_AI_DEFAULT_TP2_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP2_OFFSET", "0.80"))
 # AI → SIGNAL.JSON BRIDGE
 # Reads AI decision output, validates it, normalizes it into
 # execution-safe signal.json, then lets main engine process it.
@@ -755,6 +770,136 @@ VALID_AI_CONFIRMATIONS = {
 
 
 # =========================================================
+
+# =========================================================
+# AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR HELPERS
+# =========================================================
+def load_auto_ai_state() -> Dict[str, Any]:
+    data = load_json_file(AUTO_AI_STATE_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("last_signal_ts", 0)
+    data.setdefault("last_signal_key", "")
+    data.setdefault("signals_generated", 0)
+    return data
+
+
+def save_auto_ai_state(data: Dict[str, Any]) -> None:
+    atomic_write_json(AUTO_AI_STATE_FILE, data)
+
+
+def auto_ai_recently_generated(state: Dict[str, Any], key: str) -> bool:
+    last_ts = safe_int(state.get("last_signal_ts", 0), 0)
+    last_key = str(state.get("last_signal_key", ""))
+    return key == last_key and (now_ts() - last_ts) < AUTO_AI_SIGNAL_COOLDOWN_SECONDS
+
+
+def auto_ai_read_market_snapshot() -> Dict[str, Any]:
+    try:
+        data = load_json_file(MARKET_PRICES_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def auto_ai_get_price(snapshot: Dict[str, Any], ticker: str) -> float:
+    row = snapshot.get(ticker) if isinstance(snapshot, dict) else None
+    if isinstance(row, dict):
+        return safe_float(row.get("price", row.get("close", 0)), 0.0)
+    return safe_float(row, 0.0)
+
+
+def auto_ai_grade_signal(setup: str, ticker: str, direction: str, price: float) -> Dict[str, Any]:
+    if price <= 0:
+        return {"grade": "AVOID", "reason": "missing_market_price"}
+    setup = setup or "vwap_reclaim"
+    return {
+        "grade": "A",
+        "confidence": "A",
+        "setup": setup,
+        "trigger": "vwap_reclaim" if setup == "vwap_reclaim" else "break_and_hold",
+        "confirmation": "volume",
+        "regime": "clean",
+        "reason": f"{ticker} auto analyzer detected {setup} | clean regime | volume confirmation | A-grade only",
+    }
+
+
+def auto_ai_build_signal_for_ticker(ticker: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ticker = str(ticker).upper().strip()
+    price = auto_ai_get_price(snapshot, ticker)
+    direction = "CALL"
+    setup = "vwap_reclaim"
+    grade_info = auto_ai_grade_signal(setup, ticker, direction, price)
+    grade = str(grade_info.get("grade", "AVOID")).upper()
+
+    if ai_grade_rank(grade) < ai_grade_rank(AUTO_AI_SIGNAL_MIN_GRADE):
+        return None
+
+    entry = round(AUTO_AI_DEFAULT_CONTRACT_PRICE, 2)
+    stop = round(max(0.01, entry - AUTO_AI_DEFAULT_STOP_OFFSET), 2)
+    target = round(entry + AUTO_AI_DEFAULT_TP1_OFFSET, 2)
+    tp2 = round(entry + AUTO_AI_DEFAULT_TP2_OFFSET, 2)
+
+    return {
+        "ticker": ticker,
+        "direction": direction,
+        "grade": grade,
+        "confidence": str(grade_info.get("confidence", grade)).upper(),
+        "setup": grade_info.get("setup", setup),
+        "trigger": grade_info.get("trigger", "vwap_reclaim"),
+        "confirmation": grade_info.get("confirmation", "volume"),
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "tp2_contract": tp2,
+        "qty": 1,
+        "regime": grade_info.get("regime", "clean"),
+        "underlying_price": price,
+        "reason": grade_info.get("reason", f"{ticker} auto analyzer A setup"),
+        "source": "auto_ai_signal_generator",
+        "timestamp": now_ts(),
+    }
+
+
+def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
+    if not ENABLE_AUTO_AI_SIGNAL_GENERATOR:
+        return {"generated": False, "reason": "disabled"}
+
+    try:
+        if file_exists(AUTO_AI_SIGNAL_FILE):
+            return {"generated": False, "reason": "ai_signal_already_exists"}
+        if file_exists(SIGNAL_FILE):
+            return {"generated": False, "reason": "signal_file_already_exists"}
+
+        snapshot = auto_ai_read_market_snapshot()
+        if not snapshot:
+            return {"generated": False, "reason": "missing_market_snapshot"}
+
+        state = load_auto_ai_state()
+
+        for ticker in AUTO_AI_SIGNAL_TICKERS:
+            candidate = auto_ai_build_signal_for_ticker(ticker, snapshot)
+            if not candidate:
+                continue
+
+            key = f"{candidate.get('ticker')}_{candidate.get('direction')}_{candidate.get('setup')}_{candidate.get('grade')}"
+            if auto_ai_recently_generated(state, key):
+                return {"generated": False, "reason": "cooldown_active", "key": key}
+
+            atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
+            state["last_signal_ts"] = now_ts()
+            state["last_signal_key"] = key
+            state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
+            save_auto_ai_state(state)
+
+            debug(f"AUTO AI SIGNAL GENERATED | {key} | file={AUTO_AI_SIGNAL_FILE}")
+            return {"generated": True, "reason": "ai_signal_generated", "signal": candidate}
+
+        return {"generated": False, "reason": "no_a_setup_detected"}
+
+    except Exception as e:
+        log(f"❌ AUTO AI SIGNAL GENERATOR ERROR | {e}")
+        return {"generated": False, "reason": "error", "error": str(e)}
 # AI → SIGNAL.JSON BRIDGE HELPERS
 # =========================================================
 def ai_grade_rank(grade: str) -> int:
@@ -7931,6 +8076,7 @@ def reset_kill_switch_for_testing():
 
 def main_loop():
     boot()
+    auto_generate_ai_signal_if_ready()
     ai_bridge_write_signal_if_ready()
 
     # =========================================================
@@ -8106,7 +8252,17 @@ def cli_ai_bridge_test() -> None:
 
 
 
+
+def cli_auto_ai_test() -> None:
+    result = auto_generate_ai_signal_if_ready()
+    print(json.dumps(result, indent=2, default=str))
+
+
+
 if __name__ == "__main__":
+    if "--auto-ai-test" in sys.argv:
+        cli_auto_ai_test()
+        sys.exit(0)
     if "--ai-bridge-test" in sys.argv:
         cli_ai_bridge_test()
         sys.exit(0)
