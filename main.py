@@ -10136,6 +10136,7 @@ def uw_dp_build_levels(ticker: str, current_price: float = 0.0, force: bool = Fa
         lvl["premium"] = round(safe_float(lvl.get("premium", 0), 0.0), 2)
         lvl["size"] = round(safe_float(lvl.get("size", 0), 0.0), 2)
         lvl["strength"] = "major" if lvl["premium"] >= UW_DARKPOOL_STRONG_LEVEL_PREMIUM else "normal"
+        lvl["source_label"] = "synthetic"
         if current_price > 0:
             lvl["distance_pct"] = round((price - current_price) / current_price, 5)
             lvl["type"] = "resistance" if price > current_price else "support" if price < current_price else "at_price"
@@ -10313,31 +10314,135 @@ def unusual_whales_darkpool_blocks_signal(signal: Dict[str, Any]) -> bool:
         return False
 
 
+def uw_dp_format_money(value: Any) -> str:
+    try:
+        v = float(value or 0)
+    except Exception:
+        v = 0.0
+
+    if abs(v) >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.2f}B"
+    if abs(v) >= 1_000_000:
+        return f"${v / 1_000_000:.2f}M"
+    if abs(v) >= 1_000:
+        return f"${v / 1_000:.2f}K"
+    return f"${v:.2f}"
+
+
+def uw_dp_format_level_line(level: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(level, dict):
+        return None
+
+    price = safe_float(level.get("price", 0), 0.0)
+    if price <= 0:
+        return None
+
+    level_type = str(level.get("type", "level")).upper().strip()
+    if level_type == "AT_PRICE":
+        level_type = "AT PRICE"
+
+    premium = uw_dp_format_money(level.get("premium", 0))
+    source_label = str(level.get("source_label", "synthetic")).strip() or "synthetic"
+
+    return f"• {price:.2f} | {level_type} | {premium} | {source_label}"
+
+
+def uw_dp_top_clean_levels(dp: Dict[str, Any]) -> List[str]:
+    levels_payload = dp.get("levels", {})
+    top_levels = []
+
+    if isinstance(levels_payload, dict):
+        raw_levels = levels_payload.get("top_levels") or levels_payload.get("levels") or []
+        if isinstance(raw_levels, list):
+            top_levels.extend(raw_levels)
+
+    support = dp.get("nearest_support")
+    resistance = dp.get("nearest_resistance")
+
+    ordered = []
+    if isinstance(resistance, dict):
+        ordered.append(resistance)
+    if isinstance(support, dict):
+        ordered.append(support)
+
+    for lvl in top_levels:
+        if isinstance(lvl, dict):
+            ordered.append(lvl)
+
+    seen = set()
+    clean_lines = []
+    for lvl in ordered:
+        if not isinstance(lvl, dict):
+            continue
+
+        price = safe_float(lvl.get("price", 0), 0.0)
+        level_type = str(lvl.get("type", "")).lower().strip()
+        key = f"{price:.2f}:{level_type}"
+
+        if not price or key in seen:
+            continue
+
+        seen.add(key)
+        line = uw_dp_format_level_line(lvl)
+
+        if line:
+            clean_lines.append(line)
+
+        if len(clean_lines) >= 4:
+            break
+
+    return clean_lines
+
+
 def send_unusual_whales_darkpool_alert(signal: Dict[str, Any]) -> None:
+    """
+    Sends clean Discord dark pool resource level alerts in the preferred style.
+    """
     if not UW_DARKPOOL_SEND_ALERTS:
         return
+
     try:
-        dp = signal.get("dark_pool", {}) if isinstance(signal, dict) else {}
-        support = dp.get("nearest_support")
-        resistance = dp.get("nearest_resistance")
-        if not dp or not dp.get("enabled"):
+        if not isinstance(signal, dict):
             return
+
+        dp = signal.get("dark_pool", {})
+        if not isinstance(dp, dict) or not dp.get("enabled"):
+            return
+
+        ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
+        level_lines = uw_dp_top_clean_levels(dp)
+
+        if not level_lines:
+            reason = dp.get("reason", "no_levels")
+            msg = (
+                f"💎 DARK POOL RESOURCE LEVELS\n"
+                f"Ticker: {ticker}\n\n"
+                f"• No qualifying dark pool resource levels found yet\n"
+                f"• Status: {reason}\n\n"
+                f"How to use:\n"
+                f"• Wait for large support/resistance prints to populate\n"
+                f"• Do not force a trade without a real level\n"
+                f"• Use VWAP, oil, volume, and structure first"
+            )
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+            return
+
         msg = (
             f"💎 DARK POOL RESOURCE LEVELS\n"
-            f"Ticker: {signal.get('ticker')} | Direction: {signal.get('direction')} | Grade: {signal.get('grade', signal.get('confidence'))}\n\n"
-            f"Support: {support}\n"
-            f"Resistance: {resistance}\n"
-            f"Actions: {', '.join(dp.get('actions', [])) if isinstance(dp.get('actions'), list) else dp.get('actions')}\n\n"
+            f"Ticker: {ticker}\n\n"
+            + "\n".join(level_lines)
+            + "\n\n"
             f"How to use:\n"
             f"• Support below price can act as defense\n"
             f"• Resistance above price can act as rejection zone\n"
-            f"• Acceptance through a major level can shift bias\n"
-            f"Source: Unusual Whales dark pool endpoint"
+            f"• Acceptance through a major level can shift bias"
         )
+
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+
     except Exception as e:
         try:
-            debug(f"UW DARKPOOL alert failed: {e}")
+            debug(f"UW DARKPOOL styled alert failed: {e}")
         except Exception:
             pass
 
