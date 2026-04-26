@@ -736,6 +736,23 @@ PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled
 
 
 
+
+# =========================================================
+# ADAPTIVE LEARNING MODULE — MANUAL + ENGINE TRADE MEMORY
+# This is the new learning layer requested for manual trade input.
+# It does NOT replace Phase 3 / Phase 3.5. It feeds an additional
+# setup-memory boost into the signal BEFORE risk/execution.
+# =========================================================
+ENABLE_ADAPTIVE_LEARNING_MODULE = os.getenv("ENABLE_ADAPTIVE_LEARNING_MODULE", "true").lower() == "true"
+ADAPTIVE_TRADE_MEMORY_FILE = os.getenv("ADAPTIVE_TRADE_MEMORY_FILE", "trade_memory.json").strip()
+ADAPTIVE_LEARNING_STATS_FILE = os.getenv("ADAPTIVE_LEARNING_STATS_FILE", "learning_stats.json").strip()
+ADAPTIVE_MIN_TRADES_FOR_BOOST = int(os.getenv("ADAPTIVE_MIN_TRADES_FOR_BOOST", "3"))
+ADAPTIVE_HIGH_WINRATE_THRESHOLD = float(os.getenv("ADAPTIVE_HIGH_WINRATE_THRESHOLD", "0.70"))
+ADAPTIVE_STRONG_WINRATE_THRESHOLD = float(os.getenv("ADAPTIVE_STRONG_WINRATE_THRESHOLD", "0.80"))
+ADAPTIVE_LOW_WINRATE_THRESHOLD = float(os.getenv("ADAPTIVE_LOW_WINRATE_THRESHOLD", "0.40"))
+ADAPTIVE_MAX_GRADE_BOOST = int(os.getenv("ADAPTIVE_MAX_GRADE_BOOST", "2"))
+ADAPTIVE_SEND_ALERTS = os.getenv("ADAPTIVE_SEND_ALERTS", "true").lower() == "true"
+
 # =========================================================
 # LIVE TRADING SAFETY LOCK SYSTEM
 # Protects real money during first live rollout.
@@ -5676,6 +5693,10 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
     save_positions(GLOBAL_POSITIONS)
     phase2_post_fill_risk_snapshot("position_closed")
     intel_record_closed_trade(position, note)
+    try:
+        adaptive_record_position_close(position, note)
+    except Exception as adaptive_close_error:
+        debug(f"ADAPTIVE CLOSED-TRADE RECORD ERROR | {adaptive_close_error}")
     phase35_locked_learning_hook(position, note)
 
     msg = build_position_close_message(position, note)
@@ -9540,6 +9561,11 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     regime_signal = apply_regime_to_signal(entry_locked_signal, regime_decision)
 
+    # ADAPTIVE LEARNING MODULE:
+    # Manual + closed-trade memory adjusts grade/confidence BEFORE Phase 3 and BEFORE execution.
+    # Risk, Phase 3.5, portfolio, and kill-switch gates still remain in full control.
+    regime_signal = adaptive_apply_learning_to_signal(regime_signal)
+
     # PHASE 3: adaptive intelligence uses trade memory to block weak setups,
     # downgrade confidence, and adjust size before risk sizing/execution.
     debug(f"PHASE 3 PRE-ENTRY HOOK REACHED | ticker={regime_signal.get('ticker')} | direction={regime_signal.get('direction')} | confidence={regime_signal.get('confidence')}")
@@ -9674,6 +9700,461 @@ def handle_new_signal(signal: Dict[str, Any]):
         debug("ENTRY EXECUTION NOT CREATED | approved signal did not produce an order/position")
 
     manage_open_positions(sized_signal)
+
+
+
+# =========================================================
+# ADAPTIVE LEARNING MODULE — FUNCTIONS
+# Pattern memory for manual trades + closed engine trades.
+# Uses separate JSON files so it does not corrupt existing JSONL memory.
+# =========================================================
+
+ADAPTIVE_GRADE_ORDER = ["AVOID", "C", "B", "B+", "A", "A+"]
+
+
+def adaptive_now() -> str:
+    try:
+        return now_ts()
+    except Exception:
+        return datetime.utcnow().isoformat()
+
+
+def adaptive_load_json(path: str, default: Any) -> Any:
+    try:
+        if 'load_json_file' in globals():
+            data = load_json_file(path, default)
+            return data if data is not None else deepcopy(default)
+        if not os.path.exists(path):
+            return deepcopy(default)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return deepcopy(default)
+
+
+def adaptive_write_json(path: str, data: Any) -> None:
+    try:
+        atomic_write_json(path, data)
+    except Exception:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True, default=str)
+
+
+def adaptive_log(message: str) -> None:
+    try:
+        debug(message)
+    except Exception:
+        try:
+            log(message)
+        except Exception:
+            print(message, flush=True)
+
+
+def adaptive_alert(title: str, body: str, force: bool = False) -> None:
+    if not ENABLE_ADAPTIVE_LEARNING_MODULE:
+        return
+    if not ADAPTIVE_SEND_ALERTS and not force:
+        return
+    msg = f"🧬 {title}\n{body}\n⏰ {adaptive_now()}"
+    try:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    except Exception:
+        pass
+    try:
+        send_to_telegram(msg)
+    except Exception:
+        pass
+
+
+def adaptive_normalize_grade(value: Any) -> str:
+    g = str(value or "").upper().strip()
+    if not g:
+        return "B"
+    if g in {"NO TRADE", "NONE", "SKIP", "DO NOT TRADE"}:
+        return "AVOID"
+    return g if g in ADAPTIVE_GRADE_ORDER else "B"
+
+
+def adaptive_boost_grade(base_grade: Any, boost: int) -> str:
+    base = adaptive_normalize_grade(base_grade)
+    idx = ADAPTIVE_GRADE_ORDER.index(base)
+    new_idx = max(0, min(len(ADAPTIVE_GRADE_ORDER) - 1, idx + int(boost)))
+    return ADAPTIVE_GRADE_ORDER[new_idx]
+
+
+def adaptive_direction(value: Any) -> str:
+    d = str(value or "").upper().strip()
+    if d in {"BUY_CALL", "LONG_CALL", "CALLS"}:
+        return "CALL"
+    if d in {"BUY_PUT", "LONG_PUT", "PUTS"}:
+        return "PUT"
+    return d
+
+
+def adaptive_confluences(obj: Dict[str, Any]) -> Dict[str, Any]:
+    con = obj.get("confluences", {}) if isinstance(obj, dict) else {}
+    if not isinstance(con, dict):
+        con = {}
+
+    return {
+        "vwap": con.get("vwap") or obj.get("vwap", ""),
+        "rsi": con.get("rsi") or obj.get("rsi", ""),
+        "volume": con.get("volume") or obj.get("volume", ""),
+        "oil": con.get("oil") or obj.get("oil", obj.get("oil_context", "")),
+        "market_type": con.get("market_type") or obj.get("market_type", obj.get("regime", obj.get("market_regime", ""))),
+        "structure": con.get("structure") or obj.get("structure", obj.get("trigger", "")),
+        "premarket_high": con.get("premarket_high") or obj.get("premarket_high", ""),
+        "premarket_low": con.get("premarket_low") or obj.get("premarket_low", ""),
+    }
+
+
+def adaptive_setup_fingerprint(obj: Dict[str, Any]) -> str:
+    con = adaptive_confluences(obj)
+
+    ticker = str(obj.get("ticker") or obj.get("underlying") or "").upper().strip()
+    direction = adaptive_direction(obj.get("direction", ""))
+    setup = str(obj.get("setup_name") or obj.get("setup_type") or obj.get("setup") or obj.get("strategy") or "GENERIC").lower().strip()
+    trigger = str(obj.get("trigger") or con.get("structure") or "").lower().strip()
+    vwap = str(con.get("vwap") or "").lower().strip()
+    oil = str(con.get("oil") or "").lower().strip()
+    volume = str(con.get("volume") or "").lower().strip()
+    market_type = str(con.get("market_type") or "").lower().strip()
+
+    parts = [ticker, direction, setup, trigger, vwap, oil, volume, market_type]
+    cleaned = [re.sub(r"[^a-zA-Z0-9_+.-]+", "_", str(p))[:50] for p in parts if str(p).strip()]
+    return "|".join(cleaned) if cleaned else "UNKNOWN_PATTERN"
+
+
+def adaptive_is_win(result: Any) -> bool:
+    return str(result or "").lower().strip() in {"win", "winner", "green", "profit", "tp", "take profit", "true"}
+
+
+def adaptive_is_loss(result: Any) -> bool:
+    return str(result or "").lower().strip() in {"loss", "loser", "red", "stop", "stopped", "sl", "false"}
+
+
+def adaptive_result_from_trade(trade: Dict[str, Any]) -> str:
+    explicit = str(trade.get("result", "")).lower().strip()
+    if explicit:
+        if adaptive_is_win(explicit):
+            return "win"
+        if adaptive_is_loss(explicit):
+            return "loss"
+
+    if isinstance(trade.get("winner"), bool):
+        return "win" if trade.get("winner") else "loss"
+
+    pnl = safe_float(trade.get("realized_pnl", trade.get("pnl", trade.get("realized_pnl_pct", trade.get("pnl_pct", 0)))), 0)
+    if pnl > 0:
+        return "win"
+    if pnl < 0:
+        return "loss"
+
+    entry = safe_float(trade.get("entry_price", trade.get("entry", 0)), 0)
+    exit_price = safe_float(trade.get("exit_price", trade.get("exit", 0)), 0)
+    direction = adaptive_direction(trade.get("direction", ""))
+    if entry > 0 and exit_price > 0:
+        if direction == "PUT":
+            return "win" if exit_price > entry else "loss"
+        return "win" if exit_price > entry else "loss"
+
+    return "unknown"
+
+
+def adaptive_normalize_trade_record(trade: Dict[str, Any]) -> Dict[str, Any]:
+    con = adaptive_confluences(trade)
+    record = {
+        "id": trade.get("id") or trade.get("position_id") or trade.get("signal_id") or f"adaptive_{int(time.time())}_{hashlib.sha1(json.dumps(trade, sort_keys=True, default=str).encode()).hexdigest()[:8]}",
+        "created_at": trade.get("created_at") or trade.get("closed_time") or adaptive_now(),
+        "source": trade.get("source", "manual"),
+        "ticker": str(trade.get("ticker") or trade.get("underlying") or "").upper().strip(),
+        "symbol": trade.get("symbol") or trade.get("contract_symbol", ""),
+        "date": trade.get("date", ""),
+        "time": trade.get("time", ""),
+        "time_window": trade.get("time_window", ""),
+        "setup_name": trade.get("setup_name") or trade.get("setup") or trade.get("strategy") or trade.get("trigger") or "Unnamed Setup",
+        "setup_type": trade.get("setup_type") or trade.get("setup") or trade.get("strategy") or "",
+        "trigger": trade.get("trigger", ""),
+        "direction": adaptive_direction(trade.get("direction", "")),
+        "decision": trade.get("decision", "took it"),
+        "entry_price": trade.get("entry_price", trade.get("entry")),
+        "exit_price": trade.get("exit_price", trade.get("exit")),
+        "stop_loss": trade.get("stop_loss", trade.get("stop", trade.get("stop_price"))),
+        "targets": trade.get("targets", trade.get("target", [])),
+        "grade": adaptive_normalize_grade(trade.get("grade", trade.get("confidence", "B"))),
+        "confidence": adaptive_normalize_grade(trade.get("confidence", trade.get("grade", "B"))),
+        "result": adaptive_result_from_trade(trade),
+        "pnl": trade.get("pnl", trade.get("realized_pnl", trade.get("realized_pnl_pct", trade.get("pnl_pct")))),
+        "r_multiple": trade.get("r_multiple", 0),
+        "notes": trade.get("notes", ""),
+        "confluences": con,
+    }
+    record["pattern_key"] = adaptive_setup_fingerprint(record)
+    return record
+
+
+def adaptive_load_trade_memory() -> List[Dict[str, Any]]:
+    data = adaptive_load_json(ADAPTIVE_TRADE_MEMORY_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def adaptive_save_trade_memory(memory: List[Dict[str, Any]]) -> None:
+    adaptive_write_json(ADAPTIVE_TRADE_MEMORY_FILE, memory)
+
+
+def adaptive_rebuild_learning_stats(memory: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    memory = memory if memory is not None else adaptive_load_trade_memory()
+    patterns: Dict[str, Dict[str, Any]] = {}
+
+    for trade in memory:
+        key = trade.get("pattern_key") or adaptive_setup_fingerprint(trade)
+        bucket = patterns.setdefault(key, {
+            "pattern_key": key,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "unknown": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "total_r": 0.0,
+            "avg_r": 0.0,
+            "sample_trades": [],
+            "last_seen": "",
+        })
+
+        bucket["trades"] += 1
+        result = trade.get("result", "unknown")
+        if adaptive_is_win(result):
+            bucket["wins"] += 1
+        elif adaptive_is_loss(result):
+            bucket["losses"] += 1
+        else:
+            bucket["unknown"] += 1
+
+        pnl = trade.get("pnl")
+        if isinstance(pnl, (int, float)):
+            bucket["total_pnl"] += float(pnl)
+        r_mult = safe_float(trade.get("r_multiple", 0), 0)
+        bucket["total_r"] += r_mult
+
+        if len(bucket["sample_trades"]) < 5:
+            bucket["sample_trades"].append({
+                "id": trade.get("id"),
+                "ticker": trade.get("ticker"),
+                "setup_name": trade.get("setup_name"),
+                "grade": trade.get("grade"),
+                "confidence": trade.get("confidence"),
+                "result": trade.get("result"),
+            })
+        bucket["last_seen"] = trade.get("created_at") or bucket.get("last_seen", "")
+
+    for bucket in patterns.values():
+        closed = bucket["wins"] + bucket["losses"]
+        trades = max(bucket["trades"], 1)
+        bucket["win_rate"] = round(bucket["wins"] / closed, 4) if closed > 0 else 0.0
+        bucket["avg_pnl"] = round(bucket["total_pnl"] / trades, 4)
+        bucket["avg_r"] = round(bucket["total_r"] / trades, 4)
+
+    return {
+        "updated_at": adaptive_now(),
+        "total_trades": len(memory),
+        "patterns": patterns,
+    }
+
+
+def adaptive_load_learning_stats() -> Dict[str, Any]:
+    stats = adaptive_load_json(ADAPTIVE_LEARNING_STATS_FILE, {})
+    if not isinstance(stats, dict) or "patterns" not in stats:
+        stats = adaptive_rebuild_learning_stats()
+        adaptive_write_json(ADAPTIVE_LEARNING_STATS_FILE, stats)
+    return stats
+
+
+def adaptive_record_trade_for_learning(trade: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_ADAPTIVE_LEARNING_MODULE:
+        return {}
+    memory = adaptive_load_trade_memory()
+    normalized = adaptive_normalize_trade_record(trade)
+
+    # Prevent exact duplicate IDs from stacking if command is accidentally run twice.
+    existing_ids = {str(t.get("id")) for t in memory if isinstance(t, dict)}
+    if str(normalized.get("id")) not in existing_ids:
+        memory.append(normalized)
+        adaptive_save_trade_memory(memory)
+
+    stats = adaptive_rebuild_learning_stats(memory)
+    adaptive_write_json(ADAPTIVE_LEARNING_STATS_FILE, stats)
+
+    adaptive_log(f"ADAPTIVE LEARNING RECORDED | {normalized.get('ticker')} | {normalized.get('setup_name')} | {normalized.get('result')} | {normalized.get('pattern_key')}")
+    return normalized
+
+
+def adaptive_record_position_close(position: Dict[str, Any], close_reason: str = "") -> Dict[str, Any]:
+    try:
+        story = intel_trade_story_from_position(position, close_reason) if 'intel_trade_story_from_position' in globals() else deepcopy(position)
+    except Exception:
+        story = deepcopy(position)
+
+    story["source"] = "engine_closed_trade"
+    story["setup_name"] = position.get("setup_name") or position.get("setup") or position.get("trigger") or story.get("setup_name", "Engine Closed Trade")
+    story["setup_type"] = position.get("setup_type") or position.get("setup") or story.get("setup_type", "")
+    story["trigger"] = position.get("trigger", story.get("trigger", ""))
+    story["confluences"] = position.get("confluences", position.get("signal_confluences", {}))
+    story["close_reason"] = close_reason
+    return adaptive_record_trade_for_learning(story)
+
+
+def adaptive_learning_adjustment(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_ADAPTIVE_LEARNING_MODULE:
+        return {
+            "enabled": False,
+            "matched": False,
+            "grade_boost": 0,
+            "confidence": "disabled",
+            "reason": "adaptive_learning_disabled",
+        }
+
+    stats = adaptive_load_learning_stats()
+    key = adaptive_setup_fingerprint(signal)
+    pattern = stats.get("patterns", {}).get(key)
+
+    if not pattern:
+        return {
+            "enabled": True,
+            "pattern_key": key,
+            "matched": False,
+            "grade_boost": 0,
+            "confidence": "new_pattern",
+            "reason": "No matching manual/engine trade memory yet.",
+            "pattern_stats": None,
+        }
+
+    trades = safe_int(pattern.get("trades", 0), 0)
+    win_rate = safe_float(pattern.get("win_rate", 0), 0)
+
+    if trades < ADAPTIVE_MIN_TRADES_FOR_BOOST:
+        return {
+            "enabled": True,
+            "pattern_key": key,
+            "matched": True,
+            "grade_boost": 0,
+            "confidence": "low_sample_size",
+            "reason": f"Matched pattern, but only {trades} trade(s). Need {ADAPTIVE_MIN_TRADES_FOR_BOOST}+ before boost.",
+            "pattern_stats": pattern,
+        }
+
+    if win_rate >= ADAPTIVE_HIGH_WINRATE_THRESHOLD:
+        boost = 2 if win_rate >= ADAPTIVE_STRONG_WINRATE_THRESHOLD else 1
+        boost = min(boost, ADAPTIVE_MAX_GRADE_BOOST)
+        return {
+            "enabled": True,
+            "pattern_key": key,
+            "matched": True,
+            "grade_boost": boost,
+            "confidence": "strong_pattern",
+            "reason": f"Pattern win rate {round(win_rate * 100, 1)}% across {trades} trades.",
+            "pattern_stats": pattern,
+        }
+
+    if win_rate <= ADAPTIVE_LOW_WINRATE_THRESHOLD:
+        return {
+            "enabled": True,
+            "pattern_key": key,
+            "matched": True,
+            "grade_boost": -1,
+            "confidence": "weak_pattern",
+            "reason": f"Pattern win rate only {round(win_rate * 100, 1)}% across {trades} trades.",
+            "pattern_stats": pattern,
+        }
+
+    return {
+        "enabled": True,
+        "pattern_key": key,
+        "matched": True,
+        "grade_boost": 0,
+        "confidence": "neutral_pattern",
+        "reason": f"Pattern win rate {round(win_rate * 100, 1)}% across {trades} trades.",
+        "pattern_stats": pattern,
+    }
+
+
+def adaptive_apply_learning_to_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(signal, dict):
+        return signal
+
+    adjusted = deepcopy(signal)
+    base_grade = adaptive_normalize_grade(adjusted.get("grade", adjusted.get("confidence", "B")))
+    base_confidence = adaptive_normalize_grade(adjusted.get("confidence", adjusted.get("grade", base_grade)))
+
+    learning = adaptive_learning_adjustment(adjusted)
+    boost = safe_int(learning.get("grade_boost", 0), 0)
+
+    adjusted["adaptive_base_grade"] = base_grade
+    adjusted["adaptive_base_confidence"] = base_confidence
+    adjusted["adaptive_learning"] = learning
+
+    adjusted["grade"] = adaptive_boost_grade(base_grade, boost)
+    adjusted["confidence"] = adaptive_boost_grade(base_confidence, boost)
+
+    if boost != 0:
+        adjusted.setdefault("adaptive_notes", [])
+        adjusted["adaptive_notes"].append(learning.get("reason", "adaptive learning adjusted grade"))
+        adaptive_log(f"ADAPTIVE LEARNING SIGNAL ADJUSTED | {adjusted.get('ticker')} | {base_confidence}->{adjusted.get('confidence')} | boost={boost}")
+        adaptive_alert(
+            "ADAPTIVE LEARNING GRADE UPDATE",
+            f"Ticker: {adjusted.get('ticker')}\nSetup: {adjusted.get('setup') or adjusted.get('setup_name')}\nBase: {base_confidence}\nFinal: {adjusted.get('confidence')}\nReason: {learning.get('reason')}",
+            force=False,
+        )
+    else:
+        adaptive_log(f"ADAPTIVE LEARNING CHECK | {adjusted.get('ticker')} | {learning.get('confidence')} | {learning.get('reason')}")
+
+    return adjusted
+
+
+def adaptive_record_qqq_oil_breakout_example() -> Dict[str, Any]:
+    trade = {
+        "source": "manual",
+        "ticker": "QQQ",
+        "date": "2026-04-25",
+        "time": "11:35 AM ET",
+        "time_window": "mid-day",
+        "setup_name": "QQQ Oil-Drop Risk-On Breakout",
+        "setup_type": "breakout momentum push",
+        "setup": "breakout momentum push",
+        "trigger": "breakout hold",
+        "direction": "CALL",
+        "decision": "took it",
+        "entry_price": 661.80,
+        "stop_loss": 660.80,
+        "targets": [663, 664],
+        "grade": "A+",
+        "confidence": "A+",
+        "result": "win",
+        "pnl": None,
+        "confluences": {
+            "vwap": "above",
+            "rsi": "momentum pushing up",
+            "volume": "strong",
+            "oil": "falling",
+            "market_type": "trending continuation",
+            "structure": "breakout hold",
+            "premarket_high": 663.46,
+            "premarket_low": 651.79,
+        },
+        "notes": "QQQ broke 661.50-662 with momentum while oil/USO dropped hard. Risk-on rotation into tech. Strong volume, above VWAP, no immediate rejection.",
+    }
+    return adaptive_record_trade_for_learning(trade)
+
+
+def adaptive_record_manual_trade_file(path: str) -> Dict[str, Any]:
+    data = adaptive_load_json(path, None)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Manual trade file is not valid JSON object: {path}")
+    data.setdefault("source", "manual_file")
+    return adaptive_record_trade_for_learning(data)
 
 
 # =========================================================
@@ -10461,6 +10942,23 @@ def cli_macro_test() -> None:
 
 
 
+
+def cli_adaptive_record_example() -> None:
+    result = adaptive_record_qqq_oil_breakout_example()
+    print(json.dumps(result, indent=2, default=str))
+
+
+def cli_adaptive_record_trade(path: str) -> None:
+    result = adaptive_record_manual_trade_file(path)
+    print(json.dumps(result, indent=2, default=str))
+
+
+def cli_adaptive_rebuild_stats() -> None:
+    stats = adaptive_rebuild_learning_stats()
+    adaptive_write_json(ADAPTIVE_LEARNING_STATS_FILE, stats)
+    print(json.dumps(stats, indent=2, default=str))
+
+
 if __name__ == "__main__":
     if "--macro-test" in sys.argv:
         cli_macro_test()
@@ -10470,6 +10968,20 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--ai-bridge-test" in sys.argv:
         cli_ai_bridge_test()
+        sys.exit(0)
+    if "--adaptive-record-example" in sys.argv or "record-example" in sys.argv:
+        cli_adaptive_record_example()
+        sys.exit(0)
+    if "--adaptive-rebuild-stats" in sys.argv or "rebuild-learning" in sys.argv:
+        cli_adaptive_rebuild_stats()
+        sys.exit(0)
+    if "--adaptive-record-trade" in sys.argv or "record-trade" in sys.argv:
+        try:
+            idx = sys.argv.index("--adaptive-record-trade") if "--adaptive-record-trade" in sys.argv else sys.argv.index("record-trade")
+            cli_adaptive_record_trade(sys.argv[idx + 1])
+        except Exception as cli_error:
+            print(f"adaptive record trade failed: {cli_error}")
+            sys.exit(1)
         sys.exit(0)
     try:
         if len(sys.argv) > 1 and sys.argv[1] in {"--auto-signal-test", "--test-signal"}:
