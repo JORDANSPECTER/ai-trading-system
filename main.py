@@ -10246,49 +10246,106 @@ def free_daily_estimate_levels(ticker: str, price: float) -> Dict[str, Any]:
     }
 
 
+def free_daily_bias_score(ticker: str, price: float, levels: Dict[str, Any], oil: str, dp_support: str, dp_resistance: str) -> Tuple[str, str]:
+    """
+    Free-safe bias scoring.
+    Returns bias + market state language without giving exact entries/contracts.
+    """
+    score = 0
+    notes = []
+
+    decision = safe_float(levels.get("decision"), 0.0)
+    support = safe_float(levels.get("support"), 0.0)
+    resistance = safe_float(levels.get("resistance"), 0.0)
+
+    if price > 0 and decision > 0:
+        if price >= decision:
+            score += 1
+            notes.append("price holding above decision level")
+        else:
+            score -= 1
+            notes.append("price below decision level")
+
+    oil_l = str(oil).lower()
+    if "fall" in oil_l or "relief" in oil_l or "bullish" in oil_l:
+        score += 1
+        notes.append("oil/macro supportive")
+    elif "rising" in oil_l or "pressure" in oil_l or "risk-off" in oil_l:
+        score -= 1
+        notes.append("oil/macro pressure")
+
+    if "no clean" not in str(dp_support).lower() and "pending" not in str(dp_support).lower():
+        score += 1
+        notes.append("dark pool support mapped")
+    if "no clean" not in str(dp_resistance).lower() and "pending" not in str(dp_resistance).lower():
+        notes.append("dark pool resistance mapped")
+
+    if score >= 2:
+        return "Bullish Lean", "Expansion / Buyer Control"
+    if score <= -1:
+        return "Bearish Lean", "Pressure / Seller Control"
+    return "Neutral / Wait", "Decision Zone"
+
+
+def free_daily_control_language(bias: str, ticker: str) -> str:
+    b = str(bias).lower()
+    if "bullish" in b:
+        return f"{ticker} is showing buyer control only while price holds above the decision level."
+    if "bearish" in b:
+        return f"{ticker} is under pressure while price stays below the decision level or rejects resistance."
+    return f"{ticker} is in a decision zone. Wait for confirmation instead of trading the middle."
+
+
 def build_free_daily_levels_alert(ticker: str) -> str:
     ticker = str(ticker or "").upper().strip()
     price = free_daily_get_market_price(ticker)
     levels = free_daily_estimate_levels(ticker, price)
-
-    market_state, bias = free_daily_market_state(price, levels.get("vwap"))
     oil = free_daily_get_oil_read()
     dp_support, dp_resistance = free_daily_darkpool_levels(ticker, price)
+    bias, market_state = free_daily_bias_score(ticker, price, levels, oil, dp_support, dp_resistance)
 
     price_line = f"{price:.2f}" if price > 0 else "Pending"
+    resistance = levels.get("resistance")
+    support = levels.get("support")
+    decision = levels.get("decision")
+
+    control = free_daily_control_language(bias, ticker)
 
     return (
-        f"📊 {ticker} FREE DAILY LEVELS\n\n"
-        f"📈 Market State: {market_state}\n"
-        f"🧭 Bias: {bias}\n"
-        f"💵 Current Price: {price_line}\n\n"
-        f"💰 Key Levels:\n"
-        f"• Resistance: {levels.get('resistance')}\n"
-        f"• Support: {levels.get('support')}\n"
-        f"• Decision: {levels.get('decision')}\n\n"
-        f"📍 VWAP / Control:\n"
-        f"• {levels.get('vwap')}\n"
-        f"• Above = buyers in control\n"
-        f"• Below = sellers in control\n\n"
-        f"🌙 Premarket Map:\n"
-        f"• Premarket High: {levels.get('premarket_high')}\n"
-        f"• Premarket Low: {levels.get('premarket_low')}\n\n"
-        f"💎 Dark Pool Resource Zones:\n"
-        f"• Support: {dp_support}\n"
-        f"• Resistance: {dp_resistance}\n\n"
-        f"🟢 CALLS:\n"
-        f"• Above decision level → continuation watch\n"
-        f"• Break + hold → target resistance / next level\n\n"
-        f"🔴 PUTS:\n"
-        f"• Below decision level → weakness watch\n"
-        f"• Rejection at resistance → target support / next level\n\n"
-        f"🛢️ Oil / Macro:\n"
+        f"📊 UNBIASED TRADES — FREE DAILY LEVELS\n"
+        f"Ticker: {ticker}\n\n"
+        f"🧭 MARKET MAP\n"
+        f"• Market State: {market_state}\n"
+        f"• Bias: {bias}\n"
+        f"• Current Price: {price_line}\n"
+        f"• Control Level: {decision}\n\n"
+        f"💰 KEY REACTION LEVELS\n"
+        f"• Resistance: {resistance}\n"
+        f"• Support: {support}\n"
+        f"• Decision Zone: {decision}\n\n"
+        f"📍 VWAP / CONTROL READ\n"
+        f"• Above decision/VWAP = buyers in control\n"
+        f"• Below decision/VWAP = sellers in control\n"
+        f"• Current Read: {control}\n\n"
+        f"💎 DARK POOL RESOURCE ZONES\n"
+        f"• Support Resource: {dp_support}\n"
+        f"• Resistance Resource: {dp_resistance}\n"
+        f"• Acceptance through a major level can shift bias\n\n"
+        f"🟢 CALL SCENARIO\n"
+        f"• Bulls need price above the decision zone\n"
+        f"• Break + hold above control favors continuation\n"
+        f"• Target area: resistance / next liquidity pocket\n\n"
+        f"🔴 PUT SCENARIO\n"
+        f"• Bears need rejection from resistance or loss of decision zone\n"
+        f"• Failed reclaim favors downside pressure\n"
+        f"• Target area: support / next liquidity pocket\n\n"
+        f"🛢️ OIL / MACRO READ\n"
         f"• {oil}\n\n"
-        f"⚠️ RULES:\n"
+        f"⚠️ RULES\n"
         f"• No chasing\n"
-        f"• No trading middle\n"
-        f"• Wait for confirmation\n\n"
-        f"Free = information. Premium = execution."
+        f"• No trading the middle\n"
+        f"• Wait for confirmation at levels\n"
+        f"• Free = information | Premium = execution"
     )
 
 
