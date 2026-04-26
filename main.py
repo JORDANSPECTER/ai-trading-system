@@ -693,6 +693,22 @@ PHASE2_BLOCK_ON_RECON_MISMATCH = os.getenv("PHASE2_BLOCK_ON_RECON_MISMATCH", "tr
 PHASE2_REQUIRE_BROKER_FOR_LIVE = os.getenv("PHASE2_REQUIRE_BROKER_FOR_LIVE", "true").lower() == "true"
 PHASE2_SEND_ALERTS = os.getenv("PHASE2_SEND_ALERTS", "true").lower() == "true"
 
+
+# =========================================================
+# EXECUTION IDEMPOTENCY LAYER
+# Full-chain replay protection:
+# signal intent -> order intent -> fill event -> close intent
+# This prevents duplicate positions from webhook retries, restarts,
+# repeated signal files, or broker/event replay.
+# =========================================================
+ENABLE_EXECUTION_IDEMPOTENCY = os.getenv("ENABLE_EXECUTION_IDEMPOTENCY", "true").lower() == "true"
+IDEMPOTENCY_STORE_FILE = os.getenv("IDEMPOTENCY_STORE_FILE", "idempotency_ledger.json").strip()
+IDEMPOTENCY_MAX_RECORDS = int(os.getenv("IDEMPOTENCY_MAX_RECORDS", "2000"))
+IDEMPOTENCY_BLOCK_REPLAY_SECONDS = int(os.getenv("IDEMPOTENCY_BLOCK_REPLAY_SECONDS", "86400"))
+IDEMPOTENCY_CLIENT_PREFIX = os.getenv("IDEMPOTENCY_CLIENT_PREFIX", "ub").strip()[:8] or "ub"
+IDEMPOTENCY_STRICT_ORDER_BLOCK = os.getenv("IDEMPOTENCY_STRICT_ORDER_BLOCK", "true").lower() == "true"
+IDEMPOTENCY_SEND_ALERTS = os.getenv("IDEMPOTENCY_SEND_ALERTS", "true").lower() == "true"
+
 # =========================================================
 # INTELLIGENCE PHASE 1: TRADE MEMORY + PERFORMANCE ANALYTICS
 # Records every major decision as structured JSONL, builds trade stories,
@@ -3899,6 +3915,301 @@ def signal_hash(signal: Dict[str, Any]) -> str:
         return sha256_text(str(epoch()))
 
 
+# =========================================================
+# EXECUTION IDEMPOTENCY HELPERS
+# =========================================================
+def idempotency_enabled() -> bool:
+    return bool(globals().get("ENABLE_EXECUTION_IDEMPOTENCY", True))
+
+
+def idempotency_canonical_json(payload: Any) -> str:
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(payload)
+
+
+def idempotency_hash(payload: Any) -> str:
+    return sha256_text(idempotency_canonical_json(payload))
+
+
+def idempotency_short(key: str, n: int = 24) -> str:
+    return str(key or "")[:n]
+
+
+def idempotency_load_ledger() -> Dict[str, Any]:
+    data = load_json_file(IDEMPOTENCY_STORE_FILE, {}) if 'load_json_file' in globals() else safe_load_idempotency_json(IDEMPOTENCY_STORE_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("schema_version", 1)
+    data.setdefault("created_at", now_ts())
+    data.setdefault("updated_at", now_ts())
+    data.setdefault("records", {})
+    data.setdefault("recent_keys", [])
+    return data
+
+
+def safe_load_idempotency_json(path: str, default: Any) -> Any:
+    try:
+        if not os.path.exists(path):
+            return deepcopy(default)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        try:
+            os.replace(path, f"{path}.bad.{epoch()}")
+        except Exception:
+            pass
+        return deepcopy(default)
+
+
+def idempotency_save_ledger(data: Dict[str, Any]) -> None:
+    data["updated_at"] = now_ts()
+    records = data.get("records", {}) if isinstance(data.get("records", {}), dict) else {}
+    recent = data.get("recent_keys", []) if isinstance(data.get("recent_keys", []), list) else []
+    # Keep newest keys and matching records only.
+    max_records = safe_int(globals().get("IDEMPOTENCY_MAX_RECORDS", 2000), 2000)
+    recent = recent[-max_records:]
+    keep = set(recent)
+    data["recent_keys"] = recent
+    data["records"] = {k: v for k, v in records.items() if k in keep}
+    atomic_write_json(IDEMPOTENCY_STORE_FILE, data)
+
+
+def idempotency_record_key(kind: str, key: str) -> str:
+    return f"{kind}:{key}"
+
+
+def idempotency_alert(title: str, body: str) -> None:
+    if not globals().get("IDEMPOTENCY_SEND_ALERTS", True):
+        return
+    msg = f"🧷 {title}\n{body}\n⏰ {now_ts()}"
+    try:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
+    except Exception:
+        try:
+            debug(f"IDEMPOTENCY ALERT FAILED | {title} | {body}")
+        except Exception:
+            pass
+
+
+def idempotency_get(kind: str, key: str) -> Optional[Dict[str, Any]]:
+    if not idempotency_enabled() or not key:
+        return None
+    ledger = idempotency_load_ledger()
+    return ledger.get("records", {}).get(idempotency_record_key(kind, key))
+
+
+def idempotency_claim(kind: str, key: str, payload: Optional[Dict[str, Any]] = None, owner: str = "engine") -> Dict[str, Any]:
+    """Claim an idempotency key. Returns approved=False for replayed active/success keys."""
+    if not idempotency_enabled():
+        return {"approved": True, "reason": "idempotency_disabled", "kind": kind, "key": key}
+    if not key:
+        return {"approved": False, "reason": "missing_idempotency_key", "kind": kind, "key": key}
+
+    ledger = idempotency_load_ledger()
+    records = ledger.setdefault("records", {})
+    recent = ledger.setdefault("recent_keys", [])
+    record_id = idempotency_record_key(kind, key)
+    now = epoch()
+    existing = records.get(record_id)
+    block_seconds = safe_int(globals().get("IDEMPOTENCY_BLOCK_REPLAY_SECONDS", 86400), 86400)
+
+    if isinstance(existing, dict):
+        status = str(existing.get("status", "claimed")).lower().strip()
+        age = now - safe_int(existing.get("first_seen_epoch", existing.get("updated_epoch", now)), now)
+        if status in {"claimed", "submitted", "filled", "success", "closed", "open"} and age <= block_seconds:
+            return {
+                "approved": False,
+                "reason": f"idempotent_replay_blocked:{kind}:{status}:age_{age}s",
+                "kind": kind,
+                "key": key,
+                "record": existing,
+            }
+
+    record = {
+        "kind": kind,
+        "key": key,
+        "record_id": record_id,
+        "owner": owner,
+        "status": "claimed",
+        "first_seen_at": existing.get("first_seen_at") if isinstance(existing, dict) else now_ts(),
+        "first_seen_epoch": existing.get("first_seen_epoch") if isinstance(existing, dict) else now,
+        "updated_at": now_ts(),
+        "updated_epoch": now,
+        "payload": payload or {},
+        "attempts": safe_int(existing.get("attempts", 0), 0) + 1 if isinstance(existing, dict) else 1,
+    }
+    records[record_id] = record
+    if record_id not in recent:
+        recent.append(record_id)
+    idempotency_save_ledger(ledger)
+    return {"approved": True, "reason": "idempotency_claimed", "kind": kind, "key": key, "record": record}
+
+
+def idempotency_mark(kind: str, key: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+    if not idempotency_enabled() or not key:
+        return
+    ledger = idempotency_load_ledger()
+    records = ledger.setdefault("records", {})
+    recent = ledger.setdefault("recent_keys", [])
+    record_id = idempotency_record_key(kind, key)
+    rec = records.get(record_id)
+    if not isinstance(rec, dict):
+        rec = {
+            "kind": kind,
+            "key": key,
+            "record_id": record_id,
+            "owner": "engine",
+            "first_seen_at": now_ts(),
+            "first_seen_epoch": epoch(),
+            "attempts": 0,
+            "payload": {},
+        }
+    rec["status"] = str(status)
+    rec["updated_at"] = now_ts()
+    rec["updated_epoch"] = epoch()
+    rec.setdefault("history", []).append({"at": now_ts(), "epoch": epoch(), "status": str(status), "details": details or {}})
+    records[record_id] = rec
+    if record_id not in recent:
+        recent.append(record_id)
+    idempotency_save_ledger(ledger)
+
+
+def idempotency_signal_payload(signal: Dict[str, Any]) -> Dict[str, Any]:
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences", {}), dict) else {}
+    return {
+        "ticker": str(signal.get("ticker") or signal.get("underlying") or "").upper().strip(),
+        "symbol": str(signal.get("symbol") or signal.get("contract_symbol") or "").strip(),
+        "direction": str(signal.get("direction") or "").upper().strip(),
+        "setup": str(signal.get("setup") or signal.get("setup_name") or signal.get("strategy") or "").strip(),
+        "trigger": str(signal.get("trigger") or "").strip(),
+        "confidence": str(signal.get("confidence") or signal.get("grade") or "").upper().strip(),
+        "entry_contract": round(safe_float(signal.get("entry_contract", signal.get("contract_price", signal.get("entry", 0))), 0), 4),
+        "stop_contract": round(safe_float(signal.get("stop_contract", signal.get("stop", 0)), 0), 4),
+        "tp1_contract": round(safe_float(signal.get("tp1_contract", signal.get("target", signal.get("target_1", 0))), 0), 4),
+        "tp2_contract": round(safe_float(signal.get("tp2_contract", signal.get("target_2", 0)), 0), 4),
+        "vwap": str(con.get("vwap") or signal.get("vwap", "")).lower().strip(),
+        "oil": str(con.get("oil") or signal.get("oil", signal.get("oil_state", ""))).lower().strip(),
+    }
+
+
+def idempotency_signal_intent_id(signal: Dict[str, Any]) -> str:
+    explicit = str(signal.get("signal_id") or signal.get("idempotency_signal_id") or "").strip()
+    if explicit and len(explicit) >= 12 and not explicit.startswith("sig_"):
+        return explicit
+    return idempotency_hash(idempotency_signal_payload(signal))
+
+
+def idempotency_order_payload(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str = "market", limit_price: Optional[float] = None) -> Dict[str, Any]:
+    return {
+        "signal_intent_id": idempotency_signal_intent_id(signal),
+        "ticker": str(signal.get("ticker") or signal.get("underlying") or "").upper().strip(),
+        "symbol": str(signal.get("symbol") or signal.get("contract_symbol") or "").strip(),
+        "side": str(side).lower().strip(),
+        "qty": safe_int(qty, 0),
+        "mode": str(mode).upper().strip(),
+        "order_type": str(order_type or "market").lower().strip(),
+        "limit_price": round(safe_float(limit_price, 0), 4),
+        "entry_contract": round(safe_float(signal.get("entry_contract", signal.get("contract_price", 0)), 0), 4),
+    }
+
+
+def idempotency_order_intent_id(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str = "market", limit_price: Optional[float] = None) -> str:
+    return idempotency_hash(idempotency_order_payload(signal, side, qty, mode, order_type, limit_price))
+
+
+def idempotency_client_order_id(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str = "market", limit_price: Optional[float] = None) -> str:
+    key = idempotency_order_intent_id(signal, side, qty, mode, order_type, limit_price)
+    prefix = str(globals().get("IDEMPOTENCY_CLIENT_PREFIX", "ub")).strip()[:8] or "ub"
+    # Alpaca client_order_id limit is 48 chars; keep stable + compact.
+    return f"{prefix}-{side[:1].lower()}-{idempotency_short(key, 36)}"[:48]
+
+
+def idempotency_fill_event_id(order_or_fill: Dict[str, Any]) -> str:
+    payload = {
+        "broker_order_id": order_or_fill.get("broker_order_id") or order_or_fill.get("id") or order_or_fill.get("order_id"),
+        "client_order_id": order_or_fill.get("client_order_id"),
+        "symbol": order_or_fill.get("symbol"),
+        "side": order_or_fill.get("side"),
+        "qty_filled": order_or_fill.get("qty_filled") or order_or_fill.get("filled_qty") or order_or_fill.get("qty"),
+        "avg_fill_price": order_or_fill.get("avg_fill_price") or order_or_fill.get("filled_avg_price") or order_or_fill.get("fill_price"),
+        "status": order_or_fill.get("status"),
+    }
+    return idempotency_hash(payload)
+
+
+def idempotency_close_intent_id(position: Dict[str, Any], side: str = "sell", qty: Optional[int] = None, reason: str = "") -> str:
+    payload = {
+        "position_id": position.get("position_id") or position.get("id"),
+        "order_id": position.get("order_id"),
+        "symbol": position.get("symbol") or position.get("contract_symbol"),
+        "side": str(side).lower().strip(),
+        "qty": safe_int(qty if qty is not None else position.get("qty_open", position.get("qty", 0)), 0),
+        "reason": str(reason or "").lower().strip(),
+    }
+    return idempotency_hash(payload)
+
+
+def idempotency_attach_to_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(signal, dict) or not idempotency_enabled():
+        return signal
+    sid = idempotency_signal_intent_id(signal)
+    signal["idempotency_signal_id"] = sid
+    signal["signal_id"] = sid
+    signal.setdefault("idempotency", {})
+    signal["idempotency"]["signal_intent_id"] = sid
+    return signal
+
+
+def idempotency_pre_order_gate(signal: Dict[str, Any], side: str = "buy", qty: Optional[int] = None, mode: str = "PAPER", order_type: str = "market", limit_price: Optional[float] = None) -> Dict[str, Any]:
+    if not idempotency_enabled():
+        return {"approved": True, "reason": "idempotency_disabled"}
+    qty = safe_int(qty if qty is not None else signal.get("qty", signal.get("contracts", 0)), 0)
+    signal = idempotency_attach_to_signal(signal)
+    sig_key = idempotency_signal_intent_id(signal)
+    order_key = idempotency_order_intent_id(signal, side, qty, mode, order_type, limit_price)
+
+    # Do not claim signal key here as a hard block if already seen; order key is the true broker submit guard.
+    signal_rec = idempotency_get("signal_intent", sig_key)
+    order_claim = idempotency_claim(
+        "order_intent",
+        order_key,
+        payload=idempotency_order_payload(signal, side, qty, mode, order_type, limit_price),
+        owner="pre_order_gate",
+    )
+    if not order_claim.get("approved"):
+        idempotency_alert(
+            "IDEMPOTENCY ORDER REPLAY BLOCKED",
+            f"Mode: {mode}\nSide: {side}\nSymbol: {signal.get('symbol')}\nQty: {qty}\nReason: {order_claim.get('reason')}\nKey: {idempotency_short(order_key)}",
+        )
+        return {"approved": False, "reason": order_claim.get("reason"), "signal_key": sig_key, "order_key": order_key, "signal_record": signal_rec}
+
+    idempotency_claim("signal_intent", sig_key, payload=idempotency_signal_payload(signal), owner="pre_order_gate")
+    signal.setdefault("idempotency", {})
+    signal["idempotency"].update({
+        "signal_intent_id": sig_key,
+        "order_intent_id": order_key,
+        "client_order_id": idempotency_client_order_id(signal, side, qty, mode, order_type, limit_price),
+    })
+    return {"approved": True, "reason": "idempotency_pre_order_claimed", "signal_key": sig_key, "order_key": order_key}
+
+
+def idempotency_mark_order_submitted(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str = "market", limit_price: Optional[float] = None, broker_order: Optional[Dict[str, Any]] = None) -> None:
+    key = idempotency_order_intent_id(signal, side, qty, mode, order_type, limit_price)
+    idempotency_mark("order_intent", key, "submitted", {"broker_order": broker_order or {}, "client_order_id": idempotency_client_order_id(signal, side, qty, mode, order_type, limit_price)})
+
+
+def idempotency_mark_order_filled(order_or_fill: Dict[str, Any]) -> Dict[str, Any]:
+    key = idempotency_fill_event_id(order_or_fill)
+    claim = idempotency_claim("fill_event", key, payload=order_or_fill, owner="fill_reconciliation")
+    if not claim.get("approved"):
+        return {"approved": False, "reason": claim.get("reason"), "fill_key": key}
+    idempotency_mark("fill_event", key, "filled", {"order": order_or_fill})
+    return {"approved": True, "reason": "fill_event_recorded", "fill_key": key}
+
+
 def current_trade_day() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -4633,7 +4944,8 @@ def next_local_order_id() -> int:
 def make_order_record(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str, limit_price: Optional[float] = None) -> Dict[str, Any]:
     local_id = next_local_order_id()
     symbol = str(signal.get("symbol", "")).strip()
-    client_order_id = f"ub-{side}-{symbol}-{epoch()}-{local_id}"
+    client_order_id = idempotency_client_order_id(signal, side, qty, mode, order_type, limit_price)
+    order_intent_id = idempotency_order_intent_id(signal, side, qty, mode, order_type, limit_price)
     return {
         "local_order_id": local_id,
         "signal_id": signal.get("signal_id", ""),
@@ -4649,6 +4961,8 @@ def make_order_record(signal: Dict[str, Any], side: str, qty: int, mode: str, or
         "type": order_type,
         "limit_price": safe_float(limit_price, 0.0),
         "client_order_id": client_order_id,
+        "idempotency_order_intent_id": order_intent_id,
+        "idempotency_signal_intent_id": idempotency_signal_intent_id(signal),
         "broker_order_id": "",
         "status": "created",
         "created_at": epoch(),
@@ -5479,6 +5793,7 @@ def normalize_signal(raw: Dict[str, Any]) -> Dict[str, Any]:
     signal["symbol"] = str(signal.get("symbol", signal.get("contract_symbol", signal["ticker"]))).strip()
     signal = auto_select_option_contract(signal)
     signal["signal_id"] = str(signal.get("signal_id", signal_hash(signal)))
+    signal = idempotency_attach_to_signal(signal)
     return signal
 
 
@@ -6208,6 +6523,10 @@ def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
 
 
 def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    idem_gate = idempotency_pre_order_gate(signal, side="buy", qty=safe_int(signal.get("qty", 0), 0), mode="PAPER", order_type="market", limit_price=None)
+    if not idem_gate.get("approved", False):
+        log(f"🧷 PAPER ORDER IDEMPOTENCY BLOCK | {idem_gate.get('reason')} | key={idempotency_short(idem_gate.get('order_key',''))}")
+        return None
     phase35_exec_decision = phase35_execution_layer_gate(signal, mode="PAPER")
     if not phase35_exec_decision.get("approved", False):
         return None
@@ -6227,7 +6546,9 @@ def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     phase1_record_order_attempt("buy", str(signal.get("symbol", "")), safe_int(signal.get("qty", 0), 0))
     position = make_local_position(signal, mode="PAPER")
     save_new_position(position)
-    phase2_record_paper_order(position, side="buy", qty=safe_int(position.get("qty_open", 0), 0), fill_price=safe_float(position.get("entry_price", 0), 0), note="paper entry filled")
+    paper_order = phase2_record_paper_order(position, side="buy", qty=safe_int(position.get("qty_open", 0), 0), fill_price=safe_float(position.get("entry_price", 0), 0), note="paper entry filled")
+    idempotency_mark_order_submitted(signal, "buy", safe_int(position.get("qty_open", 0), 0), "PAPER", "market", None, paper_order)
+    idempotency_mark_order_filled(paper_order)
     phase2_post_fill_risk_snapshot("paper_entry_open")
     GLOBAL_STATE["paper_trade_count"] = safe_int(GLOBAL_STATE.get("paper_trade_count", 0), 0) + 1
     save_state(GLOBAL_STATE)
@@ -6264,6 +6585,10 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
 
     order_type = "limit" if signal.get("use_limit_entry", False) else "market"
     limit_price = safe_float(signal.get("limit_entry_price", 0), 0) if order_type == "limit" else None
+    idem_gate = idempotency_pre_order_gate(signal, side="buy", qty=safe_int(signal.get("qty", 0), 0), mode="LIVE", order_type=order_type, limit_price=limit_price)
+    if not idem_gate.get("approved", False):
+        log(f"🧷 LIVE ORDER IDEMPOTENCY BLOCK | {idem_gate.get('reason')} | key={idempotency_short(idem_gate.get('order_key',''))}")
+        return None
     order_record = make_order_record(signal=signal, side="buy", qty=signal["qty"], mode="LIVE", order_type=order_type, limit_price=limit_price)
     order_record["position_id"] = position["id"]
     save_order_record(order_record)
@@ -6279,8 +6604,10 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
     )
     if not broker_order:
         update_order_status(order_record, "rejected", "broker submit failed")
+        idempotency_mark("order_intent", order_record.get("idempotency_order_intent_id", ""), "failed", {"reason": "broker_submit_failed"})
         return None
 
+    idempotency_mark_order_submitted(signal, "buy", safe_int(signal.get("qty", 0), 0), "LIVE", order_type, limit_price, broker_order)
     apply_broker_order_snapshot(order_record, broker_order)
     update_order_status(order_record, order_record.get("status", "submitted"), "live entry submitted")
     position["broker_order_id"] = order_record.get("broker_order_id", "")
@@ -8635,6 +8962,7 @@ def phase2_record_paper_order(position: Dict[str, Any], side: str, qty: int, fil
     }
     order = make_order_record(signal_stub, side=side, qty=qty, mode="PAPER", order_type="market")
     order["position_id"] = position.get("id")
+    order["idempotency_fill_event_id"] = idempotency_fill_event_id(order)
     order["broker_order_id"] = f"paper-{side}-{position.get('symbol')}-{epoch()}-{order.get('local_order_id')}"
     order["status"] = "filled"
     order["qty_filled"] = int(qty)
@@ -9344,6 +9672,7 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Final bridge from approved signal to paper/live execution.
     """
     ensure_globals_initialized()
+    signal = idempotency_attach_to_signal(signal)
     symbol = str(signal.get("symbol", signal.get("ticker", ""))).strip()
     live_requested = bool(GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True))
 
@@ -9353,6 +9682,7 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             pos = open_live_position(signal)
             if pos:
                 remember_used_signal_id(signal)
+                idempotency_mark("signal_intent", idempotency_signal_intent_id(signal), "open", {"position": pos, "mode": "LIVE"})
                 log(f"✅ PHASE 3.5 LIVE EXECUTION CONFIRMED | {symbol} | qty={pos.get('qty_open')} | entry={pos.get('entry_price')}")
                 return pos
             msg = build_block_message("PHASE 3.5 EXECUTION ROUTER LIVE FAILED", signal, ["open_live_position_returned_none"], "Signal passed approval pipeline, but live order creation failed.")
@@ -9367,6 +9697,7 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             pos = open_paper_position(signal)
             if pos:
                 remember_used_signal_id(signal)
+                idempotency_mark("signal_intent", idempotency_signal_intent_id(signal), "open", {"position": pos, "mode": "PAPER"})
                 log(f"✅ PHASE 3.5 PAPER EXECUTION CONFIRMED | {symbol} | qty={pos.get('qty_open')} | entry={pos.get('entry_price')}")
                 send_to_discord(DISCORD_AI_WEBHOOK, build_position_open_message(pos), "AI")
                 return pos
@@ -9437,6 +9768,12 @@ def paper_bridge_should_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     sig_hash = paper_bridge_signal_hash(signal)
     current_time = epoch()
 
+    idem_gate = idempotency_pre_order_gate(signal, side="buy", qty=safe_int(signal.get("qty", signal.get("qty_hint", 1)), 1), mode="PAPER_BRIDGE", order_type="market", limit_price=None)
+    if not idem_gate.get("approved", False):
+        reason = f"paper_bridge_idempotency_block:{idem_gate.get('reason')}"
+        debug(f"🧷 PAPER BRIDGE IDEMPOTENCY BLOCK | {reason}")
+        return {"approved": False, "reason": reason, "hash": sig_hash, "idempotency": idem_gate}
+
     last_hash = str(GLOBAL_STATE.get("paper_bridge_last_executed_hash", ""))
     last_time = safe_int(GLOBAL_STATE.get("paper_bridge_last_executed_time", 0), 0)
 
@@ -9504,6 +9841,9 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "trigger": str(signal.get("trigger", "")),
         "source": str(signal.get("source", "signal_file")),
         "raw_signal_hash": paper_bridge_signal_hash(signal),
+        "idempotency_signal_intent_id": idempotency_signal_intent_id(signal),
+        "idempotency_order_intent_id": idempotency_order_intent_id(signal, "buy", qty, "PAPER_BRIDGE", "market", None),
+        "client_order_id": idempotency_client_order_id(signal, "buy", qty, "PAPER_BRIDGE", "market", None),
     }
 
     orders_store["orders"].append(order)
@@ -9529,6 +9869,8 @@ def paper_bridge_fill_order(order: Dict[str, Any]) -> Dict[str, Any]:
         orders_store.setdefault("orders", []).append(order)
     paper_bridge_save_orders_store(orders_store)
 
+    order["idempotency_fill_event_id"] = idempotency_fill_event_id(order)
+    idempotency_mark_order_filled(order)
     debug(f"✅ PAPER ORDER FILLED | {order['order_id']} | fill={order['fill_price']}")
     return order
 
@@ -10913,6 +11255,11 @@ def paper_tpsl_direction_pnl(direction: str, entry: float, price: float, qty: in
 
 
 def paper_tpsl_close_position(pos: Dict[str, Any], exit_price: float, reason: str) -> Dict[str, Any]:
+    close_key = idempotency_close_intent_id(pos, side="sell", qty=safe_int(pos.get("qty_open", pos.get("qty", 0)), 0), reason=reason)
+    close_claim = idempotency_claim("close_intent", close_key, payload={"position": pos, "exit_price": exit_price, "reason": reason}, owner="paper_tpsl")
+    if not close_claim.get("approved", False):
+        debug(f"🧷 PAPER CLOSE IDEMPOTENCY BLOCK | {close_claim.get('reason')} | key={idempotency_short(close_key)}")
+        return pos
     pos = deepcopy(pos)
     qty = safe_int(pos.get("qty", 1), 1)
     entry = safe_float(pos.get("entry_price", pos.get("entry", 0)), 0.0)
@@ -10927,6 +11274,7 @@ def paper_tpsl_close_position(pos: Dict[str, Any], exit_price: float, reason: st
     pos["realized_pnl"] = realized
     pos["unrealized_pnl"] = 0.0
 
+    idempotency_mark("close_intent", close_key, "closed", {"position": pos, "exit_price": exit_price, "reason": reason})
     return pos
 
 
