@@ -9296,6 +9296,7 @@ def phase2_reconciliation_guard() -> Dict[str, Any]:
         phase2_alert("PHASE 2 RECON MISMATCH", "\n".join(reasons), force=True)
     else:
         debug("PHASE 2 RECON OK")
+        poll_unusual_whales_darkpool_prints(force=False)
     return {"approved": len(reasons) == 0, "reject_reasons": reasons}
 
 # =========================================================
@@ -9963,6 +9964,16 @@ UW_DARKPOOL_GRADE_BOOST_ENABLED = os.getenv("UW_DARKPOOL_GRADE_BOOST_ENABLED", "
 UW_DARKPOOL_BLOCK_AGAINST_MAJOR_LEVEL = os.getenv("UW_DARKPOOL_BLOCK_AGAINST_MAJOR_LEVEL", "false").lower() == "true"
 UW_DARKPOOL_SEND_ALERTS = os.getenv("UW_DARKPOOL_SEND_ALERTS", "true").lower() == "true"
 UW_DARKPOOL_FILE = os.getenv("UW_DARKPOOL_FILE", "darkpool_levels.json").strip()
+UW_DARKPOOL_REAL_PRINT_ALERTS = os.getenv("UW_DARKPOOL_REAL_PRINT_ALERTS", "true").lower() == "true"
+UW_DARKPOOL_WATCH_TICKERS = {
+    x.strip().upper()
+    for x in os.getenv("UW_DARKPOOL_WATCH_TICKERS", "QQQ,SPY").split(",")
+    if x.strip()
+}
+UW_DARKPOOL_PRINT_POLL_SECONDS = int(os.getenv("UW_DARKPOOL_PRINT_POLL_SECONDS", "20"))
+UW_DARKPOOL_PRINT_MIN_PREMIUM = float(os.getenv("UW_DARKPOOL_PRINT_MIN_PREMIUM", str(UW_DARKPOOL_MIN_PREMIUM)))
+UW_DARKPOOL_PRINT_STATE_FILE = os.getenv("UW_DARKPOOL_PRINT_STATE_FILE", "darkpool_print_state.json").strip()
+UW_DARKPOOL_ALERT_MAX_NEW_PRINTS = int(os.getenv("UW_DARKPOOL_ALERT_MAX_NEW_PRINTS", "5"))
 
 
 def uw_dp_now_ts() -> int:
@@ -10136,7 +10147,7 @@ def uw_dp_build_levels(ticker: str, current_price: float = 0.0, force: bool = Fa
         lvl["premium"] = round(safe_float(lvl.get("premium", 0), 0.0), 2)
         lvl["size"] = round(safe_float(lvl.get("size", 0), 0.0), 2)
         lvl["strength"] = "major" if lvl["premium"] >= UW_DARKPOOL_STRONG_LEVEL_PREMIUM else "normal"
-        lvl["source_label"] = "synthetic"
+        lvl["source_label"] = "UW print cluster"
         if current_price > 0:
             lvl["distance_pct"] = round((price - current_price) / current_price, 5)
             lvl["type"] = "resistance" if price > current_price else "support" if price < current_price else "at_price"
@@ -10342,7 +10353,7 @@ def uw_dp_format_level_line(level: Optional[Dict[str, Any]]) -> Optional[str]:
         level_type = "AT PRICE"
 
     premium = uw_dp_format_money(level.get("premium", 0))
-    source_label = str(level.get("source_label", "synthetic")).strip() or "synthetic"
+    source_label = str(level.get("source_label", "UW print cluster")).strip() or "UW print cluster"
 
     return f"• {price:.2f} | {level_type} | {premium} | {source_label}"
 
@@ -10445,6 +10456,225 @@ def send_unusual_whales_darkpool_alert(signal: Dict[str, Any]) -> None:
             debug(f"UW DARKPOOL styled alert failed: {e}")
         except Exception:
             pass
+
+
+
+
+# =========================================================
+# UNUSUAL WHALES REAL DARK POOL PRINT ALERTS
+# Polls ticker darkpool endpoint and alerts when new prints arrive.
+# API Basic can use polling. True stream/websocket requires a streaming plan.
+# =========================================================
+
+def uw_dp_load_print_state() -> Dict[str, Any]:
+    try:
+        data = load_json_file(UW_DARKPOOL_PRINT_STATE_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def uw_dp_save_print_state(data: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(UW_DARKPOOL_PRINT_STATE_FILE, data)
+    except Exception as e:
+        try:
+            debug(f"UW PRINT STATE save failed: {e}")
+        except Exception:
+            pass
+
+
+def uw_dp_row_timestamp(row: Dict[str, Any]) -> int:
+    for k in ("timestamp", "executed_at", "created_at", "date_time", "time", "reported_at"):
+        v = row.get(k)
+        if v in (None, "", "."):
+            continue
+        try:
+            if isinstance(v, (int, float)):
+                return int(v)
+            text = str(v).strip()
+            if text.isdigit():
+                return int(text)
+            # Try ISO-like timestamps
+            try:
+                return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return 0
+
+
+def uw_dp_row_id(row: Dict[str, Any], ticker: str = "") -> str:
+    for k in ("id", "trade_id", "tracking_id", "uuid"):
+        v = row.get(k)
+        if v not in (None, "", "."):
+            return str(v)
+    price = uw_dp_row_price(row)
+    size = uw_dp_row_size(row)
+    premium = uw_dp_row_premium(row)
+    ts = uw_dp_row_timestamp(row)
+    return f"{ticker}:{ts}:{price}:{size}:{premium}"
+
+
+def uw_dp_fetch_recent_prints_for_alert(ticker: str, newer_than: int = 0) -> Dict[str, Any]:
+    ticker = str(ticker or "").upper().strip()
+
+    if not ticker:
+        return {"ok": False, "reason": "missing_ticker", "ticker": ticker, "prints": []}
+    if not ENABLE_UNUSUAL_WHALES_DARKPOOL or not UW_DARKPOOL_REAL_PRINT_ALERTS:
+        return {"ok": False, "reason": "disabled", "ticker": ticker, "prints": []}
+    if not UNUSUAL_WHALES_API_KEY:
+        return {"ok": False, "reason": "missing_unusual_whales_api_key", "ticker": ticker, "prints": []}
+
+    try:
+        params = {
+            "date": uw_dp_date_str(0),
+            "min_premium": int(UW_DARKPOOL_PRINT_MIN_PREMIUM),
+            "min_size": int(UW_DARKPOOL_MIN_SIZE),
+        }
+        if newer_than:
+            params["newer_than"] = int(newer_than)
+
+        url = f"{UNUSUAL_WHALES_BASE_URL}/api/darkpool/{ticker}"
+        r = requests.get(url, headers=uw_dp_headers(), params=params, timeout=12)
+
+        if r.status_code != 200:
+            return {"ok": False, "reason": f"http_{r.status_code}:{str(r.text)[:120]}", "ticker": ticker, "prints": []}
+
+        rows = uw_dp_extract_rows(r.json())
+        prints = []
+        for row in rows:
+            price = uw_dp_row_price(row)
+            size = uw_dp_row_size(row)
+            premium = uw_dp_row_premium(row)
+            ts = uw_dp_row_timestamp(row)
+            if price <= 0 or premium < UW_DARKPOOL_PRINT_MIN_PREMIUM:
+                continue
+            prints.append({
+                "id": uw_dp_row_id(row, ticker),
+                "ticker": ticker,
+                "price": price,
+                "size": size,
+                "premium": premium,
+                "timestamp": ts,
+                "raw": row,
+            })
+
+        prints = sorted(prints, key=lambda x: (safe_int(x.get("timestamp", 0), 0), str(x.get("id", ""))))
+        return {"ok": True, "reason": "ok", "ticker": ticker, "prints": prints}
+
+    except Exception as e:
+        return {"ok": False, "reason": f"exception:{e}", "ticker": ticker, "prints": []}
+
+
+def uw_dp_format_real_print_line(print_row: Dict[str, Any]) -> str:
+    ticker = str(print_row.get("ticker", "")).upper()
+    price = safe_float(print_row.get("price", 0), 0.0)
+    premium = uw_dp_format_money(print_row.get("premium", 0))
+    size = safe_float(print_row.get("size", 0), 0.0)
+
+    if size >= 1_000_000:
+        size_text = f"{size / 1_000_000:.2f}M shares"
+    elif size >= 1_000:
+        size_text = f"{size / 1_000:.1f}K shares"
+    else:
+        size_text = f"{size:.0f} shares"
+
+    return f"• {price:.2f} | REAL PRINT | {premium} | {size_text}"
+
+
+def send_uw_darkpool_real_print_alert(ticker: str, prints: List[Dict[str, Any]]) -> None:
+    if not prints:
+        return
+
+    try:
+        newest = prints[-UW_DARKPOOL_ALERT_MAX_NEW_PRINTS:]
+        lines = [uw_dp_format_real_print_line(p) for p in newest]
+
+        msg = (
+            f"💎 DARK POOL NEW PRINTS\n"
+            f"Ticker: {ticker}\n\n"
+            + "\n".join(lines)
+            + "\n\n"
+            f"How to use:\n"
+            f"• Large prints near price can become resource levels\n"
+            f"• Print below price can act as support/defense\n"
+            f"• Print above price can act as resistance/rejection\n"
+            f"• Acceptance through the print can shift bias"
+        )
+
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+        try:
+            debug(f"UW DARKPOOL REAL PRINT ALERT | ticker={ticker} prints={len(newest)}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            debug(f"UW real print alert failed: {e}")
+        except Exception:
+            pass
+
+
+def poll_unusual_whales_darkpool_prints(force: bool = False) -> None:
+    """
+    Polls Unusual Whales for new dark pool prints for QQQ/SPY.
+    This gives near-real-time alerts on API Basic. For true instant streaming,
+    use a plan with WebSocket/Kafka and wire the websocket channel later.
+    """
+    if not UW_DARKPOOL_REAL_PRINT_ALERTS:
+        return
+
+    state = uw_dp_load_print_state()
+    now = uw_dp_now_ts()
+    last_poll = safe_int(state.get("_last_poll", 0), 0)
+
+    if not force and last_poll and (now - last_poll) < UW_DARKPOOL_PRINT_POLL_SECONDS:
+        return
+
+    state["_last_poll"] = now
+
+    for ticker in sorted(UW_DARKPOOL_WATCH_TICKERS):
+        ticker_state = state.get(ticker, {}) if isinstance(state.get(ticker, {}), dict) else {}
+        newer_than = safe_int(ticker_state.get("last_timestamp", 0), 0)
+        seen_ids = set(ticker_state.get("seen_ids", [])) if isinstance(ticker_state.get("seen_ids", []), list) else set()
+
+        result = uw_dp_fetch_recent_prints_for_alert(ticker, newer_than=newer_than)
+        if not result.get("ok"):
+            try:
+                debug(f"UW DARKPOOL PRINT POLL | ticker={ticker} reason={result.get('reason')}")
+            except Exception:
+                pass
+            continue
+
+        new_prints = []
+        max_ts = newer_than
+
+        for p in result.get("prints", []):
+            pid = str(p.get("id", ""))
+            pts = safe_int(p.get("timestamp", 0), 0)
+            max_ts = max(max_ts, pts)
+
+            if pid and pid in seen_ids:
+                continue
+            if newer_than and pts and pts <= newer_than:
+                continue
+
+            new_prints.append(p)
+            if pid:
+                seen_ids.add(pid)
+
+        if new_prints:
+            send_uw_darkpool_real_print_alert(ticker, new_prints)
+
+        state[ticker] = {
+            "last_timestamp": max_ts,
+            "seen_ids": list(seen_ids)[-500:],
+            "last_checked": now,
+        }
+
+    uw_dp_save_print_state(state)
 
 
 # =========================================================
