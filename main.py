@@ -11372,6 +11372,117 @@ def premium_live_darkpool_real_summary(signal: Dict[str, Any]) -> str:
     return reason
 
 
+
+
+def premium_live_detect_session() -> str:
+    """
+    Detects trading session in ET-style windows.
+    Uses server time; set Render TZ=America/New_York if needed.
+    """
+    try:
+        now = datetime.now()
+        hhmm = now.hour * 100 + now.minute
+
+        if 930 <= hhmm <= 1030:
+            return "OPEN DRIVE / FIRST HOUR"
+        if 1031 <= hhmm <= 1130:
+            return "MORNING CONTINUATION"
+        if 1131 <= hhmm <= 1359:
+            return "MIDDAY FILTER / CHOP CONTROL"
+        if 1400 <= hhmm <= 1459:
+            return "AFTERNOON RESET"
+        if 1500 <= hhmm <= 1600:
+            return "POWER HOUR"
+        if 400 <= hhmm < 930:
+            return "PREMARKET PLAN"
+        return "AFTER HOURS / PLAN ONLY"
+    except Exception:
+        return "SESSION UNKNOWN"
+
+
+def premium_live_detect_entry_type(signal: Dict[str, Any]) -> str:
+    setup = str(
+        signal.get("setup")
+        or signal.get("setup_type")
+        or signal.get("setup_name")
+        or signal.get("trigger")
+        or ""
+    ).lower()
+
+    direction = str(signal.get("direction") or "").upper().strip()
+    vwap = str(signal.get("vwap") or signal.get("vwap_position") or "").lower()
+
+    if "break" in setup and "hold" in setup:
+        return "BREAKOUT CONTINUATION"
+    if "retest" in setup:
+        return "RETEST HOLD"
+    if "reject" in setup or "rejection" in setup:
+        return "RESISTANCE REJECTION" if direction == "PUT" else "FAILED REJECTION / WATCH"
+    if "vwap" in setup and ("reclaim" in setup or "above" in vwap):
+        return "VWAP RECLAIM CONTINUATION"
+    if "vwap" in setup and ("reject" in setup or "below" in vwap):
+        return "VWAP REJECTION"
+    if "momentum" in setup:
+        return "MOMENTUM PUSH"
+    if direction == "CALL":
+        return "CALL CONTINUATION SETUP"
+    if direction == "PUT":
+        return "PUT REJECTION SETUP"
+    return "WAIT / OBSERVE"
+
+
+def premium_live_trade_reason(signal: Dict[str, Any]) -> str:
+    """
+    Builds human-readable institutional reason language.
+    """
+    direction = str(signal.get("direction") or "").upper().strip()
+    tech = premium_live_tech_strength(signal)
+    vwap = premium_live_get(signal, "vwap", "vwap_position", default="")
+    oil = premium_live_get(signal, "oil", "oil_trend", default="")
+    volume = premium_live_get(signal, "volume", default="")
+    market = premium_live_get(signal, "market_type", "regime", default="")
+    setup = premium_live_get(signal, "setup_name", "setup", "setup_type", "trigger", default="")
+    darkpool = premium_live_darkpool_real_summary(signal)
+
+    reasons = []
+
+    tv = str(vwap).lower()
+    to = str(oil).lower()
+    vol = str(volume).lower()
+    mk = str(market).lower()
+    st = str(setup).lower()
+    dp = str(darkpool).lower()
+
+    if direction == "CALL":
+        if "above" in tv or "reclaim" in tv or "buyer" in tv:
+            reasons.append("VWAP/control favors buyers")
+        if "fall" in to or "relief" in to or "risk-on" in to:
+            reasons.append("oil relief supports tech")
+        if "break" in st or "hold" in st or "momentum" in st:
+            reasons.append("structure is breaking/holding higher")
+    elif direction == "PUT":
+        if "below" in tv or "reject" in tv or "seller" in tv:
+            reasons.append("VWAP/control favors sellers")
+        if "rising" in to or "pressure" in to or "risk-off" in to:
+            reasons.append("oil pressure supports downside")
+        if "reject" in st or "breakdown" in st or "lower" in st:
+            reasons.append("structure is rejecting/lower")
+
+    if "confirm" in vol or "strong" in vol or "spike" in vol:
+        reasons.append("volume confirms the move")
+    if "trend" in mk or "expansion" in mk:
+        reasons.append("market state supports continuation")
+    if "support" in dp or "resistance" in dp or "aligned" in dp or "holding" in dp:
+        reasons.append("dark pool context is mapped")
+
+    if not reasons:
+        if "weak" in tech.lower() or "wait" in tech.lower():
+            return "Confluence is incomplete; wait for cleaner confirmation."
+        return "Setup is forming, but confirmation must come from price holding the mapped level."
+
+    return " + ".join(reasons[:4])
+
+
 def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
     direction = str(signal.get("direction") or "WAIT").upper().strip()
@@ -11393,6 +11504,10 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     market = premium_live_get(signal, "market_type", "regime", default="Not provided")
     darkpool = premium_live_darkpool_real_summary(signal)
 
+    session = str(signal.get("session") or signal.get("time_window") or premium_live_detect_session()).upper()
+    entry_type = str(signal.get("entry_type") or premium_live_detect_entry_type(signal)).upper()
+    trade_reason = str(signal.get("trade_reason") or premium_live_trade_reason(signal))
+
     if direction == "CALL":
         bias = "BULLISH"
         alert_title = "CALL EXECUTION PLAN"
@@ -11412,6 +11527,10 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
         f"📈 Confidence: {confidence}\n"
         f"🧠 Bias: {bias}\n"
         f"⚡ Tech Strength: {tech_strength}\n"
+        f"📌 Entry Type: {entry_type}\n"
+        f"🕒 Session: {session}\n"
+        f"🧠 Why this works:\n"
+        f"• {trade_reason}\n\n"
         f"✅ Decision: {decision}\n\n"
         f"📍 Key Level:\n"
         f"• {key_level}\n\n"
@@ -14298,6 +14417,8 @@ if "--premium-alert-now" in sys.argv:
         "volume": "Confirming",
         "oil": "Falling / risk-on support",
         "market_type": "Trend / expansion",
+        "session": "MIDDAY TREND CONTINUATION",
+        "entry_type": "BREAKOUT CONTINUATION",
     }
     maybe_send_premium_live_execution_alert(sample, stage="manual_test")
     sys.exit(0)
