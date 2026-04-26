@@ -700,6 +700,305 @@ FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "
 # =========================================================
 
 # =========================================================
+
+# =========================================================
+# AI → SIGNAL.JSON BRIDGE
+# Reads AI decision output, validates it, normalizes it into
+# execution-safe signal.json, then lets main engine process it.
+# =========================================================
+ENABLE_AI_SIGNAL_BRIDGE = os.getenv("ENABLE_AI_SIGNAL_BRIDGE", "true").lower() == "true"
+AI_SIGNAL_INPUT_FILE = os.getenv("AI_SIGNAL_INPUT_FILE", "ai_signal.json")
+AI_SIGNAL_ARCHIVE_FILE = os.getenv("AI_SIGNAL_ARCHIVE_FILE", "ai_signal.last.json")
+AI_SIGNAL_MIN_GRADE = os.getenv("AI_SIGNAL_MIN_GRADE", "A").upper().strip()
+AI_SIGNAL_ALLOWED_GRADES = set(x.strip().upper() for x in os.getenv("AI_SIGNAL_ALLOWED_GRADES", "A+,A").split(",") if x.strip())
+AI_SIGNAL_REQUIRE_CONFIRMATION = os.getenv("AI_SIGNAL_REQUIRE_CONFIRMATION", "true").lower() == "true"
+AI_SIGNAL_REQUIRE_SETUP = os.getenv("AI_SIGNAL_REQUIRE_SETUP", "true").lower() == "true"
+AI_SIGNAL_REQUIRE_TRIGGER = os.getenv("AI_SIGNAL_REQUIRE_TRIGGER", "true").lower() == "true"
+AI_SIGNAL_OVERWRITE_SIGNAL_FILE = os.getenv("AI_SIGNAL_OVERWRITE_SIGNAL_FILE", "false").lower() == "true"
+
+VALID_AI_SETUPS = {
+    "vwap_reclaim",
+    "vwap_reject",
+    "break_and_hold",
+    "breakout_retest",
+    "resistance_rejection",
+    "support_hold",
+    "liquidity_grab_reversal",
+    "higher_low_continuation",
+    "lower_high_rejection",
+}
+
+VALID_AI_TRIGGERS = {
+    "vwap_reclaim",
+    "vwap_reject",
+    "break_and_hold",
+    "breakout_retest",
+    "resistance_rejection",
+    "support_hold",
+    "liquidity_grab_reversal",
+    "higher_low",
+    "lower_high",
+    "volume_breakout",
+}
+
+VALID_AI_CONFIRMATIONS = {
+    "volume",
+    "retest",
+    "hold",
+    "reclaim",
+    "reject",
+    "momentum",
+    "structure",
+    "vwap",
+}
+
+
+
+# =========================================================
+# AI → SIGNAL.JSON BRIDGE HELPERS
+# =========================================================
+def ai_grade_rank(grade: str) -> int:
+    order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1, "AVOID": 0}
+    return order.get(str(grade).upper().strip(), 0)
+
+
+def ai_signal_file_exists() -> bool:
+    try:
+        return os.path.exists(AI_SIGNAL_INPUT_FILE)
+    except Exception:
+        return False
+
+
+def load_ai_signal_input() -> Optional[Dict[str, Any]]:
+    try:
+        if not ai_signal_file_exists():
+            return None
+        data = load_json_file(AI_SIGNAL_INPUT_FILE, {})
+        if not isinstance(data, dict):
+            debug("AI BRIDGE SKIP | ai_signal.json must be a JSON object")
+            return None
+        return data
+    except Exception as e:
+        log(f"❌ AI BRIDGE LOAD ERROR | {e}")
+        return None
+
+
+def normalize_ai_signal_setup(value: Any) -> str:
+    raw = str(value or "").lower().strip().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "vwap_reclaim_continuation": "vwap_reclaim",
+        "reclaim": "vwap_reclaim",
+        "vwap_break": "vwap_reclaim",
+        "reject": "vwap_reject",
+        "vwap_rejection": "vwap_reject",
+        "break_hold": "break_and_hold",
+        "break_and_hold_over_reclaim_level": "break_and_hold",
+        "breakout_hold": "break_and_hold",
+        "retest_hold": "breakout_retest",
+    }
+    return aliases.get(raw, raw)
+
+
+def normalize_ai_signal_trigger(value: Any, setup: str) -> str:
+    raw = str(value or "").lower().strip().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "reclaim": "vwap_reclaim",
+        "vwap": "vwap_reclaim",
+        "break_hold": "break_and_hold",
+        "break_and_hold_over_reclaim_level": "break_and_hold",
+        "breakout_hold": "break_and_hold",
+        "retest_hold": "breakout_retest",
+        "reject": "vwap_reject",
+    }
+    normalized = aliases.get(raw, raw)
+    if not normalized and setup:
+        normalized = setup
+    return normalized
+
+
+def normalize_ai_confirmation(value: Any) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    raw = str(value or "").lower().strip().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "vol": "volume",
+        "volume_confirmation": "volume",
+        "confirmed_volume": "volume",
+        "held_level": "hold",
+        "level_hold": "hold",
+        "retest_hold": "retest",
+        "vwap_hold": "vwap",
+    }
+    return aliases.get(raw, raw)
+
+
+def ai_signal_validation_errors(ai: Dict[str, Any], signal: Dict[str, Any]) -> List[str]:
+    errors = []
+
+    grade = str(signal.get("grade", "")).upper().strip()
+    if AI_SIGNAL_ALLOWED_GRADES and grade not in AI_SIGNAL_ALLOWED_GRADES:
+        errors.append(f"grade_not_allowed:{grade}")
+    if ai_grade_rank(grade) < ai_grade_rank(AI_SIGNAL_MIN_GRADE):
+        errors.append(f"grade_below_min:{grade}<{AI_SIGNAL_MIN_GRADE}")
+
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    direction = str(signal.get("direction", "")).upper().strip()
+    if not ticker:
+        errors.append("missing_ticker")
+    if direction not in ("CALL", "PUT"):
+        errors.append(f"invalid_direction:{direction}")
+
+    entry = safe_float(signal.get("entry", 0), 0.0)
+    stop = safe_float(signal.get("stop", 0), 0.0)
+    target = safe_float(signal.get("target", 0), 0.0)
+
+    if entry <= 0:
+        errors.append("missing_or_invalid_entry")
+    if stop <= 0:
+        errors.append("missing_or_invalid_stop")
+    if target <= 0:
+        errors.append("missing_or_invalid_target")
+
+    if direction == "CALL":
+        if stop >= entry:
+            errors.append("call_stop_must_be_below_entry")
+        if target <= entry:
+            errors.append("call_target_must_be_above_entry")
+    if direction == "PUT":
+        if stop <= entry:
+            errors.append("put_stop_must_be_above_entry")
+        if target >= entry:
+            errors.append("put_target_must_be_below_entry")
+
+    setup = str(signal.get("setup", "")).lower().strip()
+    trigger = str(signal.get("trigger", "")).lower().strip()
+    confirmation = str(signal.get("confirmation", "")).lower().strip()
+
+    if AI_SIGNAL_REQUIRE_SETUP and setup not in VALID_AI_SETUPS:
+        errors.append(f"invalid_setup:{setup}")
+    if AI_SIGNAL_REQUIRE_TRIGGER and trigger not in VALID_AI_TRIGGERS:
+        errors.append(f"invalid_trigger:{trigger}")
+    if AI_SIGNAL_REQUIRE_CONFIRMATION and confirmation not in VALID_AI_CONFIRMATIONS:
+        errors.append(f"invalid_confirmation:{confirmation}")
+
+    return errors
+
+
+def normalize_ai_to_engine_signal(ai: Dict[str, Any]) -> Dict[str, Any]:
+    ticker = str(ai.get("ticker") or ai.get("symbol") or ai.get("underlying") or "QQQ").upper().strip()
+    direction = normalize_direction(ai.get("direction", ai.get("bias", "CALL")))
+
+    setup = normalize_ai_signal_setup(ai.get("setup") or ai.get("strategy"))
+    trigger = normalize_ai_signal_trigger(ai.get("trigger"), setup)
+    confirmation = normalize_ai_confirmation(ai.get("confirmation") or ai.get("confirm"))
+
+    entry = safe_float(ai.get("entry_contract", ai.get("entry", ai.get("contract_price", 0))), 0.0)
+    stop = safe_float(ai.get("stop_contract", ai.get("stop", 0)), 0.0)
+    target = safe_float(ai.get("tp1_contract", ai.get("target", ai.get("take_profit", 0))), 0.0)
+    tp2 = safe_float(ai.get("tp2_contract", ai.get("target_2", ai.get("tp2", target))), target)
+
+    # If AI supplied underlying levels only, keep them too.
+    underlying_price = safe_float(ai.get("underlying_price", ai.get("price", 0)), 0.0)
+
+    grade = str(ai.get("grade", ai.get("confidence", "B"))).upper().strip()
+    confidence = str(ai.get("confidence", grade)).upper().strip()
+
+    contract_symbol = str(
+        ai.get("contract_symbol")
+        or ai.get("option_symbol")
+        or ai.get("symbol")
+        or ticker
+    ).strip()
+
+    reason = str(ai.get("reason") or ai.get("thesis") or ai.get("public_reason") or "AI bridge signal").strip()
+
+    signal = {
+        "ticker": ticker,
+        "symbol": contract_symbol,
+        "contract_symbol": contract_symbol,
+        "asset_class": str(ai.get("asset_class", "option")).lower().strip(),
+        "direction": direction,
+        "confidence": confidence,
+        "grade": grade,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "entry_contract": entry,
+        "stop_contract": stop,
+        "tp1_contract": target,
+        "tp2_contract": tp2,
+        "contract_price": safe_float(ai.get("contract_price", entry), entry),
+        "underlying_price": underlying_price,
+        "qty": safe_int(ai.get("qty", ai.get("quantity", 1)), 1),
+        "setup": setup,
+        "strategy": setup,
+        "trigger": trigger,
+        "confirmation": confirmation,
+        "regime": str(ai.get("regime", "clean")).lower().strip(),
+        "reason": reason,
+        "public_reason": str(ai.get("public_reason", reason)).strip(),
+        "notes": ai.get("notes", [] if isinstance(ai.get("notes"), list) else str(ai.get("notes", reason))),
+        "source": "ai_signal_bridge",
+        "timestamp": safe_int(ai.get("timestamp", now_ts()), now_ts()),
+        "ai_bridge_version": 1,
+    }
+
+    return signal
+
+
+def archive_ai_signal_input(ai: Dict[str, Any], status: str, details: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        payload = {
+            "archived_at": now_ts(),
+            "status": status,
+            "details": details or {},
+            "ai_signal": ai,
+        }
+        atomic_write_json(AI_SIGNAL_ARCHIVE_FILE, payload)
+    except Exception as e:
+        debug(f"AI BRIDGE ARCHIVE ERROR | {e}")
+
+
+def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
+    result = {"written": False, "reason": "disabled"}
+
+    if not ENABLE_AI_SIGNAL_BRIDGE:
+        return result
+
+    ai = load_ai_signal_input()
+    if not ai:
+        return {"written": False, "reason": "no_ai_signal"}
+
+    try:
+        if file_exists(SIGNAL_FILE) and not AI_SIGNAL_OVERWRITE_SIGNAL_FILE:
+            return {"written": False, "reason": "signal_file_already_exists"}
+
+        signal = normalize_ai_to_engine_signal(ai)
+        errors = ai_signal_validation_errors(ai, signal)
+
+        if errors:
+            debug(f"AI BRIDGE BLOCKED | errors={errors}")
+            archive_ai_signal_input(ai, "blocked", {"errors": errors, "normalized_signal": signal})
+            return {"written": False, "reason": "validation_failed", "errors": errors}
+
+        atomic_write_json(SIGNAL_FILE, signal)
+        archive_ai_signal_input(ai, "written", {"signal_file": SIGNAL_FILE, "signal": signal})
+
+        # Move source out of the way after successful handoff so it does not rewrite same signal forever.
+        try:
+            os.remove(AI_SIGNAL_INPUT_FILE)
+        except Exception:
+            pass
+
+        debug(f"AI BRIDGE WROTE SIGNAL | {signal.get('ticker')} {signal.get('direction')} {signal.get('grade')} setup={signal.get('setup')}")
+        return {"written": True, "reason": "signal_written", "signal": signal}
+
+    except Exception as e:
+        log(f"❌ AI BRIDGE ERROR | {e}")
+        archive_ai_signal_input(ai, "error", {"error": str(e)})
+        return {"written": False, "reason": "bridge_error", "error": str(e)}
+
+
 # FALLBACK TEST SIGNAL CONTROL
 # Default OFF so engine does not auto-create fake/test signals.
 # =========================================================
@@ -7632,6 +7931,7 @@ def reset_kill_switch_for_testing():
 
 def main_loop():
     boot()
+    ai_bridge_write_signal_if_ready()
 
     # =========================================================
     # FORCE STARTUP SIGNAL PICKUP
@@ -7799,7 +8099,17 @@ def run_once():
 # =========================================================
 # ENTRY
 # =========================================================
+
+def cli_ai_bridge_test() -> None:
+    result = ai_bridge_write_signal_if_ready()
+    print(json.dumps(result, indent=2, default=str))
+
+
+
 if __name__ == "__main__":
+    if "--ai-bridge-test" in sys.argv:
+        cli_ai_bridge_test()
+        sys.exit(0)
     try:
         if len(sys.argv) > 1 and sys.argv[1] in {"--auto-signal-test", "--test-signal"}:
             ensure_globals_initialized()
