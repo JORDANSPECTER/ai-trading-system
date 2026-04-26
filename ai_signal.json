@@ -1,15 +1,16 @@
 {
   "ticker": "QQQ",
-  "direction": "PUT",
+  "direction": "CALL",
   "grade": "A",
   "confidence": "A",
   "entry": 1.30,
-  "stop": 1.60,
-  "target": 0.90,
-  "setup": "resistance_rejection",
-  "trigger": "reject",
+  "stop": 1.00,
+  "target": 1.80,
+  "qty": 1,
+  "setup": "break_and_hold",
+  "trigger": "break_and_hold",
   "confirmation": "volume",
   "regime": "clean",
-  "reason": "TEST FLOW",
-  "timestamp": 1714100000
+  "reason": "LIVE SAFETY TEST - SHOULD BLOCK BECAUSE ENABLE_ALPACA=false",
+  "timestamp": 9999999999
 }
