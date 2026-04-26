@@ -968,11 +968,16 @@ def get_macro_context_for_signal() -> Dict[str, Any]:
 
 
 def apply_macro_context_to_ai_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adds macro context to AI-generated signals, then applies the UnBiased Trades
+    macro/oil enforcement layer before the signal reaches execution.
+    """
     if not isinstance(signal, dict):
         return signal
 
     macro = get_macro_context_for_signal()
     enriched = deepcopy(signal)
+
     enriched["macro_bias"] = macro.get("macro_bias", "neutral")
     enriched["macro_risk_score"] = macro.get("macro_risk_score", 0)
     enriched["macro_notes"] = macro.get("macro_notes", [])
@@ -980,10 +985,86 @@ def apply_macro_context_to_ai_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     enriched["oil_price"] = macro.get("oil_price", 0)
     enriched["vix"] = macro.get("vix", 0)
 
-    if enriched.get("macro_bias") == "risk_off":
+    direction = str(enriched.get("direction", "")).upper().strip()
+    macro_bias = str(enriched.get("macro_bias", "neutral")).lower().strip()
+    oil = safe_float(enriched.get("oil_price", 0), 0.0)
+
+    enriched["blocked_by_macro"] = False
+    enriched["macro_reason"] = ""
+
+    # =====================================================
+    # MACRO + OIL ENFORCEMENT
+    # Institutional filter: do not let AI fire trades against
+    # the macro tape.
+    # =====================================================
+
+    # Risk-off blocks bullish calls.
+    if macro_bias == "risk_off" and direction == "CALL":
+        enriched["blocked_by_macro"] = True
+        enriched["macro_reason"] = "risk_off_blocks_calls"
+
+    # Strong risk-on blocks bearish puts.
+    if macro_bias == "risk_on" and direction == "PUT":
+        enriched["blocked_by_macro"] = True
+        enriched["macro_reason"] = "risk_on_blocks_puts"
+
+    # Oil spike pressure: blocks calls when WTI is elevated.
+    if oil > 90 and direction == "CALL":
+        enriched["blocked_by_macro"] = True
+        enriched["macro_reason"] = "oil_spike_blocks_calls"
+
+    # Low/contained oil pressure filter: blocks puts when oil is supportive.
+    if 0 < oil < 70 and direction == "PUT":
+        enriched["blocked_by_macro"] = True
+        enriched["macro_reason"] = "low_oil_blocks_puts"
+
+    if enriched.get("blocked_by_macro"):
+        enriched["macro_warning"] = enriched.get("macro_reason", "macro_block")
+    elif macro_bias == "risk_off":
         enriched["macro_warning"] = "risk_off_macro_context"
+    else:
+        enriched["macro_warning"] = ""
 
     return enriched
+
+
+def macro_enforcement_blocks_signal(signal: Dict[str, Any]) -> bool:
+    """
+    Final safety check before validation/execution.
+    If a signal is blocked by macro/oil context, no order path should receive it.
+    """
+    try:
+        if not isinstance(signal, dict):
+            return False
+
+        # If signal has not been enriched yet, enrich it now.
+        if "blocked_by_macro" not in signal:
+            signal.update(apply_macro_context_to_ai_signal(signal))
+
+        if signal.get("blocked_by_macro"):
+            reason = signal.get("macro_reason", "macro_blocked")
+            debug(f"MACRO BLOCKED TRADE | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            try:
+                intel_event(
+                    "macro_blocked_trade",
+                    {"reason": reason, "signal": signal},
+                    signal=signal,
+                    stage="macro_enforcement",
+                    decision="blocked",
+                )
+            except Exception:
+                pass
+            try:
+                send_to_discord(DISCORD_AI_WEBHOOK, f"🛑 MACRO BLOCKED TRADE\nTicker: {signal.get('ticker')}\nDirection: {signal.get('direction')}\nReason: {reason}\n⏰ {now_ts()}", "AI")
+            except Exception:
+                pass
+            return True
+
+        return False
+    except Exception as e:
+        debug(f"MACRO ENFORCEMENT CHECK ERROR | {e}")
+        return False
+
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
@@ -1407,7 +1488,14 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             return {"written": False, "reason": "signal_file_already_exists"}
 
         signal = normalize_ai_to_engine_signal(ai)
+        signal = apply_macro_context_to_ai_signal(signal)
         errors = ai_signal_validation_errors(ai, signal)
+
+        if signal.get("blocked_by_macro"):
+            reason = signal.get("macro_reason", "macro_blocked")
+            debug(f"MACRO BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "macro_blocked", {"reason": reason, "normalized_signal": signal})
+            return {"written": False, "reason": "macro_blocked", "macro_reason": reason, "signal": signal}
 
         if errors:
             debug(f"AI BRIDGE BLOCKED | errors={errors}")
