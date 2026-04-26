@@ -11483,6 +11483,158 @@ def premium_live_trade_reason(signal: Dict[str, Any]) -> str:
     return " + ".join(reasons[:4])
 
 
+
+
+# =========================================================
+# PREMIUM EXECUTION SCORING + POSITION SIZING LAYER
+# Adds:
+# - execution score 0-100
+# - timing quality
+# - entry quality
+# - risk state
+# - suggested size language
+# This is advisory/context unless your execution layer separately uses it.
+# =========================================================
+ENABLE_EXECUTION_SCORING_LAYER = os.getenv("ENABLE_EXECUTION_SCORING_LAYER", "true").lower() == "true"
+EXEC_SCORE_FULL_SIZE = int(os.getenv("EXEC_SCORE_FULL_SIZE", "85"))
+EXEC_SCORE_HALF_SIZE = int(os.getenv("EXEC_SCORE_HALF_SIZE", "70"))
+EXEC_SCORE_REDUCED_SIZE = int(os.getenv("EXEC_SCORE_REDUCED_SIZE", "55"))
+
+
+def premium_execution_score(signal: Dict[str, Any]) -> int:
+    if not ENABLE_EXECUTION_SCORING_LAYER:
+        return 0
+
+    grade = premium_live_grade(signal)
+    direction = str(signal.get("direction") or "").upper().strip()
+    tech = premium_live_tech_strength(signal).lower()
+    entry_type = premium_live_detect_entry_type(signal).lower()
+    reason = premium_live_trade_reason(signal).lower()
+    dp = premium_live_darkpool_real_summary(signal).lower()
+    vwap = premium_live_get(signal, "vwap", "vwap_position", default="").lower()
+    oil = premium_live_get(signal, "oil", "oil_trend", default="").lower()
+    volume = premium_live_get(signal, "volume", default="").lower()
+
+    score = 0
+
+    grade_points = {
+        "A+": 35,
+        "A": 30,
+        "B+": 22,
+        "B": 15,
+        "C": 5,
+        "AVOID": 0,
+    }
+    score += grade_points.get(grade, 15)
+
+    if "strong" in tech:
+        score += 20
+    elif "building" in tech:
+        score += 15
+    elif "mixed" in tech:
+        score += 8
+
+    if "breakout" in entry_type or "retest" in entry_type or "vwap reclaim" in entry_type:
+        score += 12
+    elif "momentum" in entry_type:
+        score += 7
+
+    if direction == "CALL":
+        if "above" in vwap or "reclaim" in vwap or "buyer" in vwap:
+            score += 8
+        if "fall" in oil or "relief" in oil or "risk-on" in oil:
+            score += 8
+    elif direction == "PUT":
+        if "below" in vwap or "reject" in vwap or "seller" in vwap:
+            score += 8
+        if "rising" in oil or "pressure" in oil or "risk-off" in oil:
+            score += 8
+
+    if "confirm" in volume or "strong" in volume or "spike" in volume:
+        score += 7
+
+    if "support" in dp or "resistance" in dp or "holding" in dp or "mapped" in dp:
+        score += 10
+
+    if "wait" in reason or "incomplete" in reason:
+        score -= 10
+
+    return max(0, min(100, score))
+
+
+def premium_timing_quality(signal: Dict[str, Any]) -> str:
+    volume = premium_live_get(signal, "volume", default="").lower()
+    vwap = premium_live_get(signal, "vwap", "vwap_position", default="").lower()
+    session = str(signal.get("session") or signal.get("time_window") or premium_live_detect_session()).upper()
+
+    if ("OPEN" in session or "POWER" in session) and ("confirm" in volume or "strong" in volume or "spike" in volume):
+        return "PRIME WINDOW + CONFIRMATION"
+    if ("above" in vwap or "reclaim" in vwap or "below" in vwap or "reject" in vwap) and ("confirm" in volume or "strong" in volume):
+        return "EARLY STRENGTH / CLEAN TIMING"
+    if "MIDDAY" in session:
+        return "MIDDAY FILTER — REQUIRE EXTRA CONFIRMATION"
+    if "weak" in volume:
+        return "WEAK PARTICIPATION"
+    return "DEVELOPING"
+
+
+def premium_entry_quality(signal: Dict[str, Any]) -> str:
+    setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("setup_name") or signal.get("trigger") or "").lower()
+    entry_type = premium_live_detect_entry_type(signal).lower()
+
+    if "retest" in setup or "retest" in entry_type:
+        return "LOW RISK RETEST"
+    if ("break" in setup and "hold" in setup) or "breakout" in entry_type:
+        return "CONFIRMED BREAKOUT"
+    if "vwap reclaim" in entry_type or "vwap reclaim" in setup:
+        return "VWAP RECLAIM CONFIRMATION"
+    if "reject" in setup or "rejection" in entry_type:
+        return "CONFIRMED REJECTION"
+    if "momentum" in setup or "momentum" in entry_type:
+        return "HIGHER RISK MOMENTUM"
+    return "WAIT FOR CONFIRMATION"
+
+
+def premium_risk_state_from_score(score: int, signal: Dict[str, Any]) -> str:
+    grade = premium_live_grade(signal)
+    tech = premium_live_tech_strength(signal).lower()
+
+    if grade in {"A+", "A"} and score >= EXEC_SCORE_FULL_SIZE and ("strong" in tech or "building" in tech):
+        return "FULL POSITION ALLOWED"
+    if score >= EXEC_SCORE_HALF_SIZE:
+        return "HALF POSITION / STANDARD RISK"
+    if score >= EXEC_SCORE_REDUCED_SIZE:
+        return "REDUCED SIZE ONLY"
+    return "NO TRADE / WAIT"
+
+
+def premium_position_size_plan(score: int, signal: Dict[str, Any]) -> str:
+    """
+    Human-readable sizing plan for alerts.
+    Actual broker size should still be controlled by your risk engine.
+    """
+    if score >= EXEC_SCORE_FULL_SIZE:
+        return "100% planned size if entry confirms"
+    if score >= EXEC_SCORE_HALF_SIZE:
+        return "50% planned size; add only after confirmation"
+    if score >= EXEC_SCORE_REDUCED_SIZE:
+        return "25% starter only; no add unless structure improves"
+    return "0% — observe only"
+
+
+def premium_execution_decision(score: int, signal: Dict[str, Any]) -> str:
+    grade = premium_live_grade(signal)
+    entry_quality = premium_entry_quality(signal)
+
+    if score >= EXEC_SCORE_FULL_SIZE and grade in {"A+", "A"}:
+        return "TRADEABLE — execute only on trigger confirmation"
+    if score >= EXEC_SCORE_HALF_SIZE:
+        return "TRADEABLE SMALL / WAIT FOR CLEAN TRIGGER"
+    if score >= EXEC_SCORE_REDUCED_SIZE:
+        return "WATCHLIST ONLY — needs stronger confirmation"
+    return "AVOID — no execution edge yet"
+
+
 def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
     direction = str(signal.get("direction") or "WAIT").upper().strip()
@@ -11508,6 +11660,13 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     entry_type = str(signal.get("entry_type") or premium_live_detect_entry_type(signal)).upper()
     trade_reason = str(signal.get("trade_reason") or premium_live_trade_reason(signal))
 
+    exec_score = premium_execution_score(signal)
+    timing_quality = premium_timing_quality(signal)
+    entry_quality = premium_entry_quality(signal)
+    risk_state = premium_risk_state_from_score(exec_score, signal)
+    position_plan = premium_position_size_plan(exec_score, signal)
+    execution_decision = premium_execution_decision(exec_score, signal)
+
     if direction == "CALL":
         bias = "BULLISH"
         alert_title = "CALL EXECUTION PLAN"
@@ -11517,8 +11676,6 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     else:
         bias = "NEUTRAL"
         alert_title = "WAIT / OBSERVE PLAN"
-
-    decision = "TRADEABLE" if grade in {"A+", "A"} and ("Strong" in tech_strength or "Building" in tech_strength) else "WAIT FOR CONFIRMATION"
 
     return (
         f"💎 UNBIASED PREMIUM ALERT\n"
@@ -11531,7 +11688,12 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
         f"🕒 Session: {session}\n"
         f"🧠 Why this works:\n"
         f"• {trade_reason}\n\n"
-        f"✅ Decision: {decision}\n\n"
+        f"✅ Decision: {execution_decision}\n"
+        f"📐 Execution Score: {exec_score}/100\n"
+        f"⏱️ Timing: {timing_quality}\n"
+        f"🧪 Entry Quality: {entry_quality}\n"
+        f"🚨 Risk State: {risk_state}\n"
+        f"📦 Position Plan: {position_plan}\n\n"
         f"📍 Key Level:\n"
         f"• {key_level}\n\n"
         f"📍 Entry Trigger:\n"
@@ -11549,6 +11711,7 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
         f"• Dark Pool: {darkpool}\n\n"
         f"⚠️ Rule:\n"
         f"• No chasing. Wait for confirmation.\n"
+        f"• Position plan is advisory; broker risk gates still control execution.\n"
         f"• Premium = execution plan."
     )
 
@@ -11581,6 +11744,16 @@ def maybe_send_premium_live_execution_alert(signal: Dict[str, Any], stage: str =
 
         state[key] = now
         premium_live_save_state(state)
+
+        
+        try:
+            signal["execution_score"] = premium_execution_score(signal)
+            signal["timing_quality"] = premium_timing_quality(signal)
+            signal["entry_quality"] = premium_entry_quality(signal)
+            signal["premium_risk_state"] = premium_risk_state_from_score(signal["execution_score"], signal)
+            signal["position_plan"] = premium_position_size_plan(signal["execution_score"], signal)
+        except Exception:
+            pass
 
         msg = build_premium_live_execution_alert(signal)
         send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
