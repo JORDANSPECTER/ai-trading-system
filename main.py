@@ -657,6 +657,26 @@ PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled
 
 
 
+
+# =========================================================
+# TRADE JOURNALING + LEARNING FEEDBACK LOOP
+# Records every accepted/blocked/executed/managed trade decision
+# and converts closed trades into learning memory for adaptive grading.
+# =========================================================
+ENABLE_TRADE_JOURNAL_LEARNING = os.getenv("ENABLE_TRADE_JOURNAL_LEARNING", "true").lower() == "true"
+TRADE_JOURNAL_FILE = os.getenv("TRADE_JOURNAL_FILE", "trade_journal.jsonl").strip()
+TRADE_LEARNING_FILE = os.getenv("TRADE_LEARNING_FILE", "trade_learning_summary.json").strip()
+TRADE_JOURNAL_SEND_ALERTS = os.getenv("TRADE_JOURNAL_SEND_ALERTS", "true").lower() == "true"
+TRADE_JOURNAL_MIN_R_FOR_WIN = float(os.getenv("TRADE_JOURNAL_MIN_R_FOR_WIN", "0.01"))
+TRADE_JOURNAL_REBUILD_ON_BOOT = os.getenv("TRADE_JOURNAL_REBUILD_ON_BOOT", "true").lower() == "true"
+
+LEARNING_MIN_SAMPLE_FOR_SETUP_SCORE = int(os.getenv("LEARNING_MIN_SAMPLE_FOR_SETUP_SCORE", "3"))
+LEARNING_WEAK_SETUP_WINRATE = float(os.getenv("LEARNING_WEAK_SETUP_WINRATE", "0.45"))
+LEARNING_STRONG_SETUP_WINRATE = float(os.getenv("LEARNING_STRONG_SETUP_WINRATE", "0.65"))
+LEARNING_SIZE_DOWN_WEAK_SETUPS = os.getenv("LEARNING_SIZE_DOWN_WEAK_SETUPS", "true").lower() == "true"
+LEARNING_BLOCK_EXTREME_WEAK_SETUPS = os.getenv("LEARNING_BLOCK_EXTREME_WEAK_SETUPS", "false").lower() == "true"
+LEARNING_WEAK_SIZE_MULT = float(os.getenv("LEARNING_WEAK_SIZE_MULT", "0.50"))
+
 # =========================================================
 # PORTFOLIO HEAT + EXPOSURE CONTROL
 # Fund-level guardrails:
@@ -1933,6 +1953,313 @@ def portfolio_heat_blocks_signal(signal: Dict[str, Any]) -> bool:
         return False
 
 
+def journal_now() -> int:
+    try:
+        return now_ts()
+    except Exception:
+        return int(time.time())
+
+
+def journal_signal_key(signal: Dict[str, Any]) -> str:
+    try:
+        raw = {
+            "ticker": str(signal.get("ticker", signal.get("symbol", ""))).upper(),
+            "direction": str(signal.get("direction", "")).upper(),
+            "grade": str(signal.get("grade", signal.get("confidence", ""))).upper(),
+            "setup": str(signal.get("setup", signal.get("strategy", ""))).lower(),
+            "entry": signal.get("entry", signal.get("entry_contract", 0)),
+            "timestamp": signal.get("timestamp", 0),
+        }
+        return hashlib.sha256(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return hashlib.sha256(str(signal).encode("utf-8")).hexdigest()[:16]
+
+
+def journal_append(event_type: str, payload: Dict[str, Any]) -> None:
+    if not ENABLE_TRADE_JOURNAL_LEARNING:
+        return
+    try:
+        row = {
+            "ts": journal_now(),
+            "event_type": str(event_type),
+            "payload": payload if isinstance(payload, dict) else {"value": payload},
+        }
+        with open(TRADE_JOURNAL_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception as e:
+        debug(f"TRADE JOURNAL APPEND ERROR | {e}")
+
+
+def journal_record_signal_decision(signal: Dict[str, Any], stage: str, decision: str, reason: str = "") -> None:
+    try:
+        if not ENABLE_TRADE_JOURNAL_LEARNING or not isinstance(signal, dict):
+            return
+        payload = {
+            "signal_key": journal_signal_key(signal),
+            "stage": stage,
+            "decision": decision,
+            "reason": reason,
+            "ticker": signal.get("ticker", signal.get("symbol", "")),
+            "direction": signal.get("direction", ""),
+            "grade": signal.get("grade", signal.get("confidence", "")),
+            "confidence": signal.get("confidence", ""),
+            "setup": signal.get("setup", signal.get("strategy", "")),
+            "trigger": signal.get("trigger", ""),
+            "confirmation": signal.get("confirmation", ""),
+            "qty": signal.get("qty", 0),
+            "entry": signal.get("entry", signal.get("entry_contract", 0)),
+            "stop": signal.get("stop", signal.get("stop_contract", 0)),
+            "target": signal.get("target", signal.get("tp1_contract", 0)),
+            "macro_bias": signal.get("macro_bias", ""),
+            "oil_price": signal.get("oil_price", 0),
+            "vix": signal.get("vix", 0),
+            "risk_state": signal.get("risk_state", ""),
+            "portfolio_heat_snapshot": signal.get("portfolio_heat_snapshot", {}),
+            "vol_conf_sizing": signal.get("vol_conf_sizing", {}),
+        }
+        journal_append("signal_decision", payload)
+    except Exception as e:
+        debug(f"TRADE JOURNAL SIGNAL DECISION ERROR | {e}")
+
+
+def journal_record_order_event(order_or_result: Dict[str, Any], event_type: str = "order_event") -> None:
+    try:
+        if not ENABLE_TRADE_JOURNAL_LEARNING:
+            return
+        payload = order_or_result if isinstance(order_or_result, dict) else {"value": order_or_result}
+        journal_append(event_type, payload)
+    except Exception as e:
+        debug(f"TRADE JOURNAL ORDER EVENT ERROR | {e}")
+
+
+def journal_trade_setup_key(trade: Dict[str, Any]) -> str:
+    try:
+        ticker = str(trade.get("ticker", trade.get("symbol", "UNKNOWN"))).upper().strip()
+        direction = str(trade.get("direction", "UNKNOWN")).upper().strip()
+        setup = str(trade.get("setup", trade.get("strategy", "GENERIC"))).lower().strip().replace(" ", "_")
+        grade = str(trade.get("grade", trade.get("confidence", "NA"))).upper().strip()
+        return f"{ticker}_{direction}_{grade}_{setup}"
+    except Exception:
+        return "UNKNOWN_UNKNOWN_NA_GENERIC"
+
+
+def journal_infer_trade_result(trade: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        entry = safe_float(trade.get("entry", trade.get("entry_price", 0)), 0.0)
+        exit_price = safe_float(trade.get("exit", trade.get("exit_price", trade.get("last_price", 0))), 0.0)
+        stop = safe_float(trade.get("stop", trade.get("stop_price", 0)), 0.0)
+        pnl = safe_float(trade.get("realized_pnl", trade.get("pnl", 0)), 0.0)
+        pnl_pct = safe_float(trade.get("realized_pnl_pct", trade.get("pnl_pct", 0)), 0.0)
+
+        risk_per_contract = abs(entry - stop) if entry > 0 and stop > 0 else 0.0
+        move = exit_price - entry if entry > 0 and exit_price > 0 else 0.0
+
+        r_multiple = 0.0
+        if risk_per_contract > 0 and move != 0:
+            r_multiple = move / risk_per_contract
+
+        if pnl != 0:
+            winner = pnl > 0
+        elif pnl_pct != 0:
+            winner = pnl_pct > 0
+        elif r_multiple != 0:
+            winner = r_multiple >= safe_float(TRADE_JOURNAL_MIN_R_FOR_WIN, 0.01)
+        else:
+            winner = bool(trade.get("winner", False))
+
+        return {
+            "winner": winner,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "r_multiple": round(r_multiple, 4),
+            "entry": entry,
+            "exit": exit_price,
+            "stop": stop,
+        }
+    except Exception:
+        return {"winner": False, "pnl": 0.0, "pnl_pct": 0.0, "r_multiple": 0.0}
+
+
+def journal_record_closed_trade(trade: Dict[str, Any], close_reason: str = "") -> None:
+    try:
+        if not ENABLE_TRADE_JOURNAL_LEARNING or not isinstance(trade, dict):
+            return
+
+        result = journal_infer_trade_result(trade)
+        payload = deepcopy(trade)
+        payload.update(result)
+        payload["setup_key"] = journal_trade_setup_key(payload)
+        payload["close_reason"] = close_reason or payload.get("close_reason", "")
+        payload["closed_at"] = journal_now()
+
+        journal_append("closed_trade", payload)
+
+        try:
+            risk_state_record_closed_trade(payload)
+        except Exception:
+            pass
+
+        rebuild_trade_learning_summary()
+
+        if TRADE_JOURNAL_SEND_ALERTS:
+            outcome = "WIN" if result.get("winner") else "LOSS"
+            send_to_discord(
+                DISCORD_AI_WEBHOOK,
+                f"📓 TRADE JOURNALED\nOutcome: {outcome}\nSetup: {payload.get('setup_key')}\nR: {result.get('r_multiple')}\nReason: {payload.get('close_reason','')}\n⏰ {now_ts()}",
+                "AI",
+            )
+    except Exception as e:
+        debug(f"TRADE JOURNAL CLOSED TRADE ERROR | {e}")
+
+
+def load_trade_journal_events(limit: int = 5000) -> List[Dict[str, Any]]:
+    rows = []
+    try:
+        if not os.path.exists(TRADE_JOURNAL_FILE):
+            return rows
+        with open(TRADE_JOURNAL_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        return rows[-limit:]
+    except Exception as e:
+        debug(f"LOAD TRADE JOURNAL ERROR | {e}")
+        return rows
+
+
+def rebuild_trade_learning_summary() -> Dict[str, Any]:
+    try:
+        events = load_trade_journal_events()
+        setup_stats: Dict[str, Any] = {}
+
+        for e in events:
+            if e.get("event_type") != "closed_trade":
+                continue
+            p = e.get("payload", {})
+            if not isinstance(p, dict):
+                continue
+
+            key = p.get("setup_key") or journal_trade_setup_key(p)
+            bucket = setup_stats.setdefault(key, {
+                "setup_key": key,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_r": 0.0,
+                "total_pnl": 0.0,
+                "recent_results": [],
+                "last_trade_ts": 0,
+            })
+
+            winner = bool(p.get("winner", False))
+            bucket["trades"] += 1
+            bucket["wins"] += 1 if winner else 0
+            bucket["losses"] += 0 if winner else 1
+            bucket["total_r"] += safe_float(p.get("r_multiple", 0), 0.0)
+            bucket["total_pnl"] += safe_float(p.get("pnl", 0), 0.0)
+            bucket["recent_results"].append("W" if winner else "L")
+            bucket["recent_results"] = bucket["recent_results"][-10:]
+            bucket["last_trade_ts"] = max(safe_int(bucket.get("last_trade_ts", 0), 0), safe_int(e.get("ts", 0), 0))
+
+        weak_setups = []
+        strong_setups = []
+
+        for key, b in setup_stats.items():
+            trades = max(safe_int(b.get("trades", 0), 0), 1)
+            win_rate = safe_float(b.get("wins", 0), 0) / trades
+            avg_r = safe_float(b.get("total_r", 0), 0.0) / trades
+            b["win_rate"] = round(win_rate, 4)
+            b["avg_r"] = round(avg_r, 4)
+            b["avg_pnl"] = round(safe_float(b.get("total_pnl", 0), 0.0) / trades, 4)
+
+            if trades >= LEARNING_MIN_SAMPLE_FOR_SETUP_SCORE and win_rate <= LEARNING_WEAK_SETUP_WINRATE:
+                weak_setups.append(key)
+            if trades >= LEARNING_MIN_SAMPLE_FOR_SETUP_SCORE and win_rate >= LEARNING_STRONG_SETUP_WINRATE:
+                strong_setups.append(key)
+
+        summary = {
+            "generated_at": journal_now(),
+            "total_closed_trades": sum(safe_int(v.get("trades", 0), 0) for v in setup_stats.values()),
+            "setup_count": len(setup_stats),
+            "weak_setups": weak_setups,
+            "strong_setups": strong_setups,
+            "setup_stats": setup_stats,
+        }
+        atomic_write_json(TRADE_LEARNING_FILE, summary)
+        debug(f"TRADE LEARNING SUMMARY WRITTEN | trades={summary['total_closed_trades']} setups={summary['setup_count']}")
+        return summary
+    except Exception as e:
+        debug(f"REBUILD TRADE LEARNING SUMMARY ERROR | {e}")
+        return {}
+
+
+def apply_learning_feedback_to_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Uses prior closed trade results to reduce/block weak setups before execution.
+    """
+    try:
+        if not ENABLE_TRADE_JOURNAL_LEARNING or not isinstance(signal, dict):
+            return signal
+
+        summary = load_json_file(TRADE_LEARNING_FILE, {})
+        if not isinstance(summary, dict) or not summary:
+            summary = rebuild_trade_learning_summary()
+
+        key = journal_trade_setup_key(signal)
+        stats = summary.get("setup_stats", {}).get(key, {}) if isinstance(summary.get("setup_stats", {}), dict) else {}
+
+        signal["learning_setup_key"] = key
+        signal["learning_stats"] = stats
+
+        trades = safe_int(stats.get("trades", 0), 0)
+        win_rate = safe_float(stats.get("win_rate", 0), 0.0)
+
+        if trades < LEARNING_MIN_SAMPLE_FOR_SETUP_SCORE:
+            signal["learning_action"] = "observe_only"
+            debug(f"LEARNING OBSERVE ONLY | setup={key} trades={trades}/{LEARNING_MIN_SAMPLE_FOR_SETUP_SCORE}")
+            return signal
+
+        if win_rate <= LEARNING_WEAK_SETUP_WINRATE:
+            signal["learning_action"] = "weak_setup"
+            if LEARNING_BLOCK_EXTREME_WEAK_SETUPS:
+                signal["blocked_by_learning"] = True
+                signal["learning_block_reason"] = f"weak_setup_winrate_{round(win_rate*100,1)}"
+                debug(f"LEARNING BLOCKED TRADE | setup={key} win_rate={round(win_rate*100,1)}%")
+                return signal
+
+            if LEARNING_SIZE_DOWN_WEAK_SETUPS:
+                original_qty = safe_int(signal.get("qty", 1), 1)
+                new_qty = max(1, int(math.floor(original_qty * safe_float(LEARNING_WEAK_SIZE_MULT, 0.5))))
+                signal["qty_before_learning"] = original_qty
+                signal["qty"] = new_qty
+                signal["learning_size_reduced"] = True
+                debug(f"LEARNING SIZE DOWN | setup={key} win_rate={round(win_rate*100,1)}% qty={original_qty}->{new_qty}")
+                return signal
+
+        if win_rate >= LEARNING_STRONG_SETUP_WINRATE:
+            signal["learning_action"] = "strong_setup"
+            debug(f"LEARNING STRONG SETUP | setup={key} win_rate={round(win_rate*100,1)}%")
+
+        signal["blocked_by_learning"] = False
+        signal["learning_block_reason"] = ""
+        return signal
+    except Exception as e:
+        debug(f"APPLY LEARNING FEEDBACK ERROR | {e}")
+        return signal
+
+
+def learning_blocks_signal(signal: Dict[str, Any]) -> bool:
+    try:
+        return bool(isinstance(signal, dict) and signal.get("blocked_by_learning"))
+    except Exception:
+        return False
+
+
 def risk_state_record_closed_trade(trade_or_position: Dict[str, Any]) -> Dict[str, Any]:
     """
     Updates win/loss streaks when a trade closes.
@@ -2180,8 +2507,15 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
 
             candidate = apply_portfolio_heat_exposure_control(candidate)
             if portfolio_heat_blocks_signal(candidate):
+                journal_record_signal_decision(candidate, "portfolio_heat", "blocked", candidate.get("portfolio_heat_reason", "portfolio_heat_blocked"))
                 return {"generated": False, "reason": "portfolio_heat_blocked", "signal": candidate}
 
+            candidate = apply_learning_feedback_to_signal(candidate)
+            if learning_blocks_signal(candidate):
+                journal_record_signal_decision(candidate, "learning_feedback", "blocked", candidate.get("learning_block_reason", "learning_blocked"))
+                return {"generated": False, "reason": "learning_blocked", "signal": candidate}
+
+            journal_record_signal_decision(candidate, "auto_ai_generator", "generated", "passed_all_filters")
             atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
             state["last_signal_ts"] = now_ts()
             state["last_signal_key"] = key
@@ -2457,6 +2791,16 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             debug(f"PORTFOLIO HEAT BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
             archive_ai_signal_input(ai, "portfolio_heat_blocked", {"reason": reason, "normalized_signal": signal})
             return {"written": False, "reason": "portfolio_heat_blocked", "portfolio_heat_reason": reason, "signal": signal}
+
+        signal = apply_learning_feedback_to_signal(signal)
+        if learning_blocks_signal(signal):
+            reason = signal.get("learning_block_reason", "learning_blocked")
+            debug(f"LEARNING BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "learning_blocked", {"reason": reason, "normalized_signal": signal})
+            journal_record_signal_decision(signal, "learning_feedback", "blocked", reason)
+            return {"written": False, "reason": "learning_blocked", "learning_reason": reason, "signal": signal}
+
+        journal_record_signal_decision(signal, "ai_bridge", "written", "passed_all_filters")
 
         if errors:
             debug(f"AI BRIDGE BLOCKED | errors={errors}")
