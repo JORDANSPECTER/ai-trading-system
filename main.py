@@ -10198,6 +10198,211 @@ def build_premium_daily_levels_alert(signal: Dict[str, Any]) -> str:
     )
 
 
+
+
+def build_live_entry_oil_alert(signal: Dict[str, Any]) -> str:
+    """
+    UnBiased live-entry channel style.
+
+    ✅ SPY | Relief Alert
+
+    🛢️ Oil: 124.83 (+0.02%)
+    📈 SPY: 679.34 (+0.00%)
+    📍 VWAP: 679.04
+
+    Plan Language
+    Price is above VWAP and oil relief is aligned, which supports bullish continuation.
+
+    Trigger
+    • Live test using current market data.
+
+    Trade Idea
+    Entry: Test mode using live prices.
+    🛑 Invalidation: Loss of key level.
+    🎯 Target: Next level based on the current map.
+
+    Bias: BULLISH
+    Session: Midday High-Conviction Filter
+    Timer: timestamp
+    """
+    ticker = str(signal.get("ticker") or signal.get("underlying") or "QQQ").upper().strip()
+    direction = str(signal.get("direction") or "").upper().strip()
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences"), dict) else {}
+
+    oil_value = (
+        signal.get("oil_price")
+        or signal.get("oil")
+        or con.get("oil_price")
+        or con.get("oil")
+        or "Not provided"
+    )
+
+    oil_change = (
+        signal.get("oil_change_pct")
+        or con.get("oil_change_pct")
+        or signal.get("uso_change_pct")
+        or con.get("uso_change_pct")
+        or "+0.00%"
+    )
+
+    ticker_price = (
+        signal.get("underlying_price")
+        or signal.get("stock_price")
+        or signal.get("current_price")
+        or signal.get("price")
+        or signal.get("entry_price")
+        or signal.get("entry")
+        or "Live"
+    )
+
+    ticker_change = (
+        signal.get("ticker_change_pct")
+        or signal.get("change_pct")
+        or con.get("ticker_change_pct")
+        or con.get("change_pct")
+        or "+0.00%"
+    )
+
+    vwap = (
+        signal.get("vwap")
+        or con.get("vwap_price")
+        or con.get("vwap")
+        or "Not provided"
+    )
+
+    setup = (
+        signal.get("trigger")
+        or signal.get("setup_name")
+        or signal.get("setup")
+        or signal.get("setup_type")
+        or "Live test using current market data."
+    )
+
+    entry = (
+        signal.get("entry")
+        or signal.get("entry_price")
+        or signal.get("contract_price")
+        or "Test mode using live prices."
+    )
+
+    invalidation = (
+        signal.get("invalidation")
+        or signal.get("stop")
+        or signal.get("stop_loss")
+        or "Loss of key level."
+    )
+
+    target = (
+        signal.get("target")
+        or signal.get("targets")
+        or "Next level based on the current map."
+    )
+
+    market_type = (
+        signal.get("session")
+        or signal.get("time_window")
+        or signal.get("market_type")
+        or con.get("market_type")
+        or "Midday High-Conviction Filter"
+    )
+
+    timestamp = (
+        signal.get("timer")
+        or signal.get("timestamp")
+        or signal.get("created_at")
+        or now_ts()
+    )
+
+    # Bias language
+    if direction == "CALL":
+        bias = "BULLISH"
+        alert_type = "Relief Alert"
+        plan = f"Price is above VWAP and oil relief is aligned, which supports bullish continuation."
+    elif direction == "PUT":
+        bias = "BEARISH"
+        alert_type = "Pressure Alert"
+        plan = f"Price is below/rejecting VWAP and oil pressure is aligned, which supports bearish continuation."
+    else:
+        bias = "NEUTRAL"
+        alert_type = "Decision Alert"
+        plan = f"Price, VWAP, oil, and structure need alignment before execution."
+
+    # Improve plan if specific fields say otherwise
+    vwap_text = str(vwap).lower()
+    oil_text = str(oil_value).lower()
+
+    if direction == "CALL" and ("below" in vwap_text or "reject" in vwap_text):
+        plan = "Price is not cleanly above VWAP yet. Wait for reclaim/hold before bullish continuation."
+    if direction == "PUT" and ("above" in vwap_text or "reclaim" in vwap_text):
+        plan = "Price is not cleanly below VWAP yet. Wait for rejection/failure before bearish continuation."
+
+    return (
+        f"✅ {ticker} | {alert_type}\n\n"
+        f"🛢️ Oil: {oil_value} ({oil_change})\n"
+        f"📈 {ticker}: {ticker_price} ({ticker_change})\n"
+        f"📍 VWAP: {vwap}\n\n"
+        f"**Plan Language**\n"
+        f"{plan}\n\n"
+        f"**Trigger**\n"
+        f"• {setup}\n\n"
+        f"**Trade Idea**\n"
+        f"Entry: {entry}\n"
+        f"🛑 Invalidation: {invalidation}\n"
+        f"🎯 Target: {target}\n\n"
+        f"Bias: {bias}\n"
+        f"Session: {market_type}\n"
+        f"Timer: {timestamp}"
+    )
+
+
+def maybe_send_live_entry_oil_style_alert(signal: Dict[str, Any], stage: str = "signal") -> None:
+    """
+    Sends the exact UnBiased live alert style to DISCORD_LIVE_ENTRY_WEBHOOK.
+    This is separate from dark pool resource alerts.
+    """
+    if not ENABLE_PREMIUM_DAILY_LEVEL_ALERTS:
+        return
+
+    try:
+        if not isinstance(signal, dict):
+            return
+
+        ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
+        if ticker not in PREMIUM_DAILY_LEVEL_TICKERS:
+            return
+
+        grade = premium_daily_get_grade(signal)
+        if not premium_daily_meets_grade(grade, PREMIUM_DAILY_MIN_GRADE):
+            return
+
+        state = premium_daily_load_state()
+        now = int(time.time())
+        direction = str(signal.get("direction") or "").upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_name") or signal.get("trigger") or "").lower().strip()
+        key = f"oil_style:{ticker}:{direction}:{grade}:{setup}:{stage}"
+        last = safe_int(state.get(key, 0), 0)
+
+        if last and (now - last) < PREMIUM_DAILY_ALERT_COOLDOWN_SECONDS:
+            return
+
+        state[key] = now
+        premium_daily_save_state(state)
+
+        msg = build_live_entry_oil_alert(signal)
+        send_to_live_entry_discord(msg)
+
+        try:
+            debug(f"LIVE ENTRY OIL STYLE ALERT SENT | ticker={ticker} grade={grade} stage={stage}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            debug(f"LIVE ENTRY OIL STYLE ALERT FAILED | {e}")
+        except Exception:
+            pass
+
+
 def maybe_send_premium_daily_levels_alert(signal: Dict[str, Any], stage: str = "signal") -> None:
     if not ENABLE_PREMIUM_DAILY_LEVEL_ALERTS:
         return
@@ -11100,7 +11305,7 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("options_liquidity_block:" + bridge_liquidity.get("reason", "unknown"))
     signal["options_liquidity"] = bridge_liquidity
     signal = apply_unusual_whales_darkpool_to_signal(signal, stage="paper_bridge_create_order")
-    maybe_send_premium_daily_levels_alert(signal, stage="paper_bridge_create_order")
+    maybe_send_live_entry_oil_style_alert(signal, stage="paper_bridge_create_order")
     if unusual_whales_darkpool_blocks_signal(signal):
         raise RuntimeError("darkpool_block:" + str(signal.get("dark_pool", {}).get("reason", "unknown")))
 
@@ -11520,7 +11725,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     if ENABLE_PAPER_BROKER_BRIDGE and FORCE_EXECUTION_MODE:
         signal = apply_unusual_whales_darkpool_to_signal(signal, stage="force_paper_bridge")
         send_unusual_whales_darkpool_alert(signal)
-        maybe_send_premium_daily_levels_alert(signal, stage="force_paper_bridge")
+        maybe_send_live_entry_oil_style_alert(signal, stage="force_paper_bridge")
         if unusual_whales_darkpool_blocks_signal(signal):
             return None
         bridge_result = paper_broker_bridge_execute(signal)
@@ -11623,7 +11828,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     # Institutional resource levels become confluence before Phase 3 sizing/execution.
     regime_signal = apply_unusual_whales_darkpool_to_signal(regime_signal, stage="pre_phase3")
     send_unusual_whales_darkpool_alert(regime_signal)
-    maybe_send_premium_daily_levels_alert(regime_signal, stage="pre_phase3")
+    maybe_send_live_entry_oil_style_alert(regime_signal, stage="pre_phase3")
     if unusual_whales_darkpool_blocks_signal(regime_signal):
         return
 
