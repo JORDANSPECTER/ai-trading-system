@@ -126,6 +126,7 @@ DISCORD_AI_WEBHOOK = os.getenv("DISCORD_AI_WEBHOOK", "").strip()
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
 DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "").strip()
 DISCORD_DARKPOOL_WEBHOOK = os.getenv("DISCORD_DARKPOOL_WEBHOOK", "").strip()
+DISCORD_LIVE_ENTRY_WEBHOOK = os.getenv("DISCORD_LIVE_ENTRY_WEBHOOK", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -623,7 +624,7 @@ def hard_kill_engine(reason: str = "", close_positions: bool = True):
     )
     try:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
     except Exception as e:
         log(f"â HARD KILL alert failed: {e}")
@@ -6429,7 +6430,7 @@ def finalize_close_position(position: Dict[str, Any], exit_price: float, note: s
 
     msg = build_position_close_message(position, note)
     send_to_telegram(msg)
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
 
 
 def recalc_position_from_fill(position: Dict[str, Any], fill_qty: int, fill_price: float):
@@ -6576,7 +6577,7 @@ def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     save_state(GLOBAL_STATE)
     msg = build_position_open_message(position)
     send_to_telegram(msg)
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
     return position
 
 
@@ -6639,7 +6640,7 @@ def submit_live_entry(signal: Dict[str, Any], position: Dict[str, Any]) -> Optio
     save_state(GLOBAL_STATE)
     msg = build_live_order_message(order_record, "LIVE ENTRY SUBMITTED")
     send_to_telegram(msg)
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
     phase2_post_fill_risk_snapshot("live_entry_submitted")
     return order_record
 
@@ -6687,7 +6688,7 @@ def live_scale_out(position: Dict[str, Any], qty_to_close: int, note: str) -> bo
     save_positions(GLOBAL_POSITIONS)
     msg = build_live_order_message(order_record, note)
     send_to_telegram(msg)
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
     return True
 
 
@@ -6718,7 +6719,7 @@ def live_close_position(position: Dict[str, Any], note: str) -> bool:
     save_positions(GLOBAL_POSITIONS)
     msg = build_live_order_message(order_record, note)
     send_to_telegram(msg)
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
     return True
 
 
@@ -7291,7 +7292,7 @@ def send_position_management_update(position: Dict[str, Any], note: str):
     msg = build_position_update_message(position, note)
     send_to_telegram(msg)
     send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
 
 
 # =========================================================
@@ -7620,7 +7621,7 @@ def open_position_if_missing(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if not duplicate_gate["approved"]:
         msg = build_block_message("HARD DUPLICATE CAP SKIPPED OPEN", signal, duplicate_gate["reject_reasons"], "open_position_if_missing refused to create a stacked position.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
         debug(f"ENTRY TRIGGER SKIPPED BY HARD DUPLICATE CAP | symbol={symbol} | reasons={duplicate_gate['reject_reasons']}")
         return None
@@ -7708,7 +7709,7 @@ def step14_send_alert(title: str, body: str):
     log(msg.replace("\n", " | "))
     if STEP14_SEND_ALERTS:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
 
 
@@ -7756,7 +7757,7 @@ def step14_can_open_new_trade(signal: Optional[Dict[str, Any]] = None) -> Dict[s
         if signal:
             msg = build_block_message("STEP 14 PORTFOLIO RISK BLOCKED ENTRY", signal, reasons, extra)
             send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-            send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+            send_to_live_entry_discord(msg)
             send_to_telegram(msg)
         else:
             step14_send_alert("STEP 14 PORTFOLIO RISK BLOCKED ENTRY", extra)
@@ -7867,7 +7868,7 @@ def step15_alert(title: str, body: str, force: bool = False):
     log(msg.replace("\n", " | "))
     if STEP15_SEND_ALERTS:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
 
 
@@ -8223,7 +8224,7 @@ def phase0_alert(title: str, body: str, force: bool = False):
     log(msg.replace("\n", " | "))
     if PHASE0_SEND_ALERTS:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
 
 
@@ -8648,7 +8649,7 @@ def phase1_alert(title: str, body: str):
     log(msg.replace("\n", " | "))
     if PHASE1_SEND_ALERTS:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
 
 
@@ -8904,7 +8905,7 @@ def options_liquidity_gate(signal_or_stub: Dict[str, Any], prices: Dict[str, Any
         )
         if OPTIONS_LIQUIDITY_SEND_ALERTS:
             send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-            send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+            send_to_live_entry_discord(msg)
             send_to_telegram(msg)
         debug(f"OPTIONS LIQUIDITY BLOCK | {symbol} | reasons={reasons} | quote={quote}")
 
@@ -9024,7 +9025,7 @@ def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty:
         )
         msg = build_block_message("PHASE 1 ORDER SAFETY BLOCK", signal_or_stub, reasons, extras)
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
         if PHASE1_SOFT_HALT_ON_RATE_LIMIT and any(r in reasons for r in ["max_orders_per_minute_hit", "max_orders_per_hour_hit", "max_orders_per_day_hit"]):
             phase1_soft_halt(", ".join(reasons))
@@ -9042,7 +9043,7 @@ def phase2_alert(title: str, details: str, force: bool = False):
         return
     msg = f"🧱 {title}\n{details}\n⏰ {now_ts()}"
     send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-    send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+    send_to_live_entry_discord(msg)
     send_to_telegram(msg)
 
 
@@ -9617,7 +9618,7 @@ def phase35_block(title: str, signal: Dict[str, Any], reasons: List[str], extras
     if PHASE35_SEND_ALERTS:
         msg = build_block_message(title, signal, reasons, extras)
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
     return {"approved": False, "stage": "phase35_enforcement", "reject_reasons": reasons, "extras": extras}
 
@@ -9941,6 +9942,304 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 
+
+
+
+
+
+def send_to_live_entry_discord(message: str) -> None:
+    """
+    Dedicated UNBIASED-LIVE-ENTRY-ALERT router.
+    Uses DISCORD_LIVE_ENTRY_WEBHOOK first.
+    Falls back to DISCORD_PREMIUM_WEBHOOK if missing.
+    """
+    try:
+        target = DISCORD_LIVE_ENTRY_WEBHOOK or DISCORD_PREMIUM_WEBHOOK
+        if not target:
+            try:
+                debug("LIVE ENTRY WEBHOOK MISSING | set DISCORD_LIVE_ENTRY_WEBHOOK")
+            except Exception:
+                pass
+            return
+        send_to_discord(target, message, "LIVE_ENTRY")
+    except Exception as e:
+        try:
+            debug(f"LIVE ENTRY webhook send failed: {e}")
+        except Exception:
+            pass
+
+
+# =========================================================
+# PREMIUM DAILY LEVELS / QQQ-SPY GRADED BIAS ALERTS
+# Sends premium-style market decision alerts with:
+# - QQQ/SPY grade
+# - confidence
+# - tech strength
+# - VWAP / volume / oil / macro / dark pool confluence
+# =========================================================
+ENABLE_PREMIUM_DAILY_LEVEL_ALERTS = os.getenv("ENABLE_PREMIUM_DAILY_LEVEL_ALERTS", "true").lower() == "true"
+PREMIUM_DAILY_LEVEL_TICKERS = {
+    x.strip().upper()
+    for x in os.getenv("PREMIUM_DAILY_LEVEL_TICKERS", "QQQ,SPY").split(",")
+    if x.strip()
+}
+PREMIUM_DAILY_MIN_GRADE = os.getenv("PREMIUM_DAILY_MIN_GRADE", "B").upper().strip()
+PREMIUM_DAILY_ALERT_COOLDOWN_SECONDS = int(os.getenv("PREMIUM_DAILY_ALERT_COOLDOWN_SECONDS", "180"))
+PREMIUM_DAILY_ALERT_STATE_FILE = os.getenv("PREMIUM_DAILY_ALERT_STATE_FILE", "premium_daily_alert_state.json").strip()
+
+
+def premium_daily_load_state() -> Dict[str, Any]:
+    try:
+        data = load_json_file(PREMIUM_DAILY_ALERT_STATE_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def premium_daily_save_state(data: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(PREMIUM_DAILY_ALERT_STATE_FILE, data)
+    except Exception as e:
+        try:
+            debug(f"PREMIUM DAILY state save failed: {e}")
+        except Exception:
+            pass
+
+
+def premium_daily_grade_rank(grade: str) -> int:
+    ladder = ["AVOID", "C", "B", "B+", "A", "A+"]
+    g = str(grade or "B").upper().strip()
+    if g not in ladder:
+        g = "B"
+    return ladder.index(g)
+
+
+def premium_daily_meets_grade(grade: str, min_grade: str) -> bool:
+    return premium_daily_grade_rank(grade) >= premium_daily_grade_rank(min_grade)
+
+
+def premium_daily_get_signal_text(signal: Dict[str, Any], *keys, default: str = "Unknown") -> str:
+    for key in keys:
+        v = signal.get(key)
+        if v not in (None, "", [], {}):
+            return str(v)
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences"), dict) else {}
+    for key in keys:
+        v = con.get(key)
+        if v not in (None, "", [], {}):
+            return str(v)
+    return default
+
+
+def premium_daily_get_grade(signal: Dict[str, Any]) -> str:
+    return str(signal.get("grade") or signal.get("confidence") or "B").upper().strip()
+
+
+def premium_daily_confidence_label(signal: Dict[str, Any]) -> str:
+    grade = premium_daily_get_grade(signal)
+    learning = signal.get("learning") or signal.get("adaptive_learning") or signal.get("adaptive_sizing") or {}
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+    boost = safe_int(dp.get("grade_boost", 0), 0)
+
+    if grade == "A+":
+        return "Very High"
+    if grade == "A":
+        return "High"
+    if grade == "B+":
+        return "Moderate-High"
+    if boost > 0:
+        return "Improving"
+    if grade in {"C", "AVOID"}:
+        return "Low"
+    return "Moderate"
+
+
+def premium_daily_tech_strength(signal: Dict[str, Any]) -> str:
+    ticker = str(signal.get("ticker", "")).upper().strip()
+    direction = str(signal.get("direction", "")).upper().strip()
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences"), dict) else {}
+
+    vwap = str(con.get("vwap") or signal.get("vwap") or "").lower()
+    volume = str(con.get("volume") or signal.get("volume") or "").lower()
+    structure = str(con.get("structure") or signal.get("structure") or signal.get("setup") or signal.get("setup_type") or "").lower()
+    market = str(con.get("market_type") or signal.get("market_type") or "").lower()
+    oil = str(con.get("oil") or signal.get("oil") or "").lower()
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+
+    score = 0
+    reasons = []
+
+    if direction == "CALL":
+        if "above" in vwap or "reclaim" in vwap:
+            score += 2
+            reasons.append("above VWAP")
+        if "breakout" in structure or "hold" in structure or "retest" in structure:
+            score += 2
+            reasons.append("structure holding")
+        if "strong" in volume or "spike" in volume:
+            score += 1
+            reasons.append("volume confirming")
+        if "falling" in oil or "down" in oil or "dump" in oil:
+            score += 1
+            reasons.append("oil supportive")
+    elif direction == "PUT":
+        if "below" in vwap or "reject" in vwap:
+            score += 2
+            reasons.append("below/rejecting VWAP")
+        if "rejection" in structure or "lower" in structure or "breakdown" in structure:
+            score += 2
+            reasons.append("bearish structure")
+        if "strong" in volume or "spike" in volume:
+            score += 1
+            reasons.append("volume confirming")
+        if "rising" in oil or "up" in oil or "spike" in oil:
+            score += 1
+            reasons.append("oil risk-off")
+
+    if isinstance(dp, dict):
+        actions = " ".join(dp.get("actions", [])) if isinstance(dp.get("actions"), list) else str(dp.get("actions", ""))
+        if "supported" in actions or "accepted" in actions:
+            score += 1
+            reasons.append("dark pool aligned")
+
+    if "trend" in market or "expansion" in market:
+        score += 1
+        reasons.append("trend/expansion")
+
+    if score >= 6:
+        label = "Strong"
+    elif score >= 4:
+        label = "Building"
+    elif score >= 2:
+        label = "Mixed"
+    else:
+        label = "Weak / Not Confirmed"
+
+    reason_text = ", ".join(reasons[:4]) if reasons else "needs confirmation"
+    return f"{label} — {reason_text}"
+
+
+def premium_daily_trade_decision(signal: Dict[str, Any]) -> str:
+    grade = premium_daily_get_grade(signal)
+    direction = str(signal.get("direction", "")).upper().strip()
+    tech = premium_daily_tech_strength(signal).lower()
+
+    if grade in {"A+", "A"} and ("strong" in tech or "building" in tech):
+        return f"TRADEABLE {direction} setup — wait for entry confirmation"
+    if grade in {"B+", "B"}:
+        return f"WAIT — bias forming, needs stronger confirmation"
+    return "AVOID / OBSERVE — not enough confluence"
+
+
+def premium_daily_dark_pool_summary(signal: Dict[str, Any]) -> str:
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+    if not dp:
+        return "No dark pool read yet"
+
+    support = dp.get("nearest_support")
+    resistance = dp.get("nearest_resistance")
+    actions = dp.get("actions", [])
+
+    parts = []
+    if isinstance(support, dict) and support.get("price"):
+        parts.append(f"support {safe_float(support.get('price'), 0):.2f}")
+    if isinstance(resistance, dict) and resistance.get("price"):
+        parts.append(f"resistance {safe_float(resistance.get('price'), 0):.2f}")
+    if isinstance(actions, list) and actions:
+        parts.append(", ".join(actions[:2]))
+
+    if not parts:
+        return str(dp.get("reason", "observe only"))
+
+    return " | ".join(parts)
+
+
+def build_premium_daily_levels_alert(signal: Dict[str, Any]) -> str:
+    ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
+    direction = str(signal.get("direction") or "NEUTRAL").upper().strip()
+    grade = premium_daily_get_grade(signal)
+    confidence = premium_daily_confidence_label(signal)
+
+    setup = premium_daily_get_signal_text(signal, "setup_name", "setup", "setup_type", "trigger", default="No setup name")
+    vwap = premium_daily_get_signal_text(signal, "vwap", default="Not provided")
+    volume = premium_daily_get_signal_text(signal, "volume", default="Not provided")
+    oil = premium_daily_get_signal_text(signal, "oil", default="Not provided")
+    market = premium_daily_get_signal_text(signal, "market_type", "regime", default="Not provided")
+    tech = premium_daily_tech_strength(signal)
+    darkpool = premium_daily_dark_pool_summary(signal)
+    decision = premium_daily_trade_decision(signal)
+
+    entry = signal.get("entry") or signal.get("entry_price") or signal.get("contract_price") or "wait for trigger"
+    stop = signal.get("stop") or signal.get("stop_loss") or "below/above structure"
+    targets = signal.get("targets") or signal.get("target") or "next key level"
+
+    return (
+        f"💎 PREMIUM DAILY LEVELS — {ticker}\n\n"
+        f"Grade: {grade}\n"
+        f"Confidence: {confidence}\n"
+        f"Bias: {direction}\n"
+        f"Decision: {decision}\n\n"
+        f"🧠 Setup:\n"
+        f"• {setup}\n\n"
+        f"📊 Tech Strength:\n"
+        f"• {tech}\n\n"
+        f"📍 Execution Plan:\n"
+        f"• Entry: {entry}\n"
+        f"• Stop: {stop}\n"
+        f"• Target(s): {targets}\n\n"
+        f"🔎 Confluence:\n"
+        f"• VWAP: {vwap}\n"
+        f"• Volume: {volume}\n"
+        f"• Oil/Macro: {oil}\n"
+        f"• Market: {market}\n"
+        f"• Dark Pool: {darkpool}\n\n"
+        f"⚠️ Rule:\n"
+        f"• No chase. Wait for confirmation at the level."
+    )
+
+
+def maybe_send_premium_daily_levels_alert(signal: Dict[str, Any], stage: str = "signal") -> None:
+    if not ENABLE_PREMIUM_DAILY_LEVEL_ALERTS:
+        return
+
+    try:
+        if not isinstance(signal, dict):
+            return
+
+        ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
+        if ticker not in PREMIUM_DAILY_LEVEL_TICKERS:
+            return
+
+        grade = premium_daily_get_grade(signal)
+        if not premium_daily_meets_grade(grade, PREMIUM_DAILY_MIN_GRADE):
+            return
+
+        state = premium_daily_load_state()
+        now = int(time.time())
+        direction = str(signal.get("direction") or "").upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_name") or signal.get("trigger") or "").lower().strip()
+        key = f"{ticker}:{direction}:{grade}:{setup}:{stage}"
+        last = safe_int(state.get(key, 0), 0)
+
+        if last and (now - last) < PREMIUM_DAILY_ALERT_COOLDOWN_SECONDS:
+            return
+
+        state[key] = now
+        premium_daily_save_state(state)
+
+        msg = build_premium_daily_levels_alert(signal)
+        send_to_live_entry_discord(msg)
+
+        try:
+            debug(f"PREMIUM DAILY ALERT SENT | ticker={ticker} grade={grade} stage={stage}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            debug(f"PREMIUM DAILY ALERT FAILED | {e}")
+        except Exception:
+            pass
 
 
 def send_to_darkpool_discord(message: str) -> None:
@@ -10801,6 +11100,7 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("options_liquidity_block:" + bridge_liquidity.get("reason", "unknown"))
     signal["options_liquidity"] = bridge_liquidity
     signal = apply_unusual_whales_darkpool_to_signal(signal, stage="paper_bridge_create_order")
+    maybe_send_premium_daily_levels_alert(signal, stage="paper_bridge_create_order")
     if unusual_whales_darkpool_blocks_signal(signal):
         raise RuntimeError("darkpool_block:" + str(signal.get("dark_pool", {}).get("reason", "unknown")))
 
@@ -11156,7 +11456,7 @@ def paper_bridge_alert(order: Dict[str, Any], position: Dict[str, Any]) -> None:
     )
     try:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
     except Exception as e:
         debug(f"paper_bridge_alert_error:{e}")
@@ -11220,6 +11520,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     if ENABLE_PAPER_BROKER_BRIDGE and FORCE_EXECUTION_MODE:
         signal = apply_unusual_whales_darkpool_to_signal(signal, stage="force_paper_bridge")
         send_unusual_whales_darkpool_alert(signal)
+        maybe_send_premium_daily_levels_alert(signal, stage="force_paper_bridge")
         if unusual_whales_darkpool_blocks_signal(signal):
             return None
         bridge_result = paper_broker_bridge_execute(signal)
@@ -11265,7 +11566,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not duplicate_gate["approved"]:
         msg = build_block_message("HARD DUPLICATE CAP BLOCKED SIGNAL", signal, duplicate_gate["reject_reasons"], "Existing symbol/direction is already open or signal was already used.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
         try:
             intel_event("duplicate_entry_blocked", {"reasons": duplicate_gate["reject_reasons"]}, signal=signal, stage="hard_duplicate_cap", decision="blocked")
@@ -11278,7 +11579,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not phase0_decision["approved"]:
         msg = build_block_message("PHASE 0 BLOCKED SIGNAL", signal, phase0_decision["reject_reasons"], "Fresh price / state / hard risk gate failed.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
         return
 
@@ -11322,6 +11623,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     # Institutional resource levels become confluence before Phase 3 sizing/execution.
     regime_signal = apply_unusual_whales_darkpool_to_signal(regime_signal, stage="pre_phase3")
     send_unusual_whales_darkpool_alert(regime_signal)
+    maybe_send_premium_daily_levels_alert(regime_signal, stage="pre_phase3")
     if unusual_whales_darkpool_blocks_signal(regime_signal):
         return
 
@@ -11332,7 +11634,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not phase3_decision["approved"]:
         msg = build_block_message("PHASE 3 ADAPTIVE BLOCKED SIGNAL", regime_signal, phase3_decision.get("reject_reasons", []), f"Setup: {phase3_decision.get('setup_key')} | Stats: {phase3_decision.get('stats', {})}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
         return
 
@@ -11393,7 +11695,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not duplicate_gate_final["approved"]:
         msg = build_block_message("HARD DUPLICATE CAP BLOCKED ENTRY", sized_signal, duplicate_gate_final["reject_reasons"], "Blocked at final pre-order gate.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
         try:
             intel_event("duplicate_entry_blocked", {"reasons": duplicate_gate_final["reject_reasons"]}, signal=sized_signal, stage="hard_duplicate_cap_final", decision="blocked")
@@ -12303,7 +12605,7 @@ def paper_tpsl_alert(title: str, pos: Dict[str, Any]) -> None:
     )
     try:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
-        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+        send_to_live_entry_discord(msg)
         send_to_telegram(msg)
     except Exception as e:
         debug(f"paper_tpsl_alert_error:{e}")
