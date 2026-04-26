@@ -10,7 +10,7 @@
   "admin_log": [],
   "bot_paused": false,
   "flatten_requested": false,
-  "armed": true,
+  "armed": false,
   "mode": "live",
   "last_command": "/ping",
   "last_command_time_utc": "2026-04-18 20:19:41 UTC",
