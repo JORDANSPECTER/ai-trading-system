@@ -9990,16 +9990,6 @@ def send_execution_or_original_discord(message: str, original_webhook: str, user
             "PAPER POSITION OPENED",
             "PAPER ORDER FILLED",
 
-    signal = enrich_signal_with_execution_risk_fields(signal)
-    try:
-        qty, exec_score_size_reason = apply_execution_score_to_order_qty(signal, qty)
-    except NameError:
-        final_qty, exec_score_size_reason = apply_execution_score_to_order_qty(signal, final_qty)
-        qty = final_qty
-    if qty <= 0:
-        debug(f"EXEC SCORE SIZE BLOCKED | reason={exec_score_size_reason}")
-        return False, exec_score_size_reason
-    debug(f"EXEC SCORE SIZE OK | reason={exec_score_size_reason}")
             "PAPER ORDER CREATED",
             "PAPER BRIDGE DUPLICATE CAP BLOCKED",
             "PAPER BROKER BRIDGE RESULT",
@@ -11744,6 +11734,27 @@ def enrich_signal_with_execution_risk_fields(signal: Dict[str, Any]) -> Dict[str
             pass
 
     return signal
+
+
+def safe_apply_execution_score_sizing(signal: Dict[str, Any], qty: Any) -> Tuple[int, str]:
+    """
+    Safe wrapper for execution-score sizing.
+    This can be called only from clean qty assignment locations.
+    """
+    try:
+        signal = enrich_signal_with_execution_risk_fields(signal)
+        final_qty, reason = apply_execution_score_to_order_qty(signal, qty)
+        return final_qty, reason
+    except Exception as e:
+        try:
+            debug(f"EXEC SCORE SAFE SIZING FAILED | {e}")
+        except Exception:
+            pass
+        try:
+            return int(qty), "exec_score_sizing_error_passthrough"
+        except Exception:
+            return 0, "exec_score_sizing_error_zero"
+
 
 
 def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
