@@ -653,6 +653,21 @@ PHASE3_ADAPTIVE_STATS_FILE = os.getenv("PHASE3_ADAPTIVE_STATS_FILE", "adaptive_s
 PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled_setups.json").strip()
 
 
+
+# =========================================================
+# ELITE EXECUTION FILTER: A/A+ ONLY + NO CHASING
+# Blocks weak grades and late entries before signal.json reaches execution.
+# =========================================================
+ENABLE_ELITE_EXECUTION_FILTER = os.getenv("ENABLE_ELITE_EXECUTION_FILTER", "true").lower() == "true"
+ELITE_ALLOWED_GRADES = {
+    x.strip().upper()
+    for x in os.getenv("ELITE_ALLOWED_GRADES", "A,A+").split(",")
+    if x.strip()
+}
+NO_CHASE_MAX_ENTRY_DRIFT_PCT = float(os.getenv("NO_CHASE_MAX_ENTRY_DRIFT_PCT", "0.15"))
+NO_CHASE_USE_CONTRACT_PRICE = os.getenv("NO_CHASE_USE_CONTRACT_PRICE", "true").lower() == "true"
+NO_CHASE_SEND_ALERTS = os.getenv("NO_CHASE_SEND_ALERTS", "true").lower() == "true"
+
 # =========================================================
 # PHASE 3.5 ENFORCEMENT LAYER
 # Locks adaptive learning into real trade enforcement.
@@ -1065,6 +1080,93 @@ def macro_enforcement_blocks_signal(signal: Dict[str, Any]) -> bool:
         debug(f"MACRO ENFORCEMENT CHECK ERROR | {e}")
         return False
 
+
+def elite_execution_filter_blocks_signal(signal: Dict[str, Any]) -> bool:
+    """
+    Final elite filter before the AI signal can become an executable signal.
+    Rules:
+    1) Only allowed grades can pass. Default: A and A+.
+    2) No chasing: if current/contract price is too far above ideal entry, block it.
+    """
+    try:
+        if not ENABLE_ELITE_EXECUTION_FILTER:
+            return False
+
+        if not isinstance(signal, dict):
+            return False
+
+        grade = str(signal.get("grade", signal.get("confidence", ""))).upper().strip()
+        ticker = str(signal.get("ticker", signal.get("symbol", "UNKNOWN"))).upper().strip()
+        direction = str(signal.get("direction", "")).upper().strip()
+
+        if grade not in ELITE_ALLOWED_GRADES:
+            reason = f"non_elite_grade_{grade or 'missing'}"
+            signal["blocked_by_elite_filter"] = True
+            signal["elite_filter_reason"] = reason
+            debug(f"BLOCKED NON-ELITE TRADE | ticker={ticker} direction={direction} grade={grade}")
+            try:
+                intel_event(
+                    "elite_filter_blocked_trade",
+                    {"reason": reason, "signal": signal},
+                    signal=signal,
+                    stage="elite_execution_filter",
+                    decision="blocked",
+                )
+            except Exception:
+                pass
+            return True
+
+        entry = safe_float(signal.get("entry_contract", signal.get("entry", 0)), 0.0)
+        current_price = safe_float(signal.get("contract_price", signal.get("price", entry)), entry)
+
+        if NO_CHASE_USE_CONTRACT_PRICE and entry > 0 and current_price > 0:
+            max_allowed = entry * (1.0 + safe_float(NO_CHASE_MAX_ENTRY_DRIFT_PCT, 0.15))
+            if current_price > max_allowed:
+                reason = "you_are_chasing_entry_too_far_from_ideal"
+                signal["blocked_by_elite_filter"] = True
+                signal["elite_filter_reason"] = reason
+                signal["ideal_entry"] = entry
+                signal["current_contract_price"] = current_price
+                signal["max_allowed_entry_price"] = round(max_allowed, 4)
+                debug(
+                    f"YOU ARE CHASING | ticker={ticker} direction={direction} "
+                    f"entry={entry} current={current_price} max_allowed={round(max_allowed, 4)}"
+                )
+                try:
+                    intel_event(
+                        "no_chase_blocked_trade",
+                        {
+                            "reason": reason,
+                            "entry": entry,
+                            "current_price": current_price,
+                            "max_allowed": max_allowed,
+                            "signal": signal,
+                        },
+                        signal=signal,
+                        stage="no_chase_filter",
+                        decision="blocked",
+                    )
+                except Exception:
+                    pass
+                try:
+                    if NO_CHASE_SEND_ALERTS:
+                        send_to_discord(
+                            DISCORD_AI_WEBHOOK,
+                            f"🚫 YOU ARE CHASING\nTicker: {ticker}\nDirection: {direction}\nIdeal Entry: {entry}\nCurrent: {current_price}\nMax Allowed: {round(max_allowed, 4)}\n⏰ {now_ts()}",
+                            "AI",
+                        )
+                except Exception:
+                    pass
+                return True
+
+        signal["blocked_by_elite_filter"] = False
+        signal["elite_filter_reason"] = ""
+        return False
+
+    except Exception as e:
+        debug(f"ELITE EXECUTION FILTER ERROR | {e}")
+        return False
+
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
@@ -1247,6 +1349,12 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
             key = f"{candidate.get('ticker')}_{candidate.get('direction')}_{candidate.get('setup')}_{candidate.get('grade')}"
             if auto_ai_recently_generated(state, key):
                 return {"generated": False, "reason": "cooldown_active", "key": key}
+
+            if macro_enforcement_blocks_signal(candidate):
+                return {"generated": False, "reason": "macro_blocked", "signal": candidate}
+
+            if elite_execution_filter_blocks_signal(candidate):
+                return {"generated": False, "reason": "elite_filter_blocked", "signal": candidate}
 
             atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
             state["last_signal_ts"] = now_ts()
@@ -1496,6 +1604,12 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             debug(f"MACRO BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
             archive_ai_signal_input(ai, "macro_blocked", {"reason": reason, "normalized_signal": signal})
             return {"written": False, "reason": "macro_blocked", "macro_reason": reason, "signal": signal}
+
+        if elite_execution_filter_blocks_signal(signal):
+            reason = signal.get("elite_filter_reason", "elite_filter_blocked")
+            debug(f"ELITE FILTER BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "elite_filter_blocked", {"reason": reason, "normalized_signal": signal})
+            return {"written": False, "reason": "elite_filter_blocked", "elite_filter_reason": reason, "signal": signal}
 
         if errors:
             debug(f"AI BRIDGE BLOCKED | errors={errors}")
