@@ -42,6 +42,83 @@ except Exception as macro_import_error:
 # =========================================================
 
 
+
+# =========================================================
+# ALPACA URL NORMALIZER + SAFE ENDPOINT BUILDER
+# Prevents 401/404 caused by bad base URLs, trailing slashes, or duplicated /v2.
+# =========================================================
+def normalize_alpaca_base_url(url: str, default: str = "https://paper-api.alpaca.markets") -> str:
+    try:
+        u = str(url or default).strip()
+        if not u:
+            u = default
+        while u.endswith("/"):
+            u = u[:-1]
+        if u.endswith("/v2"):
+            u = u[:-3]
+        return u
+    except Exception:
+        return default.rstrip("/")
+
+
+def normalize_alpaca_data_base_url(url: str, default: str = "https://data.alpaca.markets") -> str:
+    try:
+        u = str(url or default).strip()
+        if not u:
+            u = default
+        while u.endswith("/"):
+            u = u[:-1]
+        if u.endswith("/v2"):
+            u = u[:-3]
+        return u
+    except Exception:
+        return default.rstrip("/")
+
+
+def alpaca_endpoint(path: str) -> str:
+    """
+    Builds trading endpoints safely:
+    alpaca_endpoint("/account") -> https://.../v2/account
+    alpaca_endpoint("/orders") -> https://.../v2/orders
+    """
+    base = normalize_alpaca_base_url(globals().get("ALPACA_BASE_URL", os.getenv("ALPACA_BASE_URL", "")))
+    p = str(path or "").strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    if p.startswith("/v2/"):
+        p = p[3:]
+    return f"{base}/v2{p}"
+
+
+def alpaca_data_endpoint(path: str) -> str:
+    """
+    Builds data endpoints safely:
+    alpaca_data_endpoint("/v2/stocks/bars") -> https://data.alpaca.markets/v2/stocks/bars
+    """
+    base = normalize_alpaca_data_base_url(globals().get("ALPACA_DATA_BASE_URL", os.getenv("ALPACA_DATA_BASE_URL", "")))
+    p = str(path or "").strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return f"{base}{p}"
+
+
+def alpaca_headers() -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": str(globals().get("ALPACA_API_KEY", os.getenv("ALPACA_API_KEY", ""))).strip(),
+        "APCA-API-SECRET-KEY": str(globals().get("ALPACA_SECRET_KEY", os.getenv("ALPACA_SECRET_KEY", ""))).strip(),
+        "Content-Type": "application/json",
+    }
+
+
+def debug_alpaca_urls_once() -> None:
+    try:
+        if globals().get("_ALPACA_URLS_DEBUGGED", False):
+            return
+        globals()["_ALPACA_URLS_DEBUGGED"] = True
+        log(f"DEBUG: ALPACA URLS | base={normalize_alpaca_base_url(globals().get('ALPACA_BASE_URL', os.getenv('ALPACA_BASE_URL', '')))} account={alpaca_endpoint('/account')} orders={alpaca_endpoint('/orders')} positions={alpaca_endpoint('/positions')}")
+    except Exception:
+        pass
+
 # =========================================================
 # ENV VARS
 # =========================================================
@@ -88,7 +165,7 @@ MACRO_SEND_ON_BOOT = os.getenv("MACRO_SEND_ON_BOOT", "true").lower() == "true"
 ENABLE_ALPACA = os.getenv("ENABLE_ALPACA", "false").lower() == "true"
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
+ALPACA_BASE_URL = normalize_alpaca_base_url(os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
 ALPACA_ORDER_TIMEOUT = int(os.getenv("ALPACA_ORDER_TIMEOUT", "20"))
 ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "true"
 ALPACA_ENABLE_OPTIONS = os.getenv("ALPACA_ENABLE_OPTIONS", "true").lower() == "true"
@@ -176,7 +253,7 @@ MARKET_DATA_REFRESH_FILE_TIMESTAMPS = os.getenv("MARKET_DATA_REFRESH_FILE_TIMEST
 MARKET_DATA_ADD_PRICE_UPDATED_AT = os.getenv("MARKET_DATA_ADD_PRICE_UPDATED_AT", "true").lower() == "true"
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_BASE_URL = os.getenv("TWELVE_DATA_BASE_URL", "https://api.twelvedata.com").strip().rstrip("/")
-ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").strip().rstrip("/")
+ALPACA_DATA_BASE_URL = normalize_alpaca_data_base_url(os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")).rstrip("/")
 LIVE_PRICE_CACHE_SECONDS = int(os.getenv("LIVE_PRICE_CACHE_SECONDS", str(MARKET_DATA_REFRESH_SECONDS)))
 AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
 AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
@@ -10182,6 +10259,11 @@ def reset_kill_switch_for_testing():
 
 
 def main_loop():
+    try:
+        debug_alpaca_urls_once()
+    except Exception:
+        pass
+
     try:
         build_signal_from_ai()
     except Exception as e:
