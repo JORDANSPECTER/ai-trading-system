@@ -9989,6 +9989,17 @@ def send_execution_or_original_discord(message: str, original_webhook: str, user
             "PAPER STOP MOVED TO BREAKEVEN",
             "PAPER POSITION OPENED",
             "PAPER ORDER FILLED",
+
+    signal = enrich_signal_with_execution_risk_fields(signal)
+    try:
+        qty, exec_score_size_reason = apply_execution_score_to_order_qty(signal, qty)
+    except NameError:
+        final_qty, exec_score_size_reason = apply_execution_score_to_order_qty(signal, final_qty)
+        qty = final_qty
+    if qty <= 0:
+        debug(f"EXEC SCORE SIZE BLOCKED | reason={exec_score_size_reason}")
+        return False, exec_score_size_reason
+    debug(f"EXEC SCORE SIZE OK | reason={exec_score_size_reason}")
             "PAPER ORDER CREATED",
             "PAPER BRIDGE DUPLICATE CAP BLOCKED",
             "PAPER BROKER BRIDGE RESULT",
@@ -11635,6 +11646,106 @@ def premium_execution_decision(score: int, signal: Dict[str, Any]) -> str:
     return "AVOID — no execution edge yet"
 
 
+
+
+# =========================================================
+# EXECUTION SCORE -> ACTUAL ORDER SIZING + RISK ENGINE CAP
+# Risk-first rule:
+# - This layer may reduce or block size.
+# - It must NEVER increase above existing risk engine approved size.
+# - Broker/risk gates remain the final authority.
+# =========================================================
+ENABLE_EXEC_SCORE_ORDER_SIZING = os.getenv("ENABLE_EXEC_SCORE_ORDER_SIZING", "true").lower() == "true"
+EXEC_SCORE_BLOCK_BELOW = int(os.getenv("EXEC_SCORE_BLOCK_BELOW", "55"))
+EXEC_SCORE_MAX_FULL_QTY = float(os.getenv("EXEC_SCORE_MAX_FULL_QTY", "1.0"))
+EXEC_SCORE_MAX_HALF_QTY = float(os.getenv("EXEC_SCORE_MAX_HALF_QTY", "0.5"))
+EXEC_SCORE_MAX_STARTER_QTY = float(os.getenv("EXEC_SCORE_MAX_STARTER_QTY", "0.25"))
+
+
+def apply_execution_score_to_order_qty(signal: Dict[str, Any], approved_qty: Any) -> Tuple[int, str]:
+    """
+    Converts premium execution score into an actual quantity cap.
+
+    IMPORTANT:
+    - approved_qty is the quantity already allowed by risk/portfolio/vol sizing.
+    - This function only caps or blocks it.
+    - It does not increase size.
+    """
+    try:
+        base_qty = int(max(0, safe_int(approved_qty, 0)))
+    except Exception:
+        base_qty = 0
+
+    if not ENABLE_EXEC_SCORE_ORDER_SIZING:
+        return base_qty, "exec_score_sizing_disabled"
+
+    if base_qty <= 0:
+        return 0, "base_qty_zero"
+
+    try:
+        score = safe_int(signal.get("execution_score", 0), 0)
+        if score <= 0:
+            score = premium_execution_score(signal)
+            signal["execution_score"] = score
+    except Exception:
+        score = 0
+
+    if score < EXEC_SCORE_BLOCK_BELOW:
+        return 0, f"execution_score_blocked:{score}<{EXEC_SCORE_BLOCK_BELOW}"
+
+    if score >= EXEC_SCORE_FULL_SIZE:
+        cap_fraction = EXEC_SCORE_MAX_FULL_QTY
+        bucket = "full_score_bucket"
+    elif score >= EXEC_SCORE_HALF_SIZE:
+        cap_fraction = EXEC_SCORE_MAX_HALF_QTY
+        bucket = "half_score_bucket"
+    elif score >= EXEC_SCORE_REDUCED_SIZE:
+        cap_fraction = EXEC_SCORE_MAX_STARTER_QTY
+        bucket = "starter_score_bucket"
+    else:
+        return 0, f"execution_score_blocked:{score}<reduced_threshold"
+
+    capped = int(max(1, min(base_qty, max(1, round(base_qty * cap_fraction)))))
+
+    # If base_qty is 1, do not allow fraction contracts. Use 1 only for score >= half threshold.
+    if base_qty == 1:
+        if score >= EXEC_SCORE_HALF_SIZE:
+            capped = 1
+        else:
+            capped = 0
+
+    if capped <= 0:
+        return 0, f"execution_score_qty_zero:{score}:{bucket}"
+
+    return capped, f"execution_score_cap:{score}:{bucket}:base={base_qty}:final={capped}"
+
+
+def enrich_signal_with_execution_risk_fields(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Stores execution scoring fields on the signal so alerts, logs, and order sizing
+    all use the same decision state.
+    """
+    try:
+        if not isinstance(signal, dict):
+            return signal
+
+        score = premium_execution_score(signal)
+        signal["execution_score"] = score
+        signal["timing_quality"] = premium_timing_quality(signal)
+        signal["entry_quality"] = premium_entry_quality(signal)
+        signal["premium_risk_state"] = premium_risk_state_from_score(score, signal)
+        signal["position_plan"] = premium_position_size_plan(score, signal)
+        signal["execution_decision"] = premium_execution_decision(score, signal)
+
+    except Exception as e:
+        try:
+            debug(f"EXEC SCORE ENRICH FAILED | {e}")
+        except Exception:
+            pass
+
+    return signal
+
+
 def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
     direction = str(signal.get("direction") or "WAIT").upper().strip()
@@ -11755,6 +11866,7 @@ def maybe_send_premium_live_execution_alert(signal: Dict[str, Any], stage: str =
         except Exception:
             pass
 
+        signal = enrich_signal_with_execution_risk_fields(signal)
         msg = build_premium_live_execution_alert(signal)
         send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
 
@@ -14594,6 +14706,40 @@ if "--premium-alert-now" in sys.argv:
         "entry_type": "BREAKOUT CONTINUATION",
     }
     maybe_send_premium_live_execution_alert(sample, stage="manual_test")
+    sys.exit(0)
+
+
+
+# CLI helper:
+# python main.py --exec-size-test
+if "--exec-size-test" in sys.argv:
+    sample = {
+        "ticker": os.getenv("TEST_TICKER", "QQQ"),
+        "direction": os.getenv("TEST_DIRECTION", "CALL"),
+        "grade": os.getenv("TEST_GRADE", "A"),
+        "setup": "Break and hold / VWAP control test",
+        "key_level": 662.00,
+        "entry": "Break + hold above 662.00",
+        "stop_loss": 660.80,
+        "targets": [663.00, 664.20, 665.50],
+        "vwap": "Above / buyer control",
+        "volume": "Confirming",
+        "oil": "Falling / risk-on support",
+        "market_type": "Trend / expansion",
+        "session": "MIDDAY TREND CONTINUATION",
+        "entry_type": "BREAKOUT CONTINUATION",
+    }
+    sample = enrich_signal_with_execution_risk_fields(sample)
+    base_qty = int(os.getenv("TEST_BASE_QTY", "4"))
+    final_qty, reason = apply_execution_score_to_order_qty(sample, base_qty)
+    print(json.dumps({
+        "base_qty": base_qty,
+        "final_qty": final_qty,
+        "reason": reason,
+        "execution_score": sample.get("execution_score"),
+        "risk_state": sample.get("premium_risk_state"),
+        "position_plan": sample.get("position_plan"),
+    }, indent=2))
     sys.exit(0)
 
 
