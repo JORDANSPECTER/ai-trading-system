@@ -13,5 +13,5 @@
   "qty": 1,
   "regime": "clean",
   "reason": "VWAP reclaim with volume confirmation",
-  "timestamp": 1000000101
+  "timestamp": 1000000999
 }
