@@ -3,15 +3,13 @@
   "direction": "CALL",
   "grade": "A",
   "confidence": "A",
-  "setup": "break_and_hold_over_reclaim_level",
+  "entry": 1.30,
+  "stop": 1.00,
+  "target": 1.80,
+  "setup": "break_and_hold",
   "trigger": "break_and_hold",
   "confirmation": "volume",
-  "entry": 1.42,
-  "stop": 1.10,
-  "target": 1.95,
-  "tp2_contract": 2.35,
-  "qty": 1,
   "regime": "clean",
-  "reason": "QQQ reclaim + hold above key level with volume confirmation and strong momentum",
-  "timestamp": 1000005678
+  "reason": "TEST SIGNAL",
+  "timestamp": 1714100000
 }
