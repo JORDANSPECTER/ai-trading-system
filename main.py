@@ -737,30 +737,43 @@ FRED_SERIES = {
 
 def macro_load_latest() -> Dict[str, Any]:
     data = load_json_file(MACRO_LATEST_FILE, {})
-    return data if isinstance(data, dict) else {}
-
+    if not isinstance(data, dict):
+        return {}
+    try:
+        data["updated_at"] = int(float(str(data.get("updated_at", 0)).strip() or 0))
+    except Exception:
+        data["updated_at"] = 0
+    return data
 
 def macro_should_refresh(latest: Dict[str, Any]) -> bool:
     """
     Safe macro refresh check.
-    Prevents Render env string crashes:
+    Prevents Render env / JSON string crashes:
     TypeError: unsupported operand type(s) for -: 'str' and 'int'
     """
     if not isinstance(latest, dict):
         return True
 
     try:
-        updated_at = safe_int(latest.get("updated_at", 0), 0)
+        updated_raw = latest.get("updated_at", 0)
+        if isinstance(updated_raw, str):
+            updated_at = int(float(updated_raw.strip() or 0))
+        else:
+            updated_at = int(float(updated_raw or 0))
     except Exception:
         updated_at = 0
 
     try:
-        refresh_seconds = int(str(MACRO_REFRESH_SECONDS).strip())
+        refresh_seconds = int(float(str(MACRO_REFRESH_SECONDS).strip() or 300))
     except Exception:
-        refresh_seconds = 3600
+        refresh_seconds = 300
 
-    return (now_ts() - updated_at) >= refresh_seconds
+    try:
+        current_ts = int(float(now_ts()))
+    except Exception:
+        current_ts = int(time.time())
 
+    return (current_ts - updated_at) >= refresh_seconds
 
 def fred_fetch_series_observations(series_id: str, limit: int = 5) -> Dict[str, Any]:
     if not FRED_API_KEY:
