@@ -1,0 +1,17 @@
+{
+  "ticker": "QQQ",
+  "direction": "CALL",
+  "grade": "A",
+  "confidence": "A",
+  "setup": "vwap_reclaim",
+  "trigger": "vwap_reclaim",
+  "confirmation": "volume",
+  "entry": 1.35,
+  "stop": 1.0,
+  "target": 1.75,
+  "tp2_contract": 2.2,
+  "qty": 1,
+  "regime": "clean",
+  "reason": "VWAP reclaim with volume confirmation",
+  "timestamp": 1000000101
+}
