@@ -13485,6 +13485,16 @@ def main_loop():
             debug("No signal file and fallback disabled — idle cycle.")
 
     while True:
+        # FREE DAILY LEVELS AUTO — ROOT LOOP HOOK
+        # Runs every engine cycle; cooldown/state prevents spam.
+        try:
+            maybe_send_free_daily_levels(force=False)
+        except Exception as e:
+            try:
+                debug(f"FREE DAILY LOOP ERROR | {e}")
+            except Exception:
+                pass
+
         try:
             intel_periodic_snapshot()
             process_telegram_updates()
