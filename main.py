@@ -125,6 +125,7 @@ def debug_alpaca_urls_once() -> None:
 DISCORD_AI_WEBHOOK = os.getenv("DISCORD_AI_WEBHOOK", "").strip()
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
 DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "").strip()
+DISCORD_DARKPOOL_WEBHOOK = os.getenv("DISCORD_DARKPOOL_WEBHOOK", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -9941,6 +9942,29 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 
+
+def send_to_darkpool_discord(message: str) -> None:
+    """
+    Dedicated Dark Pool channel router.
+    Uses DISCORD_DARKPOOL_WEBHOOK first.
+    Falls back to DISCORD_AI_WEBHOOK only if dark pool webhook is missing.
+    """
+    try:
+        target = DISCORD_DARKPOOL_WEBHOOK or DISCORD_AI_WEBHOOK
+        if not target:
+            try:
+                debug("DARK POOL WEBHOOK MISSING | set DISCORD_DARKPOOL_WEBHOOK")
+            except Exception:
+                pass
+            return
+        send_to_discord(target, message, "DARK POOL")
+    except Exception as e:
+        try:
+            debug(f"DARK POOL webhook send failed: {e}")
+        except Exception:
+            pass
+
+
 # =========================================================
 # UNUSUAL WHALES DARK POOL INTEGRATION
 # Decision/confluence layer for QQQ/SPY institutional resource levels.
@@ -10435,7 +10459,7 @@ def send_unusual_whales_darkpool_alert(signal: Dict[str, Any]) -> None:
                 f"• Do not force a trade without a real level\n"
                 f"• Use VWAP, oil, volume, and structure first"
             )
-            send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+            send_to_darkpool_discord(msg)
             return
 
         msg = (
@@ -10449,7 +10473,7 @@ def send_unusual_whales_darkpool_alert(signal: Dict[str, Any]) -> None:
             f"• Acceptance through a major level can shift bias"
         )
 
-        send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+        send_to_darkpool_discord(msg)
 
     except Exception as e:
         try:
@@ -10604,7 +10628,7 @@ def send_uw_darkpool_real_print_alert(ticker: str, prints: List[Dict[str, Any]])
             f"• Acceptance through the print can shift bias"
         )
 
-        send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+        send_to_darkpool_discord(msg)
         try:
             debug(f"UW DARKPOOL REAL PRINT ALERT | ticker={ticker} prints={len(newest)}")
         except Exception:
