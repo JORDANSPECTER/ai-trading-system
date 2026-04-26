@@ -753,6 +753,166 @@ ADAPTIVE_LOW_WINRATE_THRESHOLD = float(os.getenv("ADAPTIVE_LOW_WINRATE_THRESHOLD
 ADAPTIVE_MAX_GRADE_BOOST = int(os.getenv("ADAPTIVE_MAX_GRADE_BOOST", "2"))
 ADAPTIVE_SEND_ALERTS = os.getenv("ADAPTIVE_SEND_ALERTS", "true").lower() == "true"
 
+
+# =========================================================
+# ADAPTIVE LEARNING → POSITION SIZING
+# =========================================================
+ENABLE_ADAPTIVE_LEARNING_SIZING = os.getenv("ENABLE_ADAPTIVE_LEARNING_SIZING", "true").lower() == "true"
+ADAPTIVE_SIZE_MIN_TRADES = int(os.getenv("ADAPTIVE_SIZE_MIN_TRADES", "2"))
+ADAPTIVE_SIZE_STRONG_WINRATE = float(os.getenv("ADAPTIVE_SIZE_STRONG_WINRATE", "0.65"))
+ADAPTIVE_SIZE_ELITE_WINRATE = float(os.getenv("ADAPTIVE_SIZE_ELITE_WINRATE", "0.80"))
+ADAPTIVE_SIZE_WEAK_WINRATE = float(os.getenv("ADAPTIVE_SIZE_WEAK_WINRATE", "0.45"))
+ADAPTIVE_SIZE_STRONG_MULT = float(os.getenv("ADAPTIVE_SIZE_STRONG_MULT", "1.25"))
+ADAPTIVE_SIZE_ELITE_MULT = float(os.getenv("ADAPTIVE_SIZE_ELITE_MULT", "1.50"))
+ADAPTIVE_SIZE_WEAK_MULT = float(os.getenv("ADAPTIVE_SIZE_WEAK_MULT", "0.50"))
+ADAPTIVE_SIZE_MAX_MULT = float(os.getenv("ADAPTIVE_SIZE_MAX_MULT", "2.00"))
+
+def adaptive_sizing_safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+def adaptive_sizing_safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+def adaptive_sizing_load_json(path, default):
+    try:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def adaptive_sizing_signal_key(signal):
+    ticker = str(signal.get("ticker") or signal.get("symbol") or "UNKNOWN").upper().strip()
+    direction = str(signal.get("direction") or "UNKNOWN").upper().strip()
+    setup = str(signal.get("setup_name") or signal.get("setup") or signal.get("trigger") or "GENERIC").lower().strip()
+    return ticker, direction, setup
+
+def adaptive_sizing_find_stats(signal):
+    ticker, direction, setup = adaptive_sizing_signal_key(signal)
+
+    phase3 = adaptive_sizing_load_json("adaptive_setup_stats.json", {})
+    stats = phase3.get("stats", {}) if isinstance(phase3, dict) else {}
+    if isinstance(stats, dict):
+        for key, bucket in stats.items():
+            k = str(key).lower()
+            if ticker.lower() in k and direction.lower() in k:
+                return {
+                    "source": "adaptive_setup_stats",
+                    "key": key,
+                    "trades": adaptive_sizing_safe_int(bucket.get("trades"), 0),
+                    "wins": adaptive_sizing_safe_int(bucket.get("wins"), 0),
+                    "losses": adaptive_sizing_safe_int(bucket.get("losses"), 0),
+                    "win_rate": adaptive_sizing_safe_float(bucket.get("win_rate"), 0.0),
+                    "avg_r": adaptive_sizing_safe_float(bucket.get("avg_r"), 0.0),
+                    "bucket": bucket,
+                }
+
+    learning = adaptive_sizing_load_json("learning_stats.json", {})
+    patterns = learning.get("patterns", {}) if isinstance(learning, dict) else {}
+    if isinstance(patterns, dict):
+        for key, bucket in patterns.items():
+            k = str(key).lower()
+            if ticker.lower() in k and direction.lower() in k:
+                return {
+                    "source": "learning_stats",
+                    "key": key,
+                    "trades": adaptive_sizing_safe_int(bucket.get("trades"), 0),
+                    "wins": adaptive_sizing_safe_int(bucket.get("wins"), 0),
+                    "losses": adaptive_sizing_safe_int(bucket.get("losses"), 0),
+                    "win_rate": adaptive_sizing_safe_float(bucket.get("win_rate"), 0.0),
+                    "avg_r": adaptive_sizing_safe_float(bucket.get("avg_r"), 0.0),
+                    "bucket": bucket,
+                }
+
+    return {"source": "none", "key": "", "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "avg_r": 0.0, "bucket": {}}
+
+def adaptive_learning_size_multiplier(signal):
+    if not ENABLE_ADAPTIVE_LEARNING_SIZING:
+        return 1.0, "adaptive_sizing_disabled", {}
+
+    stats = adaptive_sizing_find_stats(signal)
+    trades = adaptive_sizing_safe_int(stats.get("trades"), 0)
+    win_rate = adaptive_sizing_safe_float(stats.get("win_rate"), 0.0)
+    grade = str(signal.get("grade") or signal.get("confidence") or "").upper().strip()
+
+    if trades < ADAPTIVE_SIZE_MIN_TRADES:
+        return 1.0, f"observe_only_not_enough_trades_{trades}/{ADAPTIVE_SIZE_MIN_TRADES}", stats
+
+    if grade in {"A", "A+"} and win_rate >= ADAPTIVE_SIZE_ELITE_WINRATE:
+        return min(ADAPTIVE_SIZE_ELITE_MULT, ADAPTIVE_SIZE_MAX_MULT), f"elite_learned_setup_winrate_{round(win_rate*100,1)}%", stats
+
+    if grade in {"A", "A+"} and win_rate >= ADAPTIVE_SIZE_STRONG_WINRATE:
+        return min(ADAPTIVE_SIZE_STRONG_MULT, ADAPTIVE_SIZE_MAX_MULT), f"strong_learned_setup_winrate_{round(win_rate*100,1)}%", stats
+
+    if win_rate <= ADAPTIVE_SIZE_WEAK_WINRATE:
+        return ADAPTIVE_SIZE_WEAK_MULT, f"weak_learned_setup_winrate_{round(win_rate*100,1)}%", stats
+
+    return 1.0, f"neutral_learned_setup_winrate_{round(win_rate*100,1)}%", stats
+
+def apply_adaptive_learning_sizing_to_signal(signal):
+    try:
+        if not isinstance(signal, dict):
+            return signal
+
+        x = deepcopy(signal)
+        mult, reason, stats = adaptive_learning_size_multiplier(x)
+
+        base_qty = x.get("final_size") or x.get("qty") or x.get("contracts") or x.get("quantity") or 1
+        base_qty = adaptive_sizing_safe_int(base_qty, 1)
+
+        if mult > 1:
+            adjusted = int(math.ceil(base_qty * mult))
+        elif mult < 1:
+            adjusted = int(math.floor(base_qty * mult))
+        else:
+            adjusted = base_qty
+
+        min_qty = adaptive_sizing_safe_int(globals().get("MIN_POSITION_QTY", 1), 1)
+        max_qty = adaptive_sizing_safe_int(globals().get("MAX_POSITION_QTY", 10), 10)
+
+        if base_qty > 0:
+            adjusted = max(min_qty, adjusted)
+        adjusted = min(max_qty, adjusted)
+
+        x["adaptive_sizing"] = {
+            "enabled": ENABLE_ADAPTIVE_LEARNING_SIZING,
+            "base_qty": base_qty,
+            "adjusted_qty": adjusted,
+            "multiplier": mult,
+            "reason": reason,
+            "stats": stats,
+        }
+
+        x["qty"] = adjusted
+        x["contracts"] = adjusted
+        x["quantity"] = adjusted
+        x["final_size"] = adjusted
+
+        try:
+            debug(f"ADAPTIVE SIZE | ticker={x.get('ticker')} direction={x.get('direction')} base={base_qty} adjusted={adjusted} mult={mult} reason={reason}")
+        except Exception:
+            print(f"ADAPTIVE SIZE | ticker={x.get('ticker')} direction={x.get('direction')} base={base_qty} adjusted={adjusted} mult={mult} reason={reason}", flush=True)
+
+        return x
+    except Exception as e:
+        try:
+            log(f"ADAPTIVE SIZE ERROR | {e}")
+        except Exception:
+            print(f"ADAPTIVE SIZE ERROR | {e}", flush=True)
+        return signal
+
+
 # =========================================================
 # LIVE TRADING SAFETY LOCK SYSTEM
 # Protects real money during first live rollout.
@@ -10997,3 +11157,6 @@ if __name__ == "__main__":
         log(f"💥 Fatal error: {e}")
         traceback.print_exc()
         sys.exit(1)
+
+
+# MANUAL HOOK NEEDED: call signal = apply_adaptive_learning_sizing_to_signal(signal) before execution.
