@@ -658,6 +658,37 @@ PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled
 
 
 
+
+# =========================================================
+# LIVE TRADING SAFETY LOCK SYSTEM
+# Protects real money during first live rollout.
+# Live trading can only continue if keys, mode, account size,
+# risk caps, market data, and broker checks are clean.
+# =========================================================
+ENABLE_LIVE_SAFETY_LOCK = os.getenv("ENABLE_LIVE_SAFETY_LOCK", "true").lower() == "true"
+LIVE_SAFETY_FILE = os.getenv("LIVE_SAFETY_FILE", "live_safety_state.json").strip()
+LIVE_SAFETY_SEND_ALERTS = os.getenv("LIVE_SAFETY_SEND_ALERTS", "true").lower() == "true"
+
+LIVE_SAFETY_MAX_ACCOUNT_EQUITY = float(os.getenv("LIVE_SAFETY_MAX_ACCOUNT_EQUITY", "500"))
+LIVE_SAFETY_MIN_ACCOUNT_EQUITY = float(os.getenv("LIVE_SAFETY_MIN_ACCOUNT_EQUITY", "50"))
+LIVE_SAFETY_MAX_QTY = int(os.getenv("LIVE_SAFETY_MAX_QTY", "1"))
+LIVE_SAFETY_MAX_OPEN_POSITIONS = int(os.getenv("LIVE_SAFETY_MAX_OPEN_POSITIONS", "1"))
+LIVE_SAFETY_MAX_DAILY_LOSS_DOLLARS = float(os.getenv("LIVE_SAFETY_MAX_DAILY_LOSS_DOLLARS", "25"))
+LIVE_SAFETY_MAX_DAILY_LOSS_PCT = float(os.getenv("LIVE_SAFETY_MAX_DAILY_LOSS_PCT", "0.10"))
+
+LIVE_SAFETY_REQUIRE_ALPACA = os.getenv("LIVE_SAFETY_REQUIRE_ALPACA", "true").lower() == "true"
+LIVE_SAFETY_REQUIRE_OPTIONS_APPROVED = os.getenv("LIVE_SAFETY_REQUIRE_OPTIONS_APPROVED", "true").lower() == "true"
+LIVE_SAFETY_REQUIRE_FORCE_OFF = os.getenv("LIVE_SAFETY_REQUIRE_FORCE_OFF", "true").lower() == "true"
+LIVE_SAFETY_REQUIRE_DUPLICATES_OFF = os.getenv("LIVE_SAFETY_REQUIRE_DUPLICATES_OFF", "true").lower() == "true"
+LIVE_SAFETY_REQUIRE_FRESH_MARKET_DATA = os.getenv("LIVE_SAFETY_REQUIRE_FRESH_MARKET_DATA", "true").lower() == "true"
+LIVE_SAFETY_MARKET_DATA_MAX_AGE_SECONDS = int(os.getenv("LIVE_SAFETY_MARKET_DATA_MAX_AGE_SECONDS", "20"))
+
+LIVE_SAFETY_AUTO_LOCK_ON_ERROR = os.getenv("LIVE_SAFETY_AUTO_LOCK_ON_ERROR", "true").lower() == "true"
+LIVE_SAFETY_REQUIRE_MANUAL_UNLOCK = os.getenv("LIVE_SAFETY_REQUIRE_MANUAL_UNLOCK", "true").lower() == "true"
+LIVE_SAFETY_START_TIME_ET = os.getenv("LIVE_SAFETY_START_TIME_ET", "09:30").strip()
+LIVE_SAFETY_END_TIME_ET = os.getenv("LIVE_SAFETY_END_TIME_ET", "16:00").strip()
+LIVE_SAFETY_ENFORCE_MARKET_HOURS = os.getenv("LIVE_SAFETY_ENFORCE_MARKET_HOURS", "true").lower() == "true"
+
 # =========================================================
 # TRADE JOURNALING + LEARNING FEEDBACK LOOP
 # Records every accepted/blocked/executed/managed trade decision
@@ -2260,6 +2291,279 @@ def learning_blocks_signal(signal: Dict[str, Any]) -> bool:
         return False
 
 
+def live_safety_default_state() -> Dict[str, Any]:
+    return {
+        "locked": False,
+        "manual_unlock_required": False,
+        "reason": "",
+        "last_check_ts": now_ts(),
+        "last_lock_ts": 0,
+        "checks": {},
+    }
+
+
+def load_live_safety_state() -> Dict[str, Any]:
+    data = load_json_file(LIVE_SAFETY_FILE, {})
+    if not isinstance(data, dict):
+        data = live_safety_default_state()
+    data.setdefault("locked", False)
+    data.setdefault("manual_unlock_required", False)
+    data.setdefault("reason", "")
+    data.setdefault("last_check_ts", now_ts())
+    data.setdefault("last_lock_ts", 0)
+    data.setdefault("checks", {})
+    return data
+
+
+def save_live_safety_state(data: Dict[str, Any]) -> None:
+    try:
+        data["last_check_ts"] = now_ts()
+        atomic_write_json(LIVE_SAFETY_FILE, data)
+    except Exception as e:
+        debug(f"LIVE SAFETY SAVE ERROR | {e}")
+
+
+def live_safety_alert(title: str, body: str) -> None:
+    try:
+        if LIVE_SAFETY_SEND_ALERTS:
+            send_to_discord(DISCORD_AI_WEBHOOK, f"🔐 {title}\n{body}\n⏰ {now_ts()}", "AI")
+            send_to_telegram(f"🔐 {title}\n{body}\n⏰ {now_ts()}")
+    except Exception:
+        pass
+
+
+def live_safety_lock(reason: str) -> Dict[str, Any]:
+    state = load_live_safety_state()
+    state["locked"] = True
+    state["manual_unlock_required"] = bool(LIVE_SAFETY_REQUIRE_MANUAL_UNLOCK)
+    state["reason"] = str(reason)
+    state["last_lock_ts"] = now_ts()
+    save_live_safety_state(state)
+
+    debug(f"LIVE SAFETY LOCKED | reason={reason}")
+    live_safety_alert("LIVE SAFETY LOCKED", f"Reason: {reason}\nLive trading blocked until reviewed.")
+    return state
+
+
+def live_safety_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
+    state = load_live_safety_state()
+    state["locked"] = False
+    state["manual_unlock_required"] = False
+    state["reason"] = reason
+    save_live_safety_state(state)
+    debug(f"LIVE SAFETY UNLOCKED | reason={reason}")
+    live_safety_alert("LIVE SAFETY UNLOCKED", f"Reason: {reason}")
+    return state
+
+
+def live_safety_account_equity() -> float:
+    try:
+        ensure_globals_initialized()
+        eq = safe_float(GLOBAL_STATE.get("account_equity", 0), 0.0)
+        if eq > 0:
+            return eq
+    except Exception:
+        pass
+    try:
+        return safe_float(LIVE_ACCOUNT_EQUITY_FALLBACK, 25000)
+    except Exception:
+        return 0.0
+
+
+def live_safety_open_position_count() -> int:
+    try:
+        return len(portfolio_heat_open_positions())
+    except Exception:
+        try:
+            ensure_globals_initialized()
+            return len(GLOBAL_POSITIONS.get("open_positions", []))
+        except Exception:
+            return 0
+
+
+def live_safety_market_data_fresh() -> Tuple[bool, str]:
+    try:
+        if not LIVE_SAFETY_REQUIRE_FRESH_MARKET_DATA:
+            return True, "freshness_not_required"
+
+        data = load_json_file(MARKET_DATA_FILE, {})
+        if not isinstance(data, dict) or not data:
+            return False, "market_data_missing"
+
+        ts = safe_int(data.get("__updated_at", data.get("updated_at", 0)), 0)
+        if ts <= 0:
+            # Try ticker timestamps.
+            timestamps = []
+            for _, row in data.items():
+                if isinstance(row, dict):
+                    timestamps.append(safe_int(row.get("price_updated_at", row.get("timestamp", 0)), 0))
+            ts = max(timestamps) if timestamps else 0
+
+        if ts <= 0:
+            return False, "market_data_timestamp_missing"
+
+        age = now_ts() - ts
+        max_age = safe_int(LIVE_SAFETY_MARKET_DATA_MAX_AGE_SECONDS, 20)
+        if age > max_age:
+            return False, f"market_data_stale_age_{age}s"
+
+        return True, f"market_data_fresh_age_{age}s"
+    except Exception as e:
+        return False, f"market_data_check_error:{e}"
+
+
+def live_safety_within_market_hours() -> Tuple[bool, str]:
+    try:
+        if not LIVE_SAFETY_ENFORCE_MARKET_HOURS:
+            return True, "market_hours_not_enforced"
+
+        # Use UTC fallback. ET is UTC-4 during daylight time.
+        # This is intentionally conservative for day-one safety.
+        utc_now = datetime.utcnow()
+        et_now = utc_now - timedelta(hours=4)
+        hhmm = et_now.strftime("%H:%M")
+        if LIVE_SAFETY_START_TIME_ET <= hhmm <= LIVE_SAFETY_END_TIME_ET:
+            return True, f"market_hours_ok_{hhmm}_ET"
+        return False, f"outside_market_hours_{hhmm}_ET"
+    except Exception as e:
+        return False, f"market_hours_check_error:{e}"
+
+
+def live_safety_check(signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Returns approved=False when live trading should be blocked.
+    Paper trading is not blocked by this system.
+    """
+    if not ENABLE_LIVE_SAFETY_LOCK:
+        return {"approved": True, "reason": "disabled", "checks": {}}
+
+    state = load_live_safety_state()
+    if state.get("locked") and state.get("manual_unlock_required"):
+        return {"approved": False, "reason": state.get("reason", "live_safety_locked"), "checks": state.get("checks", {})}
+
+    checks = {}
+    failures = []
+
+    # Only enforce for real live mode.
+    checks["live_mode"] = bool(LIVE_MODE)
+    if not LIVE_MODE:
+        state["checks"] = checks
+        save_live_safety_state(state)
+        return {"approved": True, "reason": "paper_mode", "checks": checks}
+
+    checks["enable_alpaca"] = bool(ENABLE_ALPACA)
+    if LIVE_SAFETY_REQUIRE_ALPACA and not ENABLE_ALPACA:
+        failures.append("ENABLE_ALPACA_false")
+
+    checks["paper_execution_disabled"] = not bool(ENABLE_PAPER_EXECUTION)
+    if ENABLE_PAPER_EXECUTION:
+        failures.append("paper_execution_still_enabled")
+
+    checks["alpaca_keys_loaded"] = bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
+    if not checks["alpaca_keys_loaded"]:
+        failures.append("missing_alpaca_live_keys")
+
+    checks["alpaca_base_url"] = ALPACA_BASE_URL
+    if "paper-api" in str(ALPACA_BASE_URL).lower():
+        failures.append("alpaca_base_url_is_paper")
+
+    checks["options_approved"] = bool(ALPACA_LIVE_OPTIONS_APPROVED)
+    if LIVE_SAFETY_REQUIRE_OPTIONS_APPROVED and not ALPACA_LIVE_OPTIONS_APPROVED:
+        failures.append("options_not_marked_approved")
+
+    checks["force_execution_off"] = not bool(FORCE_EXECUTION_MODE)
+    if LIVE_SAFETY_REQUIRE_FORCE_OFF and FORCE_EXECUTION_MODE:
+        failures.append("FORCE_EXECUTION_MODE_must_be_false_live")
+
+    checks["duplicates_off"] = not bool(ALLOW_DUPLICATE_SIGNALS)
+    if LIVE_SAFETY_REQUIRE_DUPLICATES_OFF and ALLOW_DUPLICATE_SIGNALS:
+        failures.append("ALLOW_DUPLICATE_SIGNALS_must_be_false_live")
+
+    equity = live_safety_account_equity()
+    checks["account_equity"] = equity
+    if equity < safe_float(LIVE_SAFETY_MIN_ACCOUNT_EQUITY, 50):
+        failures.append(f"equity_below_min:{equity}")
+    if equity > safe_float(LIVE_SAFETY_MAX_ACCOUNT_EQUITY, 500):
+        failures.append(f"equity_above_day1_max:{equity}")
+
+    open_count = live_safety_open_position_count()
+    checks["open_positions"] = open_count
+    if open_count >= safe_int(LIVE_SAFETY_MAX_OPEN_POSITIONS, 1):
+        failures.append(f"max_live_open_positions_reached:{open_count}")
+
+    daily_pnl = risk_state_get_daily_pnl() if "risk_state_get_daily_pnl" in globals() else safe_float(GLOBAL_STATE.get("daily_pnl", 0), 0)
+    checks["daily_pnl"] = daily_pnl
+    if daily_pnl <= -abs(safe_float(LIVE_SAFETY_MAX_DAILY_LOSS_DOLLARS, 25)):
+        failures.append(f"live_daily_loss_dollars_hit:{daily_pnl}")
+    if equity > 0 and (daily_pnl / equity) <= -abs(safe_float(LIVE_SAFETY_MAX_DAILY_LOSS_PCT, 0.10)):
+        failures.append(f"live_daily_loss_pct_hit:{round((daily_pnl/equity)*100, 2)}%")
+
+    fresh_ok, fresh_reason = live_safety_market_data_fresh()
+    checks["market_data"] = fresh_reason
+    if not fresh_ok:
+        failures.append(fresh_reason)
+
+    hours_ok, hours_reason = live_safety_within_market_hours()
+    checks["market_hours"] = hours_reason
+    if not hours_ok:
+        failures.append(hours_reason)
+
+    if isinstance(signal, dict):
+        qty = safe_int(signal.get("qty", 1), 1)
+        checks["incoming_qty"] = qty
+        if qty > safe_int(LIVE_SAFETY_MAX_QTY, 1):
+            failures.append(f"live_qty_too_large:{qty}")
+
+    state["checks"] = checks
+
+    if failures:
+        reason = ",".join(failures)
+        if LIVE_SAFETY_AUTO_LOCK_ON_ERROR:
+            live_safety_lock(reason)
+        else:
+            state["reason"] = reason
+            save_live_safety_state(state)
+        return {"approved": False, "reason": reason, "checks": checks}
+
+    state["locked"] = False
+    state["reason"] = "live_safety_passed"
+    save_live_safety_state(state)
+    debug("LIVE SAFETY CHECK PASSED")
+    return {"approved": True, "reason": "live_safety_passed", "checks": checks}
+
+
+def apply_live_safety_lock_to_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not isinstance(signal, dict):
+            return signal
+        result = live_safety_check(signal)
+        signal["live_safety"] = result
+        if not result.get("approved", False):
+            signal["blocked_by_live_safety"] = True
+            signal["live_safety_reason"] = result.get("reason", "live_safety_blocked")
+            debug(f"LIVE SAFETY BLOCKED TRADE | reason={signal['live_safety_reason']}")
+            try:
+                journal_record_signal_decision(signal, "live_safety", "blocked", signal["live_safety_reason"])
+            except Exception:
+                pass
+        else:
+            signal["blocked_by_live_safety"] = False
+            signal["live_safety_reason"] = ""
+        return signal
+    except Exception as e:
+        signal["blocked_by_live_safety"] = True
+        signal["live_safety_reason"] = f"live_safety_exception:{e}"
+        debug(f"LIVE SAFETY EXCEPTION BLOCK | {e}")
+        return signal
+
+
+def live_safety_blocks_signal(signal: Dict[str, Any]) -> bool:
+    try:
+        return bool(isinstance(signal, dict) and signal.get("blocked_by_live_safety"))
+    except Exception:
+        return False
+
+
 def risk_state_record_closed_trade(trade_or_position: Dict[str, Any]) -> Dict[str, Any]:
     """
     Updates win/loss streaks when a trade closes.
@@ -2321,6 +2625,16 @@ AUTO_AI_DEFAULT_CONTRACT_PRICE = float(os.getenv("AUTO_AI_DEFAULT_CONTRACT_PRICE
 AUTO_AI_DEFAULT_STOP_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_STOP_OFFSET", "0.35"))
 AUTO_AI_DEFAULT_TP1_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP1_OFFSET", "0.40"))
 AUTO_AI_DEFAULT_TP2_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP2_OFFSET", "0.80"))
+
+# =========================================================
+# AI SIGNAL -> SIGNAL.JSON EXECUTION BRIDGE
+# Converts ai_signal.json into signal.json before execution loop.
+# =========================================================
+ENABLE_AI_TO_SIGNAL_EXECUTION_BRIDGE = os.getenv("ENABLE_AI_TO_SIGNAL_EXECUTION_BRIDGE", "true").lower() == "true"
+AI_TO_SIGNAL_FORCE_TIMESTAMP = os.getenv("AI_TO_SIGNAL_FORCE_TIMESTAMP", "true").lower() == "true"
+AI_TO_SIGNAL_DELETE_AFTER_WRITE = os.getenv("AI_TO_SIGNAL_DELETE_AFTER_WRITE", "false").lower() == "true"
+AI_TO_SIGNAL_SKIP_IF_SIGNAL_EXISTS = os.getenv("AI_TO_SIGNAL_SKIP_IF_SIGNAL_EXISTS", "false").lower() == "true"
+
 # AI → SIGNAL.JSON BRIDGE
 # Reads AI decision output, validates it, normalizes it into
 # execution-safe signal.json, then lets main engine process it.
@@ -2515,6 +2829,10 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
                 journal_record_signal_decision(candidate, "learning_feedback", "blocked", candidate.get("learning_block_reason", "learning_blocked"))
                 return {"generated": False, "reason": "learning_blocked", "signal": candidate}
 
+            candidate = apply_live_safety_lock_to_signal(candidate)
+            if live_safety_blocks_signal(candidate):
+                return {"generated": False, "reason": "live_safety_blocked", "signal": candidate}
+
             journal_record_signal_decision(candidate, "auto_ai_generator", "generated", "passed_all_filters")
             atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
             state["last_signal_ts"] = now_ts()
@@ -2532,6 +2850,107 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
         return {"generated": False, "reason": "error", "error": str(e)}
 # AI → SIGNAL.JSON BRIDGE HELPERS
 # =========================================================
+
+def build_signal_from_ai() -> Dict[str, Any]:
+    """
+    Reads ai_signal.json, applies existing filters/safety systems, then writes signal.json.
+    """
+    try:
+        if not ENABLE_AI_TO_SIGNAL_EXECUTION_BRIDGE:
+            return {"written": False, "reason": "disabled"}
+
+        ai_file = globals().get("AI_SIGNAL_INPUT_FILE", "ai_signal.json")
+        sig_file = globals().get("SIGNAL_FILE", "signal.json")
+
+        if not os.path.exists(ai_file):
+            return {"written": False, "reason": "no_ai_signal_file"}
+
+        if AI_TO_SIGNAL_SKIP_IF_SIGNAL_EXISTS and os.path.exists(sig_file):
+            return {"written": False, "reason": "signal_file_already_exists"}
+
+        ai = load_json_file(ai_file, {})
+        if not isinstance(ai, dict) or not ai:
+            debug("AI TO SIGNAL BRIDGE SKIP | invalid ai_signal.json")
+            return {"written": False, "reason": "invalid_ai_signal"}
+
+        if "normalize_ai_to_engine_signal" in globals():
+            signal = normalize_ai_to_engine_signal(ai)
+        else:
+            signal = {
+                "ticker": ai.get("ticker", ai.get("symbol", "QQQ")),
+                "symbol": ai.get("symbol", ai.get("ticker", "QQQ")),
+                "contract_symbol": ai.get("contract_symbol", ai.get("option_symbol", ai.get("symbol", ai.get("ticker", "QQQ")))),
+                "direction": ai.get("direction", "CALL"),
+                "grade": ai.get("grade", ai.get("confidence", "A")),
+                "confidence": ai.get("confidence", ai.get("grade", "A")),
+                "entry": ai.get("entry", ai.get("entry_contract", ai.get("contract_price", 0))),
+                "stop": ai.get("stop", ai.get("stop_contract", 0)),
+                "target": ai.get("target", ai.get("tp1_contract", ai.get("take_profit", 0))),
+                "qty": ai.get("qty", ai.get("quantity", 1)),
+                "setup": ai.get("setup", ai.get("strategy", "break_and_hold")),
+                "trigger": ai.get("trigger", "break_and_hold"),
+                "confirmation": ai.get("confirmation", "volume"),
+                "regime": ai.get("regime", "clean"),
+                "reason": ai.get("reason", "AI to signal bridge"),
+                "timestamp": ai.get("timestamp", now_ts()),
+                "source": "ai_to_signal_bridge",
+            }
+
+        if AI_TO_SIGNAL_FORCE_TIMESTAMP:
+            signal["timestamp"] = now_ts()
+            signal["bridge_nonce"] = hashlib.sha256(f"{now_ts()}-{time.time()}".encode("utf-8")).hexdigest()[:12]
+
+        filter_steps = [
+            ("apply_macro_context_to_ai_signal", None),
+            ("macro_enforcement_blocks_signal", "macro_blocked"),
+            ("elite_execution_filter_blocks_signal", "elite_filter_blocked"),
+            ("apply_volatility_confidence_position_sizing", None),
+            ("vol_conf_sizing_blocks_signal", "vol_conf_sizing_blocked"),
+            ("apply_risk_state_to_signal", None),
+            ("risk_state_blocks_signal", "risk_state_blocked"),
+            ("apply_portfolio_heat_exposure_control", None),
+            ("portfolio_heat_blocks_signal", "portfolio_heat_blocked"),
+            ("apply_learning_feedback_to_signal", None),
+            ("learning_blocks_signal", "learning_blocked"),
+            ("apply_live_safety_lock_to_signal", None),
+            ("live_safety_blocks_signal", "live_safety_blocked"),
+        ]
+
+        for fn_name, block_reason in filter_steps:
+            fn = globals().get(fn_name)
+            if not callable(fn):
+                continue
+            if block_reason is None:
+                updated = fn(signal)
+                if isinstance(updated, dict):
+                    signal = updated
+            else:
+                if fn(signal):
+                    debug(f"AI TO SIGNAL BRIDGE BLOCKED | stage={fn_name} reason={block_reason}")
+                    return {"written": False, "reason": block_reason, "signal": signal}
+
+        if "ai_signal_validation_errors" in globals():
+            errors = ai_signal_validation_errors(ai, signal)
+            if errors:
+                debug(f"AI TO SIGNAL BRIDGE VALIDATION BLOCKED | errors={errors}")
+                return {"written": False, "reason": "validation_failed", "errors": errors, "signal": signal}
+
+        atomic_write_json(sig_file, signal)
+        debug(f"AI TO SIGNAL BRIDGE WROTE SIGNAL | {signal.get('ticker')} {signal.get('direction')} {signal.get('grade', signal.get('confidence'))} file={sig_file}")
+
+        if AI_TO_SIGNAL_DELETE_AFTER_WRITE:
+            try:
+                os.remove(ai_file)
+            except Exception:
+                pass
+
+        return {"written": True, "reason": "signal_written", "signal": signal}
+
+    except Exception as e:
+        log(f"❌ AI TO SIGNAL BRIDGE ERROR | {e}")
+        return {"written": False, "reason": "error", "error": str(e)}
+
+
 def ai_grade_rank(grade: str) -> int:
     order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1, "AVOID": 0}
     return order.get(str(grade).upper().strip(), 0)
@@ -2799,6 +3218,13 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             archive_ai_signal_input(ai, "learning_blocked", {"reason": reason, "normalized_signal": signal})
             journal_record_signal_decision(signal, "learning_feedback", "blocked", reason)
             return {"written": False, "reason": "learning_blocked", "learning_reason": reason, "signal": signal}
+
+        signal = apply_live_safety_lock_to_signal(signal)
+        if live_safety_blocks_signal(signal):
+            reason = signal.get("live_safety_reason", "live_safety_blocked")
+            debug(f"LIVE SAFETY BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "live_safety_blocked", {"reason": reason, "normalized_signal": signal})
+            return {"written": False, "reason": "live_safety_blocked", "live_safety_reason": reason, "signal": signal}
 
         journal_record_signal_decision(signal, "ai_bridge", "written", "passed_all_filters")
 
@@ -9756,6 +10182,11 @@ def reset_kill_switch_for_testing():
 
 
 def main_loop():
+    try:
+        build_signal_from_ai()
+    except Exception as e:
+        debug(f"AI TO SIGNAL BRIDGE LOOP ERROR | {e}")
+
     boot()
     macro_bridge_fred_refresh(force=False)
     auto_generate_ai_signal_if_ready()
