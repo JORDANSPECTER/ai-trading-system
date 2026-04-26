@@ -754,6 +754,128 @@ ADAPTIVE_MAX_GRADE_BOOST = int(os.getenv("ADAPTIVE_MAX_GRADE_BOOST", "2"))
 ADAPTIVE_SEND_ALERTS = os.getenv("ADAPTIVE_SEND_ALERTS", "true").lower() == "true"
 
 
+
+# =========================================================
+# QQQ-ONLY ENFORCEMENT + CLEAN LEARNING FILTER
+# Added to prevent SPY/fallback trades and garbage learning.
+# =========================================================
+ENABLE_QQQ_ONLY_ENFORCEMENT = os.getenv("ENABLE_QQQ_ONLY_ENFORCEMENT", "true").lower() == "true"
+QQQ_ONLY_ALLOWED_TICKERS = {
+    t.strip().upper()
+    for t in os.getenv("QQQ_ONLY_ALLOWED_TICKERS", "QQQ").split(",")
+    if t.strip()
+}
+REQUIRE_VALID_TRIGGER_FOR_LEARNING = os.getenv("REQUIRE_VALID_TRIGGER_FOR_LEARNING", "true").lower() == "true"
+BLOCK_GENERIC_NO_TRIGGER_LEARNING = os.getenv("BLOCK_GENERIC_NO_TRIGGER_LEARNING", "true").lower() == "true"
+MIN_TRIGGER_LENGTH_FOR_LEARNING = int(os.getenv("MIN_TRIGGER_LENGTH_FOR_LEARNING", "3"))
+
+
+def qqq_lock_get_ticker(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return str(
+        payload.get("ticker")
+        or payload.get("underlying")
+        or payload.get("symbol")
+        or payload.get("contract_symbol")
+        or ""
+    ).upper().strip()
+
+
+def qqq_lock_get_trigger(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return str(
+        payload.get("trigger")
+        or payload.get("setup_type")
+        or payload.get("setup")
+        or payload.get("setup_name")
+        or payload.get("strategy")
+        or ""
+    ).strip()
+
+
+def qqq_only_signal_allowed(payload: Dict[str, Any], stage: str = "signal") -> Tuple[bool, str]:
+    """
+    Hard execution filter.
+    This blocks SPY/default/fallback trades before they can reach paper/live execution.
+    """
+    if not ENABLE_QQQ_ONLY_ENFORCEMENT:
+        return True, "qqq_only_disabled"
+
+    ticker = qqq_lock_get_ticker(payload)
+
+    if not ticker:
+        return False, f"{stage}_blocked_missing_ticker"
+
+    if ticker not in QQQ_ONLY_ALLOWED_TICKERS:
+        return False, f"{stage}_blocked_ticker_{ticker}_not_allowed"
+
+    return True, "qqq_only_allowed"
+
+
+def qqq_clean_learning_allowed(payload: Dict[str, Any], stage: str = "learning") -> Tuple[bool, str]:
+    """
+    Clean learning filter.
+    This prevents bad memory like:
+      SPY | No trigger provided | win
+    from polluting the adaptive model.
+    """
+    if not ENABLE_QQQ_ONLY_ENFORCEMENT:
+        return True, "qqq_only_disabled"
+
+    ok, reason = qqq_only_signal_allowed(payload, stage=stage)
+    if not ok:
+        return False, reason
+
+    if REQUIRE_VALID_TRIGGER_FOR_LEARNING:
+        trigger = qqq_lock_get_trigger(payload)
+        bad_values = {
+            "",
+            "none",
+            "null",
+            "generic",
+            "no trigger provided",
+            "no_trigger_provided",
+            "unnamed setup",
+            "engine closed trade",
+        }
+
+        trigger_clean = trigger.lower().strip()
+
+        if trigger_clean in bad_values:
+            return False, f"{stage}_blocked_invalid_trigger:{trigger}"
+
+        if len(trigger_clean) < MIN_TRIGGER_LENGTH_FOR_LEARNING:
+            return False, f"{stage}_blocked_trigger_too_short:{trigger}"
+
+        if BLOCK_GENERIC_NO_TRIGGER_LEARNING and ("no trigger" in trigger_clean or "generic" == trigger_clean):
+            return False, f"{stage}_blocked_generic_trigger:{trigger}"
+
+    return True, "clean_learning_allowed"
+
+
+def qqq_only_block_message(payload: Dict[str, Any], reason: str, stage: str = "signal") -> str:
+    return (
+        f"🚫 QQQ-ONLY BLOCK | stage={stage} "
+        f"ticker={qqq_lock_get_ticker(payload)} "
+        f"direction={payload.get('direction') if isinstance(payload, dict) else ''} "
+        f"reason={reason}"
+    )
+
+
+def qqq_only_debug_block(payload: Dict[str, Any], reason: str, stage: str = "signal") -> None:
+    msg = qqq_only_block_message(payload, reason, stage)
+    try:
+        debug(msg)
+    except Exception:
+        print(msg, flush=True)
+    try:
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    except Exception:
+        pass
+
+
 # =========================================================
 # ADAPTIVE LEARNING → POSITION SIZING
 # =========================================================
@@ -9197,6 +9319,12 @@ def paper_bridge_save_positions_store(data: Dict[str, Any]) -> None:
 
 def paper_bridge_should_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     ensure_globals_initialized()
+
+    qqq_ok, qqq_reason = qqq_only_signal_allowed(signal, stage="paper_bridge")
+    if not qqq_ok:
+        qqq_only_debug_block(signal, qqq_reason, stage="paper_bridge")
+        return {"approved": False, "reason": qqq_reason, "hash": paper_bridge_signal_hash(signal)}
+
     sig_hash = paper_bridge_signal_hash(signal)
     current_time = epoch()
 
@@ -9230,12 +9358,18 @@ def paper_bridge_extract_prices(signal: Dict[str, Any]) -> Dict[str, float]:
 
 def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     orders_store = paper_bridge_load_orders_store()
+
+    qqq_ok, qqq_reason = qqq_only_signal_allowed(signal, stage="paper_bridge_create_order")
+    if not qqq_ok:
+        qqq_only_debug_block(signal, qqq_reason, stage="paper_bridge_create_order")
+        raise RuntimeError(qqq_reason)
+
     orders_store["last_local_order_id"] = safe_int(orders_store.get("last_local_order_id", 0), 0) + 1
 
     prices = paper_bridge_extract_prices(signal)
     qty = safe_int(signal.get("qty", signal.get("qty_hint", 1)), 1)
-    symbol = str(signal.get("symbol") or signal.get("contract_symbol") or signal.get("ticker") or "").strip()
-    ticker = str(signal.get("ticker") or signal.get("underlying") or symbol).upper().strip()
+    ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
+    symbol = str(signal.get("symbol") or signal.get("contract_symbol") or ticker).strip()
     direction = normalize_direction(signal.get("direction", "CALL"))
 
     order = {
@@ -9622,6 +9756,12 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not signal:
         debug("handle_new_signal skipped: empty signal")
         return None
+
+    qqq_ok, qqq_reason = qqq_only_signal_allowed(signal, stage="handle_new_signal")
+    if not qqq_ok:
+        qqq_only_debug_block(signal, qqq_reason, stage="handle_new_signal")
+        return None
+
     debug(f"CONTROL FLAGS | force_execution={FORCE_EXECUTION_MODE} | allow_duplicates={ALLOW_DUPLICATE_SIGNALS}")
 
     # =========================================================
@@ -10136,6 +10276,17 @@ def adaptive_load_learning_stats() -> Dict[str, Any]:
 def adaptive_record_trade_for_learning(trade: Dict[str, Any]) -> Dict[str, Any]:
     if not ENABLE_ADAPTIVE_LEARNING_MODULE:
         return {}
+
+    learning_ok, learning_reason = qqq_clean_learning_allowed(trade, stage="adaptive_record_trade")
+    if not learning_ok:
+        qqq_only_debug_block(trade, learning_reason, stage="adaptive_record_trade")
+        return {
+            "skipped": True,
+            "reason": learning_reason,
+            "ticker": qqq_lock_get_ticker(trade),
+            "trigger": qqq_lock_get_trigger(trade),
+        }
+
     memory = adaptive_load_trade_memory()
     normalized = adaptive_normalize_trade_record(trade)
 
@@ -10164,6 +10315,17 @@ def adaptive_record_position_close(position: Dict[str, Any], close_reason: str =
     story["trigger"] = position.get("trigger", story.get("trigger", ""))
     story["confluences"] = position.get("confluences", position.get("signal_confluences", {}))
     story["close_reason"] = close_reason
+
+    learning_ok, learning_reason = qqq_clean_learning_allowed(story, stage="adaptive_position_close")
+    if not learning_ok:
+        qqq_only_debug_block(story, learning_reason, stage="adaptive_position_close")
+        return {
+            "skipped": True,
+            "reason": learning_reason,
+            "ticker": qqq_lock_get_ticker(story),
+            "trigger": qqq_lock_get_trigger(story),
+        }
+
     return adaptive_record_trade_for_learning(story)
 
 
@@ -11160,3 +11322,58 @@ if __name__ == "__main__":
 
 
 # MANUAL HOOK NEEDED: call signal = apply_adaptive_learning_sizing_to_signal(signal) before execution.
+
+
+
+
+# =========================================================
+# CLEAN POLLUTED LEARNING MEMORY HELPER
+# Removes non-QQQ / invalid-trigger records from adaptive memory files.
+# =========================================================
+def qqq_clean_existing_learning_memory() -> Dict[str, Any]:
+    removed = []
+    kept = []
+
+    # Clean adaptive_trade_memory.json if present
+    memory_file = globals().get("ADAPTIVE_TRADE_MEMORY_FILE", "adaptive_trade_memory.json")
+    try:
+        memory = adaptive_load_trade_memory() if "adaptive_load_trade_memory" in globals() else []
+    except Exception:
+        memory = []
+
+    if isinstance(memory, list):
+        for item in memory:
+            ok, reason = qqq_clean_learning_allowed(item, stage="clean_existing_memory")
+            if ok:
+                kept.append(item)
+            else:
+                removed.append({
+                    "ticker": qqq_lock_get_ticker(item),
+                    "trigger": qqq_lock_get_trigger(item),
+                    "reason": reason,
+                })
+
+        try:
+            adaptive_save_trade_memory(kept)
+            stats = adaptive_rebuild_learning_stats(kept)
+            adaptive_write_json(globals().get("ADAPTIVE_LEARNING_STATS_FILE", "adaptive_learning_stats.json"), stats)
+        except Exception as e:
+            try:
+                debug(f"QQQ CLEAN MEMORY adaptive file error: {e}")
+            except Exception:
+                print(f"QQQ CLEAN MEMORY adaptive file error: {e}", flush=True)
+
+    # Clean jsonl trade memory if present by preserving file backup only.
+    # jsonl memory may contain older intelligence-layer data; we do not delete it blindly.
+    result = {
+        "kept": len(kept),
+        "removed": len(removed),
+        "removed_samples": removed[:20],
+    }
+
+    try:
+        debug(f"QQQ CLEAN MEMORY COMPLETE | kept={result['kept']} removed={result['removed']}")
+    except Exception:
+        print(f"QQQ CLEAN MEMORY COMPLETE | kept={result['kept']} removed={result['removed']}", flush=True)
+
+    return result
