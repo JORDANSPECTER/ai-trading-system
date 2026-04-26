@@ -11,7 +11,7 @@
   "bot_paused": false,
   "flatten_requested": false,
   "armed": true,
-  "mode": "paper",
+  "mode": "live",
   "last_command": "/ping",
   "last_command_time_utc": "2026-04-18 20:19:41 UTC",
   "last_command_from": "Jordan Bias (8661143355)",
