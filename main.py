@@ -675,6 +675,27 @@ PHASE1_SOFT_HALT_ON_RATE_LIMIT = os.getenv("PHASE1_SOFT_HALT_ON_RATE_LIMIT", "tr
 PHASE1_SEND_ALERTS = os.getenv("PHASE1_SEND_ALERTS", "true").lower() == "true"
 
 # =========================================================
+# OPTIONS LIQUIDITY FILTER
+# Production gate before paper/live options execution.
+# Checks whether the option quote is actually tradeable:
+# - bid/ask present when required
+# - spread % of mid is not too wide
+# - volume / open interest meet minimums when supplied
+# - last/mark is not badly outside bid/ask
+# Defaults are paper-friendly but live-strict.
+# =========================================================
+ENABLE_OPTIONS_LIQUIDITY_FILTER = os.getenv("ENABLE_OPTIONS_LIQUIDITY_FILTER", "true").lower() == "true"
+OPTIONS_LIQUIDITY_REQUIRE_FOR_LIVE = os.getenv("OPTIONS_LIQUIDITY_REQUIRE_FOR_LIVE", "true").lower() == "true"
+OPTIONS_LIQUIDITY_REQUIRE_FOR_PAPER = os.getenv("OPTIONS_LIQUIDITY_REQUIRE_FOR_PAPER", "false").lower() == "true"
+OPTIONS_LIQUIDITY_MAX_SPREAD_PCT = float(os.getenv("OPTIONS_LIQUIDITY_MAX_SPREAD_PCT", "0.20"))
+OPTIONS_LIQUIDITY_MIN_VOLUME = int(os.getenv("OPTIONS_LIQUIDITY_MIN_VOLUME", "10"))
+OPTIONS_LIQUIDITY_MIN_OPEN_INTEREST = int(os.getenv("OPTIONS_LIQUIDITY_MIN_OPEN_INTEREST", "50"))
+OPTIONS_LIQUIDITY_ALLOW_MISSING_VOLUME_IN_PAPER = os.getenv("OPTIONS_LIQUIDITY_ALLOW_MISSING_VOLUME_IN_PAPER", "true").lower() == "true"
+OPTIONS_LIQUIDITY_ALLOW_MISSING_OI_IN_PAPER = os.getenv("OPTIONS_LIQUIDITY_ALLOW_MISSING_OI_IN_PAPER", "true").lower() == "true"
+OPTIONS_LIQUIDITY_MAX_LAST_OUTSIDE_BA_PCT = float(os.getenv("OPTIONS_LIQUIDITY_MAX_LAST_OUTSIDE_BA_PCT", "0.10"))
+OPTIONS_LIQUIDITY_SEND_ALERTS = os.getenv("OPTIONS_LIQUIDITY_SEND_ALERTS", "true").lower() == "true"
+
+# =========================================================
 # PHASE 2 EXECUTION RELIABILITY LAYER
 # - Order lifecycle integrity
 # - Duplicate active-order suppression
@@ -8694,6 +8715,200 @@ def phase1_spread_check(symbol: str, prices: Dict[str, Any], live_price: float, 
     return {"approved": True, "reason": "spread_ok", "bid": bid, "ask": ask, "spread_pct": round(spread_pct, 6)}
 
 
+
+
+def options_liquidity_symbol_is_option(signal_or_stub: Dict[str, Any], symbol: str) -> bool:
+    """Detects whether the order is an options contract."""
+    try:
+        asset_class = str(signal_or_stub.get("asset_class", signal_or_stub.get("asset_type", ""))).lower().strip()
+        if asset_class == "option":
+            return True
+        if is_option_contract_symbol(symbol):
+            return True
+        contract_symbol = str(signal_or_stub.get("contract_symbol", "")).strip()
+        if contract_symbol and is_option_contract_symbol(contract_symbol):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def options_liquidity_payload_for_symbol(symbol: str, prices: Dict[str, Any]) -> Dict[str, Any]:
+    """Flexible market_prices.json parser for option quotes."""
+    if not isinstance(prices, dict) or not symbol:
+        return {}
+    direct = prices.get(symbol) or prices.get(str(symbol).upper()) or prices.get(str(symbol).lower())
+    if isinstance(direct, dict):
+        return direct
+    symbol_upper = str(symbol).upper().strip()
+    for key, value in prices.items():
+        if str(key).startswith("__"):
+            continue
+        if str(key).upper().strip() == symbol_upper and isinstance(value, dict):
+            return value
+    return {}
+
+
+def options_liquidity_extract_quote(symbol: str, prices: Dict[str, Any], fallback_last: float = 0.0) -> Dict[str, Any]:
+    """Returns normalized bid/ask/mid/last/volume/open_interest/timestamp from a flexible quote payload."""
+    payload = options_liquidity_payload_for_symbol(symbol, prices)
+    nested_candidates = []
+    if isinstance(payload, dict):
+        nested_candidates.extend([
+            payload,
+            payload.get("latestQuote", {}),
+            payload.get("latest_quote", {}),
+            payload.get("quote", {}),
+            payload.get("latestTrade", {}),
+            payload.get("latest_trade", {}),
+            payload.get("trade", {}),
+            payload.get("snapshot", {}),
+        ])
+    else:
+        nested_candidates.append({})
+
+    merged: Dict[str, Any] = {}
+    for item in nested_candidates:
+        if isinstance(item, dict):
+            merged.update({k: v for k, v in item.items() if v not in (None, "")})
+
+    bid = safe_float(merged.get("bid", merged.get("bid_price", merged.get("bp", 0))), 0)
+    ask = safe_float(merged.get("ask", merged.get("ask_price", merged.get("ap", 0))), 0)
+    last = safe_float(
+        merged.get("last", merged.get("last_price", merged.get("price", merged.get("mark", merged.get("mid", merged.get("p", fallback_last)))))),
+        fallback_last,
+    )
+    mid = safe_float(merged.get("mid", merged.get("mark", 0)), 0)
+
+    if mid <= 0 and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+    if mid <= 0 and last > 0:
+        mid = last
+
+    volume = safe_int(merged.get("volume", merged.get("vol", merged.get("v", 0))), 0)
+    open_interest = safe_int(
+        merged.get("open_interest", merged.get("oi", merged.get("openInterest", merged.get("openInterestValue", 0)))),
+        0,
+    )
+    ts = safe_int(merged.get("timestamp", merged.get("ts", merged.get("updated_at", merged.get("price_updated_at", 0)))), 0)
+
+    return {
+        "symbol": symbol,
+        "bid": round(bid, 6),
+        "ask": round(ask, 6),
+        "mid": round(mid, 6),
+        "last": round(last, 6),
+        "volume": volume,
+        "open_interest": open_interest,
+        "timestamp": ts,
+        "raw_available": bool(payload),
+    }
+
+
+def options_liquidity_gate(signal_or_stub: Dict[str, Any], prices: Dict[str, Any], live_price: float = 0.0, mode: str = "PAPER") -> Dict[str, Any]:
+    """
+    Production options liquidity gate.
+    Missing data blocks live by default, but only warns in paper unless OPTIONS_LIQUIDITY_REQUIRE_FOR_PAPER=true.
+    """
+    if not ENABLE_OPTIONS_LIQUIDITY_FILTER:
+        return {"approved": True, "stage": "options_liquidity", "reason": "disabled", "reject_reasons": []}
+
+    mode_upper = str(mode or "PAPER").upper().strip()
+    symbol = str(signal_or_stub.get("symbol") or signal_or_stub.get("contract_symbol") or "").strip()
+
+    if not options_liquidity_symbol_is_option(signal_or_stub, symbol):
+        return {"approved": True, "stage": "options_liquidity", "reason": "not_option", "reject_reasons": []}
+
+    quote = options_liquidity_extract_quote(symbol, prices, fallback_last=live_price)
+    reasons: List[str] = []
+    require_data = OPTIONS_LIQUIDITY_REQUIRE_FOR_LIVE if mode_upper == "LIVE" else OPTIONS_LIQUIDITY_REQUIRE_FOR_PAPER
+
+    bid = safe_float(quote.get("bid"), 0)
+    ask = safe_float(quote.get("ask"), 0)
+    mid = safe_float(quote.get("mid"), 0)
+    last = safe_float(quote.get("last"), 0)
+    volume = safe_int(quote.get("volume"), 0)
+    open_interest = safe_int(quote.get("open_interest"), 0)
+    ts = safe_int(quote.get("timestamp"), 0)
+
+    if not quote.get("raw_available") and require_data:
+        reasons.append("options_liquidity_missing_quote")
+
+    if bid <= 0 or ask <= 0:
+        if require_data:
+            reasons.append("options_liquidity_missing_bid_ask")
+    elif ask < bid:
+        reasons.append("options_liquidity_crossed_market")
+    else:
+        if mid <= 0:
+            mid = (bid + ask) / 2.0
+        spread_pct = ((ask - bid) / mid) if mid > 0 else 0.0
+        quote["spread_pct"] = round(spread_pct, 6)
+        if spread_pct > OPTIONS_LIQUIDITY_MAX_SPREAD_PCT:
+            reasons.append("options_liquidity_spread_too_wide")
+
+        if last > 0 and mid > 0 and OPTIONS_LIQUIDITY_MAX_LAST_OUTSIDE_BA_PCT >= 0:
+            lower_bound = bid * (1.0 - OPTIONS_LIQUIDITY_MAX_LAST_OUTSIDE_BA_PCT)
+            upper_bound = ask * (1.0 + OPTIONS_LIQUIDITY_MAX_LAST_OUTSIDE_BA_PCT)
+            if last < lower_bound or last > upper_bound:
+                reasons.append("options_liquidity_bad_mid_last_outside_bid_ask")
+
+    if "spread_pct" not in quote:
+        quote["spread_pct"] = 0.0
+
+    if ts > 0 and market_price_is_stale(ts):
+        reasons.append("options_liquidity_stale_quote")
+
+    if volume <= 0:
+        if mode_upper == "LIVE" or not OPTIONS_LIQUIDITY_ALLOW_MISSING_VOLUME_IN_PAPER:
+            reasons.append("options_liquidity_missing_volume")
+    elif volume < OPTIONS_LIQUIDITY_MIN_VOLUME:
+        reasons.append("options_liquidity_volume_too_low")
+
+    if open_interest <= 0:
+        if mode_upper == "LIVE" or not OPTIONS_LIQUIDITY_ALLOW_MISSING_OI_IN_PAPER:
+            reasons.append("options_liquidity_missing_open_interest")
+    elif open_interest < OPTIONS_LIQUIDITY_MIN_OPEN_INTEREST:
+        reasons.append("options_liquidity_open_interest_too_low")
+
+    approved = len(reasons) == 0
+    decision = {
+        "approved": approved,
+        "stage": "options_liquidity",
+        "mode": mode_upper,
+        "symbol": symbol,
+        "reject_reasons": reasons,
+        "quote": quote,
+        "thresholds": {
+            "max_spread_pct": OPTIONS_LIQUIDITY_MAX_SPREAD_PCT,
+            "min_volume": OPTIONS_LIQUIDITY_MIN_VOLUME,
+            "min_open_interest": OPTIONS_LIQUIDITY_MIN_OPEN_INTEREST,
+            "max_last_outside_bid_ask_pct": OPTIONS_LIQUIDITY_MAX_LAST_OUTSIDE_BA_PCT,
+            "required": require_data,
+        },
+        "reason": "options_liquidity_ok" if approved else ",".join(reasons),
+    }
+
+    if approved:
+        debug(
+            f"OPTIONS LIQUIDITY OK | {symbol} bid={quote.get('bid')} ask={quote.get('ask')} "
+            f"spread={round(safe_float(quote.get('spread_pct'), 0)*100,2)}% vol={volume} oi={open_interest} mode={mode_upper}"
+        )
+    else:
+        msg = build_block_message(
+            "OPTIONS LIQUIDITY BLOCK",
+            signal_or_stub,
+            reasons,
+            f"Symbol: {symbol}\nQuote: {quote}\nThresholds: {decision['thresholds']}",
+        )
+        if OPTIONS_LIQUIDITY_SEND_ALERTS:
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+            send_to_telegram(msg)
+        debug(f"OPTIONS LIQUIDITY BLOCK | {symbol} | reasons={reasons} | quote={quote}")
+
+    return decision
+
 def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty: int, planned_price: float = 0.0, mode: str = "PAPER") -> Dict[str, Any]:
     """Final Phase 1 safety guard before paper open or Alpaca order submit."""
     if not ENABLE_PHASE1_EXECUTION_SAFETY:
@@ -8760,6 +8975,10 @@ def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty:
     if not spread["approved"]:
         reasons.append(spread["reason"])
 
+    options_liquidity = options_liquidity_gate(signal_or_stub, prices, live_price=live_price, mode=mode)
+    if not options_liquidity.get("approved", True):
+        reasons.extend(options_liquidity.get("reject_reasons", [options_liquidity.get("reason", "options_liquidity_block")]))
+
     if FORCE_EXECUTION_MODE and reasons:
         hard_risk_terms = ("kill", "daily_loss", "drawdown", "reconciliation", "bot_paused", "engine_disabled", "entries_not_allowed")
         hard_reasons = [r for r in reasons if any(term in str(r).lower() for term in hard_risk_terms)]
@@ -8786,6 +9005,7 @@ def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty:
         "risk_dollars": round(risk_dollars, 2),
         "order_counts": counts,
         "spread": spread,
+        "options_liquidity": options_liquidity,
     }
 
     if approved:
@@ -8799,7 +9019,7 @@ def phase1_validate_order_safety(signal_or_stub: Dict[str, Any], side: str, qty:
             f"Side: {side} | Symbol: {symbol} | Qty: {qty}\n"
             f"Live: {decision['live_price']} | Planned: {decision['planned_price']} | Slippage %: {round(decision['slippage_pct']*100, 2)}\n"
             f"Notional: ${decision['notional_dollars']} | Risk: ${decision['risk_dollars']}\n"
-            f"Counts: {counts}\nSpread: {spread}"
+            f"Counts: {counts}\nSpread: {spread}\nOptions Liquidity: {options_liquidity}"
         )
         msg = build_block_message("PHASE 1 ORDER SAFETY BLOCK", signal_or_stub, reasons, extras)
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -9810,6 +10030,14 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         qqq_only_debug_block(signal, qqq_reason, stage="paper_bridge_create_order")
         raise RuntimeError(qqq_reason)
 
+    bridge_symbol = str(signal.get("symbol") or signal.get("contract_symbol") or signal.get("ticker") or "").strip()
+    bridge_prices_store = load_market_prices([bridge_symbol, str(signal.get("ticker", "")).upper().strip()])
+    bridge_live_price, _ = get_market_price_for_symbol(bridge_symbol, bridge_prices_store)
+    bridge_liquidity = options_liquidity_gate(signal, bridge_prices_store, live_price=bridge_live_price, mode="PAPER")
+    if not bridge_liquidity.get("approved", True):
+        raise RuntimeError("options_liquidity_block:" + bridge_liquidity.get("reason", "unknown"))
+    signal["options_liquidity"] = bridge_liquidity
+
     orders_store["last_local_order_id"] = safe_int(orders_store.get("last_local_order_id", 0), 0) + 1
 
     prices = paper_bridge_extract_prices(signal)
@@ -9828,6 +10056,7 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": symbol,
         "contract_symbol": str(signal.get("contract_symbol", symbol)).strip(),
         "asset_class": str(signal.get("asset_class", "option")).lower(),
+        "options_liquidity": signal.get("options_liquidity", {}),
         "direction": direction,
         "side": "BUY",
         "qty": qty,
