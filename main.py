@@ -755,6 +755,115 @@ ADAPTIVE_SEND_ALERTS = os.getenv("ADAPTIVE_SEND_ALERTS", "true").lower() == "tru
 
 
 
+
+# =========================================================
+# AUTO PAPER / LIVE ROUTING SAFETY
+# Paper mode can execute without manual force; live stays protected.
+# =========================================================
+AUTO_DETECT_PAPER_LIVE_MODE = os.getenv("AUTO_DETECT_PAPER_LIVE_MODE", "true").lower() == "true"
+AUTO_ALLOW_PAPER_EXECUTION_WITHOUT_FORCE = os.getenv("AUTO_ALLOW_PAPER_EXECUTION_WITHOUT_FORCE", "true").lower() == "true"
+AUTO_BLOCK_LIVE_UNLESS_FULLY_APPROVED = os.getenv("AUTO_BLOCK_LIVE_UNLESS_FULLY_APPROVED", "true").lower() == "true"
+
+
+def auto_mode_is_live() -> bool:
+    mode = str(os.getenv("MODE", globals().get("MODE", "paper"))).lower().strip()
+    live_mode = str(os.getenv("LIVE_MODE", str(globals().get("LIVE_MODE", False)))).lower().strip() == "true"
+    alpaca_base = str(os.getenv("ALPACA_BASE_URL", globals().get("ALPACA_BASE_URL", ""))).lower()
+    return mode == "live" or live_mode or ("api.alpaca.markets" in alpaca_base and "paper-api" not in alpaca_base)
+
+
+def auto_mode_is_paper() -> bool:
+    mode = str(os.getenv("MODE", globals().get("MODE", "paper"))).lower().strip()
+    if auto_mode_is_live():
+        return False
+
+    enable_alpaca = str(os.getenv("ENABLE_ALPACA", str(globals().get("ENABLE_ALPACA", False)))).lower().strip() == "true"
+    paper_execution = str(os.getenv("ENABLE_PAPER_EXECUTION", str(globals().get("ENABLE_PAPER_EXECUTION", True)))).lower().strip() == "true"
+    alpaca_base = str(os.getenv("ALPACA_BASE_URL", globals().get("ALPACA_BASE_URL", ""))).lower()
+
+    if mode in {"paper", "test", "demo", "sandbox"}:
+        return True
+    if paper_execution and not enable_alpaca:
+        return True
+    if "paper-api.alpaca.markets" in alpaca_base:
+        return True
+
+    return paper_execution
+
+
+def auto_should_force_execution_for_test(signal=None) -> bool:
+    """
+    Paper mode should be allowed to execute without manual force.
+    Live mode should never be forced by this helper.
+    """
+    if not AUTO_DETECT_PAPER_LIVE_MODE:
+        return bool(globals().get("FORCE_EXECUTION_MODE", False))
+
+    if auto_mode_is_paper() and AUTO_ALLOW_PAPER_EXECUTION_WITHOUT_FORCE:
+        return True
+
+    return bool(globals().get("FORCE_EXECUTION_MODE", False))
+
+
+def auto_live_safety_reasons() -> list:
+    reasons = []
+
+    enable_alpaca = str(os.getenv("ENABLE_ALPACA", str(globals().get("ENABLE_ALPACA", False)))).lower().strip() == "true"
+    enable_execution = str(os.getenv("ENABLE_EXECUTION", str(globals().get("ENABLE_EXECUTION", False)))).lower().strip() == "true"
+    live_approved = str(os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", str(globals().get("ALPACA_LIVE_OPTIONS_APPROVED", False)))).lower().strip() == "true"
+    allow_live_buys = str(os.getenv("ALLOW_LIVE_BUYS", str(globals().get("ALLOW_LIVE_BUYS", False)))).lower().strip() == "true"
+    force = bool(globals().get("FORCE_EXECUTION_MODE", False))
+
+    if not enable_alpaca:
+        reasons.append("ENABLE_ALPACA_false")
+    if not enable_execution:
+        reasons.append("ENABLE_EXECUTION_false")
+    if not live_approved:
+        reasons.append("ALPACA_LIVE_OPTIONS_APPROVED_false")
+    if not allow_live_buys:
+        reasons.append("ALLOW_LIVE_BUYS_false")
+    if force:
+        reasons.append("FORCE_EXECUTION_MODE_must_be_false_live")
+
+    return reasons
+
+
+def auto_execution_allowed(signal=None) -> tuple:
+    """
+    Returns (allowed, mode, reasons)
+    """
+    if auto_mode_is_paper():
+        return True, "paper", []
+
+    if auto_mode_is_live():
+        reasons = auto_live_safety_reasons()
+        if AUTO_BLOCK_LIVE_UNLESS_FULLY_APPROVED and reasons:
+            return False, "live", reasons
+        return True, "live", []
+
+    return False, "unknown", ["mode_not_detected"]
+
+
+def auto_debug_routing(signal=None) -> None:
+    try:
+        allowed, mode, reasons = auto_execution_allowed(signal)
+        msg = (
+            f"AUTO ROUTING | mode={mode} allowed={allowed} "
+            f"paper={auto_mode_is_paper()} live={auto_mode_is_live()} "
+            f"force={auto_should_force_execution_for_test(signal)} "
+            f"reasons={','.join(reasons) if reasons else 'none'}"
+        )
+        try:
+            debug(msg)
+        except Exception:
+            print(msg, flush=True)
+    except Exception as e:
+        try:
+            debug(f"AUTO ROUTING ERROR | {e}")
+        except Exception:
+            print(f"AUTO ROUTING ERROR | {e}", flush=True)
+
+
 # =========================================================
 # QQQ-ONLY ENFORCEMENT + CLEAN LEARNING FILTER
 # Added to prevent SPY/fallback trades and garbage learning.
@@ -4128,7 +4237,7 @@ def paper_pnl_dollars(entry_price: float, exit_price: float, qty: int, multiplie
 def update_daily_realized_pnl(delta_dollars: float = 0.0, delta_pct_decimal: float = 0.0, source: str = ""):
     ensure_globals_initialized()
     reset_daily_risk_counters_if_needed(GLOBAL_STATE)
-    if FORCE_EXECUTION_MODE:
+    if auto_should_force_execution_for_test(signal) if 'signal' in locals() else FORCE_EXECUTION_MODE:
         log("🚨 FORCE EXECUTION MODE ENABLED — PHASE 3.5 GATE OVERRIDE")
         if not FORCE_EXECUTION_KEEP_RISK_GATES:
             return {"approved": True, "stage": "phase35_enforcement", "notes": ["force_execution_all_gates_bypassed"], "reject_reasons": []}
@@ -9019,7 +9128,7 @@ def phase35_is_edge_window() -> bool:
 
 def phase35_strategy_execution_lock(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Hard strategy filter before any paper/live execution."""
-    if FORCE_EXECUTION_MODE:
+    if auto_should_force_execution_for_test(signal) if 'signal' in locals() else FORCE_EXECUTION_MODE:
         log("🚨 FORCE MODE ACTIVE — BYPASSING STRATEGY LOCK")
         # Anti-spam: keep force bypass in logs only. Paper bridge sends execution alert once.
         return {
@@ -9762,7 +9871,8 @@ def handle_new_signal(signal: Dict[str, Any]):
         qqq_only_debug_block(signal, qqq_reason, stage="handle_new_signal")
         return None
 
-    debug(f"CONTROL FLAGS | force_execution={FORCE_EXECUTION_MODE} | allow_duplicates={ALLOW_DUPLICATE_SIGNALS}")
+    auto_debug_routing(signal)
+    debug(f"CONTROL FLAGS | force_execution={auto_should_force_execution_for_test(signal)} | allow_duplicates={ALLOW_DUPLICATE_SIGNALS}")
 
     # =========================================================
     # PAPER BROKER BRIDGE ROUTER
