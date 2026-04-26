@@ -1,15 +1,15 @@
 {
   "ticker": "QQQ",
-  "direction": "CALL",
+  "direction": "PUT",
   "grade": "A",
   "confidence": "A",
   "entry": 1.30,
-  "stop": 1.00,
-  "target": 1.80,
-  "setup": "break_and_hold",
-  "trigger": "break_and_hold",
+  "stop": 1.60,
+  "target": 0.90,
+  "setup": "resistance_rejection",
+  "trigger": "reject",
   "confirmation": "volume",
   "regime": "clean",
-  "reason": "TEST SIGNAL",
+  "reason": "TEST FLOW",
   "timestamp": 1714100000
 }
