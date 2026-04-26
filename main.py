@@ -11164,6 +11164,214 @@ def premium_live_darkpool_summary(signal: Dict[str, Any]) -> str:
     return " | ".join(parts) if parts else str(dp.get("reason", "observe only"))
 
 
+
+
+def premium_live_format_price(value: Any) -> Optional[str]:
+    try:
+        px = safe_float(value, 0.0)
+        if px <= 0:
+            return None
+        return f"{px:.2f}"
+    except Exception:
+        return None
+
+
+def premium_live_format_targets(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, list):
+        clean = []
+        for x in value:
+            px = premium_live_format_price(x)
+            clean.append(px if px else str(x))
+        return " → ".join(clean)
+    if isinstance(value, tuple):
+        return premium_live_format_targets(list(value))
+    return str(value)
+
+
+def premium_live_extract_real_levels(signal: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Pull real execution levels from signal first, then confluences/dark pool fallback.
+    This prevents premium alerts from using generic placeholders.
+    """
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences"), dict) else {}
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+
+    direction = str(signal.get("direction") or "").upper().strip()
+
+    # Key / decision / trigger level
+    key_level_raw = (
+        signal.get("key_level")
+        or signal.get("decision_level")
+        or signal.get("trigger_level")
+        or signal.get("level")
+        or con.get("key_level")
+        or con.get("decision_level")
+        or con.get("trigger_level")
+    )
+
+    key_level = premium_live_format_price(key_level_raw) or str(key_level_raw or "").strip()
+
+    # Dark pool fallback levels
+    dp_support = dp.get("nearest_support") if isinstance(dp, dict) else None
+    dp_resistance = dp.get("nearest_resistance") if isinstance(dp, dict) else None
+
+    support_px = None
+    resistance_px = None
+
+    if isinstance(dp_support, dict):
+        support_px = premium_live_format_price(dp_support.get("price"))
+    if isinstance(dp_resistance, dict):
+        resistance_px = premium_live_format_price(dp_resistance.get("price"))
+
+    if not key_level:
+        if direction == "CALL" and resistance_px:
+            key_level = resistance_px
+        elif direction == "PUT" and support_px:
+            key_level = support_px
+        elif support_px:
+            key_level = support_px
+        elif resistance_px:
+            key_level = resistance_px
+
+    # Entry
+    entry_raw = (
+        signal.get("entry")
+        or signal.get("entry_price")
+        or signal.get("entry_trigger")
+        or signal.get("trigger")
+    )
+
+    if entry_raw not in (None, "", [], {}):
+        entry = str(entry_raw)
+    elif key_level and direction == "CALL":
+        entry = f"Break + hold above {key_level}"
+    elif key_level and direction == "PUT":
+        entry = f"Reject / lose {key_level}"
+    else:
+        entry = "Wait for confirmed break/hold at the mapped level"
+
+    # Stop / invalidation
+    stop_raw = (
+        signal.get("stop")
+        or signal.get("stop_loss")
+        or signal.get("invalidation")
+        or con.get("stop")
+        or con.get("stop_loss")
+        or con.get("invalidation")
+    )
+
+    stop_px = premium_live_format_price(stop_raw)
+    if stop_px:
+        stop = f"Loss of {stop_px}"
+    elif stop_raw not in (None, "", [], {}):
+        stop = str(stop_raw)
+    elif direction == "CALL" and support_px:
+        stop = f"Loss of dark pool support {support_px}"
+    elif direction == "PUT" and resistance_px:
+        stop = f"Reclaim above dark pool resistance {resistance_px}"
+    else:
+        stop = "Loss of structure / failed confirmation"
+
+    # Targets
+    targets_raw = (
+        signal.get("targets")
+        or signal.get("target")
+        or signal.get("next_levels")
+        or con.get("targets")
+        or con.get("target")
+        or con.get("next_levels")
+    )
+
+    targets = premium_live_format_targets(targets_raw)
+    if not targets:
+        if direction == "CALL" and resistance_px and key_level != resistance_px:
+            targets = f"{resistance_px} → next liquidity pocket"
+        elif direction == "PUT" and support_px and key_level != support_px:
+            targets = f"{support_px} → next liquidity pocket"
+        elif direction == "CALL" and key_level:
+            try:
+                base = safe_float(key_level, 0.0)
+                if base > 0:
+                    targets = f"{base + 1:.2f} → {base + 2:.2f}"
+            except Exception:
+                pass
+        elif direction == "PUT" and key_level:
+            try:
+                base = safe_float(key_level, 0.0)
+                if base > 0:
+                    targets = f"{base - 1:.2f} → {base - 2:.2f}"
+            except Exception:
+                pass
+
+    if not targets:
+        targets = "Next key level / liquidity pocket"
+
+    return {
+        "key_level": key_level or "mapped decision level",
+        "entry": entry,
+        "stop": stop,
+        "targets": targets,
+        "darkpool_support": support_px or "",
+        "darkpool_resistance": resistance_px or "",
+    }
+
+
+def premium_live_darkpool_real_summary(signal: Dict[str, Any]) -> str:
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+    if not dp:
+        return "No dark pool confirmation yet"
+
+    support = dp.get("nearest_support")
+    resistance = dp.get("nearest_resistance")
+    actions = dp.get("actions", [])
+
+    parts = []
+
+    if isinstance(support, dict) and support.get("price"):
+        px = premium_live_format_price(support.get("price"))
+        prem = support.get("premium")
+        if prem:
+            try:
+                prem_f = safe_float(prem, 0.0)
+                if prem_f >= 1_000_000:
+                    parts.append(f"Support {px} (${prem_f/1_000_000:.2f}M) holding")
+                else:
+                    parts.append(f"Support {px} holding")
+            except Exception:
+                parts.append(f"Support {px} holding")
+        else:
+            parts.append(f"Support {px} holding")
+
+    if isinstance(resistance, dict) and resistance.get("price"):
+        px = premium_live_format_price(resistance.get("price"))
+        prem = resistance.get("premium")
+        if prem:
+            try:
+                prem_f = safe_float(prem, 0.0)
+                if prem_f >= 1_000_000:
+                    parts.append(f"Resistance {px} (${prem_f/1_000_000:.2f}M) mapped")
+                else:
+                    parts.append(f"Resistance {px} mapped")
+            except Exception:
+                parts.append(f"Resistance {px} mapped")
+        else:
+            parts.append(f"Resistance {px} mapped")
+
+    if isinstance(actions, list) and actions:
+        clean_actions = [str(a).replace("_", " ") for a in actions[:2]]
+        parts.append(", ".join(clean_actions))
+
+    if parts:
+        return " | ".join(parts)
+
+    reason = str(dp.get("reason", "observe only"))
+    if "observe" in reason:
+        return "Observe only — no confirmed dark pool alignment yet"
+    return reason
+
+
 def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
     direction = str(signal.get("direction") or "WAIT").upper().strip()
@@ -11171,15 +11379,19 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
     confidence = premium_live_confidence(signal)
     tech_strength = premium_live_tech_strength(signal)
 
+    real_levels = premium_live_extract_real_levels(signal)
+
     setup = premium_live_get(signal, "setup_name", "setup", "setup_type", "trigger", default="Awaiting clean trigger")
-    entry = premium_live_get(signal, "entry", "entry_price", "entry_trigger", default="Wait for confirmation at the level")
-    stop = premium_live_get(signal, "stop", "stop_loss", "invalidation", default="Loss of structure / invalidation level")
-    targets = premium_live_get(signal, "targets", "target", default="Next key level / liquidity pocket")
+    entry = real_levels.get("entry", "Wait for confirmation at the level")
+    stop = real_levels.get("stop", "Loss of structure / invalidation level")
+    targets = real_levels.get("targets", "Next key level / liquidity pocket")
+    key_level = real_levels.get("key_level", "mapped decision level")
+
     vwap = premium_live_get(signal, "vwap", "vwap_position", default="Not provided")
     oil = premium_live_get(signal, "oil", "oil_trend", default="Not provided")
     volume = premium_live_get(signal, "volume", default="Not provided")
     market = premium_live_get(signal, "market_type", "regime", default="Not provided")
-    darkpool = premium_live_darkpool_summary(signal)
+    darkpool = premium_live_darkpool_real_summary(signal)
 
     if direction == "CALL":
         bias = "BULLISH"
@@ -11201,6 +11413,8 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
         f"🧠 Bias: {bias}\n"
         f"⚡ Tech Strength: {tech_strength}\n"
         f"✅ Decision: {decision}\n\n"
+        f"📍 Key Level:\n"
+        f"• {key_level}\n\n"
         f"📍 Entry Trigger:\n"
         f"• {entry}\n\n"
         f"🛑 Invalidation:\n"
@@ -14076,9 +14290,10 @@ if "--premium-alert-now" in sys.argv:
         "grade": os.getenv("TEST_GRADE", "A"),
         "confidence": os.getenv("TEST_CONFIDENCE", "High"),
         "setup": "Break and hold / VWAP control test",
-        "entry": "Break + hold above decision level",
-        "stop_loss": "Loss of structure",
-        "targets": "Next resistance / liquidity pocket",
+        "key_level": 662.00,
+        "entry": "Break + hold above 662.00",
+        "stop_loss": 660.80,
+        "targets": [663.00, 664.20, 665.50],
         "vwap": "Above / buyer control",
         "volume": "Confirming",
         "oil": "Falling / risk-on support",
