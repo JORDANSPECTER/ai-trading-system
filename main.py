@@ -124,6 +124,7 @@ def debug_alpaca_urls_once() -> None:
 # =========================================================
 DISCORD_AI_WEBHOOK = os.getenv("DISCORD_AI_WEBHOOK", "").strip()
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
+DISCORD_FREE_DAILY_LEVELS_WEBHOOK = os.getenv("DISCORD_FREE_DAILY_LEVELS_WEBHOOK", DISCORD_FREE_WEBHOOK).strip()
 DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "").strip()
 DISCORD_DARKPOOL_WEBHOOK = os.getenv("DISCORD_DARKPOOL_WEBHOOK", "").strip()
 DISCORD_LIVE_ENTRY_WEBHOOK = os.getenv("DISCORD_LIVE_ENTRY_WEBHOOK", "").strip()
@@ -9300,6 +9301,7 @@ def phase2_reconciliation_guard() -> Dict[str, Any]:
     else:
         debug("PHASE 2 RECON OK")
         poll_unusual_whales_darkpool_prints(force=False)
+        maybe_send_free_daily_levels(force=False)
     return {"approved": len(reasons) == 0, "reject_reasons": reasons}
 
 # =========================================================
@@ -10046,6 +10048,278 @@ def send_to_live_entry_discord(message: str) -> None:
     except Exception as e:
         try:
             debug(f"LIVE ENTRY webhook send failed: {e}")
+        except Exception:
+            pass
+
+
+
+
+# =========================================================
+# AUTOMATED FREE DAILY LEVELS — QQQ / SPY
+# Free = information only. Premium/live-entry = execution.
+# Sends clean daily-level game plans to the free channel.
+# =========================================================
+ENABLE_FREE_DAILY_LEVELS = os.getenv("ENABLE_FREE_DAILY_LEVELS", "true").lower() == "true"
+FREE_DAILY_LEVEL_TICKERS = {
+    x.strip().upper()
+    for x in os.getenv("FREE_DAILY_LEVEL_TICKERS", "QQQ,SPY").split(",")
+    if x.strip()
+}
+FREE_DAILY_LEVEL_STATE_FILE = os.getenv("FREE_DAILY_LEVEL_STATE_FILE", "free_daily_levels_state.json").strip()
+FREE_DAILY_LEVEL_COOLDOWN_SECONDS = int(os.getenv("FREE_DAILY_LEVEL_COOLDOWN_SECONDS", "10800"))  # 3 hours
+FREE_DAILY_LEVEL_SEND_ON_BOOT = os.getenv("FREE_DAILY_LEVEL_SEND_ON_BOOT", "true").lower() == "true"
+FREE_DAILY_LEVEL_INCLUDE_DARKPOOL = os.getenv("FREE_DAILY_LEVEL_INCLUDE_DARKPOOL", "true").lower() == "true"
+FREE_DAILY_LEVEL_INCLUDE_OIL = os.getenv("FREE_DAILY_LEVEL_INCLUDE_OIL", "true").lower() == "true"
+
+
+def free_daily_load_state() -> Dict[str, Any]:
+    try:
+        data = load_json_file(FREE_DAILY_LEVEL_STATE_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def free_daily_save_state(data: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(FREE_DAILY_LEVEL_STATE_FILE, data)
+    except Exception as e:
+        try:
+            debug(f"FREE DAILY state save failed: {e}")
+        except Exception:
+            pass
+
+
+def free_daily_send(message: str) -> None:
+    try:
+        target = DISCORD_FREE_DAILY_LEVELS_WEBHOOK or DISCORD_FREE_WEBHOOK
+        if not target:
+            try:
+                debug("FREE DAILY WEBHOOK MISSING | set DISCORD_FREE_DAILY_LEVELS_WEBHOOK or DISCORD_FREE_WEBHOOK")
+            except Exception:
+                pass
+            return
+        send_to_discord(target, message, "FREE_DAILY_LEVELS")
+    except Exception as e:
+        try:
+            debug(f"FREE DAILY send failed: {e}")
+        except Exception:
+            pass
+
+
+def free_daily_get_market_price(ticker: str) -> float:
+    ticker = str(ticker or "").upper().strip()
+    try:
+        prices = load_json_file(MARKET_DATA_FILE if "MARKET_DATA_FILE" in globals() else "market_prices.json", {})
+        if isinstance(prices, dict):
+            row = prices.get(ticker, {})
+            if isinstance(row, dict):
+                return safe_float(row.get("price") or row.get("last") or row.get("close"), 0.0)
+            return safe_float(row, 0.0)
+    except Exception:
+        pass
+
+    try:
+        prices = load_market_prices([ticker])
+        px, _ = get_market_price_for_symbol(ticker, prices)
+        return safe_float(px, 0.0)
+    except Exception:
+        return 0.0
+
+
+def free_daily_get_oil_read() -> str:
+    if not FREE_DAILY_LEVEL_INCLUDE_OIL:
+        return "Not included"
+
+    try:
+        macro = load_json_file(MACRO_FILE if "MACRO_FILE" in globals() else "macro_store.json", {})
+        if isinstance(macro, dict):
+            for key in ("oil", "uso", "crude_oil", "wti"):
+                v = macro.get(key)
+                if isinstance(v, dict):
+                    direction = str(v.get("direction") or v.get("bias") or "").lower()
+                    price = v.get("price") or v.get("last") or ""
+                    if "fall" in direction or "down" in direction:
+                        return f"Falling / relief → bullish support for tech ({price})"
+                    if "rise" in direction or "up" in direction:
+                        return f"Rising / pressure → risk-off pressure for tech ({price})"
+                    if price:
+                        return f"Watching oil/USO around {price}"
+                elif isinstance(v, str) and v:
+                    return v
+    except Exception:
+        pass
+
+    return "Watch oil/USO — falling supports tech, rising pressures tech"
+
+
+def free_daily_market_state(price: float, vwap: Any = None) -> Tuple[str, str]:
+    vwap_text = str(vwap or "").lower()
+
+    if "above" in vwap_text or "reclaim" in vwap_text:
+        return "Trending / buyer control", "Bullish above VWAP"
+    if "below" in vwap_text or "reject" in vwap_text:
+        return "Weak / seller control", "Bearish below VWAP"
+    if price > 0:
+        return "Decision zone", "Neutral until level confirmation"
+    return "Data pending", "Neutral"
+
+
+def free_daily_darkpool_levels(ticker: str, price: float) -> Tuple[str, str]:
+    if not FREE_DAILY_LEVEL_INCLUDE_DARKPOOL:
+        return "Not included", "Not included"
+
+    try:
+        levels = None
+
+        # Prefer live evaluator if available.
+        if "uw_dp_build_levels" in globals():
+            levels = uw_dp_build_levels(ticker, current_price=price, force=False)
+
+        if not isinstance(levels, dict):
+            cache = load_json_file(UW_DARKPOOL_FILE if "UW_DARKPOOL_FILE" in globals() else "darkpool_levels.json", {})
+            if isinstance(cache, dict):
+                levels = cache.get(ticker, {})
+
+        support = None
+        resistance = None
+
+        if isinstance(levels, dict):
+            support = levels.get("nearest_support")
+            resistance = levels.get("nearest_resistance")
+
+        def fmt(lvl, fallback):
+            if not isinstance(lvl, dict):
+                return fallback
+            px = safe_float(lvl.get("price"), 0.0)
+            premium = safe_float(lvl.get("premium"), 0.0)
+            if px <= 0:
+                return fallback
+            if premium >= 1_000_000:
+                prem = f"${premium / 1_000_000:.2f}M"
+            elif premium >= 1_000:
+                prem = f"${premium / 1_000:.2f}K"
+            else:
+                prem = f"${premium:.0f}"
+            return f"{px:.2f} ({prem})"
+
+        return fmt(support, "No clean support print yet"), fmt(resistance, "No clean resistance print yet")
+
+    except Exception:
+        return "Dark pool pending", "Dark pool pending"
+
+
+def free_daily_estimate_levels(ticker: str, price: float) -> Dict[str, Any]:
+    """
+    Free daily levels are simple reaction zones:
+    support, resistance, and decision level.
+    If live level data is missing, estimate around current price so free alerts still render.
+    """
+    if price <= 0:
+        return {
+            "support": "Pending",
+            "resistance": "Pending",
+            "decision": "Pending",
+            "vwap": "Pending",
+            "premarket_high": "Pending",
+            "premarket_low": "Pending",
+        }
+
+    # Wider increments for SPY/QQQ so levels are readable.
+    if ticker == "SPY":
+        step = 1.0
+    else:
+        step = 2.0
+
+    decision = round(price / step) * step
+    support = decision - step
+    resistance = decision + step
+
+    return {
+        "support": round(support, 2),
+        "resistance": round(resistance, 2),
+        "decision": round(decision, 2),
+        "vwap": "Use live VWAP / control level",
+        "premarket_high": "Add premarket high when available",
+        "premarket_low": "Add premarket low when available",
+    }
+
+
+def build_free_daily_levels_alert(ticker: str) -> str:
+    ticker = str(ticker or "").upper().strip()
+    price = free_daily_get_market_price(ticker)
+    levels = free_daily_estimate_levels(ticker, price)
+
+    market_state, bias = free_daily_market_state(price, levels.get("vwap"))
+    oil = free_daily_get_oil_read()
+    dp_support, dp_resistance = free_daily_darkpool_levels(ticker, price)
+
+    price_line = f"{price:.2f}" if price > 0 else "Pending"
+
+    return (
+        f"📊 {ticker} FREE DAILY LEVELS\n\n"
+        f"📈 Market State: {market_state}\n"
+        f"🧭 Bias: {bias}\n"
+        f"💵 Current Price: {price_line}\n\n"
+        f"💰 Key Levels:\n"
+        f"• Resistance: {levels.get('resistance')}\n"
+        f"• Support: {levels.get('support')}\n"
+        f"• Decision: {levels.get('decision')}\n\n"
+        f"📍 VWAP / Control:\n"
+        f"• {levels.get('vwap')}\n"
+        f"• Above = buyers in control\n"
+        f"• Below = sellers in control\n\n"
+        f"🌙 Premarket Map:\n"
+        f"• Premarket High: {levels.get('premarket_high')}\n"
+        f"• Premarket Low: {levels.get('premarket_low')}\n\n"
+        f"💎 Dark Pool Resource Zones:\n"
+        f"• Support: {dp_support}\n"
+        f"• Resistance: {dp_resistance}\n\n"
+        f"🟢 CALLS:\n"
+        f"• Above decision level → continuation watch\n"
+        f"• Break + hold → target resistance / next level\n\n"
+        f"🔴 PUTS:\n"
+        f"• Below decision level → weakness watch\n"
+        f"• Rejection at resistance → target support / next level\n\n"
+        f"🛢️ Oil / Macro:\n"
+        f"• {oil}\n\n"
+        f"⚠️ RULES:\n"
+        f"• No chasing\n"
+        f"• No trading middle\n"
+        f"• Wait for confirmation\n\n"
+        f"Free = information. Premium = execution."
+    )
+
+
+def maybe_send_free_daily_levels(force: bool = False) -> None:
+    if not ENABLE_FREE_DAILY_LEVELS:
+        return
+
+    try:
+        state = free_daily_load_state()
+        now = int(time.time())
+
+        for ticker in sorted(FREE_DAILY_LEVEL_TICKERS):
+            key = f"{ticker}:{datetime.utcnow().strftime('%Y-%m-%d')}"
+            last = safe_int(state.get(key, 0), 0)
+
+            if not force and last and (now - last) < FREE_DAILY_LEVEL_COOLDOWN_SECONDS:
+                continue
+
+            msg = build_free_daily_levels_alert(ticker)
+            free_daily_send(msg)
+            state[key] = now
+
+            try:
+                debug(f"FREE DAILY LEVELS SENT | ticker={ticker}")
+            except Exception:
+                pass
+
+        free_daily_save_state(state)
+
+    except Exception as e:
+        try:
+            debug(f"FREE DAILY LEVELS FAILED | {e}")
         except Exception:
             pass
 
