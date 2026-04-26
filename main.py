@@ -11008,6 +11008,262 @@ def send_to_darkpool_discord(message: str) -> None:
             pass
 
 
+
+
+# =========================================================
+# PREMIUM DAILY LEVELS — LIVE EXECUTION STYLE
+# Premium = execution plan, not just information.
+# Routes to DISCORD_PREMIUM_WEBHOOK.
+# =========================================================
+ENABLE_PREMIUM_LIVE_STYLE_ALERTS = os.getenv("ENABLE_PREMIUM_LIVE_STYLE_ALERTS", "true").lower() == "true"
+PREMIUM_LIVE_ALERT_TICKERS = {
+    x.strip().upper()
+    for x in os.getenv("PREMIUM_LIVE_ALERT_TICKERS", "QQQ,SPY").split(",")
+    if x.strip()
+}
+PREMIUM_LIVE_MIN_GRADE = os.getenv("PREMIUM_LIVE_MIN_GRADE", "B").upper().strip()
+PREMIUM_LIVE_ALERT_COOLDOWN_SECONDS = int(os.getenv("PREMIUM_LIVE_ALERT_COOLDOWN_SECONDS", "180"))
+PREMIUM_LIVE_ALERT_STATE_FILE = os.getenv("PREMIUM_LIVE_ALERT_STATE_FILE", "premium_live_alert_state.json").strip()
+
+
+def premium_live_load_state() -> Dict[str, Any]:
+    try:
+        data = load_json_file(PREMIUM_LIVE_ALERT_STATE_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def premium_live_save_state(data: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(PREMIUM_LIVE_ALERT_STATE_FILE, data)
+    except Exception as e:
+        try:
+            debug(f"PREMIUM LIVE state save failed: {e}")
+        except Exception:
+            pass
+
+
+def premium_live_grade_rank(grade: str) -> int:
+    ladder = ["AVOID", "C", "B", "B+", "A", "A+"]
+    g = str(grade or "B").upper().strip()
+    if g not in ladder:
+        g = "B"
+    return ladder.index(g)
+
+
+def premium_live_meets_grade(grade: str, min_grade: str) -> bool:
+    return premium_live_grade_rank(grade) >= premium_live_grade_rank(min_grade)
+
+
+def premium_live_get(signal: Dict[str, Any], *keys, default: str = "Not provided") -> str:
+    for key in keys:
+        v = signal.get(key)
+        if v not in (None, "", [], {}):
+            return str(v)
+
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences"), dict) else {}
+    for key in keys:
+        v = con.get(key)
+        if v not in (None, "", [], {}):
+            return str(v)
+
+    return default
+
+
+def premium_live_grade(signal: Dict[str, Any]) -> str:
+    return str(signal.get("grade") or signal.get("confidence") or "B").upper().strip()
+
+
+def premium_live_confidence(signal: Dict[str, Any]) -> str:
+    grade = premium_live_grade(signal)
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+    boost = safe_int(dp.get("grade_boost", 0), 0)
+
+    if grade == "A+":
+        return "Very High"
+    if grade == "A":
+        return "High"
+    if grade == "B+":
+        return "Moderate-High"
+    if boost > 0:
+        return "Improving"
+    if grade in {"C", "AVOID"}:
+        return "Low"
+    return "Moderate"
+
+
+def premium_live_tech_strength(signal: Dict[str, Any]) -> str:
+    direction = str(signal.get("direction") or "").upper().strip()
+    con = signal.get("confluences", {}) if isinstance(signal.get("confluences"), dict) else {}
+
+    setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("setup_name") or con.get("setup") or "").lower()
+    vwap = str(signal.get("vwap") or signal.get("vwap_position") or con.get("vwap") or "").lower()
+    volume = str(signal.get("volume") or con.get("volume") or "").lower()
+    oil = str(signal.get("oil") or signal.get("oil_trend") or con.get("oil") or "").lower()
+    market = str(signal.get("market_type") or signal.get("regime") or con.get("market_type") or "").lower()
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+
+    score = 0
+    reasons = []
+
+    if direction == "CALL":
+        if "above" in vwap or "reclaim" in vwap:
+            score += 2; reasons.append("VWAP control")
+        if "break" in setup or "hold" in setup or "retest" in setup or "momentum" in setup:
+            score += 2; reasons.append("bullish structure")
+        if "fall" in oil or "down" in oil or "relief" in oil:
+            score += 1; reasons.append("oil relief")
+    elif direction == "PUT":
+        if "below" in vwap or "reject" in vwap:
+            score += 2; reasons.append("VWAP rejection")
+        if "reject" in setup or "lower" in setup or "breakdown" in setup:
+            score += 2; reasons.append("bearish structure")
+        if "rising" in oil or "up" in oil or "pressure" in oil:
+            score += 1; reasons.append("oil pressure")
+
+    if "strong" in volume or "spike" in volume or "high" in volume:
+        score += 1; reasons.append("volume confirming")
+    if "trend" in market or "expansion" in market:
+        score += 1; reasons.append("trend environment")
+
+    if isinstance(dp, dict):
+        actions = " ".join(dp.get("actions", [])) if isinstance(dp.get("actions"), list) else str(dp.get("actions", ""))
+        if "supported" in actions or "accepted" in actions:
+            score += 1; reasons.append("dark pool aligned")
+
+    if score >= 6:
+        label = "Strong"
+    elif score >= 4:
+        label = "Building"
+    elif score >= 2:
+        label = "Mixed"
+    else:
+        label = "Weak / Wait"
+
+    return f"{label} — {', '.join(reasons[:4]) if reasons else 'needs confirmation'}"
+
+
+def premium_live_darkpool_summary(signal: Dict[str, Any]) -> str:
+    dp = signal.get("dark_pool", {}) if isinstance(signal.get("dark_pool"), dict) else {}
+    if not dp:
+        return "No dark pool confirmation yet"
+
+    support = dp.get("nearest_support")
+    resistance = dp.get("nearest_resistance")
+    actions = dp.get("actions", [])
+
+    parts = []
+    if isinstance(support, dict) and support.get("price"):
+        parts.append(f"Support {safe_float(support.get('price'), 0):.2f}")
+    if isinstance(resistance, dict) and resistance.get("price"):
+        parts.append(f"Resistance {safe_float(resistance.get('price'), 0):.2f}")
+    if isinstance(actions, list) and actions:
+        parts.append(", ".join(actions[:2]))
+
+    return " | ".join(parts) if parts else str(dp.get("reason", "observe only"))
+
+
+def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
+    ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper().strip()
+    direction = str(signal.get("direction") or "WAIT").upper().strip()
+    grade = premium_live_grade(signal)
+    confidence = premium_live_confidence(signal)
+    tech_strength = premium_live_tech_strength(signal)
+
+    setup = premium_live_get(signal, "setup_name", "setup", "setup_type", "trigger", default="Awaiting clean trigger")
+    entry = premium_live_get(signal, "entry", "entry_price", "entry_trigger", default="Wait for confirmation at the level")
+    stop = premium_live_get(signal, "stop", "stop_loss", "invalidation", default="Loss of structure / invalidation level")
+    targets = premium_live_get(signal, "targets", "target", default="Next key level / liquidity pocket")
+    vwap = premium_live_get(signal, "vwap", "vwap_position", default="Not provided")
+    oil = premium_live_get(signal, "oil", "oil_trend", default="Not provided")
+    volume = premium_live_get(signal, "volume", default="Not provided")
+    market = premium_live_get(signal, "market_type", "regime", default="Not provided")
+    darkpool = premium_live_darkpool_summary(signal)
+
+    if direction == "CALL":
+        bias = "BULLISH"
+        alert_title = "CALL EXECUTION PLAN"
+    elif direction == "PUT":
+        bias = "BEARISH"
+        alert_title = "PUT EXECUTION PLAN"
+    else:
+        bias = "NEUTRAL"
+        alert_title = "WAIT / OBSERVE PLAN"
+
+    decision = "TRADEABLE" if grade in {"A+", "A"} and ("Strong" in tech_strength or "Building" in tech_strength) else "WAIT FOR CONFIRMATION"
+
+    return (
+        f"💎 UNBIASED PREMIUM ALERT\n"
+        f"{ticker} | {alert_title}\n\n"
+        f"📊 Grade: {grade}\n"
+        f"📈 Confidence: {confidence}\n"
+        f"🧠 Bias: {bias}\n"
+        f"⚡ Tech Strength: {tech_strength}\n"
+        f"✅ Decision: {decision}\n\n"
+        f"📍 Entry Trigger:\n"
+        f"• {entry}\n\n"
+        f"🛑 Invalidation:\n"
+        f"• {stop}\n\n"
+        f"🎯 Targets:\n"
+        f"• {targets}\n\n"
+        f"🔎 Confluence:\n"
+        f"• Setup: {setup}\n"
+        f"• VWAP: {vwap}\n"
+        f"• Volume: {volume}\n"
+        f"• Oil/Macro: {oil}\n"
+        f"• Market: {market}\n"
+        f"• Dark Pool: {darkpool}\n\n"
+        f"⚠️ Rule:\n"
+        f"• No chasing. Wait for confirmation.\n"
+        f"• Premium = execution plan."
+    )
+
+
+def maybe_send_premium_live_execution_alert(signal: Dict[str, Any], stage: str = "signal") -> None:
+    if not ENABLE_PREMIUM_LIVE_STYLE_ALERTS:
+        return
+
+    try:
+        if not isinstance(signal, dict):
+            return
+
+        ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
+        if ticker not in PREMIUM_LIVE_ALERT_TICKERS:
+            return
+
+        grade = premium_live_grade(signal)
+        if not premium_live_meets_grade(grade, PREMIUM_LIVE_MIN_GRADE):
+            return
+
+        state = premium_live_load_state()
+        now = int(time.time())
+        direction = str(signal.get("direction") or "").upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_name") or signal.get("trigger") or "").lower().strip()
+        key = f"{ticker}:{direction}:{grade}:{setup}:{stage}"
+        last = safe_int(state.get(key, 0), 0)
+
+        if last and (now - last) < PREMIUM_LIVE_ALERT_COOLDOWN_SECONDS:
+            return
+
+        state[key] = now
+        premium_live_save_state(state)
+
+        msg = build_premium_live_execution_alert(signal)
+        send_to_discord(DISCORD_PREMIUM_WEBHOOK, msg, "PREMIUM")
+
+        try:
+            debug(f"PREMIUM LIVE EXECUTION ALERT SENT | ticker={ticker} grade={grade} stage={stage}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            debug(f"PREMIUM LIVE EXECUTION ALERT FAILED | {e}")
+        except Exception:
+            pass
+
+
 # =========================================================
 # UNUSUAL WHALES DARK POOL INTEGRATION
 # Decision/confluence layer for QQQ/SPY institutional resource levels.
@@ -13807,6 +14063,28 @@ def cli_adaptive_rebuild_stats() -> None:
 # python main.py --free-daily-now
 if "--free-daily-now" in sys.argv:
     maybe_send_free_daily_levels(force=True)
+    sys.exit(0)
+
+
+
+# CLI helper:
+# python main.py --premium-alert-now
+if "--premium-alert-now" in sys.argv:
+    sample = {
+        "ticker": os.getenv("TEST_TICKER", "QQQ"),
+        "direction": os.getenv("TEST_DIRECTION", "CALL"),
+        "grade": os.getenv("TEST_GRADE", "A"),
+        "confidence": os.getenv("TEST_CONFIDENCE", "High"),
+        "setup": "Break and hold / VWAP control test",
+        "entry": "Break + hold above decision level",
+        "stop_loss": "Loss of structure",
+        "targets": "Next resistance / liquidity pocket",
+        "vwap": "Above / buyer control",
+        "volume": "Confirming",
+        "oil": "Falling / risk-on support",
+        "market_type": "Trend / expansion",
+    }
+    maybe_send_premium_live_execution_alert(sample, stage="manual_test")
     sys.exit(0)
 
 
