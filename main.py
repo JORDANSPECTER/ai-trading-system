@@ -656,6 +656,37 @@ PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled
 
 
 
+
+# =========================================================
+# PORTFOLIO HEAT + EXPOSURE CONTROL
+# Fund-level guardrails:
+# - Max total portfolio heat
+# - Max same ticker exposure
+# - Max correlated index exposure
+# - Max directional concentration
+# =========================================================
+ENABLE_PORTFOLIO_HEAT_EXPOSURE = os.getenv("ENABLE_PORTFOLIO_HEAT_EXPOSURE", "true").lower() == "true"
+PORTFOLIO_HEAT_SEND_ALERTS = os.getenv("PORTFOLIO_HEAT_SEND_ALERTS", "true").lower() == "true"
+
+PORTFOLIO_MAX_HEAT_PCT = float(os.getenv("PORTFOLIO_MAX_HEAT_PCT", str(MAX_PROJECTED_PORTFOLIO_HEAT_PCT)))
+PORTFOLIO_MAX_TICKER_HEAT_PCT = float(os.getenv("PORTFOLIO_MAX_TICKER_HEAT_PCT", "0.015"))
+PORTFOLIO_MAX_DIRECTION_HEAT_PCT = float(os.getenv("PORTFOLIO_MAX_DIRECTION_HEAT_PCT", "0.02"))
+
+PORTFOLIO_MAX_OPEN_TOTAL = int(os.getenv("PORTFOLIO_MAX_OPEN_TOTAL", str(MAX_OPEN_POSITIONS)))
+PORTFOLIO_MAX_OPEN_PER_TICKER = int(os.getenv("PORTFOLIO_MAX_OPEN_PER_TICKER", str(MAX_SAME_TICKER_POSITIONS)))
+PORTFOLIO_MAX_CORRELATED_OPEN = int(os.getenv("PORTFOLIO_MAX_CORRELATED_OPEN", "2"))
+PORTFOLIO_MAX_SAME_DIRECTION_OPEN = int(os.getenv("PORTFOLIO_MAX_SAME_DIRECTION_OPEN", "2"))
+
+PORTFOLIO_CORRELATED_INDEX_TICKERS = {
+    x.strip().upper()
+    for x in os.getenv("PORTFOLIO_CORRELATED_INDEX_TICKERS", "SPY,QQQ,IWM,DIA,NVDA,AAPL,MSFT,META,AMD,TSLA").split(",")
+    if x.strip()
+}
+
+PORTFOLIO_REDUCE_SIZE_IF_NEAR_HEAT = os.getenv("PORTFOLIO_REDUCE_SIZE_IF_NEAR_HEAT", "true").lower() == "true"
+PORTFOLIO_NEAR_HEAT_THRESHOLD_PCT = float(os.getenv("PORTFOLIO_NEAR_HEAT_THRESHOLD_PCT", "0.80"))
+PORTFOLIO_NEAR_HEAT_SIZE_MULT = float(os.getenv("PORTFOLIO_NEAR_HEAT_SIZE_MULT", "0.50"))
+
 # =========================================================
 # RISK STATE + DRAWDOWN ENGINE
 # Self-protecting account logic:
@@ -1623,6 +1654,285 @@ def risk_state_blocks_signal(signal: Dict[str, Any]) -> bool:
         return False
 
 
+def portfolio_heat_account_equity() -> float:
+    try:
+        if LIVE_MODE:
+            return safe_float(GLOBAL_STATE.get("account_equity", LIVE_ACCOUNT_EQUITY_FALLBACK), LIVE_ACCOUNT_EQUITY_FALLBACK)
+        return safe_float(PAPER_ACCOUNT_EQUITY, 25000)
+    except Exception:
+        return 25000.0
+
+
+def portfolio_heat_open_positions() -> List[Dict[str, Any]]:
+    try:
+        ensure_globals_initialized()
+        positions = GLOBAL_POSITIONS.get("open_positions", [])
+        if isinstance(positions, list):
+            return [p for p in positions if isinstance(p, dict)]
+    except Exception:
+        pass
+
+    try:
+        data = load_json_file(POSITIONS_FILE, {})
+        if isinstance(data, dict):
+            positions = data.get("open_positions", [])
+            if isinstance(positions, list):
+                return [p for p in positions if isinstance(p, dict)]
+        if isinstance(data, list):
+            return [p for p in data if isinstance(p, dict)]
+    except Exception:
+        pass
+
+    return []
+
+
+def portfolio_position_symbol(pos: Dict[str, Any]) -> str:
+    return str(pos.get("ticker", pos.get("symbol", pos.get("underlying", "")))).upper().strip()
+
+
+def portfolio_position_direction(pos: Dict[str, Any]) -> str:
+    return str(pos.get("direction", pos.get("side", ""))).upper().strip()
+
+
+def portfolio_position_qty(pos: Dict[str, Any]) -> int:
+    return max(0, safe_int(pos.get("qty", pos.get("quantity", pos.get("open_qty", 0))), 0))
+
+
+def portfolio_position_entry(pos: Dict[str, Any]) -> float:
+    return safe_float(pos.get("entry", pos.get("entry_price", pos.get("contract_price", 0))), 0.0)
+
+
+def portfolio_position_stop(pos: Dict[str, Any]) -> float:
+    return safe_float(pos.get("stop", pos.get("stop_price", 0)), 0.0)
+
+
+def portfolio_position_risk_dollars(pos: Dict[str, Any]) -> float:
+    """
+    Options risk estimate:
+    abs(entry - stop) * qty * 100.
+    If no stop exists, use entry * qty * 100 as worst-case premium risk.
+    """
+    try:
+        qty = portfolio_position_qty(pos)
+        entry = portfolio_position_entry(pos)
+        stop = portfolio_position_stop(pos)
+
+        if qty <= 0 or entry <= 0:
+            return 0.0
+
+        if stop > 0:
+            risk_per_contract = abs(entry - stop) * 100.0
+        else:
+            risk_per_contract = entry * 100.0
+
+        return max(0.0, risk_per_contract * qty)
+    except Exception:
+        return 0.0
+
+
+def portfolio_signal_risk_dollars(signal: Dict[str, Any]) -> float:
+    try:
+        qty = max(1, safe_int(signal.get("qty", 1), 1))
+        entry = safe_float(signal.get("entry_contract", signal.get("entry", signal.get("contract_price", 0))), 0.0)
+        stop = safe_float(signal.get("stop_contract", signal.get("stop", 0)), 0.0)
+
+        if entry <= 0:
+            return 0.0
+
+        if stop > 0:
+            risk_per_contract = abs(entry - stop) * 100.0
+        else:
+            risk_per_contract = entry * 100.0
+
+        return max(0.0, risk_per_contract * qty)
+    except Exception:
+        return 0.0
+
+
+def portfolio_heat_snapshot(signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    positions = portfolio_heat_open_positions()
+    equity = max(portfolio_heat_account_equity(), 1.0)
+
+    total_risk = 0.0
+    ticker_risk: Dict[str, float] = {}
+    direction_risk: Dict[str, float] = {}
+    ticker_counts: Dict[str, int] = {}
+    direction_counts: Dict[str, int] = {}
+    correlated_count = 0
+
+    for p in positions:
+        ticker = portfolio_position_symbol(p)
+        direction = portfolio_position_direction(p)
+        risk = portfolio_position_risk_dollars(p)
+
+        total_risk += risk
+        ticker_risk[ticker] = ticker_risk.get(ticker, 0.0) + risk
+        direction_risk[direction] = direction_risk.get(direction, 0.0) + risk
+        ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
+        direction_counts[direction] = direction_counts.get(direction, 0) + 1
+
+        if ticker in PORTFOLIO_CORRELATED_INDEX_TICKERS:
+            correlated_count += 1
+
+    incoming = {}
+    if isinstance(signal, dict):
+        ticker = str(signal.get("ticker", signal.get("symbol", ""))).upper().strip()
+        direction = str(signal.get("direction", "")).upper().strip()
+        risk = portfolio_signal_risk_dollars(signal)
+        incoming = {
+            "ticker": ticker,
+            "direction": direction,
+            "risk_dollars": risk,
+            "risk_pct": risk / equity,
+            "is_correlated": ticker in PORTFOLIO_CORRELATED_INDEX_TICKERS,
+        }
+
+    return {
+        "equity": equity,
+        "open_count": len(positions),
+        "total_risk_dollars": total_risk,
+        "total_heat_pct": total_risk / equity,
+        "ticker_risk": ticker_risk,
+        "ticker_heat_pct": {k: v / equity for k, v in ticker_risk.items()},
+        "direction_risk": direction_risk,
+        "direction_heat_pct": {k: v / equity for k, v in direction_risk.items()},
+        "ticker_counts": ticker_counts,
+        "direction_counts": direction_counts,
+        "correlated_count": correlated_count,
+        "incoming": incoming,
+    }
+
+
+def apply_portfolio_heat_exposure_control(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Blocks or reduces a signal if portfolio exposure is already too concentrated.
+    """
+    try:
+        if not ENABLE_PORTFOLIO_HEAT_EXPOSURE:
+            return signal
+        if not isinstance(signal, dict):
+            return signal
+
+        x = signal
+        ticker = str(x.get("ticker", x.get("symbol", "UNKNOWN"))).upper().strip()
+        direction = str(x.get("direction", "")).upper().strip()
+
+        snap = portfolio_heat_snapshot(x)
+        equity = max(safe_float(snap.get("equity", 0), 0), 1.0)
+        incoming = snap.get("incoming", {}) if isinstance(snap.get("incoming"), dict) else {}
+        incoming_risk = safe_float(incoming.get("risk_dollars", 0), 0.0)
+        incoming_heat = incoming_risk / equity
+
+        projected_total_heat = safe_float(snap.get("total_heat_pct", 0), 0.0) + incoming_heat
+        current_ticker_heat = safe_float(snap.get("ticker_heat_pct", {}).get(ticker, 0), 0.0)
+        projected_ticker_heat = current_ticker_heat + incoming_heat
+
+        current_direction_heat = safe_float(snap.get("direction_heat_pct", {}).get(direction, 0), 0.0)
+        projected_direction_heat = current_direction_heat + incoming_heat
+
+        ticker_count = safe_int(snap.get("ticker_counts", {}).get(ticker, 0), 0)
+        direction_count = safe_int(snap.get("direction_counts", {}).get(direction, 0), 0)
+        correlated_count = safe_int(snap.get("correlated_count", 0), 0)
+
+        reasons = []
+
+        if safe_int(snap.get("open_count", 0), 0) >= safe_int(PORTFOLIO_MAX_OPEN_TOTAL, MAX_OPEN_POSITIONS):
+            reasons.append("max_open_total_reached")
+
+        if ticker_count >= safe_int(PORTFOLIO_MAX_OPEN_PER_TICKER, MAX_SAME_TICKER_POSITIONS):
+            reasons.append(f"max_open_per_ticker_reached:{ticker}")
+
+        if direction_count >= safe_int(PORTFOLIO_MAX_SAME_DIRECTION_OPEN, 2):
+            reasons.append(f"max_same_direction_reached:{direction}")
+
+        if ticker in PORTFOLIO_CORRELATED_INDEX_TICKERS and correlated_count >= safe_int(PORTFOLIO_MAX_CORRELATED_OPEN, 2):
+            reasons.append("max_correlated_index_exposure_reached")
+
+        if projected_total_heat > safe_float(PORTFOLIO_MAX_HEAT_PCT, MAX_PROJECTED_PORTFOLIO_HEAT_PCT):
+            reasons.append(f"portfolio_heat_exceeded:{round(projected_total_heat*100,2)}%")
+
+        if projected_ticker_heat > safe_float(PORTFOLIO_MAX_TICKER_HEAT_PCT, 0.015):
+            reasons.append(f"ticker_heat_exceeded:{ticker}:{round(projected_ticker_heat*100,2)}%")
+
+        if projected_direction_heat > safe_float(PORTFOLIO_MAX_DIRECTION_HEAT_PCT, 0.02):
+            reasons.append(f"direction_heat_exceeded:{direction}:{round(projected_direction_heat*100,2)}%")
+
+        x["portfolio_heat_snapshot"] = {
+            "open_count": snap.get("open_count", 0),
+            "total_heat_pct": round(safe_float(snap.get("total_heat_pct", 0), 0) * 100, 4),
+            "projected_total_heat_pct": round(projected_total_heat * 100, 4),
+            "ticker_count": ticker_count,
+            "direction_count": direction_count,
+            "correlated_count": correlated_count,
+            "incoming_risk_dollars": round(incoming_risk, 2),
+            "incoming_heat_pct": round(incoming_heat * 100, 4),
+        }
+
+        if reasons:
+            x["blocked_by_portfolio_heat"] = True
+            x["portfolio_heat_reason"] = ",".join(reasons)
+            debug(
+                f"PORTFOLIO HEAT BLOCKED | ticker={ticker} direction={direction} "
+                f"reasons={reasons} projected_heat={round(projected_total_heat*100,2)}%"
+            )
+            try:
+                intel_event(
+                    "portfolio_heat_blocked_trade",
+                    {"reasons": reasons, "snapshot": x.get("portfolio_heat_snapshot", {})},
+                    signal=x,
+                    stage="portfolio_heat_exposure",
+                    decision="blocked",
+                )
+            except Exception:
+                pass
+            try:
+                if PORTFOLIO_HEAT_SEND_ALERTS:
+                    send_to_discord(
+                        DISCORD_AI_WEBHOOK,
+                        f"🧯 PORTFOLIO HEAT BLOCKED\nTicker: {ticker}\nDirection: {direction}\nReasons: {', '.join(reasons)}\nProjected Heat: {round(projected_total_heat*100,2)}%\n⏰ {now_ts()}",
+                        "AI",
+                    )
+            except Exception:
+                pass
+            return x
+
+        # Near heat limit: reduce size instead of full block.
+        max_heat = safe_float(PORTFOLIO_MAX_HEAT_PCT, MAX_PROJECTED_PORTFOLIO_HEAT_PCT)
+        near_threshold = max_heat * safe_float(PORTFOLIO_NEAR_HEAT_THRESHOLD_PCT, 0.80)
+
+        if PORTFOLIO_REDUCE_SIZE_IF_NEAR_HEAT and projected_total_heat >= near_threshold:
+            original_qty = safe_int(x.get("qty", 1), 1)
+            new_qty = max(1, int(math.floor(original_qty * safe_float(PORTFOLIO_NEAR_HEAT_SIZE_MULT, 0.5))))
+            x["qty_before_portfolio_heat"] = original_qty
+            x["qty"] = new_qty
+            x["portfolio_heat_size_reduced"] = True
+            debug(
+                f"PORTFOLIO HEAT SIZE REDUCED | ticker={ticker} "
+                f"base_qty={original_qty} final_qty={new_qty} projected_heat={round(projected_total_heat*100,2)}%"
+            )
+        else:
+            x["portfolio_heat_size_reduced"] = False
+
+        x["blocked_by_portfolio_heat"] = False
+        x["portfolio_heat_reason"] = ""
+        debug(
+            f"PORTFOLIO HEAT OK | ticker={ticker} direction={direction} "
+            f"open={snap.get('open_count', 0)} projected_heat={round(projected_total_heat*100,2)}%"
+        )
+        return x
+
+    except Exception as e:
+        debug(f"PORTFOLIO HEAT CONTROL ERROR | {e}")
+        return signal
+
+
+def portfolio_heat_blocks_signal(signal: Dict[str, Any]) -> bool:
+    try:
+        return bool(isinstance(signal, dict) and signal.get("blocked_by_portfolio_heat"))
+    except Exception:
+        return False
+
+
 def risk_state_record_closed_trade(trade_or_position: Dict[str, Any]) -> Dict[str, Any]:
     """
     Updates win/loss streaks when a trade closes.
@@ -1867,6 +2177,10 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
             candidate = apply_risk_state_to_signal(candidate)
             if risk_state_blocks_signal(candidate):
                 return {"generated": False, "reason": "risk_state_blocked", "signal": candidate}
+
+            candidate = apply_portfolio_heat_exposure_control(candidate)
+            if portfolio_heat_blocks_signal(candidate):
+                return {"generated": False, "reason": "portfolio_heat_blocked", "signal": candidate}
 
             atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
             state["last_signal_ts"] = now_ts()
@@ -2136,6 +2450,13 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             debug(f"RISK STATE BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
             archive_ai_signal_input(ai, "risk_state_blocked", {"reason": reason, "normalized_signal": signal})
             return {"written": False, "reason": "risk_state_blocked", "risk_state_reason": reason, "signal": signal}
+
+        signal = apply_portfolio_heat_exposure_control(signal)
+        if portfolio_heat_blocks_signal(signal):
+            reason = signal.get("portfolio_heat_reason", "portfolio_heat_blocked")
+            debug(f"PORTFOLIO HEAT BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "portfolio_heat_blocked", {"reason": reason, "normalized_signal": signal})
+            return {"written": False, "reason": "portfolio_heat_blocked", "portfolio_heat_reason": reason, "signal": signal}
 
         if errors:
             debug(f"AI BRIDGE BLOCKED | errors={errors}")
