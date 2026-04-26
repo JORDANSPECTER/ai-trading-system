@@ -655,6 +655,37 @@ PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled
 
 
 
+
+# =========================================================
+# RISK STATE + DRAWDOWN ENGINE
+# Self-protecting account logic:
+# AGGRESSIVE / NORMAL / DEFENSIVE / LOCKDOWN
+# =========================================================
+ENABLE_RISK_STATE_ENGINE = os.getenv("ENABLE_RISK_STATE_ENGINE", "true").lower() == "true"
+RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", "risk_state.json").strip()
+RISK_STATE_SEND_ALERTS = os.getenv("RISK_STATE_SEND_ALERTS", "true").lower() == "true"
+
+RISK_STATE_DAILY_DRAWDOWN_LOCK_PCT = float(os.getenv("RISK_STATE_DAILY_DRAWDOWN_LOCK_PCT", "0.02"))
+RISK_STATE_DAILY_DRAWDOWN_DEFENSIVE_PCT = float(os.getenv("RISK_STATE_DAILY_DRAWDOWN_DEFENSIVE_PCT", "0.01"))
+RISK_STATE_DAILY_PROFIT_AGGRESSIVE_PCT = float(os.getenv("RISK_STATE_DAILY_PROFIT_AGGRESSIVE_PCT", "0.01"))
+
+RISK_STATE_LOCK_DOLLARS = float(os.getenv("RISK_STATE_LOCK_DOLLARS", "500"))
+RISK_STATE_DEFENSIVE_DOLLARS = float(os.getenv("RISK_STATE_DEFENSIVE_DOLLARS", "250"))
+RISK_STATE_AGGRESSIVE_PROFIT_DOLLARS = float(os.getenv("RISK_STATE_AGGRESSIVE_PROFIT_DOLLARS", "250"))
+
+RISK_STATE_LOSS_STREAK_DEFENSIVE = int(os.getenv("RISK_STATE_LOSS_STREAK_DEFENSIVE", "2"))
+RISK_STATE_LOSS_STREAK_LOCKDOWN = int(os.getenv("RISK_STATE_LOSS_STREAK_LOCKDOWN", "3"))
+RISK_STATE_WIN_STREAK_AGGRESSIVE = int(os.getenv("RISK_STATE_WIN_STREAK_AGGRESSIVE", "3"))
+
+RISK_STATE_AGGRESSIVE_SIZE_MULT = float(os.getenv("RISK_STATE_AGGRESSIVE_SIZE_MULT", "1.25"))
+RISK_STATE_NORMAL_SIZE_MULT = float(os.getenv("RISK_STATE_NORMAL_SIZE_MULT", "1.00"))
+RISK_STATE_DEFENSIVE_SIZE_MULT = float(os.getenv("RISK_STATE_DEFENSIVE_SIZE_MULT", "0.50"))
+RISK_STATE_LOCKDOWN_SIZE_MULT = float(os.getenv("RISK_STATE_LOCKDOWN_SIZE_MULT", "0.00"))
+
+RISK_STATE_AUTO_LOCK_ON_DRAWDOWN = os.getenv("RISK_STATE_AUTO_LOCK_ON_DRAWDOWN", "true").lower() == "true"
+RISK_STATE_REQUIRE_MANUAL_UNLOCK = os.getenv("RISK_STATE_REQUIRE_MANUAL_UNLOCK", "true").lower() == "true"
+RISK_STATE_RESET_DAILY = os.getenv("RISK_STATE_RESET_DAILY", "true").lower() == "true"
+
 # =========================================================
 # VOLATILITY + CONFIDENCE POSITION SIZING
 # A+ = larger size, A = normal, B = reduced.
@@ -1337,6 +1368,309 @@ def vol_conf_sizing_blocks_signal(signal: Dict[str, Any]) -> bool:
     except Exception:
         return False
 
+
+def risk_state_today_key() -> str:
+    try:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+    except Exception:
+        return str(now_ts())[:10]
+
+
+def risk_state_default() -> Dict[str, Any]:
+    return {
+        "date": risk_state_today_key(),
+        "state": "NORMAL",
+        "locked": False,
+        "manual_unlock_required": False,
+        "daily_realized_pnl": 0.0,
+        "daily_realized_pnl_pct": 0.0,
+        "loss_streak": 0,
+        "win_streak": 0,
+        "last_reason": "initialized",
+        "updated_at": now_ts(),
+        "state_history": [],
+    }
+
+
+def load_risk_state() -> Dict[str, Any]:
+    data = load_json_file(RISK_STATE_FILE, {})
+    if not isinstance(data, dict):
+        data = risk_state_default()
+
+    if RISK_STATE_RESET_DAILY and data.get("date") != risk_state_today_key():
+        old_state = data
+        data = risk_state_default()
+        data["previous_day"] = old_state
+
+    data.setdefault("date", risk_state_today_key())
+    data.setdefault("state", "NORMAL")
+    data.setdefault("locked", False)
+    data.setdefault("manual_unlock_required", False)
+    data.setdefault("daily_realized_pnl", 0.0)
+    data.setdefault("daily_realized_pnl_pct", 0.0)
+    data.setdefault("loss_streak", 0)
+    data.setdefault("win_streak", 0)
+    data.setdefault("last_reason", "")
+    data.setdefault("updated_at", now_ts())
+    data.setdefault("state_history", [])
+    return data
+
+
+def save_risk_state(data: Dict[str, Any]) -> None:
+    try:
+        data["updated_at"] = now_ts()
+        atomic_write_json(RISK_STATE_FILE, data)
+    except Exception as e:
+        debug(f"RISK STATE SAVE ERROR | {e}")
+
+
+def risk_state_account_equity() -> float:
+    try:
+        if LIVE_MODE:
+            return safe_float(GLOBAL_STATE.get("account_equity", LIVE_ACCOUNT_EQUITY_FALLBACK), LIVE_ACCOUNT_EQUITY_FALLBACK)
+        return safe_float(PAPER_ACCOUNT_EQUITY, 25000)
+    except Exception:
+        return 25000.0
+
+
+def risk_state_get_daily_pnl() -> float:
+    """
+    Uses GLOBAL_STATE daily_pnl if available, then risk_state file fallback.
+    """
+    try:
+        ensure_globals_initialized()
+        return safe_float(GLOBAL_STATE.get("daily_pnl", 0.0), 0.0)
+    except Exception:
+        state = load_risk_state()
+        return safe_float(state.get("daily_realized_pnl", 0.0), 0.0)
+
+
+def risk_state_transition(new_state: str, reason: str, current: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    state = current if isinstance(current, dict) else load_risk_state()
+    old = str(state.get("state", "NORMAL")).upper()
+    new = str(new_state or "NORMAL").upper().strip()
+
+    if old != new:
+        state.setdefault("state_history", []).append({
+            "at": now_ts(),
+            "from": old,
+            "to": new,
+            "reason": reason,
+        })
+        state["state_history"] = state.get("state_history", [])[-100:]
+
+        debug(f"RISK STATE CHANGE | {old} -> {new} | reason={reason}")
+        try:
+            if RISK_STATE_SEND_ALERTS:
+                send_to_discord(
+                    DISCORD_AI_WEBHOOK,
+                    f"🛡️ RISK STATE CHANGE\nFrom: {old}\nTo: {new}\nReason: {reason}\n⏰ {now_ts()}",
+                    "AI",
+                )
+        except Exception:
+            pass
+
+    state["state"] = new
+    state["last_reason"] = reason
+    if new == "LOCKDOWN":
+        state["locked"] = True
+        state["manual_unlock_required"] = bool(RISK_STATE_REQUIRE_MANUAL_UNLOCK)
+    elif not state.get("manual_unlock_required", False):
+        state["locked"] = False
+
+    save_risk_state(state)
+    return state
+
+
+def risk_state_evaluate() -> Dict[str, Any]:
+    """
+    Evaluates account condition and returns active risk state.
+    """
+    if not ENABLE_RISK_STATE_ENGINE:
+        return {"state": "NORMAL", "locked": False, "reason": "disabled", "size_multiplier": 1.0}
+
+    state = load_risk_state()
+    equity = max(risk_state_account_equity(), 1.0)
+    daily_pnl = risk_state_get_daily_pnl()
+    daily_pnl_pct = daily_pnl / equity
+
+    state["daily_realized_pnl"] = daily_pnl
+    state["daily_realized_pnl_pct"] = daily_pnl_pct
+
+    loss_streak = safe_int(state.get("loss_streak", 0), 0)
+    win_streak = safe_int(state.get("win_streak", 0), 0)
+
+    # Manual lock stays locked until reset/unlock command.
+    if state.get("locked") and state.get("manual_unlock_required"):
+        save_risk_state(state)
+        return {
+            "state": "LOCKDOWN",
+            "locked": True,
+            "reason": state.get("last_reason", "manual_unlock_required"),
+            "size_multiplier": 0.0,
+            "daily_pnl": daily_pnl,
+            "daily_pnl_pct": daily_pnl_pct,
+        }
+
+    lock_dollars = -abs(safe_float(RISK_STATE_LOCK_DOLLARS, 500))
+    defensive_dollars = -abs(safe_float(RISK_STATE_DEFENSIVE_DOLLARS, 250))
+    aggressive_profit_dollars = abs(safe_float(RISK_STATE_AGGRESSIVE_PROFIT_DOLLARS, 250))
+
+    if RISK_STATE_AUTO_LOCK_ON_DRAWDOWN and (
+        daily_pnl <= lock_dollars
+        or daily_pnl_pct <= -abs(safe_float(RISK_STATE_DAILY_DRAWDOWN_LOCK_PCT, 0.02))
+        or loss_streak >= safe_int(RISK_STATE_LOSS_STREAK_LOCKDOWN, 3)
+    ):
+        reason = f"drawdown_or_loss_streak_lock | pnl={round(daily_pnl,2)} pct={round(daily_pnl_pct*100,2)}% losses={loss_streak}"
+        state = risk_state_transition("LOCKDOWN", reason, state)
+        return {"state": "LOCKDOWN", "locked": True, "reason": reason, "size_multiplier": 0.0, "daily_pnl": daily_pnl, "daily_pnl_pct": daily_pnl_pct}
+
+    if (
+        daily_pnl <= defensive_dollars
+        or daily_pnl_pct <= -abs(safe_float(RISK_STATE_DAILY_DRAWDOWN_DEFENSIVE_PCT, 0.01))
+        or loss_streak >= safe_int(RISK_STATE_LOSS_STREAK_DEFENSIVE, 2)
+    ):
+        reason = f"defensive_mode | pnl={round(daily_pnl,2)} pct={round(daily_pnl_pct*100,2)}% losses={loss_streak}"
+        state = risk_state_transition("DEFENSIVE", reason, state)
+        return {"state": "DEFENSIVE", "locked": False, "reason": reason, "size_multiplier": safe_float(RISK_STATE_DEFENSIVE_SIZE_MULT, 0.5), "daily_pnl": daily_pnl, "daily_pnl_pct": daily_pnl_pct}
+
+    if (
+        daily_pnl >= aggressive_profit_dollars
+        or daily_pnl_pct >= abs(safe_float(RISK_STATE_DAILY_PROFIT_AGGRESSIVE_PCT, 0.01))
+        or win_streak >= safe_int(RISK_STATE_WIN_STREAK_AGGRESSIVE, 3)
+    ):
+        reason = f"aggressive_mode | pnl={round(daily_pnl,2)} pct={round(daily_pnl_pct*100,2)}% wins={win_streak}"
+        state = risk_state_transition("AGGRESSIVE", reason, state)
+        return {"state": "AGGRESSIVE", "locked": False, "reason": reason, "size_multiplier": safe_float(RISK_STATE_AGGRESSIVE_SIZE_MULT, 1.25), "daily_pnl": daily_pnl, "daily_pnl_pct": daily_pnl_pct}
+
+    reason = f"normal_mode | pnl={round(daily_pnl,2)} pct={round(daily_pnl_pct*100,2)}%"
+    state = risk_state_transition("NORMAL", reason, state)
+    return {"state": "NORMAL", "locked": False, "reason": reason, "size_multiplier": safe_float(RISK_STATE_NORMAL_SIZE_MULT, 1.0), "daily_pnl": daily_pnl, "daily_pnl_pct": daily_pnl_pct}
+
+
+def apply_risk_state_to_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Blocks or adjusts size based on risk state before execution.
+    """
+    try:
+        if not ENABLE_RISK_STATE_ENGINE:
+            return signal
+        if not isinstance(signal, dict):
+            return signal
+
+        result = risk_state_evaluate()
+        state_name = str(result.get("state", "NORMAL")).upper()
+        multiplier = safe_float(result.get("size_multiplier", 1.0), 1.0)
+
+        signal["risk_state"] = state_name
+        signal["risk_state_reason"] = result.get("reason", "")
+        signal["risk_state_size_multiplier"] = multiplier
+        signal["risk_state_daily_pnl"] = result.get("daily_pnl", 0)
+        signal["risk_state_daily_pnl_pct"] = result.get("daily_pnl_pct", 0)
+
+        if result.get("locked") or state_name == "LOCKDOWN" or multiplier <= 0:
+            signal["blocked_by_risk_state"] = True
+            signal["risk_state_block_reason"] = result.get("reason", "risk_state_lockdown")
+            debug(f"RISK STATE BLOCKED TRADE | state={state_name} reason={signal.get('risk_state_block_reason')}")
+            return signal
+
+        original_qty = safe_int(signal.get("qty", 1), 1)
+        adjusted_qty = int(math.floor(original_qty * multiplier))
+        if original_qty > 0 and adjusted_qty < 1:
+            adjusted_qty = 1
+
+        adjusted_qty = min(adjusted_qty, safe_int(MAX_POSITION_QTY, adjusted_qty))
+        adjusted_qty = max(1, adjusted_qty)
+
+        signal["qty_before_risk_state"] = original_qty
+        signal["qty"] = adjusted_qty
+        signal["blocked_by_risk_state"] = False
+        signal["risk_state_block_reason"] = ""
+
+        debug(
+            f"RISK STATE SIZE | state={state_name} base_qty={original_qty} "
+            f"mult={multiplier} final_qty={adjusted_qty}"
+        )
+
+        try:
+            intel_event(
+                "risk_state_position_adjustment",
+                {
+                    "state": state_name,
+                    "multiplier": multiplier,
+                    "base_qty": original_qty,
+                    "final_qty": adjusted_qty,
+                    "reason": result.get("reason", ""),
+                },
+                signal=signal,
+                stage="risk_state_engine",
+                decision="adjusted",
+            )
+        except Exception:
+            pass
+
+        return signal
+
+    except Exception as e:
+        debug(f"RISK STATE APPLY ERROR | {e}")
+        return signal
+
+
+def risk_state_blocks_signal(signal: Dict[str, Any]) -> bool:
+    try:
+        return bool(isinstance(signal, dict) and signal.get("blocked_by_risk_state"))
+    except Exception:
+        return False
+
+
+def risk_state_record_closed_trade(trade_or_position: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Updates win/loss streaks when a trade closes.
+    This is safe even if no close hook exists yet.
+    """
+    try:
+        if not ENABLE_RISK_STATE_ENGINE or not isinstance(trade_or_position, dict):
+            return load_risk_state()
+
+        state = load_risk_state()
+        pnl = safe_float(
+            trade_or_position.get(
+                "realized_pnl",
+                trade_or_position.get("realized_pnl_pct", trade_or_position.get("pnl", trade_or_position.get("pnl_pct", 0))),
+            ),
+            0.0,
+        )
+
+        if pnl > 0:
+            state["win_streak"] = safe_int(state.get("win_streak", 0), 0) + 1
+            state["loss_streak"] = 0
+        elif pnl < 0:
+            state["loss_streak"] = safe_int(state.get("loss_streak", 0), 0) + 1
+            state["win_streak"] = 0
+
+        state["daily_realized_pnl"] = safe_float(state.get("daily_realized_pnl", 0), 0) + pnl
+        equity = max(risk_state_account_equity(), 1.0)
+        state["daily_realized_pnl_pct"] = safe_float(state.get("daily_realized_pnl", 0), 0) / equity
+        save_risk_state(state)
+        risk_state_evaluate()
+        return state
+
+    except Exception as e:
+        debug(f"RISK STATE RECORD CLOSED TRADE ERROR | {e}")
+        return load_risk_state()
+
+
+def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
+    state = load_risk_state()
+    state["locked"] = False
+    state["manual_unlock_required"] = False
+    state["loss_streak"] = 0
+    state["state"] = "NORMAL"
+    state["last_reason"] = reason
+    save_risk_state(state)
+    debug(f"RISK STATE UNLOCKED | reason={reason}")
+    return state
+
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
@@ -1529,6 +1863,10 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
             candidate = apply_volatility_confidence_position_sizing(candidate)
             if vol_conf_sizing_blocks_signal(candidate):
                 return {"generated": False, "reason": "vol_conf_sizing_blocked", "signal": candidate}
+
+            candidate = apply_risk_state_to_signal(candidate)
+            if risk_state_blocks_signal(candidate):
+                return {"generated": False, "reason": "risk_state_blocked", "signal": candidate}
 
             atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
             state["last_signal_ts"] = now_ts()
@@ -1791,6 +2129,13 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             debug(f"VOL CONF SIZING BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
             archive_ai_signal_input(ai, "vol_conf_sizing_blocked", {"reason": reason, "normalized_signal": signal})
             return {"written": False, "reason": "vol_conf_sizing_blocked", "vol_conf_sizing_reason": reason, "signal": signal}
+
+        signal = apply_risk_state_to_signal(signal)
+        if risk_state_blocks_signal(signal):
+            reason = signal.get("risk_state_block_reason", "risk_state_blocked")
+            debug(f"RISK STATE BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "risk_state_blocked", {"reason": reason, "normalized_signal": signal})
+            return {"written": False, "reason": "risk_state_blocked", "risk_state_reason": reason, "signal": signal}
 
         if errors:
             debug(f"AI BRIDGE BLOCKED | errors={errors}")
