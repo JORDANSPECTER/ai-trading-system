@@ -15,16 +15,34 @@ import requests
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
-# Safe import so main engine still runs even if macro_bridge fails
+# Safe import so main engine still runs even if macro_bridge fails.
+# Supports BOTH versions:
+# 1) build_macro_bridge_snapshot / load_last_macro_snapshot
+# 2) get_macro_snapshot / load_macro_snapshot
+# This fixes: "Macro: No macro snapshot loaded" when macro_bridge.py
+# was rebuilt with the newer function names.
 # =========================================================
 try:
     from macro_bridge import build_macro_bridge_snapshot, load_last_macro_snapshot
     MACRO_BRIDGE_AVAILABLE = True
-except Exception as macro_import_error:
-    MACRO_BRIDGE_AVAILABLE = False
-    build_macro_bridge_snapshot = None
-    load_last_macro_snapshot = None
-    print(f"[MACRO IMPORT WARNING] macro_bridge unavailable: {macro_import_error}", flush=True)
+except Exception as macro_import_error_1:
+    try:
+        from macro_bridge import get_macro_snapshot as _get_macro_snapshot
+        from macro_bridge import load_macro_snapshot as _load_macro_snapshot
+
+        def build_macro_bridge_snapshot():
+            return _get_macro_snapshot()
+
+        def load_last_macro_snapshot():
+            return _load_macro_snapshot()
+
+        MACRO_BRIDGE_AVAILABLE = True
+        print("[MACRO IMPORT OK] using get_macro_snapshot/load_macro_snapshot compatibility wrapper", flush=True)
+    except Exception as macro_import_error_2:
+        MACRO_BRIDGE_AVAILABLE = False
+        build_macro_bridge_snapshot = None
+        load_last_macro_snapshot = None
+        print(f"[MACRO IMPORT WARNING] macro_bridge unavailable: {macro_import_error_1} | fallback failed: {macro_import_error_2}", flush=True)
 
 # =========================================================
 # UNBIASED TRADES ELITE ENGINE - HARDENED MAIN.PY
@@ -14112,8 +14130,18 @@ def boot():
         startup_reconcile_and_gate()
 
     if ENABLE_MACRO_BRIDGE:
-        refresh_macro_bridge(force=True, send_alerts=MACRO_SEND_ON_BOOT)
-
+        # AUTO MACRO SNAPSHOT ON BOOT / PREMARKET
+        # Creates/loads macro snapshot immediately when Render starts.
+        # Then runtime_housekeeping() refreshes it automatically every
+        # MACRO_REFRESH_SECONDS while the engine is running.
+        boot_macro = refresh_macro_bridge(force=True, send_alerts=MACRO_SEND_ON_BOOT)
+        try:
+            if boot_macro:
+                debug("✅ AUTO MACRO SNAPSHOT LOADED ON BOOT")
+            else:
+                debug("⚠️ AUTO MACRO SNAPSHOT BOOT RETURNED EMPTY")
+        except Exception:
+            pass
     send_heartbeat(force=True)
 
 
