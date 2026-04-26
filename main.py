@@ -10066,8 +10066,9 @@ FREE_DAILY_LEVEL_TICKERS = {
     if x.strip()
 }
 FREE_DAILY_LEVEL_STATE_FILE = os.getenv("FREE_DAILY_LEVEL_STATE_FILE", "free_daily_levels_state.json").strip()
-FREE_DAILY_LEVEL_COOLDOWN_SECONDS = int(os.getenv("FREE_DAILY_LEVEL_COOLDOWN_SECONDS", "10800"))  # 3 hours
+FREE_DAILY_LEVEL_COOLDOWN_SECONDS = int(os.getenv("FREE_DAILY_LEVEL_COOLDOWN_SECONDS", "1800"))  # 3 hours
 FREE_DAILY_LEVEL_SEND_ON_BOOT = os.getenv("FREE_DAILY_LEVEL_SEND_ON_BOOT", "true").lower() == "true"
+FREE_DAILY_LEVEL_SEND_MODE = os.getenv("FREE_DAILY_LEVEL_SEND_MODE", "interval").lower().strip()
 FREE_DAILY_LEVEL_INCLUDE_DARKPOOL = os.getenv("FREE_DAILY_LEVEL_INCLUDE_DARKPOOL", "true").lower() == "true"
 FREE_DAILY_LEVEL_INCLUDE_OIL = os.getenv("FREE_DAILY_LEVEL_INCLUDE_OIL", "true").lower() == "true"
 
@@ -10292,18 +10293,35 @@ def build_free_daily_levels_alert(ticker: str) -> str:
 
 
 def maybe_send_free_daily_levels(force: bool = False) -> None:
+    """
+    Automated free daily levels sender.
+
+    Best production mode for this engine:
+    - interval mode
+    - QQQ/SPY alerts every FREE_DAILY_LEVEL_COOLDOWN_SECONDS
+    - default = 1800 seconds / 30 minutes
+    - force=True bypasses cooldown
+
+    Why interval mode:
+    - Render restarts will not miss fixed clock windows.
+    - The loop can run continuously without spamming.
+    - Free channel gets consistent market-desk style updates.
+    """
     if not ENABLE_FREE_DAILY_LEVELS:
         return
 
     try:
         state = free_daily_load_state()
         now = int(time.time())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        interval = max(60, safe_int(FREE_DAILY_LEVEL_COOLDOWN_SECONDS, 1800))
 
         for ticker in sorted(FREE_DAILY_LEVEL_TICKERS):
-            key = f"{ticker}:{datetime.utcnow().strftime('%Y-%m-%d')}"
+            # One key per ticker per day. The timestamp updates every successful send.
+            key = f"{ticker}:{today}:interval"
             last = safe_int(state.get(key, 0), 0)
 
-            if not force and last and (now - last) < FREE_DAILY_LEVEL_COOLDOWN_SECONDS:
+            if not force and last and (now - last) < interval:
                 continue
 
             msg = build_free_daily_levels_alert(ticker)
@@ -10311,7 +10329,8 @@ def maybe_send_free_daily_levels(force: bool = False) -> None:
             state[key] = now
 
             try:
-                debug(f"FREE DAILY LEVELS SENT | ticker={ticker}")
+                minutes = round(interval / 60, 1)
+                debug(f"FREE DAILY LEVELS SENT | ticker={ticker} interval_min={minutes}")
             except Exception:
                 pass
 
@@ -13486,7 +13505,7 @@ def main_loop():
 
     while True:
         # FREE DAILY LEVELS AUTO — ROOT LOOP HOOK
-        # Runs every engine cycle; cooldown/state prevents spam.
+        # Runs every engine cycle; interval cooldown prevents spam.
         try:
             maybe_send_free_daily_levels(force=False)
         except Exception as e:
