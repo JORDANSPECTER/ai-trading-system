@@ -704,6 +704,249 @@ FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "
 # =========================================================
 
 # =========================================================
+
+# =========================================================
+# MACRO BRIDGE — FRED FIRST
+# Pulls FRED macro context when FRED_API_KEY exists.
+# Missing key never blocks trading; defaults to neutral.
+# =========================================================
+ENABLE_MACRO_BRIDGE = os.getenv("ENABLE_MACRO_BRIDGE", "true").lower() == "true"
+ENABLE_FRED_MACRO_BRIDGE = os.getenv("ENABLE_FRED_MACRO_BRIDGE", "true").lower() == "true"
+FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
+MACRO_LATEST_FILE = os.getenv("MACRO_LATEST_FILE", "macro_latest.json")
+MACRO_STORE_FILE = os.getenv("MACRO_STORE_FILE", "macro_store.json")
+MACRO_REFRESH_SECONDS = int(os.getenv("MACRO_REFRESH_SECONDS", "3600"))
+
+FRED_SERIES = {
+    "DGS10": "10Y Treasury Yield",
+    "DGS2": "2Y Treasury Yield",
+    "T10Y2Y": "10Y minus 2Y Yield Curve",
+    "DFF": "Fed Funds Effective Rate",
+    "CPIAUCSL": "CPI",
+    "UNRATE": "Unemployment Rate",
+    "VIXCLS": "VIX Close",
+    "DCOILWTICO": "WTI Crude Oil",
+}
+
+
+def macro_load_latest() -> Dict[str, Any]:
+    data = load_json_file(MACRO_LATEST_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def macro_should_refresh(latest: Dict[str, Any]) -> bool:
+    return (now_ts() - safe_int(latest.get("updated_at", 0), 0)) >= MACRO_REFRESH_SECONDS
+
+
+def fred_fetch_series_observations(series_id: str, limit: int = 5) -> Dict[str, Any]:
+    if not FRED_API_KEY:
+        return {"ok": False, "series_id": series_id, "reason": "missing_fred_api_key"}
+
+    try:
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": series_id,
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": limit,
+        }
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return {"ok": False, "series_id": series_id, "reason": f"http_{r.status_code}", "body": r.text[:250]}
+
+        payload = r.json()
+        rows = []
+        for obs in payload.get("observations", []):
+            value = obs.get("value")
+            if value in (None, "", "."):
+                continue
+            rows.append({"date": obs.get("date"), "value": safe_float(value, 0.0)})
+
+        if not rows:
+            return {"ok": False, "series_id": series_id, "reason": "no_valid_observations"}
+
+        return {"ok": True, "series_id": series_id, "observations": rows}
+
+    except Exception as e:
+        return {"ok": False, "series_id": series_id, "reason": f"exception:{e}"}
+
+
+def macro_interpret_fred(series_values: Dict[str, Any]) -> Dict[str, Any]:
+    oil = safe_float(series_values.get("DCOILWTICO", {}).get("value", 0), 0.0)
+    vix = safe_float(series_values.get("VIXCLS", {}).get("value", 0), 0.0)
+    curve = safe_float(series_values.get("T10Y2Y", {}).get("value", 0), 0.0)
+    y10 = safe_float(series_values.get("DGS10", {}).get("value", 0), 0.0)
+    fed = safe_float(series_values.get("DFF", {}).get("value", 0), 0.0)
+
+    score = 0
+    notes = []
+
+    if vix >= 25:
+        score -= 2
+        notes.append("VIX elevated: risk-off pressure")
+    elif vix >= 18:
+        score -= 1
+        notes.append("VIX moderate: caution")
+    elif vix > 0:
+        score += 1
+        notes.append("VIX calm: risk supportive")
+
+    if oil >= 90:
+        score -= 1
+        notes.append("WTI elevated: inflation/geopolitical pressure")
+    elif 0 < oil <= 75:
+        score += 1
+        notes.append("WTI contained: macro supportive")
+
+    if curve < -0.50:
+        score -= 1
+        notes.append("Yield curve deeply inverted: growth concern")
+    elif curve > 0.25:
+        score += 1
+        notes.append("Yield curve positive: growth supportive")
+
+    if y10 >= 4.75:
+        score -= 1
+        notes.append("10Y yield elevated: duration pressure")
+
+    if fed >= 5:
+        score -= 1
+        notes.append("Fed funds restrictive")
+
+    if score >= 2:
+        bias = "risk_on"
+    elif score <= -2:
+        bias = "risk_off"
+    else:
+        bias = "neutral"
+
+    return {
+        "macro_bias": bias,
+        "risk_score": score,
+        "notes": notes,
+        "oil_price": oil,
+        "vix": vix,
+        "yield_curve_10y2y": curve,
+        "ten_year_yield": y10,
+        "fed_funds": fed,
+    }
+
+
+def macro_bridge_fred_refresh(force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_MACRO_BRIDGE or not ENABLE_FRED_MACRO_BRIDGE:
+        return {"updated": False, "reason": "disabled"}
+
+    latest = macro_load_latest()
+    if latest and not force and not macro_should_refresh(latest):
+        return {"updated": False, "reason": "fresh_cache", "macro": latest}
+
+    if not FRED_API_KEY:
+        payload = {
+            "updated_at": now_ts(),
+            "source": "fred",
+            "status": "missing_fred_api_key",
+            "macro_bias": "neutral",
+            "risk_score": 0,
+            "notes": ["FRED_API_KEY missing; macro bridge neutral"],
+            "series": {},
+            "errors": {"FRED_API_KEY": "missing"},
+        }
+        atomic_write_json(MACRO_LATEST_FILE, payload)
+        debug("MACRO BRIDGE FRED SKIP | missing FRED_API_KEY")
+        return {"updated": False, "reason": "missing_fred_api_key", "macro": payload}
+
+    series_values = {}
+    errors = {}
+
+    for series_id, label in FRED_SERIES.items():
+        fetched = fred_fetch_series_observations(series_id)
+        if fetched.get("ok"):
+            obs = fetched.get("observations", [])
+            latest_obs = obs[0]
+            prior_obs = obs[1] if len(obs) > 1 else latest_obs
+            current = safe_float(latest_obs.get("value", 0), 0.0)
+            prior = safe_float(prior_obs.get("value", current), current)
+            series_values[series_id] = {
+                "label": label,
+                "date": latest_obs.get("date"),
+                "value": current,
+                "prior": prior,
+                "change": round(current - prior, 4),
+                "observations": obs,
+            }
+        else:
+            errors[series_id] = fetched.get("reason", "unknown_error")
+
+    interpretation = macro_interpret_fred(series_values)
+    payload = {
+        "updated_at": now_ts(),
+        "source": "fred",
+        "status": "ok" if series_values else "empty",
+        "macro_bias": interpretation.get("macro_bias", "neutral"),
+        "risk_score": interpretation.get("risk_score", 0),
+        "notes": interpretation.get("notes", []),
+        "series": series_values,
+        "errors": errors,
+    }
+
+    atomic_write_json(MACRO_LATEST_FILE, payload)
+
+    store = load_json_file(MACRO_STORE_FILE, {})
+    if not isinstance(store, dict):
+        store = {}
+    history = store.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(payload)
+    store["history"] = history[-100:]
+    store["last"] = payload
+    atomic_write_json(MACRO_STORE_FILE, store)
+
+    debug(f"MACRO BRIDGE FRED UPDATED | bias={payload['macro_bias']} score={payload['risk_score']} errors={len(errors)}")
+    return {"updated": True, "reason": "fred_refreshed", "macro": payload}
+
+
+def get_macro_context_for_signal() -> Dict[str, Any]:
+    macro = macro_load_latest()
+    if not macro:
+        macro_bridge_fred_refresh(force=False)
+        macro = macro_load_latest()
+
+    series = macro.get("series", {}) if isinstance(macro, dict) else {}
+    oil = 0
+    vix = 0
+    if isinstance(series, dict):
+        oil = safe_float(series.get("DCOILWTICO", {}).get("value", 0), 0.0)
+        vix = safe_float(series.get("VIXCLS", {}).get("value", 0), 0.0)
+
+    return {
+        "macro_bias": macro.get("macro_bias", "neutral") if isinstance(macro, dict) else "neutral",
+        "macro_risk_score": safe_int(macro.get("risk_score", 0), 0) if isinstance(macro, dict) else 0,
+        "macro_notes": macro.get("notes", []) if isinstance(macro, dict) else [],
+        "macro_updated_at": macro.get("updated_at", 0) if isinstance(macro, dict) else 0,
+        "oil_price": oil,
+        "vix": vix,
+    }
+
+
+def apply_macro_context_to_ai_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(signal, dict):
+        return signal
+
+    macro = get_macro_context_for_signal()
+    enriched = deepcopy(signal)
+    enriched["macro_bias"] = macro.get("macro_bias", "neutral")
+    enriched["macro_risk_score"] = macro.get("macro_risk_score", 0)
+    enriched["macro_notes"] = macro.get("macro_notes", [])
+    enriched["macro_updated_at"] = macro.get("macro_updated_at", 0)
+    enriched["oil_price"] = macro.get("oil_price", 0)
+    enriched["vix"] = macro.get("vix", 0)
+
+    if enriched.get("macro_bias") == "risk_off":
+        enriched["macro_warning"] = "risk_off_macro_context"
+
+    return enriched
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
@@ -840,7 +1083,7 @@ def auto_ai_build_signal_for_ticker(ticker: str, snapshot: Dict[str, Any]) -> Op
     target = round(entry + AUTO_AI_DEFAULT_TP1_OFFSET, 2)
     tp2 = round(entry + AUTO_AI_DEFAULT_TP2_OFFSET, 2)
 
-    return {
+    signal = {
         "ticker": ticker,
         "direction": direction,
         "grade": grade,
@@ -859,6 +1102,7 @@ def auto_ai_build_signal_for_ticker(ticker: str, snapshot: Dict[str, Any]) -> Op
         "source": "auto_ai_signal_generator",
         "timestamp": now_ts(),
     }
+    return apply_macro_context_to_ai_signal(signal)
 
 
 def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
@@ -1086,6 +1330,13 @@ def normalize_ai_to_engine_signal(ai: Dict[str, Any]) -> Dict[str, Any]:
         "source": "ai_signal_bridge",
         "timestamp": safe_int(ai.get("timestamp", now_ts()), now_ts()),
         "ai_bridge_version": 1,
+        "macro_bias": ai.get("macro_bias", "neutral"),
+        "macro_risk_score": safe_int(ai.get("macro_risk_score", 0), 0),
+        "macro_notes": ai.get("macro_notes", []),
+        "macro_updated_at": ai.get("macro_updated_at", 0),
+        "oil_price": ai.get("oil_price", 0),
+        "vix": ai.get("vix", 0),
+        "macro_warning": ai.get("macro_warning", ""),
     }
 
     return signal
@@ -8076,6 +8327,7 @@ def reset_kill_switch_for_testing():
 
 def main_loop():
     boot()
+    macro_bridge_fred_refresh(force=False)
     auto_generate_ai_signal_if_ready()
     ai_bridge_write_signal_if_ready()
 
@@ -8259,7 +8511,17 @@ def cli_auto_ai_test() -> None:
 
 
 
+
+def cli_macro_test() -> None:
+    result = macro_bridge_fred_refresh(force=True)
+    print(json.dumps(result, indent=2, default=str))
+
+
+
 if __name__ == "__main__":
+    if "--macro-test" in sys.argv:
+        cli_macro_test()
+        sys.exit(0)
     if "--auto-ai-test" in sys.argv:
         cli_auto_ai_test()
         sys.exit(0)
