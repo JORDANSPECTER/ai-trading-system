@@ -3160,7 +3160,7 @@ def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
 ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
-AUTO_AI_SIGNAL_TICKERS = [x.strip().upper() for x in os.getenv("AUTO_AI_SIGNAL_TICKERS", "QQQ,SPY").split(",") if x.strip()]
+AUTO_AI_SIGNAL_TICKERS = [x.strip().upper() for x in os.getenv("AUTO_AI_SIGNAL_TICKERS", "QQQ").split(",") if x.strip()]
 AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
 AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
 AUTO_AI_SIGNAL_FILE = os.getenv("AUTO_AI_SIGNAL_FILE", "ai_signal.json")
@@ -3169,6 +3169,27 @@ AUTO_AI_DEFAULT_CONTRACT_PRICE = float(os.getenv("AUTO_AI_DEFAULT_CONTRACT_PRICE
 AUTO_AI_DEFAULT_STOP_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_STOP_OFFSET", "0.35"))
 AUTO_AI_DEFAULT_TP1_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP1_OFFSET", "0.40"))
 AUTO_AI_DEFAULT_TP2_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP2_OFFSET", "0.80"))
+
+# =========================================================
+# SIMPLE AUTO SIGNAL GENERATOR — PAPER DRIVER
+# Keeps ai_signal.json AND signal.json fresh so the engine does not
+# reject entries with "Signal skipped: stale timestamp".
+# This is for PAPER validation. Keep LIVE_MODE=false and ALLOW_LIVE_BUYS=false.
+# =========================================================
+ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "false").lower() == "true"
+AUTO_SIGNAL_TICKER = os.getenv("AUTO_SIGNAL_TICKER", "QQQ").upper().strip()
+AUTO_SIGNAL_DIRECTION = os.getenv("AUTO_SIGNAL_DIRECTION", "CALL").upper().strip()
+AUTO_SIGNAL_MIN_UNDERLYING_PRICE = float(os.getenv("AUTO_SIGNAL_MIN_UNDERLYING_PRICE", "100"))
+AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "300"))
+AUTO_SIGNAL_CONTRACT_PRICE = float(os.getenv("AUTO_SIGNAL_CONTRACT_PRICE", str(AUTO_AI_DEFAULT_CONTRACT_PRICE)))
+AUTO_SIGNAL_STOP_OFFSET = float(os.getenv("AUTO_SIGNAL_STOP_OFFSET", str(AUTO_AI_DEFAULT_STOP_OFFSET)))
+AUTO_SIGNAL_TP1_OFFSET = float(os.getenv("AUTO_SIGNAL_TP1_OFFSET", str(AUTO_AI_DEFAULT_TP1_OFFSET)))
+AUTO_SIGNAL_TP2_OFFSET = float(os.getenv("AUTO_SIGNAL_TP2_OFFSET", str(AUTO_AI_DEFAULT_TP2_OFFSET)))
+AUTO_SIGNAL_SETUP = os.getenv("AUTO_SIGNAL_SETUP", "break_and_hold").strip()
+AUTO_SIGNAL_TRIGGER = os.getenv("AUTO_SIGNAL_TRIGGER", "auto_price_signal").strip()
+AUTO_SIGNAL_GRADE = os.getenv("AUTO_SIGNAL_GRADE", "A").upper().strip()
+AUTO_SIGNAL_FORCE_OVERWRITE = os.getenv("AUTO_SIGNAL_FORCE_OVERWRITE", "true").lower() == "true"
+AUTO_SIGNAL_STATE_FILE = os.getenv("AUTO_SIGNAL_STATE_FILE", "auto_signal_generator_state.json").strip()
 
 # =========================================================
 # AI SIGNAL -> SIGNAL.JSON EXECUTION BRIDGE
@@ -3319,7 +3340,7 @@ def auto_ai_build_signal_for_ticker(ticker: str, snapshot: Dict[str, Any]) -> Op
         "underlying_price": price,
         "reason": grade_info.get("reason", f"{ticker} auto analyzer A setup"),
         "source": "auto_ai_signal_generator",
-        "timestamp": now_ts(),
+        "timestamp": epoch(),
     }
     return apply_macro_context_to_ai_signal(signal)
 
@@ -3392,6 +3413,129 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
     except Exception as e:
         log(f"❌ AUTO AI SIGNAL GENERATOR ERROR | {e}")
         return {"generated": False, "reason": "error", "error": str(e)}
+
+
+def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
+    """
+    Simple paper-mode signal driver.
+    Writes a fresh ai_signal.json and signal.json using current market price.
+    It does not place live trades by itself; normal engine risk + paper routing still control execution.
+    """
+    if not ENABLE_AUTO_SIGNAL_GENERATOR:
+        return {"generated": False, "reason": "disabled"}
+
+    try:
+        try:
+            ensure_globals_initialized()
+        except Exception:
+            pass
+
+        # Never generate new entries while a position is open.
+        try:
+            open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+            if open_positions:
+                return {"generated": False, "reason": "open_position_exists", "open_count": len(open_positions)}
+        except Exception:
+            pass
+
+        state = load_json_file(AUTO_SIGNAL_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+
+        now = epoch()
+        last_ts = safe_int(state.get("last_signal_ts", 0), 0)
+        if not force and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
+            return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
+
+        ticker = str(AUTO_SIGNAL_TICKER or "QQQ").upper().strip()
+        direction = normalize_direction(AUTO_SIGNAL_DIRECTION or "CALL")
+
+        # Pull live market price through the engine's existing market-data router.
+        underlying_price = 0.0
+        try:
+            prices = load_market_prices([ticker])
+            underlying_price, _ts = get_market_price_for_symbol(ticker, prices)
+        except Exception as price_error:
+            debug(f"AUTO SIGNAL PRICE ERROR | {price_error}")
+            underlying_price = 0.0
+
+        if underlying_price < AUTO_SIGNAL_MIN_UNDERLYING_PRICE:
+            return {"generated": False, "reason": "invalid_underlying_price", "ticker": ticker, "price": underlying_price}
+
+        entry = round(max(0.01, AUTO_SIGNAL_CONTRACT_PRICE), 2)
+        if direction == "PUT":
+            stop = round(entry + AUTO_SIGNAL_STOP_OFFSET, 2)
+            tp1 = round(max(0.01, entry - AUTO_SIGNAL_TP1_OFFSET), 2)
+            tp2 = round(max(0.01, entry - AUTO_SIGNAL_TP2_OFFSET), 2)
+            targets = [tp1, tp2]
+            public_reason = f"{ticker} auto paper PUT signal generated from live price validation."
+        else:
+            stop = round(max(0.01, entry - AUTO_SIGNAL_STOP_OFFSET), 2)
+            tp1 = round(entry + AUTO_SIGNAL_TP1_OFFSET, 2)
+            tp2 = round(entry + AUTO_SIGNAL_TP2_OFFSET, 2)
+            targets = [tp1, tp2]
+            public_reason = f"{ticker} auto paper CALL signal generated from live price validation."
+
+        signal = {
+            "ticker": ticker,
+            "symbol": ticker,
+            "direction": direction,
+            "grade": AUTO_SIGNAL_GRADE,
+            "confidence": AUTO_SIGNAL_GRADE,
+            "setup": AUTO_SIGNAL_SETUP,
+            "strategy": AUTO_SIGNAL_SETUP,
+            "trigger": AUTO_SIGNAL_TRIGGER,
+            "confirmation": "auto_price_refresh",
+            "regime": "clean",
+            "entry": entry,
+            "stop": stop,
+            "target": tp1,
+            "targets": targets,
+            "entry_contract": entry,
+            "contract_price": entry,
+            "stop_contract": stop,
+            "tp1_contract": tp1,
+            "tp2_contract": tp2,
+            "qty": safe_int(os.getenv("DEFAULT_PAPER_QTY", "1"), 1),
+            "underlying_price": underlying_price,
+            "reason": public_reason,
+            "public_reason": public_reason,
+            "source": "simple_auto_signal_generator",
+            "timestamp": now,
+            "auto_generated": True,
+        }
+
+        try:
+            signal = apply_macro_context_to_ai_signal(signal)
+        except Exception:
+            pass
+
+        # Keep both files fresh. signal.json is what the execution loop reads.
+        if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(AUTO_AI_SIGNAL_FILE):
+            atomic_write_json(AUTO_AI_SIGNAL_FILE, signal)
+        if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(SIGNAL_FILE):
+            atomic_write_json(SIGNAL_FILE, signal)
+
+        state["last_signal_ts"] = now
+        state["last_signal"] = {
+            "ticker": ticker,
+            "direction": direction,
+            "entry": entry,
+            "underlying_price": underlying_price,
+            "timestamp": now,
+        }
+        state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
+        atomic_write_json(AUTO_SIGNAL_STATE_FILE, state)
+
+        debug(f"[AUTO SIGNAL] Generated fresh {ticker} {direction} | underlying={underlying_price} | contract={entry} | ts={now}")
+        return {"generated": True, "reason": "fresh_signal_written", "signal": signal}
+
+    except Exception as e:
+        log(f"❌ AUTO SIGNAL GENERATOR ERROR | {e}")
+        log(traceback.format_exc())
+        return {"generated": False, "reason": "error", "error": str(e)}
+
+
 # AI → SIGNAL.JSON BRIDGE HELPERS
 # =========================================================
 
@@ -3436,13 +3580,13 @@ def build_signal_from_ai() -> Dict[str, Any]:
                 "confirmation": ai.get("confirmation", "volume"),
                 "regime": ai.get("regime", "clean"),
                 "reason": ai.get("reason", "AI to signal bridge"),
-                "timestamp": ai.get("timestamp", now_ts()),
+                "timestamp": safe_int(ai.get("timestamp", epoch()), epoch()),
                 "source": "ai_to_signal_bridge",
             }
 
         if AI_TO_SIGNAL_FORCE_TIMESTAMP:
-            signal["timestamp"] = now_ts()
-            signal["bridge_nonce"] = hashlib.sha256(f"{now_ts()}-{time.time()}".encode("utf-8")).hexdigest()[:12]
+            signal["timestamp"] = epoch()
+            signal["bridge_nonce"] = hashlib.sha256(f"{epoch()}-{time.time()}".encode("utf-8")).hexdigest()[:12]
 
         filter_steps = [
             ("apply_macro_context_to_ai_signal", None),
@@ -3677,7 +3821,7 @@ def normalize_ai_to_engine_signal(ai: Dict[str, Any]) -> Dict[str, Any]:
         "public_reason": str(ai.get("public_reason", reason)).strip(),
         "notes": ai.get("notes", [] if isinstance(ai.get("notes"), list) else str(ai.get("notes", reason))),
         "source": "ai_signal_bridge",
-        "timestamp": safe_int(ai.get("timestamp", now_ts()), now_ts()),
+        "timestamp": safe_int(ai.get("timestamp", epoch()), epoch()),
         "ai_bridge_version": 1,
         "macro_bias": ai.get("macro_bias", "neutral"),
         "macro_risk_score": safe_int(ai.get("macro_risk_score", 0), 0),
@@ -14498,6 +14642,7 @@ def main_loop():
 
     boot()
     macro_bridge_fred_refresh(force=False)
+    auto_signal_generator_tick(force=True)
     auto_generate_ai_signal_if_ready()
     ai_bridge_write_signal_if_ready()
 
@@ -14554,6 +14699,21 @@ def main_loop():
                 debug(f"PAPER TP/SL LOOP RESULT | {tpsl_loop_result}")
 
             debug(f"FINAL ELITE ROUTING FLAGS | force={FORCE_EXECUTION_MODE} | bypass_routing={FORCE_BYPASS_SIGNAL_ROUTING} | treat_fresh={FORCE_TREAT_SIGNAL_AS_FRESH}")
+
+            # =========================================================
+            # SIMPLE AUTO SIGNAL GENERATOR
+            # Runs before the signal listener so signal.json stays fresh.
+            # Cooldown + open-position guard prevent constant re-entry.
+            # =========================================================
+            try:
+                auto_signal_generator_tick(force=False)
+            except Exception as auto_signal_loop_error:
+                debug(f"AUTO SIGNAL LOOP ERROR | {auto_signal_loop_error}")
+
+            try:
+                ai_bridge_write_signal_if_ready()
+            except Exception as bridge_loop_error:
+                debug(f"AI SIGNAL BRIDGE LOOP ERROR | {bridge_loop_error}")
 
             # =========================================================
             # PERSISTENT SIGNAL LISTENER
