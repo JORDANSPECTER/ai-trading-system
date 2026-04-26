@@ -10324,6 +10324,37 @@ def maybe_send_free_daily_levels(force: bool = False) -> None:
             pass
 
 
+def free_daily_levels_autoloop_tick() -> None:
+    """
+    Safe loop hook for automated free daily levels.
+    Runs every engine cycle, but cooldown/state prevents spam.
+    """
+    try:
+        maybe_send_free_daily_levels(force=False)
+    except Exception as e:
+        try:
+            debug(f"FREE DAILY AUTOLOOP FAILED | {e}")
+        except Exception:
+            pass
+
+
+
+def free_daily_levels_autoloop_boot_tick() -> None:
+    """
+    Optional boot hook. If FREE_DAILY_LEVEL_SEND_ON_BOOT=true,
+    sends once on startup, then normal cooldown controls the rest.
+    """
+    try:
+        if FREE_DAILY_LEVEL_SEND_ON_BOOT:
+            maybe_send_free_daily_levels(force=False)
+    except Exception as e:
+        try:
+            debug(f"FREE DAILY BOOT SEND FAILED | {e}")
+        except Exception:
+            pass
+
+
+
 # =========================================================
 # PREMIUM DAILY LEVELS / QQQ-SPY GRADED BIAS ALERTS
 # Sends premium-style market decision alerts with:
