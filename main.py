@@ -654,6 +654,36 @@ PHASE3_DISABLED_SETUPS_FILE = os.getenv("PHASE3_DISABLED_SETUPS_FILE", "disabled
 
 
 
+
+# =========================================================
+# VOLATILITY + CONFIDENCE POSITION SIZING
+# A+ = larger size, A = normal, B = reduced.
+# High volatility automatically reduces size.
+# =========================================================
+ENABLE_VOL_CONF_POSITION_SIZING = os.getenv("ENABLE_VOL_CONF_POSITION_SIZING", "true").lower() == "true"
+VOL_CONF_BASE_QTY = int(os.getenv("VOL_CONF_BASE_QTY", "1"))
+VOL_CONF_MAX_QTY = int(os.getenv("VOL_CONF_MAX_QTY", str(MAX_POSITION_QTY)))
+VOL_CONF_MIN_QTY = int(os.getenv("VOL_CONF_MIN_QTY", "1"))
+
+VOL_CONF_MULT_A_PLUS = float(os.getenv("VOL_CONF_MULT_A_PLUS", "1.50"))
+VOL_CONF_MULT_A = float(os.getenv("VOL_CONF_MULT_A", "1.00"))
+VOL_CONF_MULT_B_PLUS = float(os.getenv("VOL_CONF_MULT_B_PLUS", "0.75"))
+VOL_CONF_MULT_B = float(os.getenv("VOL_CONF_MULT_B", "0.50"))
+VOL_CONF_MULT_C = float(os.getenv("VOL_CONF_MULT_C", "0.00"))
+
+VOL_CONF_VIX_LOW = float(os.getenv("VOL_CONF_VIX_LOW", "15"))
+VOL_CONF_VIX_MEDIUM = float(os.getenv("VOL_CONF_VIX_MEDIUM", "20"))
+VOL_CONF_VIX_HIGH = float(os.getenv("VOL_CONF_VIX_HIGH", "25"))
+
+VOL_CONF_LOW_VOL_MULT = float(os.getenv("VOL_CONF_LOW_VOL_MULT", "1.10"))
+VOL_CONF_NORMAL_VOL_MULT = float(os.getenv("VOL_CONF_NORMAL_VOL_MULT", "1.00"))
+VOL_CONF_MEDIUM_VOL_MULT = float(os.getenv("VOL_CONF_MEDIUM_VOL_MULT", "0.75"))
+VOL_CONF_HIGH_VOL_MULT = float(os.getenv("VOL_CONF_HIGH_VOL_MULT", "0.50"))
+VOL_CONF_EXTREME_VOL_MULT = float(os.getenv("VOL_CONF_EXTREME_VOL_MULT", "0.25"))
+
+VOL_CONF_BLOCK_C_GRADE = os.getenv("VOL_CONF_BLOCK_C_GRADE", "true").lower() == "true"
+VOL_CONF_SEND_ALERTS = os.getenv("VOL_CONF_SEND_ALERTS", "true").lower() == "true"
+
 # =========================================================
 # ELITE EXECUTION FILTER: A/A+ ONLY + NO CHASING
 # Blocks weak grades and late entries before signal.json reaches execution.
@@ -1167,6 +1197,146 @@ def elite_execution_filter_blocks_signal(signal: Dict[str, Any]) -> bool:
         debug(f"ELITE EXECUTION FILTER ERROR | {e}")
         return False
 
+
+def confidence_grade_multiplier(grade: str) -> float:
+    g = str(grade or "").upper().strip()
+    if g == "A+":
+        return safe_float(VOL_CONF_MULT_A_PLUS, 1.5)
+    if g == "A":
+        return safe_float(VOL_CONF_MULT_A, 1.0)
+    if g == "B+":
+        return safe_float(VOL_CONF_MULT_B_PLUS, 0.75)
+    if g == "B":
+        return safe_float(VOL_CONF_MULT_B, 0.50)
+    if g == "C":
+        return safe_float(VOL_CONF_MULT_C, 0.0)
+    return 0.0 if VOL_CONF_BLOCK_C_GRADE else safe_float(VOL_CONF_MULT_C, 0.0)
+
+
+def volatility_multiplier_from_signal(signal: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Uses VIX from macro context if available.
+    Lower VIX = full/boosted size.
+    Higher VIX = reduced size.
+    """
+    try:
+        vix = safe_float(signal.get("vix", 0), 0.0)
+        if vix <= 0:
+            macro = get_macro_context_for_signal()
+            vix = safe_float(macro.get("vix", 0), 0.0)
+            signal["vix"] = vix
+
+        if vix <= 0:
+            return safe_float(VOL_CONF_NORMAL_VOL_MULT, 1.0), "unknown_volatility"
+
+        if vix < safe_float(VOL_CONF_VIX_LOW, 15):
+            return safe_float(VOL_CONF_LOW_VOL_MULT, 1.10), "low_volatility"
+        if vix < safe_float(VOL_CONF_VIX_MEDIUM, 20):
+            return safe_float(VOL_CONF_NORMAL_VOL_MULT, 1.0), "normal_volatility"
+        if vix < safe_float(VOL_CONF_VIX_HIGH, 25):
+            return safe_float(VOL_CONF_MEDIUM_VOL_MULT, 0.75), "medium_volatility"
+        if vix < 35:
+            return safe_float(VOL_CONF_HIGH_VOL_MULT, 0.50), "high_volatility"
+        return safe_float(VOL_CONF_EXTREME_VOL_MULT, 0.25), "extreme_volatility"
+
+    except Exception as e:
+        debug(f"VOL CONF volatility multiplier error | {e}")
+        return 1.0, "volatility_error"
+
+
+def apply_volatility_confidence_position_sizing(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adjusts signal qty before execution:
+    - A+ bigger
+    - A normal
+    - B/B+ reduced
+    - C blocked/reduced
+    - high VIX cuts size
+    """
+    try:
+        if not ENABLE_VOL_CONF_POSITION_SIZING:
+            return signal
+        if not isinstance(signal, dict):
+            return signal
+
+        x = signal
+
+        grade = str(x.get("grade", x.get("confidence", ""))).upper().strip()
+        ticker = str(x.get("ticker", x.get("symbol", "UNKNOWN"))).upper().strip()
+        direction = str(x.get("direction", "")).upper().strip()
+
+        if VOL_CONF_BLOCK_C_GRADE and grade in {"", "C", "D", "F", "AVOID"}:
+            x["blocked_by_vol_conf_sizing"] = True
+            x["vol_conf_sizing_reason"] = f"blocked_low_grade_{grade or 'missing'}"
+            debug(f"VOL CONF BLOCKED | ticker={ticker} direction={direction} grade={grade}")
+            return x
+
+        original_qty = safe_int(x.get("qty", VOL_CONF_BASE_QTY), safe_int(VOL_CONF_BASE_QTY, 1))
+        if original_qty <= 0:
+            original_qty = safe_int(VOL_CONF_BASE_QTY, 1)
+
+        grade_mult = confidence_grade_multiplier(grade)
+        vol_mult, vol_bucket = volatility_multiplier_from_signal(x)
+
+        raw_qty = original_qty * grade_mult * vol_mult
+        final_qty = int(math.floor(raw_qty))
+
+        if raw_qty >= 1 and final_qty < 1:
+            final_qty = 1
+
+        final_qty = max(safe_int(VOL_CONF_MIN_QTY, 1), final_qty)
+        final_qty = min(safe_int(VOL_CONF_MAX_QTY, MAX_POSITION_QTY), final_qty)
+        final_qty = min(final_qty, safe_int(MAX_POSITION_QTY, final_qty))
+
+        x["qty_original"] = original_qty
+        x["qty"] = final_qty
+        x["vol_conf_sizing"] = {
+            "enabled": True,
+            "grade": grade,
+            "grade_multiplier": grade_mult,
+            "volatility_multiplier": vol_mult,
+            "volatility_bucket": vol_bucket,
+            "vix": safe_float(x.get("vix", 0), 0.0),
+            "raw_qty": round(raw_qty, 4),
+            "final_qty": final_qty,
+            "min_qty": safe_int(VOL_CONF_MIN_QTY, 1),
+            "max_qty": safe_int(VOL_CONF_MAX_QTY, MAX_POSITION_QTY),
+        }
+        x["blocked_by_vol_conf_sizing"] = False
+        x["vol_conf_sizing_reason"] = ""
+
+        debug(
+            f"VOL CONF SIZE | ticker={ticker} direction={direction} grade={grade} "
+            f"base={original_qty} grade_mult={grade_mult} vol_mult={vol_mult} "
+            f"bucket={vol_bucket} final_qty={final_qty}"
+        )
+
+        try:
+            intel_event(
+                "vol_conf_position_sizing",
+                x.get("vol_conf_sizing", {}),
+                signal=x,
+                stage="position_sizing",
+                decision="sized",
+            )
+        except Exception:
+            pass
+
+        return x
+
+    except Exception as e:
+        debug(f"VOL CONF POSITION SIZING ERROR | {e}")
+        return signal
+
+
+def vol_conf_sizing_blocks_signal(signal: Dict[str, Any]) -> bool:
+    try:
+        if not isinstance(signal, dict):
+            return False
+        return bool(signal.get("blocked_by_vol_conf_sizing"))
+    except Exception:
+        return False
+
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
@@ -1355,6 +1525,10 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
 
             if elite_execution_filter_blocks_signal(candidate):
                 return {"generated": False, "reason": "elite_filter_blocked", "signal": candidate}
+
+            candidate = apply_volatility_confidence_position_sizing(candidate)
+            if vol_conf_sizing_blocks_signal(candidate):
+                return {"generated": False, "reason": "vol_conf_sizing_blocked", "signal": candidate}
 
             atomic_write_json(AUTO_AI_SIGNAL_FILE, candidate)
             state["last_signal_ts"] = now_ts()
@@ -1610,6 +1784,13 @@ def ai_bridge_write_signal_if_ready() -> Dict[str, Any]:
             debug(f"ELITE FILTER BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
             archive_ai_signal_input(ai, "elite_filter_blocked", {"reason": reason, "normalized_signal": signal})
             return {"written": False, "reason": "elite_filter_blocked", "elite_filter_reason": reason, "signal": signal}
+
+        signal = apply_volatility_confidence_position_sizing(signal)
+        if vol_conf_sizing_blocks_signal(signal):
+            reason = signal.get("vol_conf_sizing_reason", "vol_conf_sizing_blocked")
+            debug(f"VOL CONF SIZING BLOCKED AI SIGNAL | ticker={signal.get('ticker')} direction={signal.get('direction')} reason={reason}")
+            archive_ai_signal_input(ai, "vol_conf_sizing_blocked", {"reason": reason, "normalized_signal": signal})
+            return {"written": False, "reason": "vol_conf_sizing_blocked", "vol_conf_sizing_reason": reason, "signal": signal}
 
         if errors:
             debug(f"AI BRIDGE BLOCKED | errors={errors}")
