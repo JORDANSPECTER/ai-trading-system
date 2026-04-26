@@ -3,8 +3,8 @@
   "kill_switch": false,
   "override_minutes": 0,
   "operator": "Jordan",
-  "note": "Paper reset clean state",
-  "command_id": "cmd-reset",
+  "note": "reset clean",
+  "command_id": "cmd-unlock",
   "last_applied_command_id": "",
   "last_applied_at_utc": "",
   "admin_log": [],
@@ -12,8 +12,8 @@
   "flatten_requested": false,
   "armed": true,
   "mode": "paper",
-  "last_command": "/reset",
+  "last_command": "/unlock",
   "last_command_time_utc": "",
   "last_command_from": "Jordan Bias",
-  "notes": "reset after reconciliation mismatch"
+  "notes": "unlock for paper test"
 }
