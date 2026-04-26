@@ -9938,6 +9938,410 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
+
+
+# =========================================================
+# UNUSUAL WHALES DARK POOL INTEGRATION
+# Decision/confluence layer for QQQ/SPY institutional resource levels.
+# Uses Unusual Whales REST API when UNUSUAL_WHALES_API_KEY is set.
+# Official API docs: https://api.unusualwhales.com/docs
+# Ticker dark pool endpoint: GET /api/darkpool/{ticker}
+# =========================================================
+ENABLE_UNUSUAL_WHALES_DARKPOOL = os.getenv("ENABLE_UNUSUAL_WHALES_DARKPOOL", "true").lower() == "true"
+UNUSUAL_WHALES_API_KEY = os.getenv("UNUSUAL_WHALES_API_KEY", os.getenv("UW_API_KEY", "")).strip()
+UNUSUAL_WHALES_BASE_URL = os.getenv("UNUSUAL_WHALES_BASE_URL", "https://api.unusualwhales.com").strip().rstrip("/")
+UW_DARKPOOL_MIN_PREMIUM = float(os.getenv("UW_DARKPOOL_MIN_PREMIUM", "50000"))
+UW_DARKPOOL_MIN_SIZE = float(os.getenv("UW_DARKPOOL_MIN_SIZE", "0"))
+UW_DARKPOOL_LOOKBACK_DAYS = int(os.getenv("UW_DARKPOOL_LOOKBACK_DAYS", "1"))
+UW_DARKPOOL_MAX_TRADES = int(os.getenv("UW_DARKPOOL_MAX_TRADES", "250"))
+UW_DARKPOOL_CACHE_SECONDS = int(os.getenv("UW_DARKPOOL_CACHE_SECONDS", "120"))
+UW_DARKPOOL_LEVEL_BUCKET = float(os.getenv("UW_DARKPOOL_LEVEL_BUCKET", "0.25"))
+UW_DARKPOOL_NEAR_LEVEL_PCT = float(os.getenv("UW_DARKPOOL_NEAR_LEVEL_PCT", "0.006"))
+UW_DARKPOOL_ACCEPTANCE_PCT = float(os.getenv("UW_DARKPOOL_ACCEPTANCE_PCT", "0.0015"))
+UW_DARKPOOL_STRONG_LEVEL_PREMIUM = float(os.getenv("UW_DARKPOOL_STRONG_LEVEL_PREMIUM", "500000"))
+UW_DARKPOOL_GRADE_BOOST_ENABLED = os.getenv("UW_DARKPOOL_GRADE_BOOST_ENABLED", "true").lower() == "true"
+UW_DARKPOOL_BLOCK_AGAINST_MAJOR_LEVEL = os.getenv("UW_DARKPOOL_BLOCK_AGAINST_MAJOR_LEVEL", "false").lower() == "true"
+UW_DARKPOOL_SEND_ALERTS = os.getenv("UW_DARKPOOL_SEND_ALERTS", "true").lower() == "true"
+UW_DARKPOOL_FILE = os.getenv("UW_DARKPOOL_FILE", "darkpool_levels.json").strip()
+
+
+def uw_dp_now_ts() -> int:
+    try:
+        return int(time.time())
+    except Exception:
+        return 0
+
+
+def uw_dp_date_str(offset_days: int = 0) -> str:
+    try:
+        return (datetime.utcnow() - timedelta(days=offset_days)).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def uw_dp_load_cache() -> Dict[str, Any]:
+    try:
+        data = load_json_file(UW_DARKPOOL_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def uw_dp_save_cache(data: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(UW_DARKPOOL_FILE, data)
+    except Exception as e:
+        try:
+            debug(f"UW DARKPOOL cache save failed: {e}")
+        except Exception:
+            pass
+
+
+def uw_dp_headers() -> Dict[str, str]:
+    h = {"Accept": "application/json"}
+    if UNUSUAL_WHALES_API_KEY:
+        h["Authorization"] = f"Bearer {UNUSUAL_WHALES_API_KEY}"
+    return h
+
+
+def uw_dp_extract_rows(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "results", "trades", "darkpool", "items"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+        if isinstance(val, dict):
+            nested = uw_dp_extract_rows(val)
+            if nested:
+                return nested
+    if any(k in payload for k in ("price", "premium", "size", "volume")):
+        return [payload]
+    return []
+
+
+def uw_dp_row_price(row: Dict[str, Any]) -> float:
+    for k in ("price", "price_level", "execution_price", "trade_price", "avg_price"):
+        v = row.get(k)
+        if v not in (None, "", "."):
+            return safe_float(v, 0.0)
+    return 0.0
+
+
+def uw_dp_row_size(row: Dict[str, Any]) -> float:
+    for k in ("size", "volume", "shares", "quantity", "qty"):
+        v = row.get(k)
+        if v not in (None, "", "."):
+            return safe_float(v, 0.0)
+    return 0.0
+
+
+def uw_dp_row_premium(row: Dict[str, Any]) -> float:
+    for k in ("premium", "notional", "value", "dollar_volume", "total_value"):
+        v = row.get(k)
+        if v not in (None, "", "."):
+            return safe_float(v, 0.0)
+    price = uw_dp_row_price(row)
+    size = uw_dp_row_size(row)
+    return price * size if price and size else 0.0
+
+
+def uw_dp_fetch_ticker(ticker: str, force: bool = False) -> Dict[str, Any]:
+    ticker = str(ticker or "").upper().strip()
+    if not ticker:
+        return {"ok": False, "reason": "missing_ticker", "ticker": ticker, "trades": []}
+    if not ENABLE_UNUSUAL_WHALES_DARKPOOL:
+        return {"ok": False, "reason": "disabled", "ticker": ticker, "trades": []}
+    if not UNUSUAL_WHALES_API_KEY:
+        return {"ok": False, "reason": "missing_unusual_whales_api_key", "ticker": ticker, "trades": []}
+
+    cache = uw_dp_load_cache()
+    cached = cache.get(ticker, {}) if isinstance(cache, dict) else {}
+    if cached and not force:
+        age = uw_dp_now_ts() - safe_int(cached.get("updated_at", 0), 0)
+        if 0 <= age <= UW_DARKPOOL_CACHE_SECONDS:
+            return cached
+
+    all_rows = []
+    errors = []
+    for offset in range(max(1, UW_DARKPOOL_LOOKBACK_DAYS)):
+        try:
+            params = {
+                "date": uw_dp_date_str(offset),
+                "min_premium": int(UW_DARKPOOL_MIN_PREMIUM),
+                "min_size": int(UW_DARKPOOL_MIN_SIZE),
+            }
+            url = f"{UNUSUAL_WHALES_BASE_URL}/api/darkpool/{ticker}"
+            r = requests.get(url, headers=uw_dp_headers(), params=params, timeout=12)
+            if r.status_code != 200:
+                errors.append(f"{params.get('date')}:http_{r.status_code}:{str(r.text)[:120]}")
+                continue
+            rows = uw_dp_extract_rows(r.json())
+            all_rows.extend(rows)
+        except Exception as e:
+            errors.append(f"exception:{e}")
+
+    clean_rows = []
+    for row in all_rows[: max(1, UW_DARKPOOL_MAX_TRADES)]:
+        price = uw_dp_row_price(row)
+        premium = uw_dp_row_premium(row)
+        size = uw_dp_row_size(row)
+        if price <= 0:
+            continue
+        if premium < UW_DARKPOOL_MIN_PREMIUM:
+            continue
+        clean_rows.append({"price": price, "premium": premium, "size": size, "raw": row})
+
+    result = {
+        "ok": bool(clean_rows),
+        "reason": "ok" if clean_rows else ("no_rows" if not errors else ",".join(errors[:3])),
+        "ticker": ticker,
+        "updated_at": uw_dp_now_ts(),
+        "source": "unusual_whales",
+        "trades": clean_rows,
+        "errors": errors[:10],
+    }
+    cache[ticker] = result
+    uw_dp_save_cache(cache)
+    return result
+
+
+def uw_dp_bucket_price(price: float) -> float:
+    try:
+        bucket = max(0.01, float(UW_DARKPOOL_LEVEL_BUCKET))
+        return round(round(float(price) / bucket) * bucket, 2)
+    except Exception:
+        return round(float(price), 2)
+
+
+def uw_dp_build_levels(ticker: str, current_price: float = 0.0, force: bool = False) -> Dict[str, Any]:
+    fetched = uw_dp_fetch_ticker(ticker, force=force)
+    trades = fetched.get("trades", []) if isinstance(fetched, dict) else []
+    buckets = {}
+    for tr in trades:
+        price = uw_dp_bucket_price(safe_float(tr.get("price", 0), 0.0))
+        if price <= 0:
+            continue
+        key = str(price)
+        b = buckets.setdefault(key, {"price": price, "premium": 0.0, "size": 0.0, "prints": 0})
+        b["premium"] += safe_float(tr.get("premium", 0), 0.0)
+        b["size"] += safe_float(tr.get("size", 0), 0.0)
+        b["prints"] += 1
+
+    levels = sorted(buckets.values(), key=lambda x: x.get("premium", 0), reverse=True)
+    for lvl in levels:
+        price = safe_float(lvl.get("price", 0), 0.0)
+        lvl["premium"] = round(safe_float(lvl.get("premium", 0), 0.0), 2)
+        lvl["size"] = round(safe_float(lvl.get("size", 0), 0.0), 2)
+        lvl["strength"] = "major" if lvl["premium"] >= UW_DARKPOOL_STRONG_LEVEL_PREMIUM else "normal"
+        if current_price > 0:
+            lvl["distance_pct"] = round((price - current_price) / current_price, 5)
+            lvl["type"] = "resistance" if price > current_price else "support" if price < current_price else "at_price"
+        else:
+            lvl["distance_pct"] = None
+            lvl["type"] = "unknown"
+
+    supports = sorted([x for x in levels if x.get("type") in ("support", "at_price")], key=lambda x: abs(safe_float(x.get("distance_pct", 999), 999)))
+    resistances = sorted([x for x in levels if x.get("type") in ("resistance", "at_price")], key=lambda x: abs(safe_float(x.get("distance_pct", 999), 999)))
+
+    return {
+        "ok": fetched.get("ok", False),
+        "reason": fetched.get("reason", "unknown"),
+        "ticker": str(ticker).upper().strip(),
+        "source": "unusual_whales_darkpool",
+        "updated_at": fetched.get("updated_at", uw_dp_now_ts()),
+        "current_price": current_price,
+        "levels": levels[:20],
+        "nearest_support": supports[0] if supports else None,
+        "nearest_resistance": resistances[0] if resistances else None,
+        "top_levels": levels[:5],
+        "trade_count": len(trades),
+    }
+
+
+def uw_dp_get_underlying_price(signal: Dict[str, Any]) -> float:
+    for k in ("underlying_price", "stock_price", "current_price", "spot", "price"):
+        v = signal.get(k)
+        if v not in (None, "", 0):
+            px = safe_float(v, 0.0)
+            if px > 0:
+                return px
+    try:
+        ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
+        prices = load_market_prices([ticker])
+        px, _ = get_market_price_for_symbol(ticker, prices)
+        return safe_float(px, 0.0)
+    except Exception:
+        return 0.0
+
+
+def uw_dp_grade_up(grade: str, steps: int = 1) -> str:
+    ladder = ["C", "B", "B+", "A", "A+"]
+    g = str(grade or "B").upper().strip()
+    if g not in ladder:
+        g = "B"
+    idx = min(len(ladder) - 1, ladder.index(g) + max(0, int(steps)))
+    return ladder[idx]
+
+
+def uw_dp_evaluate_signal(signal: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_UNUSUAL_WHALES_DARKPOOL:
+        return {"approved": True, "enabled": False, "reason": "disabled"}
+    ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
+    direction = str(signal.get("direction") or "").upper().strip()
+    current_price = uw_dp_get_underlying_price(signal)
+    levels = uw_dp_build_levels(ticker, current_price=current_price, force=force)
+    support = levels.get("nearest_support")
+    resistance = levels.get("nearest_resistance")
+    actions = []
+    reasons = []
+    grade_boost = 0
+    approved = True
+
+    def near(lvl):
+        if not lvl or current_price <= 0:
+            return False
+        return abs(safe_float(lvl.get("distance_pct", 999), 999)) <= UW_DARKPOOL_NEAR_LEVEL_PCT
+
+    def accepted_through_res(lvl):
+        if not lvl or current_price <= 0:
+            return False
+        return current_price >= safe_float(lvl.get("price", 0), 0.0) * (1 + UW_DARKPOOL_ACCEPTANCE_PCT)
+
+    def accepted_below_sup(lvl):
+        if not lvl or current_price <= 0:
+            return False
+        return current_price <= safe_float(lvl.get("price", 0), 0.0) * (1 - UW_DARKPOOL_ACCEPTANCE_PCT)
+
+    if not levels.get("ok"):
+        return {
+            "approved": True,
+            "enabled": True,
+            "reason": f"darkpool_unavailable:{levels.get('reason')}",
+            "grade_boost": 0,
+            "levels": levels,
+            "actions": ["observe_only"],
+        }
+
+    if direction == "CALL":
+        if support and near(support):
+            grade_boost += 1
+            actions.append("call_supported_by_darkpool_support")
+            reasons.append(f"support_near_{support.get('price')}")
+        if resistance and near(resistance):
+            actions.append("call_near_darkpool_resistance")
+            reasons.append(f"resistance_near_{resistance.get('price')}")
+            if resistance.get("strength") == "major" and UW_DARKPOOL_BLOCK_AGAINST_MAJOR_LEVEL and not accepted_through_res(resistance):
+                approved = False
+                reasons.append("major_resistance_not_accepted")
+        if resistance and accepted_through_res(resistance):
+            grade_boost += 1
+            actions.append("call_accepted_through_darkpool_resistance")
+            reasons.append(f"accepted_above_{resistance.get('price')}")
+    elif direction == "PUT":
+        if resistance and near(resistance):
+            grade_boost += 1
+            actions.append("put_supported_by_darkpool_resistance")
+            reasons.append(f"resistance_near_{resistance.get('price')}")
+        if support and near(support):
+            actions.append("put_near_darkpool_support")
+            reasons.append(f"support_near_{support.get('price')}")
+            if support.get("strength") == "major" and UW_DARKPOOL_BLOCK_AGAINST_MAJOR_LEVEL and not accepted_below_sup(support):
+                approved = False
+                reasons.append("major_support_not_broken")
+        if support and accepted_below_sup(support):
+            grade_boost += 1
+            actions.append("put_accepted_below_darkpool_support")
+            reasons.append(f"accepted_below_{support.get('price')}")
+
+    return {
+        "approved": approved,
+        "enabled": True,
+        "reason": "darkpool_ok" if approved else "darkpool_block",
+        "reject_reasons": [] if approved else reasons,
+        "grade_boost": min(2, grade_boost),
+        "current_price": current_price,
+        "nearest_support": support,
+        "nearest_resistance": resistance,
+        "levels": levels,
+        "actions": actions,
+        "reasons": reasons,
+    }
+
+
+def apply_unusual_whales_darkpool_to_signal(signal: Dict[str, Any], stage: str = "decision") -> Dict[str, Any]:
+    if not isinstance(signal, dict):
+        return signal
+    x = deepcopy(signal)
+    decision = uw_dp_evaluate_signal(x)
+    x["dark_pool"] = decision
+    if decision.get("enabled") and UW_DARKPOOL_GRADE_BOOST_ENABLED and decision.get("grade_boost", 0) > 0:
+        old_grade = str(x.get("grade") or x.get("confidence") or "B").upper().strip()
+        new_grade = uw_dp_grade_up(old_grade, safe_int(decision.get("grade_boost", 0), 0))
+        x["dark_pool_base_grade"] = old_grade
+        x["grade"] = new_grade
+        if not x.get("confidence") or str(x.get("confidence")).upper() == old_grade:
+            x["confidence"] = new_grade
+    try:
+        debug(f"UW DARKPOOL | stage={stage} ticker={x.get('ticker')} direction={x.get('direction')} approved={decision.get('approved')} boost={decision.get('grade_boost')} actions={decision.get('actions')}")
+    except Exception:
+        pass
+    return x
+
+
+def unusual_whales_darkpool_blocks_signal(signal: Dict[str, Any]) -> bool:
+    try:
+        decision = signal.get("dark_pool") if isinstance(signal.get("dark_pool"), dict) else uw_dp_evaluate_signal(signal)
+        if not decision.get("approved", True):
+            msg = build_block_message(
+                "UNUSUAL WHALES DARK POOL BLOCKED SIGNAL",
+                signal,
+                decision.get("reject_reasons", [decision.get("reason", "darkpool_block")]),
+                f"Support: {decision.get('nearest_support')} | Resistance: {decision.get('nearest_resistance')}"
+            )
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_telegram(msg)
+            return True
+        return False
+    except Exception as e:
+        try:
+            debug(f"UW DARKPOOL block check failed safe-open: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def send_unusual_whales_darkpool_alert(signal: Dict[str, Any]) -> None:
+    if not UW_DARKPOOL_SEND_ALERTS:
+        return
+    try:
+        dp = signal.get("dark_pool", {}) if isinstance(signal, dict) else {}
+        support = dp.get("nearest_support")
+        resistance = dp.get("nearest_resistance")
+        if not dp or not dp.get("enabled"):
+            return
+        msg = (
+            f"💎 DARK POOL RESOURCE LEVELS\n"
+            f"Ticker: {signal.get('ticker')} | Direction: {signal.get('direction')} | Grade: {signal.get('grade', signal.get('confidence'))}\n\n"
+            f"Support: {support}\n"
+            f"Resistance: {resistance}\n"
+            f"Actions: {', '.join(dp.get('actions', [])) if isinstance(dp.get('actions'), list) else dp.get('actions')}\n\n"
+            f"How to use:\n"
+            f"• Support below price can act as defense\n"
+            f"• Resistance above price can act as rejection zone\n"
+            f"• Acceptance through a major level can shift bias\n"
+            f"Source: Unusual Whales dark pool endpoint"
+        )
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "DARK POOL")
+    except Exception as e:
+        try:
+            debug(f"UW DARKPOOL alert failed: {e}")
+        except Exception:
+            pass
+
+
 # =========================================================
 # PAPER BROKER BRIDGE + ANTI-SPAM HELPERS
 # =========================================================
@@ -10037,6 +10441,9 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not bridge_liquidity.get("approved", True):
         raise RuntimeError("options_liquidity_block:" + bridge_liquidity.get("reason", "unknown"))
     signal["options_liquidity"] = bridge_liquidity
+    signal = apply_unusual_whales_darkpool_to_signal(signal, stage="paper_bridge_create_order")
+    if unusual_whales_darkpool_blocks_signal(signal):
+        raise RuntimeError("darkpool_block:" + str(signal.get("dark_pool", {}).get("reason", "unknown")))
 
     orders_store["last_local_order_id"] = safe_int(orders_store.get("last_local_order_id", 0), 0) + 1
 
@@ -10057,6 +10464,7 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "contract_symbol": str(signal.get("contract_symbol", symbol)).strip(),
         "asset_class": str(signal.get("asset_class", "option")).lower(),
         "options_liquidity": signal.get("options_liquidity", {}),
+        "dark_pool": signal.get("dark_pool", {}),
         "direction": direction,
         "side": "BUY",
         "qty": qty,
@@ -10451,6 +10859,10 @@ def handle_new_signal(signal: Dict[str, Any]):
     # and one paper position per signal hash/cooldown.
     # =========================================================
     if ENABLE_PAPER_BROKER_BRIDGE and FORCE_EXECUTION_MODE:
+        signal = apply_unusual_whales_darkpool_to_signal(signal, stage="force_paper_bridge")
+        send_unusual_whales_darkpool_alert(signal)
+        if unusual_whales_darkpool_blocks_signal(signal):
+            return None
         bridge_result = paper_broker_bridge_execute(signal)
         debug(f"PAPER BROKER BRIDGE RESULT | executed={bridge_result.get('executed')} | reason={bridge_result.get('reason')}")
         if bridge_result.get("executed"):
@@ -10546,6 +10958,13 @@ def handle_new_signal(signal: Dict[str, Any]):
     # Manual + closed-trade memory adjusts grade/confidence BEFORE Phase 3 and BEFORE execution.
     # Risk, Phase 3.5, portfolio, and kill-switch gates still remain in full control.
     regime_signal = adaptive_apply_learning_to_signal(regime_signal)
+
+    # UNUSUAL WHALES DARK POOL:
+    # Institutional resource levels become confluence before Phase 3 sizing/execution.
+    regime_signal = apply_unusual_whales_darkpool_to_signal(regime_signal, stage="pre_phase3")
+    send_unusual_whales_darkpool_alert(regime_signal)
+    if unusual_whales_darkpool_blocks_signal(regime_signal):
+        return
 
     # PHASE 3: adaptive intelligence uses trade memory to block weak setups,
     # downgrade confidence, and adjust size before risk sizing/execution.
