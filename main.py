@@ -127,6 +127,7 @@ DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
 DISCORD_PREMIUM_WEBHOOK = os.getenv("DISCORD_PREMIUM_WEBHOOK", "").strip()
 DISCORD_DARKPOOL_WEBHOOK = os.getenv("DISCORD_DARKPOOL_WEBHOOK", "").strip()
 DISCORD_LIVE_ENTRY_WEBHOOK = os.getenv("DISCORD_LIVE_ENTRY_WEBHOOK", "").strip()
+DISCORD_EXECUTION_WEBHOOK = os.getenv("DISCORD_EXECUTION_WEBHOOK", os.getenv("DISCORD_AI_EXECUTION_WEBHOOK", "")).strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -9947,13 +9948,93 @@ def execute_approved_signal(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 
+
+def send_to_execution_discord(message: str) -> None:
+    """
+    Dedicated AI execution-alert router.
+    Uses DISCORD_EXECUTION_WEBHOOK first.
+    Falls back to DISCORD_AI_WEBHOOK if missing.
+    Execution lifecycle messages should NOT go to DISCORD_LIVE_ENTRY_WEBHOOK.
+    """
+    try:
+        target = DISCORD_EXECUTION_WEBHOOK or DISCORD_AI_WEBHOOK
+        if not target:
+            try:
+                debug("EXECUTION WEBHOOK MISSING | set DISCORD_EXECUTION_WEBHOOK")
+            except Exception:
+                pass
+            return
+        send_to_discord(target, message, "AI_EXECUTION")
+    except Exception as e:
+        try:
+            debug(f"EXECUTION webhook send failed: {e}")
+        except Exception:
+            pass
+
+
+
+def send_execution_or_original_discord(message: str, original_webhook: str, username: str = "AI") -> None:
+    """
+    Content-aware router:
+    - execution lifecycle messages -> DISCORD_EXECUTION_WEBHOOK
+    - everything else -> original webhook
+    """
+    try:
+        text = str(message or "")
+        execution_markers = [
+            "PAPER BROKER BRIDGE EXECUTED",
+            "PAPER TP1 HIT",
+            "PAPER STOP MOVED TO BREAKEVEN",
+            "PAPER POSITION OPENED",
+            "PAPER ORDER FILLED",
+            "PAPER ORDER CREATED",
+            "PAPER BRIDGE DUPLICATE CAP BLOCKED",
+            "PAPER BROKER BRIDGE RESULT",
+            "ORDER FILLED",
+            "POSITION OPENED",
+            "TP1 HIT",
+            "STOP MOVED",
+        ]
+        if any(m in text for m in execution_markers):
+            send_to_execution_discord(text)
+            return
+        send_to_discord(original_webhook, text, username)
+    except Exception as e:
+        try:
+            debug(f"SMART Discord route failed: {e}")
+        except Exception:
+            pass
+
+
 def send_to_live_entry_discord(message: str) -> None:
     """
     Dedicated UNBIASED-LIVE-ENTRY-ALERT router.
     Uses DISCORD_LIVE_ENTRY_WEBHOOK first.
     Falls back to DISCORD_PREMIUM_WEBHOOK if missing.
+
+    Safety rule:
+    execution lifecycle alerts are redirected to DISCORD_EXECUTION_WEBHOOK.
     """
     try:
+        text = str(message or "")
+        execution_markers = [
+            "PAPER BROKER BRIDGE EXECUTED",
+            "PAPER TP1 HIT",
+            "PAPER STOP MOVED TO BREAKEVEN",
+            "PAPER POSITION OPENED",
+            "PAPER ORDER FILLED",
+            "PAPER ORDER CREATED",
+            "PAPER BRIDGE DUPLICATE CAP BLOCKED",
+            "PAPER BROKER BRIDGE RESULT",
+            "ORDER FILLED",
+            "POSITION OPENED",
+            "TP1 HIT",
+            "STOP MOVED",
+        ]
+        if any(m in text for m in execution_markers):
+            send_to_execution_discord(text)
+            return
+
         target = DISCORD_LIVE_ENTRY_WEBHOOK or DISCORD_PREMIUM_WEBHOOK
         if not target:
             try:
