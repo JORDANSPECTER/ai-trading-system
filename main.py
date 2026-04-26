@@ -10109,23 +10109,71 @@ def free_daily_send(message: str) -> None:
 
 
 def free_daily_get_market_price(ticker: str) -> float:
+    """
+    Free daily levels must use the true underlying ETF price only.
+    This prevents bad alerts like:
+    SPY Current Price: 1.35
+    because 1.35 is usually an option/contract price, not the ETF.
+    """
     ticker = str(ticker or "").upper().strip()
+    if not ticker:
+        return 0.0
+
+    def valid_underlying_price(symbol: str, px: float) -> bool:
+        px = safe_float(px, 0.0)
+        # Hard sanity filter for QQQ/SPY ETF-level prices.
+        if symbol in {"SPY", "QQQ"} and px < 100:
+            return False
+        if px <= 0:
+            return False
+        return True
+
+    # 1) Prefer live market data helpers if available.
     try:
-        prices = load_json_file(MARKET_DATA_FILE if "MARKET_DATA_FILE" in globals() else "market_prices.json", {})
-        if isinstance(prices, dict):
-            row = prices.get(ticker, {})
+        prices = load_market_prices([ticker])
+        px, _src = get_market_price_for_symbol(ticker, prices)
+        px = safe_float(px, 0.0)
+        if valid_underlying_price(ticker, px):
+            return px
+    except Exception:
+        pass
+
+    # 2) Read market_prices.json, but reject option-like values under 100.
+    try:
+        data = load_json_file(MARKET_DATA_FILE if "MARKET_DATA_FILE" in globals() else "market_prices.json", {})
+        if isinstance(data, dict):
+            row = data.get(ticker, {})
+            candidates = []
             if isinstance(row, dict):
-                return safe_float(row.get("price") or row.get("last") or row.get("close"), 0.0)
-            return safe_float(row, 0.0)
+                # Prefer explicit underlying fields first.
+                for k in ("underlying_price", "stock_price", "etf_price", "last", "close", "price"):
+                    if k in row:
+                        candidates.append(row.get(k))
+            else:
+                candidates.append(row)
+
+            for raw in candidates:
+                px = safe_float(raw, 0.0)
+                if valid_underlying_price(ticker, px):
+                    return px
+    except Exception:
+        pass
+
+    # 3) Last resort: if TwelveData helper exists, use it directly.
+    try:
+        if "get_twelvedata_price" in globals():
+            px = safe_float(get_twelvedata_price(ticker), 0.0)
+            if valid_underlying_price(ticker, px):
+                return px
     except Exception:
         pass
 
     try:
-        prices = load_market_prices([ticker])
-        px, _ = get_market_price_for_symbol(ticker, prices)
-        return safe_float(px, 0.0)
+        debug(f"FREE DAILY PRICE INVALID | ticker={ticker} reason=no_valid_underlying_price")
     except Exception:
-        return 0.0
+        pass
+
+    return 0.0
 
 
 def free_daily_get_oil_read() -> str:
@@ -10214,32 +10262,45 @@ def free_daily_estimate_levels(ticker: str, price: float) -> Dict[str, Any]:
     """
     Free daily levels are simple reaction zones:
     support, resistance, and decision level.
-    If live level data is missing, estimate around current price so free alerts still render.
+
+    Important:
+    - If price is invalid, do NOT print fake levels like 0.0 / 1.0 / 2.0.
+    - Wait for clean underlying data instead.
     """
-    if price <= 0:
+    ticker = str(ticker or "").upper().strip()
+    price = safe_float(price, 0.0)
+
+    if price <= 0 or (ticker in {"SPY", "QQQ"} and price < 100):
         return {
-            "support": "Pending",
-            "resistance": "Pending",
-            "decision": "Pending",
-            "vwap": "Pending",
-            "premarket_high": "Pending",
-            "premarket_low": "Pending",
+            "support": "Pending structure",
+            "resistance": "Pending structure",
+            "decision": "Pending live price",
+            "vwap": "Pending live VWAP / control level",
+            "premarket_high": "Pending premarket high",
+            "premarket_low": "Pending premarket low",
         }
 
     # Wider increments for SPY/QQQ so levels are readable.
     if ticker == "SPY":
-        step = 1.0
+        step = 5.0
+    elif ticker == "QQQ":
+        step = 2.5
     else:
-        step = 2.0
+        step = 1.0
 
     decision = round(price / step) * step
     support = decision - step
     resistance = decision + step
 
+    # Safety: never return zero/negative levels.
+    support_out = round(support, 2) if support > 0 else "Pending structure"
+    resistance_out = round(resistance, 2) if resistance > 0 else "Pending structure"
+    decision_out = round(decision, 2) if decision > 0 else "Pending live price"
+
     return {
-        "support": round(support, 2),
-        "resistance": round(resistance, 2),
-        "decision": round(decision, 2),
+        "support": support_out,
+        "resistance": resistance_out,
+        "decision": decision_out,
         "vwap": "Use live VWAP / control level",
         "premarket_high": "Add premarket high when available",
         "premarket_low": "Add premarket low when available",
@@ -10304,7 +10365,7 @@ def build_free_daily_levels_alert(ticker: str) -> str:
     dp_support, dp_resistance = free_daily_darkpool_levels(ticker, price)
     bias, market_state = free_daily_bias_score(ticker, price, levels, oil, dp_support, dp_resistance)
 
-    price_line = f"{price:.2f}" if price > 0 else "Pending"
+    price_line = f"{price:.2f}" if price > 0 else "Pending live ETF price"
     resistance = levels.get("resistance")
     support = levels.get("support")
     decision = levels.get("decision")
