@@ -76,7 +76,10 @@ ENABLE_HEARTBEAT = os.getenv("ENABLE_HEARTBEAT", "true").lower() == "true"
 
 # MACRO BRIDGE
 ENABLE_MACRO_BRIDGE = os.getenv("ENABLE_MACRO_BRIDGE", "true").lower() == "true"
-MACRO_REFRESH_SECONDS = int(os.getenv("MACRO_REFRESH_SECONDS", "300"))
+try:
+    MACRO_REFRESH_SECONDS = int(str(os.getenv("MACRO_REFRESH_SECONDS", "300")).strip())
+except Exception:
+    MACRO_REFRESH_SECONDS = 300
 MACRO_SEND_TO_AI = os.getenv("MACRO_SEND_TO_AI", "true").lower() == "true"
 MACRO_SEND_TO_TELEGRAM = os.getenv("MACRO_SEND_TO_TELEGRAM", "false").lower() == "true"
 MACRO_SEND_ON_BOOT = os.getenv("MACRO_SEND_ON_BOOT", "true").lower() == "true"
@@ -715,7 +718,10 @@ ENABLE_FRED_MACRO_BRIDGE = os.getenv("ENABLE_FRED_MACRO_BRIDGE", "true").lower()
 FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
 MACRO_LATEST_FILE = os.getenv("MACRO_LATEST_FILE", "macro_latest.json")
 MACRO_STORE_FILE = os.getenv("MACRO_STORE_FILE", "macro_store.json")
-MACRO_REFRESH_SECONDS = int(os.getenv("MACRO_REFRESH_SECONDS", "3600"))
+try:
+    MACRO_REFRESH_SECONDS = int(str(os.getenv("MACRO_REFRESH_SECONDS", "3600")).strip())
+except Exception:
+    MACRO_REFRESH_SECONDS = 3600
 
 FRED_SERIES = {
     "DGS10": "10Y Treasury Yield",
@@ -735,7 +741,25 @@ def macro_load_latest() -> Dict[str, Any]:
 
 
 def macro_should_refresh(latest: Dict[str, Any]) -> bool:
-    return (now_ts() - safe_int(latest.get("updated_at", 0), 0)) >= MACRO_REFRESH_SECONDS
+    """
+    Safe macro refresh check.
+    Prevents Render env string crashes:
+    TypeError: unsupported operand type(s) for -: 'str' and 'int'
+    """
+    if not isinstance(latest, dict):
+        return True
+
+    try:
+        updated_at = safe_int(latest.get("updated_at", 0), 0)
+    except Exception:
+        updated_at = 0
+
+    try:
+        refresh_seconds = int(str(MACRO_REFRESH_SECONDS).strip())
+    except Exception:
+        refresh_seconds = 3600
+
+    return (now_ts() - updated_at) >= refresh_seconds
 
 
 def fred_fetch_series_observations(series_id: str, limit: int = 5) -> Dict[str, Any]:
