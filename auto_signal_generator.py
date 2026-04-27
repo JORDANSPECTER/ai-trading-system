@@ -1,5 +1,6 @@
 # =========================================================
 # UnBiased Trades — QQQ ONLY AUTO SIGNAL GENERATOR
+# OPEN SESSION LOCK: 9:30–10:30 AM ET
 # FIXED PATH + UNIQUE SIGNAL ID + SMART SCORE BOOST
 # HARD LOCK: QQQ only, no SPY
 # =========================================================
@@ -8,6 +9,12 @@ import os
 import json
 import time
 from datetime import datetime, timezone
+
+try:
+    import pytz
+except Exception:
+    pytz = None
+
 
 SIGNAL_FILE = "/opt/render/project/src/ai_signal.json"
 MARKET_FILE = "/opt/render/project/src/market_prices.json"
@@ -18,9 +25,33 @@ TICKER = "QQQ"
 ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "true").lower() == "true"
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "60"))
 
+AUTO_REQUIRE_OPEN_SESSION = os.getenv("AUTO_REQUIRE_OPEN_SESSION", "true").lower() == "true"
+
 STOP_DISTANCE = float(os.getenv("AUTO_STOP_DISTANCE", "1.50"))
 TARGET_1 = float(os.getenv("AUTO_TARGET_1", "1.50"))
 TARGET_2 = float(os.getenv("AUTO_TARGET_2", "3.00"))
+
+
+def now_ts():
+    return int(time.time())
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def eastern_now():
+    if pytz:
+        eastern = pytz.timezone("US/Eastern")
+        return datetime.now(eastern)
+    return datetime.now()
+
+
+def is_open_session():
+    now = eastern_now()
+    start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    end = now.replace(hour=10, minute=30, second=0, microsecond=0)
+    return start <= now <= end
 
 
 def load_json(path, default=None):
@@ -47,14 +78,6 @@ def safe_float(value, default=None):
         return float(value)
     except Exception:
         return default
-
-
-def now_ts():
-    return int(time.time())
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
 
 
 def cooldown_ready(force=False):
@@ -146,7 +169,10 @@ def calculate_score(price, vwap, pm_high, pm_low, direction, grade):
     if price < pm_low:
         base_score += 10
 
-    return min(base_score, 85)
+    if is_open_session():
+        base_score += 5
+
+    return min(base_score, 90)
 
 
 def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
@@ -185,7 +211,7 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
         "execution_score": score,
 
         "setup": setup,
-        "setup_type": "qqq_vwap_premarket_generator",
+        "setup_type": "qqq_open_session_vwap_premarket_generator",
         "trigger": setup,
 
         "vwap": round(vwap, 2),
@@ -194,9 +220,9 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
         "pm_high": pm_high,
         "pm_low": pm_low,
 
-        "session": "auto",
-        "time_window": "auto",
-        "trade_reason": "QQQ-only signal generated from premarket levels and VWAP trend continuation with smart execution-score boost.",
+        "session": "open" if is_open_session() else "off_hours",
+        "time_window": "open" if is_open_session() else "off_hours",
+        "trade_reason": "QQQ-only open-session signal generated from premarket levels and VWAP trend continuation.",
 
         "execution_override": True,
         "force_execution": True,
@@ -209,10 +235,14 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
 
 
 def generate_signal(force=False):
-    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded | smart score boost enabled", flush=True)
+    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded | open session lock enabled", flush=True)
 
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         print("[AUTO SIGNAL] disabled", flush=True)
+        return None
+
+    if AUTO_REQUIRE_OPEN_SESSION and not is_open_session() and not force:
+        print("[AUTO SIGNAL] blocked: outside open session 9:30–10:30 ET", flush=True)
         return None
 
     if not cooldown_ready(force=force):
@@ -254,13 +284,14 @@ def generate_signal(force=False):
         "last_grade": grade,
         "last_score": signal["score"],
         "last_signal_id": signal["signal_id"],
+        "session": signal["session"],
     })
 
     print(
         f"[AUTO SIGNAL] GENERATED QQQ {direction} | setup={setup} "
         f"grade={grade} score={signal['score']} entry={signal['entry']} "
         f"vwap={signal['vwap']} pm_high={pm_high} pm_low={pm_low} "
-        f"signal_id={signal['signal_id']}",
+        f"session={signal['session']} signal_id={signal['signal_id']}",
         flush=True,
     )
 
