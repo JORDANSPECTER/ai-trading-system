@@ -277,6 +277,9 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_BASE_URL = os.getenv("TWELVE_DATA_BASE_URL", "https://api.twelvedata.com").strip().rstrip("/")
 ALPACA_DATA_BASE_URL = normalize_alpaca_data_base_url(os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")).rstrip("/")
 LIVE_PRICE_CACHE_SECONDS = int(os.getenv("LIVE_PRICE_CACHE_SECONDS", str(MARKET_DATA_REFRESH_SECONDS)))
+TWELVE_DATA_VWAP_INTERVAL = os.getenv("TWELVE_DATA_VWAP_INTERVAL", "1min").strip()
+TWELVE_DATA_VWAP_OUTPUTSIZE = int(os.getenv("TWELVE_DATA_VWAP_OUTPUTSIZE", "390"))
+MARKET_DATA_WRITE_LIVE_SNAPSHOT = os.getenv("MARKET_DATA_WRITE_LIVE_SNAPSHOT", "true").lower() == "true"
 AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
 AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
 AUTO_TRAILING_STOP_ENABLED = os.getenv("AUTO_TRAILING_STOP_ENABLED", "true").lower() == "true"
@@ -3415,212 +3418,11 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
         return {"generated": False, "reason": "error", "error": str(e)}
 
 
-# =========================================================
-# DARK POOL → QQQ SIGNAL ENGINE
-# Uses institutional dark pool levels as the decision layer for
-# the internal QQQ signal generator. Free daily levels stay informational;
-# this layer controls whether a paper/execution signal is created.
-# =========================================================
-ENABLE_DARKPOOL_QQQ_SIGNAL_ENGINE = os.getenv("ENABLE_DARKPOOL_QQQ_SIGNAL_ENGINE", "true").lower() == "true"
-DARKPOOL_QQQ_REQUIRE_LEVEL = os.getenv("DARKPOOL_QQQ_REQUIRE_LEVEL", "true").lower() == "true"
-DARKPOOL_QQQ_ALLOW_CALLS = os.getenv("DARKPOOL_QQQ_ALLOW_CALLS", "true").lower() == "true"
-DARKPOOL_QQQ_ALLOW_PUTS = os.getenv("DARKPOOL_QQQ_ALLOW_PUTS", "true").lower() == "true"
-DARKPOOL_QQQ_MIN_GRADE = os.getenv("DARKPOOL_QQQ_MIN_GRADE", "A").upper().strip()
-DARKPOOL_QQQ_NEAR_LEVEL_PCT = float(os.getenv("DARKPOOL_QQQ_NEAR_LEVEL_PCT", str(globals().get("UW_DARKPOOL_NEAR_LEVEL_PCT", 0.006))))
-DARKPOOL_QQQ_ACCEPTANCE_PCT = float(os.getenv("DARKPOOL_QQQ_ACCEPTANCE_PCT", str(globals().get("UW_DARKPOOL_ACCEPTANCE_PCT", 0.0015))))
-DARKPOOL_QQQ_SEND_DEBUG_ALERTS = os.getenv("DARKPOOL_QQQ_SEND_DEBUG_ALERTS", "true").lower() == "true"
-
-
-def dp_qqq_level_price(level: Any) -> float:
-    if isinstance(level, dict):
-        return safe_float(level.get("price", 0), 0.0)
-    return 0.0
-
-
-def dp_qqq_level_strength(level: Any) -> str:
-    if isinstance(level, dict):
-        return str(level.get("strength", "normal")).lower().strip()
-    return "normal"
-
-
-def dp_qqq_get_vwap_from_market_snapshot(snapshot: Dict[str, Any], ticker: str = "QQQ") -> float:
-    try:
-        row = snapshot.get(ticker) if isinstance(snapshot, dict) else None
-        if isinstance(row, dict):
-            return safe_float(row.get("vwap") or row.get("VWAP") or row.get("session_vwap") or row.get("anchored_vwap"), 0.0)
-    except Exception:
-        pass
-    return 0.0
-
-
-def dp_qqq_grade_up(base: str, boost: int = 0) -> str:
-    ladder = ["AVOID", "C", "B", "B+", "A", "A+"]
-    g = str(base or "B").upper().strip()
-    if g not in ladder:
-        g = "B"
-    return ladder[min(len(ladder) - 1, ladder.index(g) + max(0, int(boost)))]
-
-
-def dp_qqq_meets_min_grade(grade: str) -> bool:
-    try:
-        return ai_grade_rank(grade) >= ai_grade_rank(DARKPOOL_QQQ_MIN_GRADE)
-    except Exception:
-        order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1, "AVOID": 0}
-        return order.get(str(grade).upper().strip(), 0) >= order.get(DARKPOOL_QQQ_MIN_GRADE, 4)
-
-
-def dp_qqq_build_decision(current_price: float, vwap: float = 0.0, force: bool = False) -> Dict[str, Any]:
-    """
-    Converts dark pool levels into one of four actionable QQQ plans:
-    - CALL: support hold near a resource level
-    - CALL: acceptance through resistance
-    - PUT: rejection near resistance
-    - PUT: acceptance below support
-    If no clean level reaction exists, returns NO_TRADE.
-    """
-    if not ENABLE_DARKPOOL_QQQ_SIGNAL_ENGINE:
-        return {"action": "NO_TRADE", "reason": "darkpool_qqq_engine_disabled"}
-
-    if current_price <= 0:
-        return {"action": "NO_TRADE", "reason": "missing_current_price"}
-
-    try:
-        levels = uw_dp_build_levels("QQQ", current_price=current_price, force=force) if "uw_dp_build_levels" in globals() else {}
-    except Exception as e:
-        levels = {"ok": False, "reason": f"uw_build_error:{e}"}
-
-    if not isinstance(levels, dict) or not levels.get("ok"):
-        if DARKPOOL_QQQ_REQUIRE_LEVEL:
-            return {
-                "action": "NO_TRADE",
-                "reason": f"darkpool_levels_required_unavailable:{levels.get('reason') if isinstance(levels, dict) else 'unknown'}",
-                "levels": levels,
-            }
-        return {
-            "action": "CALL" if DARKPOOL_QQQ_ALLOW_CALLS else "NO_TRADE",
-            "direction": "CALL",
-            "grade": "B",
-            "setup": "vwap_reclaim",
-            "trigger": "vwap_reclaim",
-            "confirmation": "vwap",
-            "reason": "fallback_vwap_signal_no_darkpool_levels",
-            "levels": levels,
-            "darkpool_actions": ["fallback_no_darkpool_levels"],
-        }
-
-    support = levels.get("nearest_support")
-    resistance = levels.get("nearest_resistance")
-    support_px = dp_qqq_level_price(support)
-    resistance_px = dp_qqq_level_price(resistance)
-
-    def near(px: float) -> bool:
-        if not px or current_price <= 0:
-            return False
-        return abs(current_price - px) / current_price <= DARKPOOL_QQQ_NEAR_LEVEL_PCT
-
-    def accepted_above(px: float) -> bool:
-        return bool(px and current_price >= px * (1 + DARKPOOL_QQQ_ACCEPTANCE_PCT))
-
-    def accepted_below(px: float) -> bool:
-        return bool(px and current_price <= px * (1 - DARKPOOL_QQQ_ACCEPTANCE_PCT))
-
-    decisions = []
-
-    if DARKPOOL_QQQ_ALLOW_CALLS and support_px and near(support_px) and current_price >= support_px:
-        boost = 1 if dp_qqq_level_strength(support) == "major" else 0
-        if vwap and current_price > vwap:
-            boost += 1
-        decisions.append({
-            "action": "CALL",
-            "direction": "CALL",
-            "grade": dp_qqq_grade_up("A", boost),
-            "setup": "support_hold",
-            "trigger": "support_hold",
-            "confirmation": "hold",
-            "reason": f"QQQ holding dark pool support/resource level near {support_px}",
-            "decision_level": support_px,
-            "darkpool_actions": ["call_supported_by_darkpool_support", "support_hold"],
-        })
-
-    if DARKPOOL_QQQ_ALLOW_CALLS and resistance_px and accepted_above(resistance_px):
-        boost = 1 if dp_qqq_level_strength(resistance) == "major" else 0
-        if vwap and current_price > vwap:
-            boost += 1
-        decisions.append({
-            "action": "CALL",
-            "direction": "CALL",
-            "grade": dp_qqq_grade_up("A", boost),
-            "setup": "break_and_hold",
-            "trigger": "break_and_hold",
-            "confirmation": "vwap" if vwap else "momentum",
-            "reason": f"QQQ accepted above dark pool resistance/resource level {resistance_px}",
-            "decision_level": resistance_px,
-            "darkpool_actions": ["call_accepted_through_darkpool_resistance", "break_and_hold"],
-        })
-
-    if DARKPOOL_QQQ_ALLOW_PUTS and resistance_px and near(resistance_px) and current_price <= resistance_px:
-        boost = 1 if dp_qqq_level_strength(resistance) == "major" else 0
-        if vwap and current_price < vwap:
-            boost += 1
-        decisions.append({
-            "action": "PUT",
-            "direction": "PUT",
-            "grade": dp_qqq_grade_up("A", boost),
-            "setup": "resistance_rejection",
-            "trigger": "resistance_rejection",
-            "confirmation": "reject",
-            "reason": f"QQQ rejecting dark pool resistance/resource level near {resistance_px}",
-            "decision_level": resistance_px,
-            "darkpool_actions": ["put_supported_by_darkpool_resistance", "resistance_rejection"],
-        })
-
-    if DARKPOOL_QQQ_ALLOW_PUTS and support_px and accepted_below(support_px):
-        boost = 1 if dp_qqq_level_strength(support) == "major" else 0
-        if vwap and current_price < vwap:
-            boost += 1
-        decisions.append({
-            "action": "PUT",
-            "direction": "PUT",
-            "grade": dp_qqq_grade_up("A", boost),
-            "setup": "vwap_reject",
-            "trigger": "vwap_reject",
-            "confirmation": "vwap" if vwap else "structure",
-            "reason": f"QQQ accepted below dark pool support/resource level {support_px}",
-            "decision_level": support_px,
-            "darkpool_actions": ["put_accepted_below_darkpool_support", "support_break"],
-        })
-
-    if not decisions:
-        return {
-            "action": "NO_TRADE",
-            "reason": "no_darkpool_level_reaction",
-            "current_price": current_price,
-            "vwap": vwap,
-            "nearest_support": support,
-            "nearest_resistance": resistance,
-            "levels": levels,
-        }
-
-    decisions.sort(key=lambda d: (ai_grade_rank(d.get("grade", "B")), "accepted" in " ".join(d.get("darkpool_actions", []))), reverse=True)
-    best = decisions[0]
-    best["current_price"] = current_price
-    best["vwap"] = vwap
-    best["nearest_support"] = support
-    best["nearest_resistance"] = resistance
-    best["levels"] = levels
-
-    if not dp_qqq_meets_min_grade(best.get("grade")):
-        best["action"] = "NO_TRADE"
-        best["reason"] = f"grade_below_darkpool_min:{best.get('grade')}<{DARKPOOL_QQQ_MIN_GRADE}"
-
-    return best
-
-
 def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
     """
-    QQQ dark-pool-driven signal generator.
-    Writes fresh ai_signal.json and signal.json only when QQQ reacts to institutional resource levels.
-    Normal engine risk, QQQ lock, macro, portfolio heat, duplicate caps, and paper/live controls still gate execution.
+    Simple paper-mode signal driver.
+    Writes a fresh ai_signal.json and signal.json using current market price.
+    It does not place live trades by itself; normal engine risk + paper routing still control execution.
     """
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         return {"generated": False, "reason": "disabled"}
@@ -3631,6 +3433,7 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # Never generate new entries while a position is open.
         try:
             open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
             if open_positions:
@@ -3647,61 +3450,46 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         if not force and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
             return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
 
-        ticker = "QQQ"
-        debug("[AUTO SIGNAL DEBUG] darkpool QQQ signal engine loaded | hard_locked_ticker=QQQ")
+        ticker = "QQQ"  # HARD LOCK: do not allow SPY or any fallback ticker
+        debug("[AUTO SIGNAL DEBUG] internal generator hard_locked_ticker=QQQ")
+        direction = normalize_direction(AUTO_SIGNAL_DIRECTION or "CALL")
 
+        # Pull live market price through the engine's existing market-data router.
         underlying_price = 0.0
-        market_snapshot = {}
-        vwap = 0.0
         try:
-            market_snapshot = load_market_prices([ticker])
-            underlying_price, _ts = get_market_price_for_symbol(ticker, market_snapshot)
-            vwap = dp_qqq_get_vwap_from_market_snapshot(market_snapshot, ticker)
+            prices = load_market_prices([ticker])
+            underlying_price, _ts = get_market_price_for_symbol(ticker, prices)
         except Exception as price_error:
-            debug(f"DARKPOOL QQQ SIGNAL PRICE ERROR | {price_error}")
+            debug(f"AUTO SIGNAL PRICE ERROR | {price_error}")
             underlying_price = 0.0
 
         if underlying_price < AUTO_SIGNAL_MIN_UNDERLYING_PRICE:
             return {"generated": False, "reason": "invalid_underlying_price", "ticker": ticker, "price": underlying_price}
 
-        decision = dp_qqq_build_decision(underlying_price, vwap=vwap, force=force)
-        if decision.get("action") == "NO_TRADE":
-            try:
-                debug(f"DARKPOOL QQQ SIGNAL NO TRADE | reason={decision.get('reason')} price={underlying_price} vwap={vwap}")
-            except Exception:
-                pass
-            return {"generated": False, "reason": decision.get("reason", "no_trade"), "decision": decision}
-
-        direction = normalize_direction(decision.get("direction", "CALL"))
         entry = round(max(0.01, AUTO_SIGNAL_CONTRACT_PRICE), 2)
         if direction == "PUT":
             stop = round(entry + AUTO_SIGNAL_STOP_OFFSET, 2)
             tp1 = round(max(0.01, entry - AUTO_SIGNAL_TP1_OFFSET), 2)
             tp2 = round(max(0.01, entry - AUTO_SIGNAL_TP2_OFFSET), 2)
             targets = [tp1, tp2]
+            public_reason = f"{ticker} auto paper PUT signal generated from live price validation."
         else:
             stop = round(max(0.01, entry - AUTO_SIGNAL_STOP_OFFSET), 2)
             tp1 = round(entry + AUTO_SIGNAL_TP1_OFFSET, 2)
             tp2 = round(entry + AUTO_SIGNAL_TP2_OFFSET, 2)
             targets = [tp1, tp2]
-
-        grade = str(decision.get("grade") or AUTO_SIGNAL_GRADE or "A").upper().strip()
-        setup = str(decision.get("setup") or AUTO_SIGNAL_SETUP or "break_and_hold").lower().strip()
-        trigger = str(decision.get("trigger") or setup).lower().strip()
-        confirmation = str(decision.get("confirmation") or "vwap").lower().strip()
-        decision_level = safe_float(decision.get("decision_level", 0), 0.0)
-        public_reason = str(decision.get("reason") or f"QQQ {direction} dark pool level reaction").strip()
+            public_reason = f"{ticker} auto paper CALL signal generated from live price validation."
 
         signal = {
             "ticker": ticker,
             "symbol": ticker,
             "direction": direction,
-            "grade": grade,
-            "confidence": grade,
-            "setup": setup,
-            "strategy": setup,
-            "trigger": trigger,
-            "confirmation": confirmation,
+            "grade": AUTO_SIGNAL_GRADE,
+            "confidence": AUTO_SIGNAL_GRADE,
+            "setup": AUTO_SIGNAL_SETUP,
+            "strategy": AUTO_SIGNAL_SETUP,
+            "trigger": AUTO_SIGNAL_TRIGGER,
+            "confirmation": "auto_price_refresh",
             "regime": "clean",
             "entry": entry,
             "stop": stop,
@@ -3714,25 +3502,11 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
             "tp2_contract": tp2,
             "qty": safe_int(os.getenv("DEFAULT_PAPER_QTY", "1"), 1),
             "underlying_price": underlying_price,
-            "price": underlying_price,
-            "vwap": vwap,
-            "key_level": decision_level,
-            "decision_level": decision_level,
             "reason": public_reason,
             "public_reason": public_reason,
-            "source": "darkpool_qqq_signal_engine",
+            "source": "simple_auto_signal_generator",
             "timestamp": now,
             "auto_generated": True,
-            "dark_pool_signal": {
-                "enabled": True,
-                "decision": decision.get("action"),
-                "actions": decision.get("darkpool_actions", []),
-                "nearest_support": decision.get("nearest_support"),
-                "nearest_resistance": decision.get("nearest_resistance"),
-                "decision_level": decision_level,
-                "current_price": underlying_price,
-                "vwap": vwap,
-            },
         }
 
         try:
@@ -3740,13 +3514,7 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
-        try:
-            signal = apply_unusual_whales_darkpool_to_signal(signal, stage="auto_signal_generator")
-            if unusual_whales_darkpool_blocks_signal(signal):
-                return {"generated": False, "reason": "darkpool_confluence_blocked", "signal": signal}
-        except Exception as dp_apply_error:
-            debug(f"DARKPOOL QQQ SIGNAL APPLY WARNING | {dp_apply_error}")
-
+        # Keep both files fresh. signal.json is what the execution loop reads.
         if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(AUTO_AI_SIGNAL_FILE):
             atomic_write_json(AUTO_AI_SIGNAL_FILE, signal)
         if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(SIGNAL_FILE):
@@ -3756,23 +3524,18 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         state["last_signal"] = {
             "ticker": ticker,
             "direction": direction,
-            "grade": signal.get("grade"),
-            "setup": setup,
-            "decision_level": decision_level,
+            "entry": entry,
             "underlying_price": underlying_price,
             "timestamp": now,
         }
         state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
         atomic_write_json(AUTO_SIGNAL_STATE_FILE, state)
 
-        debug(
-            f"[AUTO SIGNAL] DARKPOOL QQQ {direction} | grade={signal.get('grade')} "
-            f"setup={setup} level={decision_level} underlying={underlying_price} contract={entry} ts={now}"
-        )
-        return {"generated": True, "reason": "darkpool_qqq_signal_written", "signal": signal}
+        debug(f"[AUTO SIGNAL] Generated fresh {ticker} {direction} | underlying={underlying_price} | contract={entry} | ts={now}")
+        return {"generated": True, "reason": "fresh_signal_written", "signal": signal}
 
     except Exception as e:
-        log(f"❌ DARKPOOL QQQ SIGNAL GENERATOR ERROR | {e}")
+        log(f"❌ AUTO SIGNAL GENERATOR ERROR | {e}")
         log(traceback.format_exc())
         return {"generated": False, "reason": "error", "error": str(e)}
 
@@ -7341,6 +7104,7 @@ def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     refresh_market_data_file_metadata()
 
     prices = {}
+    market_data_live_updated = False
 
     # 1) File fallback/manual override still supported.
     if MARKET_DATA_FILE and file_exists(MARKET_DATA_FILE):
@@ -7379,45 +7143,97 @@ def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
                 else:
                     debug(f"OPTION CONTRACT DETECTED | {sym}. No file contract price found. Skipping stock quote endpoints and fetching underlying {underlying} only.")
 
-                underlying_price = get_live_market_price(underlying)
+                underlying_snapshot = get_live_market_snapshot(underlying)
+                underlying_price = safe_float(underlying_snapshot.get("price", 0), 0)
                 if underlying_price > 0:
-                    prices[f"__UNDERLYING__:{sym}"] = {
-                        "price": underlying_price,
-                        "timestamp": epoch(),
-                        "source": f"{MARKET_DATA_PROVIDER}:underlying:{underlying}",
-                    }
-                    debug(f"UNDERLYING LIVE MARKET DATA READ | {underlying} for {sym}: {underlying_price}")
+                    underlying_snapshot["source"] = f"{underlying_snapshot.get('source', MARKET_DATA_PROVIDER)}:underlying:{underlying}"
+                    prices[f"__UNDERLYING__:{sym}"] = underlying_snapshot
+                    market_data_live_updated = True
+                    debug(
+                        f"UNDERLYING LIVE MARKET DATA READ | {underlying} for {sym}: "
+                        f"price={underlying_price} vwap={underlying_snapshot.get('vwap', 0)}"
+                    )
                 continue
 
-            live_price = get_live_market_price(sym)
+            live_snapshot = get_live_market_snapshot(sym)
+            live_price = safe_float(live_snapshot.get("price", 0), 0)
             if live_price > 0:
-                prices[sym] = {"price": live_price, "timestamp": epoch(), "source": MARKET_DATA_PROVIDER}
-                debug(f"LIVE MARKET DATA READ | {sym}: {live_price}")
+                prices[sym] = live_snapshot
+                market_data_live_updated = True
+                debug(
+                    f"LIVE MARKET DATA READ | {sym}: {live_price} "
+                    f"vwap={live_snapshot.get('vwap', 0)} volume={live_snapshot.get('volume', 0)}"
+                )
+
+    if market_data_live_updated and MARKET_DATA_WRITE_LIVE_SNAPSHOT and MARKET_DATA_FILE:
+        try:
+            atomic_write_json(MARKET_DATA_FILE, prices)
+            debug(f"MARKET DATA FILE UPDATED WITH LIVE SNAPSHOT | file={MARKET_DATA_FILE}")
+        except Exception as e:
+            debug(f"MARKET DATA LIVE SNAPSHOT WRITE FAILED | {e}")
 
     return prices
 
 
-def cache_get_market_price(symbol: str) -> Tuple[float, int, str]:
+def cache_get_market_snapshot(symbol: str) -> Dict[str, Any]:
     item = MARKET_PRICE_CACHE.get(str(symbol).upper().strip(), {})
     if not isinstance(item, dict):
-        return 0.0, 0, ""
+        return {}
     price = safe_float(item.get("price", 0), 0)
     ts = safe_int(item.get("timestamp", 0), 0)
-    source = str(item.get("source", ""))
     if price > 0 and ts > 0 and (epoch() - ts) <= LIVE_PRICE_CACHE_SECONDS:
-        return price, ts, source
-    return 0.0, 0, ""
+        return deepcopy(item)
+    return {}
+
+
+def cache_get_market_price(symbol: str) -> Tuple[float, int, str]:
+    item = cache_get_market_snapshot(symbol)
+    if not item:
+        return 0.0, 0, ""
+    return (
+        safe_float(item.get("price", 0), 0),
+        safe_int(item.get("timestamp", 0), 0),
+        str(item.get("source", "")),
+    )
+
+
+def cache_set_market_snapshot(symbol: str, snapshot: Dict[str, Any], source: str = ""):
+    if not symbol or not isinstance(snapshot, dict):
+        return
+    price = safe_float(snapshot.get("price", snapshot.get("last", 0)), 0)
+    if price <= 0:
+        return
+
+    item = deepcopy(snapshot)
+    item["price"] = round(float(price), 6)
+    item.setdefault("last", round(float(price), 6))
+    item.setdefault("timestamp", epoch())
+    item.setdefault("price_updated_at", epoch())
+    item.setdefault("source", source or item.get("source", "live"))
+
+    vwap = safe_float(item.get("vwap", item.get("session_vwap", 0)), 0)
+    if vwap > 0:
+        item["vwap"] = round(float(vwap), 6)
+        item["session_vwap"] = round(float(vwap), 6)
+        item.setdefault("vwap_updated_at", epoch())
+
+    MARKET_PRICE_CACHE[str(symbol).upper().strip()] = item
 
 
 def cache_set_market_price(symbol: str, price: float, source: str):
     if not symbol or price <= 0:
         return
-    MARKET_PRICE_CACHE[str(symbol).upper().strip()] = {
-        "price": round(float(price), 6),
-        "timestamp": epoch(),
-        "source": source,
-    }
-
+    cache_set_market_snapshot(
+        symbol,
+        {
+            "price": round(float(price), 6),
+            "last": round(float(price), 6),
+            "timestamp": epoch(),
+            "price_updated_at": epoch(),
+            "source": source,
+        },
+        source,
+    )
 
 def parse_occ_option_symbol(symbol: str) -> Dict[str, Any]:
     """
@@ -7500,8 +7316,113 @@ def extract_price_from_payload(payload: Any) -> float:
     return 0.0
 
 
+def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
+    """
+    Fetches Twelve Data intraday candles and computes session VWAP.
+    Writes a snapshot shape compatible with market_prices.json:
+      {"price": ..., "vwap": ..., "volume": ..., "timestamp": ..., "source": "twelvedata"}
+    """
+    symbol = str(symbol or "").upper().strip()
+    if not TWELVE_DATA_API_KEY or not symbol:
+        return {}
+
+    try:
+        r = requests.get(
+            f"{TWELVE_DATA_BASE_URL}/time_series",
+            params={
+                "symbol": symbol,
+                "interval": TWELVE_DATA_VWAP_INTERVAL,
+                "outputsize": TWELVE_DATA_VWAP_OUTPUTSIZE,
+                "apikey": TWELVE_DATA_API_KEY,
+            },
+            timeout=10,
+        )
+
+        if r.status_code != 200:
+            debug(f"Twelve Data time_series failed for {symbol}: {r.status_code} {r.text[:200]}")
+            return {}
+
+        data = r.json()
+        if isinstance(data, dict) and data.get("status") == "error":
+            debug(f"Twelve Data time_series returned error for {symbol}: {data}")
+            return {}
+
+        values = data.get("values", []) if isinstance(data, dict) else []
+        if not isinstance(values, list) or not values:
+            debug(f"Twelve Data time_series missing values for {symbol}: {str(data)[:200]}")
+            return {}
+
+        # Twelve Data usually returns newest candle first. Reverse so VWAP is old -> new.
+        candles = list(reversed(values))
+
+        pv_sum = 0.0
+        vol_sum = 0.0
+        last_price = 0.0
+        last_volume = 0.0
+        last_datetime = ""
+
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+
+            close = safe_float(
+                candle.get("close")
+                or candle.get("price")
+                or candle.get("last")
+                or candle.get("c"),
+                0.0,
+            )
+            high = safe_float(candle.get("high") or candle.get("h"), 0.0)
+            low = safe_float(candle.get("low") or candle.get("l"), 0.0)
+            volume = safe_float(candle.get("volume") or candle.get("v"), 0.0)
+
+            if close <= 0:
+                continue
+
+            typical_price = close
+            if high > 0 and low > 0:
+                typical_price = (high + low + close) / 3.0
+
+            if volume > 0:
+                pv_sum += typical_price * volume
+                vol_sum += volume
+                last_volume = volume
+
+            last_price = close
+            last_datetime = str(candle.get("datetime") or candle.get("timestamp") or "")
+
+        if last_price <= 0:
+            return {}
+
+        vwap = (pv_sum / vol_sum) if vol_sum > 0 else last_price
+
+        return {
+            "price": round(float(last_price), 6),
+            "last": round(float(last_price), 6),
+            "vwap": round(float(vwap), 6),
+            "session_vwap": round(float(vwap), 6),
+            "volume": round(float(vol_sum), 2),
+            "last_candle_volume": round(float(last_volume), 2),
+            "timestamp": epoch(),
+            "price_updated_at": epoch(),
+            "vwap_updated_at": epoch(),
+            "last_candle_datetime": last_datetime,
+            "source": "twelvedata",
+            "interval": TWELVE_DATA_VWAP_INTERVAL,
+        }
+
+    except Exception as e:
+        debug(f"Twelve Data VWAP exception for {symbol}: {e}")
+        return {}
+
+
 def fetch_twelve_data_price(symbol: str) -> float:
     """Fetches a quote/price from Twelve Data. Falls back safely if unsupported."""
+    snapshot = fetch_twelve_data_intraday_snapshot(symbol)
+    price = safe_float(snapshot.get("price", 0), 0)
+    if price > 0:
+        return price
+
     if not TWELVE_DATA_API_KEY or not symbol:
         return 0.0
     try:
@@ -7521,7 +7442,6 @@ def fetch_twelve_data_price(symbol: str) -> float:
     except Exception as e:
         debug(f"Twelve Data exception for {symbol}: {e}")
         return 0.0
-
 
 def alpaca_data_headers() -> Dict[str, str]:
     return {
@@ -7566,43 +7486,60 @@ def fetch_alpaca_data_price(symbol: str) -> float:
     return 0.0
 
 
-def get_live_market_price(symbol: str) -> float:
-    """Step 10 live price router with cache + provider fallback.
-
-    Safety rule: this function prices equities/underlyings only. Compact OCC-style
-    option contracts are intentionally not sent to stock quote endpoints.
-    """
+def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
+    """Live market snapshot router. Returns price + VWAP when available."""
     symbol = str(symbol or "").strip().upper()
     if not symbol:
-        return 0.0
+        return {}
 
     if is_option_contract_symbol(symbol):
         debug(f"Skipping live stock quote lookup for option contract symbol: {symbol}")
-        return 0.0
+        return {}
 
-    cached_price, _, cached_source = cache_get_market_price(symbol)
-    if cached_price > 0:
-        debug(f"Using cached live price for {symbol}: {cached_price} from {cached_source}")
-        return cached_price
+    cached = cache_get_market_snapshot(symbol)
+    if cached:
+        debug(
+            f"Using cached live snapshot for {symbol}: "
+            f"price={cached.get('price')} vwap={cached.get('vwap', 0)} from {cached.get('source')}"
+        )
+        return cached
 
     if MARKET_DATA_PROVIDER == "auto":
-        providers = ["alpaca", "twelvedata"]
+        providers = ["twelvedata", "alpaca"]
     elif MARKET_DATA_PROVIDER in {"alpaca", "twelvedata"}:
         providers = [MARKET_DATA_PROVIDER]
     else:
-        return 0.0
+        return {}
 
     for provider in providers:
-        price = 0.0
-        if provider == "alpaca":
-            price = fetch_alpaca_data_price(symbol)
-        elif provider == "twelvedata":
-            price = fetch_twelve_data_price(symbol)
-        if price > 0:
-            cache_set_market_price(symbol, price, provider)
-            return price
+        snapshot: Dict[str, Any] = {}
 
-    return 0.0
+        if provider == "twelvedata":
+            snapshot = fetch_twelve_data_intraday_snapshot(symbol)
+            if snapshot and safe_float(snapshot.get("price", 0), 0) > 0:
+                cache_set_market_snapshot(symbol, snapshot, "twelvedata")
+                return snapshot
+
+        elif provider == "alpaca":
+            price = fetch_alpaca_data_price(symbol)
+            if price > 0:
+                snapshot = {
+                    "price": round(float(price), 6),
+                    "last": round(float(price), 6),
+                    "timestamp": epoch(),
+                    "price_updated_at": epoch(),
+                    "source": "alpaca",
+                }
+                cache_set_market_snapshot(symbol, snapshot, "alpaca")
+                return snapshot
+
+    return {}
+
+
+def get_live_market_price(symbol: str) -> float:
+    """Step 10 live price router with cache + provider fallback."""
+    snapshot = get_live_market_snapshot(symbol)
+    return safe_float(snapshot.get("price", 0), 0)
 
 def parse_market_price_value(value: Any) -> Tuple[float, int]:
     """Returns (price, timestamp). Timestamp can be 0 if not supplied."""
