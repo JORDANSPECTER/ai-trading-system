@@ -1,0 +1,33 @@
+{
+  "app": "COUGAR",
+  "ticker": "QQQ",
+  "market_state": "Neutral",
+  "cougar_state": "WAIT",
+  "cougar_score": 0,
+  "grade": "WAIT",
+  "bias": "No live signal loaded yet.",
+  "vwap_status": "Not loaded",
+  "premarket_high": null,
+  "premarket_low": null,
+  "key_levels": {
+    "support": [],
+    "resistance": []
+  },
+  "call_plan": {
+    "trigger": "Waiting for analyzer",
+    "entry_type": "None",
+    "stop": "None",
+    "targets": []
+  },
+  "put_plan": {
+    "trigger": "Waiting for analyzer",
+    "entry_type": "None",
+    "stop": "None",
+    "targets": []
+  },
+  "oil_confirmation": "Not loaded",
+  "anti_chase_warning": "Wait for confirmation. Do not chase.",
+  "beginner_explanation": "The analyzer has not produced a live setup yet.",
+  "expert_summary": "No signal data available.",
+  "last_updated": null
+}
