@@ -1,5 +1,22 @@
 {
-  "SPY": { "price": 1.35 },
-  "QQQ": { "price": 1.35 }
+  "QQQ": {
+    "price": 663.91,
+    "last": 663.91,
+    "vwap": 661.49,
+    "session_vwap": 661.49,
+    "premarket_high": null,
+    "premarket_low": null,
+    "volume": 0,
+    "last_candle_volume": 0,
+    "timestamp": 0,
+    "price_updated_at": 0,
+    "vwap_updated_at": 0,
+    "premarket_updated_at": 0,
+    "premarket_window": "04:00-09:29",
+    "source": "manual_template",
+    "interval": "1min"
+  },
+  "__updated_at": 0,
+  "__freshness_source": "manual_template",
+  "__max_age_seconds": 300
 }
-
