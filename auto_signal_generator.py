@@ -1,6 +1,7 @@
 # =========================================================
-# UnBiased Trades — REAL QQQ STRATEGY GENERATOR
+# UnBiased Trades — QQQ ONLY AUTO SIGNAL GENERATOR
 # VWAP + PREMARKET LEVELS + ENTRY TYPES + OIL + NO CHASING
+# HARD LOCKED: CAN NEVER WRITE SPY
 # =========================================================
 
 import os
@@ -8,17 +9,19 @@ import json
 import time
 from datetime import datetime, timezone
 
-SIGNAL_FILE = os.getenv("SIGNAL_FILE", "ai_signal.json")
-MARKET_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json")
-MACRO_FILE = os.getenv("MACRO_FILE", "macro_snapshot.json")
-LEVELS_FILE = os.getenv("LEVELS_FILE", "darkpool_levels.json")
+SIGNAL_FILE = os.getenv("SIGNAL_FILE", "ai_signal.json").strip()
+MARKET_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
+MACRO_FILE = os.getenv("MACRO_FILE", "macro_snapshot.json").strip()
+LEVELS_FILE = os.getenv("LEVELS_FILE", "darkpool_levels.json").strip()
 STATE_FILE = "auto_signal_generator_state.json"
 
 ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "true").lower() == "true"
-AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "60"))
 
 TICKER = "QQQ"
+if TICKER != "QQQ":
+    raise RuntimeError("Only QQQ allowed in this system")
 
+AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "60"))
 AUTO_REQUIRE_SESSION = os.getenv("AUTO_REQUIRE_SESSION", "false").lower() == "true"
 AUTO_USE_PREMARKET_LEVELS = os.getenv("AUTO_USE_PREMARKET_LEVELS", "true").lower() == "true"
 
@@ -58,11 +61,11 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_float(x, default=None):
+def safe_float(value, default=None):
     try:
-        if x is None or x == "":
+        if value is None or value == "":
             return default
-        return float(x)
+        return float(value)
     except Exception:
         return default
 
@@ -88,7 +91,10 @@ def session_allowed():
 
 def get_market():
     data = load_json(MARKET_FILE, {})
-    return data.get("QQQ", {}) if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    qqq = data.get("QQQ", {})
+    return qqq if isinstance(qqq, dict) else {}
 
 
 def get_price():
@@ -133,30 +139,45 @@ def get_darkpool_levels(price):
         raw = list(raw.values())
 
     levels = []
-    for x in raw:
-        if isinstance(x, dict):
-            lvl = safe_float(x.get("price") or x.get("level") or x.get("value"))
+    for item in raw:
+        if isinstance(item, dict):
+            level = safe_float(item.get("price") or item.get("level") or item.get("value"))
         else:
-            lvl = safe_float(x)
+            level = safe_float(item)
 
-        if lvl and lvl > 100:
-            levels.append(lvl)
+        if level and level > 100:
+            levels.append(level)
 
     if not levels:
-        return {"nearest": None, "support": None, "resistance": None, "state": "no_levels_loaded"}
+        return {
+            "nearest": None,
+            "support": None,
+            "resistance": None,
+            "state": "no_levels_loaded",
+        }
 
     support = max([x for x in levels if x <= price], default=None)
     resistance = min([x for x in levels if x >= price], default=None)
     nearest = min(levels, key=lambda x: abs(x - price))
 
-    return {"nearest": nearest, "support": support, "resistance": resistance, "state": "levels_loaded"}
+    return {
+        "nearest": nearest,
+        "support": support,
+        "resistance": resistance,
+        "state": "levels_loaded",
+    }
 
 
 def get_oil_bias():
     macro = load_json(MACRO_FILE, {})
-    oil = macro.get("oil", {}) if isinstance(macro, dict) else {}
+    if not isinstance(macro, dict):
+        return "neutral"
 
-    text = str(
+    oil = macro.get("oil", {})
+    if not isinstance(oil, dict):
+        oil = {}
+
+    oil_text = str(
         oil.get("trend")
         or oil.get("direction")
         or oil.get("state")
@@ -166,10 +187,10 @@ def get_oil_bias():
     risk = str(macro.get("risk_environment", "")).lower()
     bias = str(macro.get("macro_bias", "")).lower()
 
-    if "fall" in text or text in {"down", "weak", "bearish"}:
+    if "fall" in oil_text or oil_text in {"down", "weak", "bearish"}:
         return "bullish_for_qqq"
 
-    if "rise" in text or text in {"up", "strong", "bullish"}:
+    if "rise" in oil_text or oil_text in {"up", "strong", "bullish"}:
         return "bearish_for_qqq"
 
     if risk == "risk_on" or bias == "bullish":
@@ -181,20 +202,29 @@ def get_oil_bias():
     return "neutral"
 
 
-def cooldown_ready():
+def cooldown_ready(force=False):
+    if force:
+        return True
+
     state = load_json(STATE_FILE, {})
+    if not isinstance(state, dict):
+        return True
+
     last = int(state.get("last_signal_ts", 0) or 0)
     return last <= 0 or now_ts() - last >= AUTO_SIGNAL_COOLDOWN_SECONDS
 
 
 def is_chasing(price, vwap, direction):
-    dist = abs(price - vwap)
+    if not vwap:
+        return False, "no_vwap_chase_check"
 
-    if direction == "CALL" and price > vwap and dist > CHASE_DISTANCE:
-        return True, f"YOU ARE CHASING CALL: price {round(dist, 2)} above VWAP"
+    distance = abs(price - vwap)
 
-    if direction == "PUT" and price < vwap and dist > CHASE_DISTANCE:
-        return True, f"YOU ARE CHASING PUT: price {round(dist, 2)} below VWAP"
+    if direction == "CALL" and price > vwap and distance > CHASE_DISTANCE:
+        return True, f"YOU ARE CHASING CALL: price {round(distance, 2)} above VWAP"
+
+    if direction == "PUT" and price < vwap and distance > CHASE_DISTANCE:
+        return True, f"YOU ARE CHASING PUT: price {round(distance, 2)} below VWAP"
 
     return False, "not_chasing"
 
@@ -211,15 +241,14 @@ def score_trade(price, vwap, levels, oil_bias, pm_high, pm_low):
     support = levels.get("support")
     resistance = levels.get("resistance")
 
-    # VWAP logic
     if price > vwap + VWAP_BUFFER:
         call_score += 2
         call_reasons.append("VWAP reclaim / holding above VWAP")
-    elif price < vwap - VWAP_BUFFER:
+
+    if price < vwap - VWAP_BUFFER:
         put_score += 2
         put_reasons.append("VWAP rejection / holding below VWAP")
 
-    # Premarket high/low logic
     if AUTO_USE_PREMARKET_LEVELS and pm_high:
         if price > pm_high + PREMARKET_BUFFER:
             call_score += 3
@@ -252,7 +281,6 @@ def score_trade(price, vwap, levels, oil_bias, pm_high, pm_low):
             call_setup = "RETEST_HOLD_PREMARKET_LOW"
             call_reasons.append(f"support hold near premarket low {pm_low}")
 
-    # Dark pool / key levels
     if support and abs(price - support) <= LEVEL_BUFFER:
         call_score += 2
         if not call_setup:
@@ -265,7 +293,6 @@ def score_trade(price, vwap, levels, oil_bias, pm_high, pm_low):
             put_setup = "REJECTION_RESISTANCE"
         put_reasons.append(f"rejecting key resistance {resistance}")
 
-    # Oil / macro
     if oil_bias == "bullish_for_qqq":
         call_score += 2
         call_reasons.append("oil/macro bullish for QQQ")
@@ -274,9 +301,8 @@ def score_trade(price, vwap, levels, oil_bias, pm_high, pm_low):
         put_score += 2
         put_reasons.append("oil/macro bearish for QQQ")
 
-    # Session boost
-    sess = session_name()
-    if sess in {"open", "power_hour"}:
+    current_session = session_name()
+    if current_session in {"open", "power_hour"}:
         call_score += 1
         put_score += 1
 
@@ -320,7 +346,7 @@ def build_signal(price, vwap, decision, levels, oil_bias, pm_high, pm_low):
         stop = round(price + STOP_DISTANCE, 2)
         targets = [round(price - TARGET_1, 2), round(price - TARGET_2, 2)]
 
-    return {
+    signal = {
         "ticker": "QQQ",
         "symbol": "QQQ",
         "underlying": "QQQ",
@@ -347,6 +373,8 @@ def build_signal(price, vwap, decision, levels, oil_bias, pm_high, pm_low):
         "oil_bias": oil_bias,
         "premarket_high": pm_high,
         "premarket_low": pm_low,
+        "pm_high": pm_high,
+        "pm_low": pm_low,
         "level_context": levels,
         "strategy_reasons": decision["reasons"],
 
@@ -359,21 +387,28 @@ def build_signal(price, vwap, decision, levels, oil_bias, pm_high, pm_low):
         "source": "auto_signal_generator",
 
         "force_execution": True,
-        "paper_only": True
+        "paper_only": True,
     }
+
+    if signal.get("ticker") != "QQQ":
+        print("[GENERATOR BLOCK] Non-QQQ prevented before save", flush=True)
+        return None
+
+    return signal
 
 
 def generate_signal(force=False):
-    print("[AUTO SIGNAL DEBUG] REAL QQQ STRATEGY | PM LEVELS + ENTRY TYPES loaded", flush=True)
+    print("[AUTO SIGNAL DEBUG] QQQ ONLY | PM LEVELS + VWAP + OIL loaded", flush=True)
 
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
+        print("[AUTO SIGNAL] disabled", flush=True)
         return None
 
     if not session_allowed():
         print(f"[AUTO SIGNAL] skipped: session not allowed | session={session_name()}", flush=True)
         return None
 
-    if not force and not cooldown_ready():
+    if not cooldown_ready(force=force):
         print("[AUTO SIGNAL] cooldown active", flush=True)
         return None
 
@@ -396,13 +431,19 @@ def generate_signal(force=False):
 
     if not decision:
         print(
-            f"[AUTO SIGNAL] no trade | price={round(price,2)} vwap={round(vwap,2)} "
-            f"pm_high={pm_high} pm_low={pm_low} levels={levels.get('state')} oil={oil_bias}",
+            f"[AUTO SIGNAL] no trade | ticker=QQQ price={round(price, 2)} "
+            f"vwap={round(vwap, 2)} pm_high={pm_high} pm_low={pm_low} "
+            f"levels={levels.get('state')} oil={oil_bias}",
             flush=True,
         )
         return None
 
     signal = build_signal(price, vwap, decision, levels, oil_bias, pm_high, pm_low)
+
+    if not signal or signal.get("ticker") != "QQQ":
+        print("[GENERATOR BLOCK] Non-QQQ signal prevented", flush=True)
+        return None
+
     save_json(SIGNAL_FILE, signal)
 
     save_json(STATE_FILE, {
@@ -413,12 +454,14 @@ def generate_signal(force=False):
         "last_grade": signal["grade"],
         "last_score": signal["score"],
         "last_setup": signal["setup"],
+        "last_source": "auto_signal_generator",
     })
 
     print(
         f"[AUTO SIGNAL] Generated QQQ {signal['direction']} "
         f"setup={signal['setup']} grade={signal['grade']} "
-        f"score={signal['score']} entry={signal['entry']} vwap={signal['vwap']}",
+        f"score={signal['score']} entry={signal['entry']} "
+        f"vwap={signal['vwap']} pm_high={pm_high} pm_low={pm_low}",
         flush=True,
     )
 
