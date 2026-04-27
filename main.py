@@ -199,6 +199,24 @@ ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "t
 ALPACA_ENABLE_OPTIONS = os.getenv("ALPACA_ENABLE_OPTIONS", "true").lower() == "true"
 ALPACA_LIVE_OPTIONS_APPROVED = os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", "false").lower() == "true"
 USE_ALPACA_OPTIONS_BUYING_POWER = os.getenv("USE_ALPACA_OPTIONS_BUYING_POWER", "true").lower() == "true"
+
+# ALPACA OPTIONS PAPER ROUTING / INSTITUTIONAL SELECTOR
+ALPACA_OPTION_PAPER_TEST = os.getenv("ALPACA_OPTION_PAPER_TEST", "false").lower() == "true"
+ALPACA_OPTION_UNDERLYING = os.getenv("ALPACA_OPTION_UNDERLYING", "QQQ").upper().strip()
+ALPACA_OPTION_QTY = int(float(os.getenv("ALPACA_OPTION_QTY", "1")))
+ALPACA_OPTION_EXPIRY_MODE = os.getenv("ALPACA_OPTION_EXPIRY_MODE", "next_friday").lower().strip()
+ALPACA_OPTION_DTE_MIN = int(float(os.getenv("ALPACA_OPTION_DTE_MIN", "0")))
+ALPACA_OPTION_DTE_MAX = int(float(os.getenv("ALPACA_OPTION_DTE_MAX", "7")))
+ALPACA_OPTION_STRIKE_WINDOW = int(float(os.getenv("ALPACA_OPTION_STRIKE_WINDOW", "12")))
+ALPACA_OPTION_MAX_SPREAD_PCT = float(os.getenv("ALPACA_OPTION_MAX_SPREAD_PCT", "0.18"))
+ALPACA_OPTION_MAX_SPREAD_DOLLARS = float(os.getenv("ALPACA_OPTION_MAX_SPREAD_DOLLARS", "0.35"))
+ALPACA_OPTION_MIN_BID = float(os.getenv("ALPACA_OPTION_MIN_BID", "0.05"))
+ALPACA_OPTION_MIN_VOLUME = int(float(os.getenv("ALPACA_OPTION_MIN_VOLUME", "0")))
+ALPACA_OPTION_MIN_OPEN_INTEREST = int(float(os.getenv("ALPACA_OPTION_MIN_OPEN_INTEREST", "0")))
+ALPACA_OPTION_ALLOW_NO_QUOTE = os.getenv("ALPACA_OPTION_ALLOW_NO_QUOTE", "false").lower() == "true"
+ALPACA_OPTION_ALLOW_MARKET_ORDER = os.getenv("ALPACA_OPTION_ALLOW_MARKET_ORDER", "true").lower() == "true"
+ALPACA_OPTION_LIMIT_PRICE_OFFSET = float(os.getenv("ALPACA_OPTION_LIMIT_PRICE_OFFSET", "0.03"))
+ALPACA_OPTION_TIME_IN_FORCE = os.getenv("ALPACA_OPTION_TIME_IN_FORCE", "day").lower().strip()
 LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
 
 # SIGNAL / EXECUTION DEFAULTS
@@ -5061,6 +5079,266 @@ def alpaca_submit_equity_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         debug(f"❌ ALPACA ORDER EXCEPTION | {e}")
         return {"submitted": False, "reason": f"alpaca_order_exception:{e}", "payload": payload}
 
+
+# =========================================================
+# ALPACA OPTIONS SELECTOR + ORDER ROUTING
+# =========================================================
+def option_side_from_direction(direction: str) -> str:
+    d = normalize_direction(direction)
+    return "call" if d == "CALL" else "put"
+
+
+def next_friday_date(base_dt: Optional[datetime] = None) -> datetime:
+    base_dt = base_dt or datetime.utcnow()
+    days_ahead = 4 - base_dt.weekday()  # Monday=0, Friday=4
+    if days_ahead <= 0:
+        days_ahead += 7
+    return base_dt + timedelta(days=days_ahead)
+
+
+def alpaca_option_target_expiration() -> str:
+    """Return target expiration date YYYY-MM-DD. Defaults to next Friday."""
+    if ALPACA_OPTION_EXPIRY_MODE in {"today", "0dte", "same_day"}:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+    if ALPACA_OPTION_EXPIRY_MODE in {"tomorrow", "1dte"}:
+        return (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+    return next_friday_date().strftime("%Y-%m-%d")
+
+
+def alpaca_option_contracts_query(underlying: str, expiration_date: str, option_type: str) -> List[Dict[str, Any]]:
+    """Query Alpaca contract metadata. Parser is defensive because API shapes can differ."""
+    if not alpaca_ready():
+        return []
+    params = {
+        "underlying_symbols": underlying,
+        "expiration_date": expiration_date,
+        "status": "active",
+        "type": option_type,
+        "limit": 1000,
+    }
+    try:
+        r = alpaca_get("/v2/options/contracts", params=params)
+        if r.status_code not in (200, 201):
+            debug(f"❌ ALPACA OPTIONS CONTRACTS FAILED | status={r.status_code} body={r.text[:500]}")
+            return []
+        data = r.json()
+        contracts = data.get("option_contracts") or data.get("contracts") or data.get("data") or []
+        if isinstance(contracts, dict):
+            contracts = list(contracts.values())
+        return contracts if isinstance(contracts, list) else []
+    except Exception as e:
+        debug(f"❌ ALPACA OPTIONS CONTRACTS EXCEPTION | {e}")
+        return []
+
+
+def normalize_option_symbol(contract: Dict[str, Any]) -> str:
+    return str(
+        contract.get("symbol")
+        or contract.get("option_symbol")
+        or contract.get("occ_symbol")
+        or contract.get("name")
+        or ""
+    ).strip().upper()
+
+
+def normalize_option_strike(contract: Dict[str, Any]) -> float:
+    return safe_float(contract.get("strike_price") or contract.get("strike") or contract.get("strikePrice"), 0.0)
+
+
+def normalize_option_expiration(contract: Dict[str, Any]) -> str:
+    return str(contract.get("expiration_date") or contract.get("expiration") or contract.get("expiry") or "").strip()[:10]
+
+
+def alpaca_get_latest_option_quote(symbol: str) -> Dict[str, Any]:
+    """Fetch latest option quote from Alpaca data API for one contract symbol."""
+    if not alpaca_ready() or not symbol:
+        return {"ok": False, "reason": "alpaca_not_ready_or_missing_symbol"}
+    headers = alpaca_data_headers() if "alpaca_data_headers" in globals() else alpaca_headers()
+    base = normalize_alpaca_data_base_url(globals().get("ALPACA_DATA_BASE_URL", os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")))
+
+    # Try common Alpaca option quote shapes. Keep defensive parsing.
+    candidate_urls = [
+        (f"{base}/v1beta1/options/quotes/latest", {"symbols": symbol}),
+        (f"{base}/v1beta1/options/snapshots/{ALPACA_OPTION_UNDERLYING}", {"symbols": symbol}),
+    ]
+    last_error = "no_attempt"
+    for url, params in candidate_urls:
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=ALPACA_ORDER_TIMEOUT)
+            if r.status_code not in (200, 201):
+                last_error = f"status={r.status_code} body={r.text[:250]}"
+                continue
+            data = r.json()
+            raw = None
+            if isinstance(data, dict):
+                if "quotes" in data and isinstance(data["quotes"], dict):
+                    raw = data["quotes"].get(symbol) or data["quotes"].get(symbol.upper())
+                if raw is None and "snapshots" in data and isinstance(data["snapshots"], dict):
+                    snap = data["snapshots"].get(symbol) or data["snapshots"].get(symbol.upper())
+                    if isinstance(snap, dict):
+                        raw = snap.get("latestQuote") or snap.get("latest_quote") or snap.get("quote") or snap
+                if raw is None:
+                    raw = data.get(symbol) or data.get(symbol.upper()) or data.get("quote") or data.get("latestQuote") or data.get("latest_quote")
+            if not isinstance(raw, dict):
+                last_error = "quote_shape_unrecognized"
+                continue
+            bid = safe_float(raw.get("bp") or raw.get("bid_price") or raw.get("bidPrice") or raw.get("bid"), 0.0)
+            ask = safe_float(raw.get("ap") or raw.get("ask_price") or raw.get("askPrice") or raw.get("ask"), 0.0)
+            bid_size = safe_float(raw.get("bs") or raw.get("bid_size") or raw.get("bidSize"), 0.0)
+            ask_size = safe_float(raw.get("as") or raw.get("ask_size") or raw.get("askSize"), 0.0)
+            mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else 0.0
+            return {"ok": True, "symbol": symbol, "bid": bid, "ask": ask, "mid": mid, "bid_size": bid_size, "ask_size": ask_size, "raw": raw}
+        except Exception as e:
+            last_error = str(e)
+    return {"ok": False, "reason": last_error, "symbol": symbol}
+
+
+def option_contract_passes_liquidity(contract: Dict[str, Any], quote: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    symbol = normalize_option_symbol(contract)
+    volume = safe_int(contract.get("volume") or contract.get("day_volume") or contract.get("trade_volume"), 0)
+    oi = safe_int(contract.get("open_interest") or contract.get("openInterest"), 0)
+
+    details = {"symbol": symbol, "volume": volume, "open_interest": oi}
+
+    if volume < ALPACA_OPTION_MIN_VOLUME:
+        return False, f"volume_below_min:{volume}<{ALPACA_OPTION_MIN_VOLUME}", details
+    if oi < ALPACA_OPTION_MIN_OPEN_INTEREST:
+        return False, f"open_interest_below_min:{oi}<{ALPACA_OPTION_MIN_OPEN_INTEREST}", details
+
+    if not quote.get("ok"):
+        if ALPACA_OPTION_ALLOW_NO_QUOTE:
+            details.update({"quote_ok": False, "quote_reason": quote.get("reason")})
+            return True, "quote_unavailable_allowed", details
+        return False, f"quote_unavailable:{quote.get('reason')}", details
+
+    bid = safe_float(quote.get("bid"), 0.0)
+    ask = safe_float(quote.get("ask"), 0.0)
+    mid = safe_float(quote.get("mid"), 0.0)
+    spread = round(max(ask - bid, 0.0), 4)
+    spread_pct = round(spread / mid, 4) if mid > 0 else 999.0
+    details.update({"quote_ok": True, "bid": bid, "ask": ask, "mid": mid, "spread": spread, "spread_pct": spread_pct})
+
+    if bid < ALPACA_OPTION_MIN_BID:
+        return False, f"bid_below_min:{bid}<{ALPACA_OPTION_MIN_BID}", details
+    if spread > ALPACA_OPTION_MAX_SPREAD_DOLLARS:
+        return False, f"spread_dollars_too_wide:{spread}>{ALPACA_OPTION_MAX_SPREAD_DOLLARS}", details
+    if spread_pct > ALPACA_OPTION_MAX_SPREAD_PCT:
+        return False, f"spread_pct_too_wide:{spread_pct}>{ALPACA_OPTION_MAX_SPREAD_PCT}", details
+    return True, "liquidity_ok", details
+
+
+def select_institutional_qqq_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
+    underlying = ALPACA_OPTION_UNDERLYING or "QQQ"
+    if underlying != "QQQ":
+        return {"selected": False, "reason": f"blocked_non_qqq_underlying:{underlying}"}
+
+    direction = normalize_direction(signal.get("direction", "CALL"))
+    option_type = option_side_from_direction(direction)
+    price = safe_float(signal.get("entry") or signal.get("entry_price") or signal.get("price"), 0.0)
+    if price <= 0:
+        prices_store = load_market_prices(["QQQ"])
+        price, _ = get_market_price_for_symbol("QQQ", prices_store)
+    if price <= 0:
+        return {"selected": False, "reason": "missing_underlying_price"}
+
+    expiration = alpaca_option_target_expiration()
+    contracts = alpaca_option_contracts_query(underlying, expiration, option_type)
+    if not contracts:
+        return {"selected": False, "reason": f"no_contracts_found:{underlying}:{expiration}:{option_type}"}
+
+    # ATM first: sort by strike distance to underlying price, then inspect a small strike window.
+    contracts = [c for c in contracts if normalize_option_symbol(c) and normalize_option_strike(c) > 0]
+    contracts.sort(key=lambda c: abs(normalize_option_strike(c) - price))
+    candidates = contracts[:max(1, ALPACA_OPTION_STRIKE_WINDOW)]
+
+    rejected = []
+    best = None
+    best_details = None
+    for contract in candidates:
+        symbol = normalize_option_symbol(contract)
+        quote = alpaca_get_latest_option_quote(symbol)
+        ok, reason, details = option_contract_passes_liquidity(contract, quote)
+        details.update({
+            "reason": reason,
+            "strike": normalize_option_strike(contract),
+            "expiration": normalize_option_expiration(contract) or expiration,
+            "option_type": option_type,
+            "underlying_price": price,
+        })
+        if ok:
+            # Best = tightest spread if quotes exist; otherwise closest ATM.
+            if best is None:
+                best, best_details = contract, details
+            else:
+                old_spread_pct = safe_float(best_details.get("spread_pct"), 999.0)
+                new_spread_pct = safe_float(details.get("spread_pct"), 999.0)
+                old_dist = abs(safe_float(best_details.get("strike"), 0) - price)
+                new_dist = abs(safe_float(details.get("strike"), 0) - price)
+                if (new_spread_pct, new_dist) < (old_spread_pct, old_dist):
+                    best, best_details = contract, details
+        else:
+            rejected.append(details)
+
+    if best is None:
+        return {"selected": False, "reason": "no_contract_passed_liquidity", "rejected": rejected[:8], "expiration": expiration, "option_type": option_type}
+
+    symbol = normalize_option_symbol(best)
+    return {"selected": True, "symbol": symbol, "contract": best, "details": best_details, "rejected": rejected[:5]}
+
+
+def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Submit a real Alpaca PAPER option order with institutional contract selection."""
+    if not ENABLE_ALPACA or not USE_ALPACA_PAPER or PAPER_BROKER_MODE != "alpaca":
+        return {"submitted": False, "reason": "alpaca_options_paper_routing_disabled"}
+    if not ALPACA_ENABLE_OPTIONS:
+        return {"submitted": False, "reason": "ALPACA_ENABLE_OPTIONS_false"}
+    if not alpaca_ready():
+        return {"submitted": False, "reason": "alpaca_not_ready_missing_keys_or_base_url"}
+
+    selector = select_institutional_qqq_option_contract(signal)
+    if not selector.get("selected"):
+        debug(f"❌ ALPACA OPTION SELECTOR BLOCK | {selector.get('reason')} | rejected={selector.get('rejected')}")
+        return {"submitted": False, "reason": f"option_selector_block:{selector.get('reason')}", "selector": selector}
+
+    symbol = selector["symbol"]
+    qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_OPTION_QTY)), ALPACA_OPTION_QTY)
+    if qty <= 0:
+        qty = max(1, ALPACA_OPTION_QTY)
+
+    # Prefer market for first paper test if enabled. If disabled, use limit at ask + small offset.
+    order_type = "market" if ALPACA_OPTION_ALLOW_MARKET_ORDER else "limit"
+    payload = {
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": "buy",
+        "type": order_type,
+        "time_in_force": ALPACA_OPTION_TIME_IN_FORCE,
+        "client_order_id": f"ubt-opt-{symbol}-{int(time.time())}"[:48],
+    }
+    details = selector.get("details", {}) or {}
+    ask = safe_float(details.get("ask"), 0.0)
+    if order_type == "limit":
+        if ask <= 0:
+            return {"submitted": False, "reason": "limit_order_missing_ask", "selector": selector}
+        payload["limit_price"] = str(round(ask + ALPACA_OPTION_LIMIT_PRICE_OFFSET, 2))
+
+    try:
+        debug(f"ALPACA PAPER OPTIONS ROUTE | contract={symbol} qty={qty} details={details}")
+        r = alpaca_post("/v2/orders", payload)
+        if r.status_code in (200, 201):
+            data = r.json()
+            debug(f"✅ ALPACA OPTION ORDER SUBMITTED | {symbol} BUY qty={qty} id={data.get('id')} client={payload['client_order_id']}")
+            try:
+                send_to_discord(DISCORD_AI_WEBHOOK, f"✅ ALPACA PAPER OPTION ORDER SUBMITTED\nContract: {symbol}\nUnderlying: QQQ\nDirection: {signal.get('direction')}\nQty: {qty}\nOrder ID: {data.get('id')}\nSetup: {signal.get('setup')}\nScore: {signal.get('execution_score', signal.get('score'))}\nSelector: {details}", "AI_EXECUTION")
+                send_to_telegram(f"✅ ALPACA PAPER OPTION ORDER SUBMITTED\n{symbol} BUY qty={qty}\nOrder ID: {data.get('id')}")
+            except Exception:
+                pass
+            return {"submitted": True, "reason": "alpaca_option_order_submitted", "order": data, "payload": payload, "selector": selector}
+        debug(f"❌ ALPACA OPTION ORDER FAILED | status={r.status_code} body={r.text} payload={payload} selector={selector}")
+        return {"submitted": False, "reason": f"alpaca_option_order_failed_{r.status_code}", "body": r.text, "payload": payload, "selector": selector}
+    except Exception as e:
+        debug(f"❌ ALPACA OPTION ORDER EXCEPTION | {e}")
+        return {"submitted": False, "reason": f"alpaca_option_order_exception:{e}", "payload": payload, "selector": selector}
 
 def alpaca_delete(path: str):
     return requests.delete(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
@@ -13783,6 +14061,30 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     gate = paper_bridge_should_execute(signal)
     if not gate.get("approved"):
         return {"executed": False, "reason": gate.get("reason"), "hash": gate.get("hash")}
+
+    # ALPACA PAPER OPTIONS ROUTE
+    # Sends a real QQQ option paper order to Alpaca using institutional selector:
+    # ATM contract -> liquidity/spread/OI/volume checks -> submit order.
+    if ALPACA_OPTION_PAPER_TEST and PAPER_BROKER_MODE == "alpaca" and USE_ALPACA_PAPER:
+        signal = enrich_signal_with_execution_risk_fields(signal)
+        start_qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_OPTION_QTY)), ALPACA_OPTION_QTY)
+        exec_qty, exec_reason = safe_apply_execution_score_sizing(signal, start_qty)
+        if exec_qty <= 0 and os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true":
+            exec_qty = 1
+            exec_reason = f"alpaca_option_force_min_qty_after_score:{signal.get('execution_score')}"
+        signal["qty"] = max(1, safe_int(exec_qty, 1))
+        debug(f"ALPACA PAPER OPTIONS ROUTE | ticker={signal.get('ticker')} direction={signal.get('direction')} qty={signal.get('qty')} score={signal.get('execution_score')} reason={exec_reason}")
+        alpaca_result = alpaca_submit_option_paper_order(signal)
+        if alpaca_result.get("submitted"):
+            paper_bridge_mark_executed(gate.get("hash", ""))
+            if PAPER_BRIDGE_CLEAR_SIGNAL_AFTER_EXECUTION:
+                try:
+                    atomic_write_json(SIGNAL_FILE, {})
+                    debug(f"🧹 ALPACA OPTION ROUTE CLEARED SIGNAL FILE | {SIGNAL_FILE}")
+                except Exception as e:
+                    debug(f"alpaca_option_route_clear_signal_error:{e}")
+            return {"executed": True, "reason": "alpaca_paper_option_order_submitted", "alpaca": alpaca_result}
+        return {"executed": False, "reason": alpaca_result.get("reason", "alpaca_option_submit_failed"), "alpaca": alpaca_result}
 
     # ALPACA PAPER EQUITY TEST ROUTE
     # Sends a real QQQ equity paper order to Alpaca so it appears in the Alpaca dashboard.
