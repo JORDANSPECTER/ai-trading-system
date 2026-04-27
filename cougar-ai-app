@@ -1,0 +1,15 @@
+# COUGAR AI App
+
+COUGAR is an AI trading analyzer app built for beginner-to-expert traders.
+
+Tagline: Wait. Stalk. Strike. Reset.
+
+## App Structure
+
+- engine/ = AI analyzer logic
+- backend/ = API that connects analyzer to app
+- frontend/ = user dashboard/app
+
+## First Goal
+
+Analyzer → cougar_signal.json → Backend API → Frontend Dashboard
