@@ -208,12 +208,12 @@ ALPACA_OPTION_EXPIRY_MODE = os.getenv("ALPACA_OPTION_EXPIRY_MODE", "next_friday"
 ALPACA_OPTION_DTE_MIN = int(float(os.getenv("ALPACA_OPTION_DTE_MIN", "0")))
 ALPACA_OPTION_DTE_MAX = int(float(os.getenv("ALPACA_OPTION_DTE_MAX", "7")))
 ALPACA_OPTION_STRIKE_WINDOW = int(float(os.getenv("ALPACA_OPTION_STRIKE_WINDOW", "12")))
-ALPACA_OPTION_MIN_STRIKE = float(os.getenv("ALPACA_OPTION_MIN_STRIKE", "0"))
-ALPACA_OPTION_MAX_STRIKE = float(os.getenv("ALPACA_OPTION_MAX_STRIKE", "999999"))
-ALPACA_OPTION_MAX_CONTRACT_MID = float(os.getenv("ALPACA_OPTION_MAX_CONTRACT_MID", "999999"))
-ALPACA_OPTION_MAX_NOTIONAL = float(os.getenv("ALPACA_OPTION_MAX_NOTIONAL", "999999"))
+ALPACA_OPTION_MIN_STRIKE = float(os.getenv("ALPACA_OPTION_MIN_STRIKE", "650"))  # HARD DEFAULT: block deep ITM garbage
+ALPACA_OPTION_MAX_STRIKE = float(os.getenv("ALPACA_OPTION_MAX_STRIKE", "680"))  # HARD DEFAULT: near QQQ ATM only
+ALPACA_OPTION_MAX_CONTRACT_MID = float(os.getenv("ALPACA_OPTION_MAX_CONTRACT_MID", "8"))  # HARD DEFAULT: affordable contracts only
+ALPACA_OPTION_MAX_NOTIONAL = float(os.getenv("ALPACA_OPTION_MAX_NOTIONAL", "800"))  # HARD DEFAULT: max $800/contract
 ALPACA_OPTION_DELTA_MODE = os.getenv("ALPACA_OPTION_DELTA_MODE", "ATM").upper().strip()
-ALPACA_OPTION_MAX_ITM_DISTANCE = float(os.getenv("ALPACA_OPTION_MAX_ITM_DISTANCE", "999999"))
+ALPACA_OPTION_MAX_ITM_DISTANCE = float(os.getenv("ALPACA_OPTION_MAX_ITM_DISTANCE", "10"))  # HARD DEFAULT: within $10 of QQQ spot
 ALPACA_OPTION_MAX_SPREAD_PCT = float(os.getenv("ALPACA_OPTION_MAX_SPREAD_PCT", "0.18"))
 ALPACA_OPTION_MAX_SPREAD_DOLLARS = float(os.getenv("ALPACA_OPTION_MAX_SPREAD_DOLLARS", "0.35"))
 ALPACA_OPTION_MIN_BID = float(os.getenv("ALPACA_OPTION_MIN_BID", "0.05"))
@@ -5233,22 +5233,60 @@ def option_contract_passes_liquidity(contract: Dict[str, Any], quote: Dict[str, 
     return True, "liquidity_ok", details
 
 
+def get_valid_qqq_underlying_price_from_market_file() -> float:
+    """Hard source of truth for QQQ spot. Never use Alpaca option contract underlying_price.
+    This prevents bad strikes like 305/350 caused by bogus underlying_price=1.35.
+    """
+    try:
+        prices_store = load_json(MARKET_DATA_FILE if "MARKET_DATA_FILE" in globals() else "market_prices.json", {})
+        q = prices_store.get("QQQ", {}) if isinstance(prices_store, dict) else {}
+        px = safe_float(q.get("price") or q.get("last") or q.get("close"), 0.0)
+        if px and px > 100:
+            return float(px)
+    except Exception as e:
+        debug(f"❌ QQQ PRICE FILE READ ERROR | {e}")
+
+    try:
+        prices_store = load_market_prices(["QQQ"])
+        q = prices_store.get("QQQ", {}) if isinstance(prices_store, dict) else {}
+        px = safe_float(q.get("price") or q.get("last") or q.get("close"), 0.0)
+        if px and px > 100:
+            return float(px)
+    except Exception as e:
+        debug(f"❌ QQQ PRICE STORE READ ERROR | {e}")
+
+    return 0.0
+
+
+def hard_reject_bad_option_strike(strike: float, underlying_price: float) -> Tuple[bool, str]:
+    """Final hard lock so bad strikes can never pass."""
+    if underlying_price <= 100:
+        return True, f"invalid_underlying_price:{underlying_price}"
+    if strike < 600:
+        return True, f"hard_bad_strike_under_600:{strike}"
+    if strike < ALPACA_OPTION_MIN_STRIKE or strike > ALPACA_OPTION_MAX_STRIKE:
+        return True, f"strike_out_of_env_range:{strike}:{ALPACA_OPTION_MIN_STRIKE}-{ALPACA_OPTION_MAX_STRIKE}"
+    if abs(strike - underlying_price) > ALPACA_OPTION_MAX_ITM_DISTANCE:
+        return True, f"too_far_from_true_atm:{abs(strike-underlying_price):.2f}>{ALPACA_OPTION_MAX_ITM_DISTANCE}"
+    return False, "ok"
+
+
 def select_institutional_qqq_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
-    """FIXED ATM selector: use real QQQ price, block deep ITM, block unaffordable contracts."""
-    underlying = ALPACA_OPTION_UNDERLYING or "QQQ"
+    """HARDLOCKED ATM selector: always use real QQQ price from market_prices.json.
+    Blocks bogus deep ITM contracts forever, even if Alpaca returns underlying_price=1.35.
+    """
+    underlying = (ALPACA_OPTION_UNDERLYING or "QQQ").upper().strip()
     if underlying != "QQQ":
         return {"selected": False, "reason": f"blocked_non_qqq_underlying:{underlying}"}
 
     direction = normalize_direction(signal.get("direction", "CALL"))
     option_type = option_side_from_direction(direction)
 
-    prices_store = load_market_prices(["QQQ"])
-    price, _ = get_market_price_for_symbol("QQQ", prices_store)
-    if price <= 100:
-        q = prices_store.get("QQQ", {}) if isinstance(prices_store, dict) else {}
-        price = safe_float(q.get("price") or q.get("last") or q.get("close"), 0.0)
+    price = get_valid_qqq_underlying_price_from_market_file()
     if price <= 100:
         return {"selected": False, "reason": f"missing_or_invalid_real_qqq_underlying_price:{price}"}
+
+    debug(f"✅ USING TRUE QQQ UNDERLYING PRICE FOR OPTIONS | price={price}")
 
     expiration = alpaca_option_target_expiration()
     contracts = alpaca_option_contracts_query(underlying, expiration, option_type)
@@ -5264,38 +5302,71 @@ def select_institutional_qqq_option_contract(signal: Dict[str, Any]) -> Dict[str
         strike = normalize_option_strike(c)
         if not symbol or strike <= 0:
             continue
-        if strike < ALPACA_OPTION_MIN_STRIKE or strike > ALPACA_OPTION_MAX_STRIKE:
-            rejected.append({"symbol": symbol, "strike": strike, "reason": f"strike_out_of_allowed_range:{strike}"})
+
+        blocked, reason = hard_reject_bad_option_strike(strike, price)
+        if blocked:
+            rejected.append({"symbol": symbol, "strike": strike, "reason": reason, "true_underlying_price": price})
             continue
-        if ALPACA_OPTION_DELTA_MODE == "ATM" and abs(strike - price) > ALPACA_OPTION_MAX_ITM_DISTANCE:
-            rejected.append({"symbol": symbol, "strike": strike, "reason": f"too_far_from_atm:{abs(strike-price):.2f}>{ALPACA_OPTION_MAX_ITM_DISTANCE}"})
-            continue
+
         clean_contracts.append(c)
 
     if not clean_contracts:
-        return {"selected": False, "reason": "no_contracts_inside_atm_strike_window", "underlying_price": price, "allowed_min_strike": ALPACA_OPTION_MIN_STRIKE, "allowed_max_strike": ALPACA_OPTION_MAX_STRIKE, "rejected": rejected[:12]}
+        return {
+            "selected": False,
+            "reason": "no_contracts_inside_hardlocked_atm_window",
+            "underlying_price": price,
+            "allowed_min_strike": ALPACA_OPTION_MIN_STRIKE,
+            "allowed_max_strike": ALPACA_OPTION_MAX_STRIKE,
+            "max_distance": ALPACA_OPTION_MAX_ITM_DISTANCE,
+            "rejected": rejected[:20],
+        }
 
     clean_contracts.sort(key=lambda c: abs(normalize_option_strike(c) - price))
     candidates = clean_contracts[:max(1, ALPACA_OPTION_STRIKE_WINDOW)]
 
     best = None
     best_details = None
+
     for contract in candidates:
         symbol = normalize_option_symbol(contract)
         strike = normalize_option_strike(contract)
+
+        # Final safety gate before even getting quote.
+        blocked, reason = hard_reject_bad_option_strike(strike, price)
+        if blocked:
+            rejected.append({"symbol": symbol, "strike": strike, "reason": reason, "true_underlying_price": price})
+            continue
+
         quote = alpaca_get_latest_option_quote(symbol)
         ok, reason, details = option_contract_passes_liquidity(contract, quote)
+
         mid = safe_float(details.get("mid"), 0.0)
         ask = safe_float(details.get("ask"), 0.0)
         contract_mid = mid if mid > 0 else ask
         notional = contract_mid * 100.0
+
+        if contract_mid <= 0:
+            ok = False
+            reason = "contract_mid_missing_or_zero"
         if contract_mid > ALPACA_OPTION_MAX_CONTRACT_MID:
             ok = False
             reason = f"contract_mid_too_high:{contract_mid}>{ALPACA_OPTION_MAX_CONTRACT_MID}"
         if notional > ALPACA_OPTION_MAX_NOTIONAL:
             ok = False
             reason = f"contract_notional_too_high:{notional}>{ALPACA_OPTION_MAX_NOTIONAL}"
-        details.update({"reason": reason, "strike": strike, "expiration": normalize_option_expiration(contract) or expiration, "option_type": option_type, "underlying_price": price, "atm_reference": atm, "contract_mid": contract_mid, "contract_notional": notional})
+
+        details.update({
+            "reason": reason,
+            "strike": strike,
+            "expiration": normalize_option_expiration(contract) or expiration,
+            "option_type": option_type,
+            "underlying_price": price,
+            "true_underlying_price": price,
+            "atm_reference": atm,
+            "contract_mid": contract_mid,
+            "contract_notional": notional,
+        })
+
         if ok:
             if best is None:
                 best, best_details = contract, details
@@ -5312,10 +5383,29 @@ def select_institutional_qqq_option_contract(signal: Dict[str, Any]) -> Dict[str
             rejected.append(details)
 
     if best is None:
-        return {"selected": False, "reason": "no_contract_passed_atm_affordability_liquidity", "underlying_price": price, "expiration": expiration, "option_type": option_type, "rejected": rejected[:12]}
+        return {
+            "selected": False,
+            "reason": "no_contract_passed_hardlocked_atm_affordability_liquidity",
+            "underlying_price": price,
+            "expiration": expiration,
+            "option_type": option_type,
+            "rejected": rejected[:20],
+        }
 
     symbol = normalize_option_symbol(best)
-    debug(f"ALPACA OPTION SELECTED ATM | symbol={symbol} strike={best_details.get('strike')} mid={best_details.get('contract_mid')} notional={best_details.get('contract_notional')} underlying={price}")
+    selected_strike = safe_float(best_details.get("strike"), 0.0)
+
+    # Absolute final safety lock before returning selected contract.
+    blocked, reason = hard_reject_bad_option_strike(selected_strike, price)
+    if blocked:
+        return {"selected": False, "reason": f"final_safety_bad_strike_block:{reason}", "symbol": symbol, "strike": selected_strike, "underlying_price": price}
+
+    debug(
+        f"✅ ALPACA OPTION SELECTED ATM HARDLOCK | symbol={symbol} "
+        f"strike={selected_strike} mid={best_details.get('contract_mid')} "
+        f"notional={best_details.get('contract_notional')} true_underlying={price}"
+    )
+
     return {"selected": True, "symbol": symbol, "contract": best, "details": best_details, "rejected": rejected[:5]}
 
 def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
