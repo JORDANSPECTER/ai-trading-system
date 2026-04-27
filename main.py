@@ -11730,6 +11730,28 @@ def premium_daily_get_signal_text(signal: Dict[str, Any], *keys, default: str = 
     return default
 
 
+
+
+# Compatibility wrapper — fixes: name 'load_json' is not defined
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        return load_json_file(path, default)
+    except NameError:
+        try:
+            if not os.path.exists(path):
+                return default
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                if not raw:
+                    return default
+                return json.loads(raw)
+        except Exception:
+            return default
+    except Exception:
+        return default
+
 def premium_daily_get_grade(signal: Dict[str, Any]) -> str:
     return str(signal.get("grade") or signal.get("confidence") or "B").upper().strip()
 
