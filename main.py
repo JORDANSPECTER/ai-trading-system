@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
+print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
@@ -392,6 +393,27 @@ STEP15_SEND_ALERTS = os.getenv("STEP15_SEND_ALERTS", "true").lower() == "true"
 STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "60"))
 
 
+
+
+# =========================================================
+# UNIFIED TRADE DECISION ENGINE
+# Single institutional policy score before execution.
+# =========================================================
+ENABLE_UNIFIED_DECISION_ENGINE = os.getenv("ENABLE_UNIFIED_DECISION_ENGINE", "true").lower() == "true"
+UNIFIED_DECISION_MIN_SCORE = int(float(os.getenv("UNIFIED_DECISION_MIN_SCORE", "65")))
+UNIFIED_DECISION_MIN_LIQUIDITY_SCORE = int(float(os.getenv("UNIFIED_DECISION_MIN_LIQUIDITY_SCORE", "45")))
+UNIFIED_DECISION_MIN_RISK_SCORE = int(float(os.getenv("UNIFIED_DECISION_MIN_RISK_SCORE", "45")))
+UNIFIED_DECISION_BLOCK_IF_EXISTING_QQQ_EXPOSURE = os.getenv("UNIFIED_DECISION_BLOCK_IF_EXISTING_QQQ_EXPOSURE", "true").lower() == "true"
+UNIFIED_DECISION_SEND_ALERTS = os.getenv("UNIFIED_DECISION_SEND_ALERTS", "true").lower() == "true"
+UNIFIED_DECISION_LOG_FILE = os.getenv("UNIFIED_DECISION_LOG_FILE", "decision_log.jsonl").strip()
+UNIFIED_DECISION_SIZE_MIN = float(os.getenv("UNIFIED_DECISION_SIZE_MIN", "0.25"))
+UNIFIED_DECISION_SIZE_MAX = float(os.getenv("UNIFIED_DECISION_SIZE_MAX", "1.00"))
+UNIFIED_DECISION_STRONG_SCORE = int(float(os.getenv("UNIFIED_DECISION_STRONG_SCORE", "80")))
+UNIFIED_DECISION_WEAK_SCORE = int(float(os.getenv("UNIFIED_DECISION_WEAK_SCORE", "65")))
+UNIFIED_DECISION_MAX_SPREAD_PCT = float(os.getenv("UNIFIED_DECISION_MAX_SPREAD_PCT", os.getenv("ALPACA_OPTION_MAX_SPREAD_PCT", "0.18")))
+UNIFIED_DECISION_MAX_CONTRACT_MID = float(os.getenv("UNIFIED_DECISION_MAX_CONTRACT_MID", os.getenv("ALPACA_OPTION_MAX_CONTRACT_MID", "8")))
+UNIFIED_DECISION_MAX_NOTIONAL = float(os.getenv("UNIFIED_DECISION_MAX_NOTIONAL", os.getenv("ALPACA_OPTION_MAX_NOTIONAL", "800")))
+UNIFIED_DECISION_REQUIRE_QQQ_ONLY = os.getenv("UNIFIED_DECISION_REQUIRE_QQQ_ONLY", "true").lower() == "true"
 
 # =========================================================
 # INTELLIGENCE PHASE 3: ADAPTIVE INTELLIGENCE
@@ -5646,6 +5668,20 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     symbol = selector["symbol"]
     details = selector.get("details", {}) or {}
+
+    
+    # Unified institutional decision layer before Alpaca option order submission
+    if ENABLE_UNIFIED_DECISION_ENGINE:
+        try:
+            selected_for_decision = selected if isinstance(selected, dict) else {}
+        except Exception:
+            selected_for_decision = {}
+        unified_decision = evaluate_trade_opportunity(signal, selected_for_decision)
+        signal["unified_decision"] = unified_decision
+        if not unified_decision.get("approved"):
+            debug(f"🧠 UNIFIED DECISION BLOCKED ORDER | score={unified_decision.get('score')} reasons={unified_decision.get('block_reasons')}")
+            return {"executed": False, "reason": "unified_decision_block", "decision": unified_decision}
+        signal = unified_decision_apply_size(signal, unified_decision)
 
     gate_ok, gate_reason, is_scale = one_trade_entry_gate(signal)
     if not gate_ok:
@@ -14429,7 +14465,346 @@ def paper_bridge_alert(order: Dict[str, Any], position: Dict[str, Any]) -> None:
         debug(f"paper_bridge_alert_error:{e}")
 
 
+
+
+# =========================================================
+# UNIFIED TRADE DECISION ENGINE
+# =========================================================
+
+def unified_decision_append_log(payload: Dict[str, Any]) -> None:
+    try:
+        with open(UNIFIED_DECISION_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception as e:
+        try:
+            debug(f"UNIFIED DECISION LOG ERROR | {e}")
+        except Exception:
+            print(f"UNIFIED DECISION LOG ERROR | {e}", flush=True)
+
+
+def unified_decision_get_ticker(signal: Dict[str, Any]) -> str:
+    return str(signal.get("ticker") or signal.get("symbol") or signal.get("underlying") or signal.get("root_symbol") or "").upper().strip()
+
+
+def unified_decision_get_direction(signal: Dict[str, Any]) -> str:
+    d = str(signal.get("direction") or signal.get("side") or signal.get("bias") or "CALL").upper().strip()
+    return "PUT" if d in {"PUT", "BEARISH", "SHORT"} else "CALL"
+
+
+def unified_decision_safe_score(value: Any, default: float = 50.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return max(0.0, min(100.0, float(value)))
+    except Exception:
+        return default
+
+
+def unified_decision_clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    try:
+        return max(lo, min(hi, float(v)))
+    except Exception:
+        return lo
+
+
+def unified_decision_existing_qqq_exposure() -> Tuple[bool, List[str]]:
+    symbols = []
+    try:
+        if "get_alpaca_positions_safe" in globals():
+            positions = get_alpaca_positions_safe()
+        elif "get_alpaca_positions" in globals():
+            positions = get_alpaca_positions()
+        elif "alpaca_get_positions" in globals():
+            positions = alpaca_get_positions()
+        else:
+            positions = []
+
+        for p in positions or []:
+            sym = str(p.get("symbol", "")).upper()
+            qty = safe_float(p.get("qty", 0), 0) if "safe_float" in globals() else float(p.get("qty", 0) or 0)
+            if abs(qty) > 0 and (sym == "QQQ" or sym.startswith("QQQ")):
+                symbols.append(sym)
+    except Exception:
+        pass
+
+    try:
+        local = load_json_file(POSITIONS_FILE, {}) if "load_json_file" in globals() else load_json(POSITIONS_FILE, {})
+        if isinstance(local, dict):
+            for _, p in local.items():
+                if isinstance(p, dict):
+                    sym = str(p.get("symbol") or p.get("ticker") or p.get("contract_symbol") or "").upper()
+                    status = str(p.get("status", "open")).lower()
+                    if status not in {"closed", "done", "flat"} and (sym == "QQQ" or sym.startswith("QQQ")):
+                        symbols.append(sym)
+    except Exception:
+        pass
+
+    return len(symbols) > 0, sorted(set(symbols))
+
+
+def unified_decision_grade_score(signal: Dict[str, Any]) -> float:
+    grade = str(signal.get("grade") or signal.get("confidence") or "").upper().strip()
+    mapping = {"A+": 95, "A": 88, "B+": 76, "B": 68, "C": 52, "D": 35, "AVOID": 0, "NO TRADE": 0}
+    raw = signal.get("execution_score") or signal.get("score") or signal.get("strategy_score")
+    base = unified_decision_safe_score(raw, mapping.get(grade, 60))
+    if grade in mapping:
+        base = max(base, mapping[grade])
+    return unified_decision_clamp(base)
+
+
+def unified_decision_regime_score(signal: Dict[str, Any]) -> Tuple[float, List[str]]:
+    reasons = []
+    regime = str(signal.get("regime") or signal.get("market_regime") or signal.get("market_type") or "").upper()
+    session = str(signal.get("session") or signal.get("time_window") or "").lower()
+    score = 70.0
+
+    if any(x in regime for x in ["TREND", "EXPANSION", "MOMENTUM"]):
+        score += 18
+        reasons.append("regime supports trend/expansion")
+    elif any(x in regime for x in ["CHOP", "RANGE", "SIDEWAYS"]):
+        score -= 25
+        reasons.append("regime is choppy/range")
+    else:
+        reasons.append("regime unknown/neutral")
+
+    if "open" in session or "power" in session:
+        score += 8
+        reasons.append("session has priority liquidity")
+    elif "after" in session or "off" in session:
+        score -= 12
+        reasons.append("session is after-hours / plan-only")
+
+    return unified_decision_clamp(score), reasons
+
+
+def unified_decision_liquidity_score(signal: Dict[str, Any], selected_contract: Optional[Dict[str, Any]] = None) -> Tuple[float, List[str]]:
+    reasons = []
+    score = 70.0
+    c = selected_contract or {}
+
+    mid = c.get("mid") or c.get("contract_mid") or signal.get("contract_price") or signal.get("price")
+    spread_pct = c.get("spread_pct") or signal.get("spread_pct")
+    spread = c.get("spread") or signal.get("spread")
+    notional = c.get("notional") or c.get("contract_notional")
+
+    mid = safe_float(mid, 0) if "safe_float" in globals() else float(mid or 0)
+    spread_pct = safe_float(spread_pct, 0) if "safe_float" in globals() else float(spread_pct or 0)
+    spread = safe_float(spread, 0) if "safe_float" in globals() else float(spread or 0)
+    notional = safe_float(notional, mid * 100 if mid else 0) if "safe_float" in globals() else float(notional or (mid * 100 if mid else 0))
+
+    if mid <= 0:
+        score -= 25
+        reasons.append("missing/zero option midpoint")
+    elif mid > UNIFIED_DECISION_MAX_CONTRACT_MID:
+        score -= 22
+        reasons.append(f"contract mid too expensive: {mid}")
+    else:
+        score += 8
+        reasons.append(f"contract mid acceptable: {round(mid, 2)}")
+
+    if notional > UNIFIED_DECISION_MAX_NOTIONAL:
+        score -= 20
+        reasons.append(f"contract notional too high: {round(notional, 2)}")
+
+    if spread_pct and spread_pct > UNIFIED_DECISION_MAX_SPREAD_PCT:
+        score -= 22
+        reasons.append(f"spread pct too wide: {round(spread_pct, 4)}")
+    elif spread_pct:
+        score += 8
+        reasons.append(f"spread pct acceptable: {round(spread_pct, 4)}")
+    elif spread and mid and (spread / mid) > UNIFIED_DECISION_MAX_SPREAD_PCT:
+        score -= 22
+        reasons.append(f"spread dollars too wide: {round(spread, 2)}")
+    else:
+        reasons.append("spread neutral/missing")
+
+    return unified_decision_clamp(score), reasons
+
+
+def unified_decision_learning_score(signal: Dict[str, Any]) -> Tuple[float, List[str], float]:
+    reasons = []
+    score = 60.0
+    size_mult = 1.0
+    try:
+        if "adaptive_learning_size_multiplier" in globals():
+            mult, reason, stats = adaptive_learning_size_multiplier(signal)
+            size_mult = float(mult or 1.0)
+            win_rate = float(stats.get("win_rate", 0) or 0) if isinstance(stats, dict) else 0
+            trades = int(float(stats.get("trades", 0) or 0)) if isinstance(stats, dict) else 0
+
+            if trades <= 0:
+                reasons.append("learning observe-only / no history")
+            elif win_rate >= 0.70:
+                score += 20
+                reasons.append(f"positive expectancy history win_rate={round(win_rate*100,1)}%")
+            elif win_rate <= 0.45:
+                score -= 20
+                reasons.append(f"weak history win_rate={round(win_rate*100,1)}%")
+            else:
+                reasons.append(f"neutral history win_rate={round(win_rate*100,1)}%")
+            return unified_decision_clamp(score), reasons, size_mult
+    except Exception as e:
+        reasons.append(f"learning unavailable: {e}")
+
+    return unified_decision_clamp(score), reasons, size_mult
+
+
+def unified_decision_risk_score(signal: Dict[str, Any]) -> Tuple[float, List[str]]:
+    reasons = []
+    score = 85.0
+    kill = str(os.getenv("KILL_SWITCH", str(globals().get("KILL_SWITCH", False)))).lower() == "true"
+    paused = str(os.getenv("BOT_PAUSED", str(globals().get("BOT_PAUSED", False)))).lower() == "true"
+
+    try:
+        kill = kill or bool(GLOBAL_STATE.get("kill_switch", False))
+        paused = paused or bool(GLOBAL_STATE.get("bot_paused", False))
+    except Exception:
+        pass
+
+    if kill or paused:
+        return 0, ["kill switch or bot paused"]
+
+    existing, symbols = unified_decision_existing_qqq_exposure()
+    if existing and UNIFIED_DECISION_BLOCK_IF_EXISTING_QQQ_EXPOSURE:
+        return 0, [f"existing QQQ exposure: {symbols}"]
+
+    try:
+        if "one_trade_daily_limits_ok" in globals():
+            ok, reason = one_trade_daily_limits_ok()
+            if not ok:
+                score -= 35
+                reasons.append(reason)
+    except Exception:
+        pass
+
+    try:
+        if "one_trade_cooldown_ok" in globals() and not one_trade_cooldown_ok():
+            score -= 30
+            reasons.append("cooldown active")
+    except Exception:
+        pass
+
+    reasons.append("risk state acceptable")
+    return unified_decision_clamp(score), reasons
+
+
+def evaluate_trade_opportunity(signal: Dict[str, Any], selected_contract: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ticker = unified_decision_get_ticker(signal)
+    direction = unified_decision_get_direction(signal)
+    block_reasons = []
+
+    if UNIFIED_DECISION_REQUIRE_QQQ_ONLY and ticker != "QQQ":
+        block_reasons.append(f"non-QQQ ticker blocked: {ticker}")
+
+    edge_score = unified_decision_grade_score(signal)
+    regime_score, regime_reasons = unified_decision_regime_score(signal)
+    liquidity_score, liquidity_reasons = unified_decision_liquidity_score(signal, selected_contract)
+    learning_score, learning_reasons, learning_size_mult = unified_decision_learning_score(signal)
+    risk_score, risk_reasons = unified_decision_risk_score(signal)
+    execution_score = unified_decision_safe_score(signal.get("execution_quality_score") or signal.get("execution_score"), liquidity_score)
+
+    total = round(unified_decision_clamp(
+        edge_score * 0.28
+        + regime_score * 0.18
+        + liquidity_score * 0.18
+        + execution_score * 0.14
+        + learning_score * 0.12
+        + risk_score * 0.10
+    ), 2)
+
+    if liquidity_score < UNIFIED_DECISION_MIN_LIQUIDITY_SCORE:
+        block_reasons.append(f"liquidity score too low: {liquidity_score}")
+    if risk_score < UNIFIED_DECISION_MIN_RISK_SCORE:
+        block_reasons.append(f"risk score too low: {risk_score}")
+    if total < UNIFIED_DECISION_MIN_SCORE:
+        block_reasons.append(f"unified score below threshold: {total}<{UNIFIED_DECISION_MIN_SCORE}")
+
+    if total >= UNIFIED_DECISION_STRONG_SCORE:
+        score_mult = 1.0
+    elif total >= UNIFIED_DECISION_WEAK_SCORE:
+        score_mult = 0.75
+    else:
+        score_mult = 0.25
+
+    size_multiplier = max(UNIFIED_DECISION_SIZE_MIN, min(UNIFIED_DECISION_SIZE_MAX, score_mult * float(learning_size_mult or 1.0)))
+    approved = len(block_reasons) == 0
+
+    explanation = (
+        ("APPROVED" if approved else "BLOCKED")
+        + f" | Edge={round(edge_score,1)} Regime={round(regime_score,1)} Liquidity={round(liquidity_score,1)} "
+        + f"Execution={round(execution_score,1)} Learning={round(learning_score,1)} Risk={round(risk_score,1)} Final={total}"
+    )
+    if block_reasons:
+        explanation += " | Reasons=" + "; ".join(block_reasons)
+
+    decision = {
+        "approved": approved,
+        "score": total,
+        "edge_score": round(edge_score, 2),
+        "regime_score": round(regime_score, 2),
+        "liquidity_score": round(liquidity_score, 2),
+        "execution_score": round(execution_score, 2),
+        "learning_score": round(learning_score, 2),
+        "risk_score": round(risk_score, 2),
+        "size_multiplier": round(size_multiplier, 4),
+        "block_reasons": block_reasons,
+        "explanation": explanation,
+        "ticker": ticker,
+        "direction": direction,
+        "regime_reasons": regime_reasons,
+        "liquidity_reasons": liquidity_reasons,
+        "learning_reasons": learning_reasons,
+        "risk_reasons": risk_reasons,
+        "selected_contract": selected_contract,
+        "timestamp": now_ts() if "now_ts" in globals() else datetime.now().isoformat(),
+    }
+
+    try:
+        debug(f"UNIFIED DECISION | approved={approved} score={total} size_mult={round(size_multiplier,2)} ticker={ticker} direction={direction} reasons={'; '.join(block_reasons) if block_reasons else 'none'}")
+        debug(f"UNIFIED DECISION EXPLAIN | {explanation}")
+    except Exception:
+        print(f"UNIFIED DECISION | {explanation}", flush=True)
+
+    unified_decision_append_log(decision)
+    return decision
+
+
+def unified_decision_apply_size(signal: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        x = deepcopy(signal)
+        mult = float(decision.get("size_multiplier", 1.0) or 1.0)
+        base = x.get("final_size") or x.get("qty") or x.get("contracts") or x.get("quantity") or 1
+        try:
+            base = int(float(base))
+        except Exception:
+            base = 1
+        adjusted = max(1, int(math.floor(base * mult))) if mult < 1 else max(1, int(math.ceil(base * mult)))
+        max_qty = int(float(os.getenv("MAX_POSITION_QTY", str(globals().get("MAX_POSITION_QTY", 10)))))
+        adjusted = min(adjusted, max_qty)
+        x["unified_decision"] = decision
+        x["qty"] = adjusted
+        x["contracts"] = adjusted
+        x["quantity"] = adjusted
+        x["final_size"] = adjusted
+        try:
+            debug(f"UNIFIED SIZE APPLIED | base={base} adjusted={adjusted} mult={mult}")
+        except Exception:
+            pass
+        return x
+    except Exception:
+        signal["unified_decision"] = decision
+        return signal
+
+
 def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
+
+    # Unified decision pre-check. Option route runs a second pass with selected contract.
+    if ENABLE_UNIFIED_DECISION_ENGINE:
+        pre_decision = evaluate_trade_opportunity(signal, None)
+        signal["unified_pre_decision"] = pre_decision
+        if not pre_decision.get("approved") and pre_decision.get("risk_score", 100) <= 0:
+            debug(f"🧠 UNIFIED PRECHECK HARD BLOCK | {pre_decision.get('block_reasons')}")
+            return {"executed": False, "reason": "unified_precheck_hard_block", "decision": pre_decision}
     if not ENABLE_PAPER_BROKER_BRIDGE:
         return {"executed": False, "reason": "paper_bridge_disabled"}
 
