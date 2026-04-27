@@ -225,6 +225,22 @@ ALPACA_OPTION_LIMIT_PRICE_OFFSET = float(os.getenv("ALPACA_OPTION_LIMIT_PRICE_OF
 ALPACA_OPTION_TIME_IN_FORCE = os.getenv("ALPACA_OPTION_TIME_IN_FORCE", "day").lower().strip()
 LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
 
+# =========================================================
+# ONE TRADE PER SETUP + SCALING HARDLOCKS
+# Prevents stacking multiple QQQ/options positions.
+# =========================================================
+ONE_TRADE_PER_SETUP = os.getenv("ONE_TRADE_PER_SETUP", "true").lower() == "true"
+MAX_DAILY_TRADES = int(float(os.getenv("MAX_DAILY_TRADES", "2")))
+COOLDOWN_AFTER_TRADE_SECONDS = int(float(os.getenv("COOLDOWN_AFTER_TRADE_SECONDS", "900")))
+ALLOW_SCALING = os.getenv("ALLOW_SCALING", "true").lower() == "true"
+SCALE_ONLY_AFTER_TP1 = os.getenv("SCALE_ONLY_AFTER_TP1", "true").lower() == "true"
+SCALE_ONLY_IF_GREEN = os.getenv("SCALE_ONLY_IF_GREEN", "true").lower() == "true"
+MAX_TOTAL_CONTRACTS_PER_TRADE = int(float(os.getenv("MAX_TOTAL_CONTRACTS_PER_TRADE", "2")))
+SCALE_OPTION_QTY = int(float(os.getenv("SCALE_OPTION_QTY", "1")))
+ONE_TRADE_LOCK_FILE = os.getenv("ONE_TRADE_LOCK_FILE", "one_trade_setup_locks.json").strip()
+ONE_TRADE_RISK_FILE = os.getenv("ONE_TRADE_RISK_FILE", "one_trade_risk_state.json").strip()
+
+
 # SIGNAL / EXECUTION DEFAULTS
 MAX_SIGNAL_AGE_SECONDS = int(os.getenv("MAX_SIGNAL_AGE_SECONDS", "180"))
 MAX_ENTRY_AGE_SECONDS = MAX_SIGNAL_AGE_SECONDS
@@ -243,7 +259,7 @@ REQUIRE_OPTION_SYMBOL = os.getenv("REQUIRE_OPTION_SYMBOL", "true").lower() == "t
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.005"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.02"))
 MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("MAX_PORTFOLIO_HEAT_PCT", "0.03"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
 MAX_SAME_TICKER_POSITIONS = int(os.getenv("MAX_SAME_TICKER_POSITIONS", "1"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 PAPER_ACCOUNT_EQUITY = float(os.getenv("PAPER_ACCOUNT_EQUITY", "25000"))
@@ -251,7 +267,7 @@ LIVE_ACCOUNT_EQUITY_FALLBACK = float(os.getenv("LIVE_ACCOUNT_EQUITY_FALLBACK", "
 
 # POSITION SIZING
 MIN_POSITION_QTY = int(os.getenv("MIN_POSITION_QTY", "1"))
-MAX_POSITION_QTY = int(os.getenv("MAX_POSITION_QTY", "10"))
+MAX_POSITION_QTY = int(os.getenv("MAX_POSITION_QTY", "2"))
 USE_SIGNAL_QTY_AS_MAX = os.getenv("USE_SIGNAL_QTY_AS_MAX", "false").lower() == "true"
 CONFIDENCE_MULT_A_PLUS = float(os.getenv("CONFIDENCE_MULT_A_PLUS", "1.00"))
 CONFIDENCE_MULT_A = float(os.getenv("CONFIDENCE_MULT_A", "1.00"))
@@ -3994,7 +4010,7 @@ def fallback_signal_enabled() -> bool:
 ENABLE_POSITION_SCHEMA_LOCK = os.getenv("ENABLE_POSITION_SCHEMA_LOCK", "true").lower() == "true"
 ENABLE_HARD_DUPLICATE_POSITION_CAP = os.getenv("ENABLE_HARD_DUPLICATE_POSITION_CAP", "true").lower() == "true"
 MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION = int(os.getenv("MAX_OPEN_POSITIONS_PER_SYMBOL_DIRECTION", "1"))
-MAX_OPEN_POSITIONS_TOTAL = int(os.getenv("MAX_OPEN_POSITIONS_TOTAL", "3"))
+MAX_OPEN_POSITIONS_TOTAL = int(os.getenv("MAX_OPEN_POSITIONS_TOTAL", "1"))
 
 ENABLE_PAPER_TPSL_LIFECYCLE = os.getenv("ENABLE_PAPER_TPSL_LIFECYCLE", "true").lower() == "true"
 PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK = os.getenv("PAPER_TPSL_USE_SIGNAL_PRICE_FALLBACK", "true").lower() == "true"
@@ -5038,6 +5054,178 @@ def alpaca_get(path: str, params: Optional[Dict[str, Any]] = None):
 def alpaca_post(path: str, payload: Dict[str, Any]):
     return requests.post(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
 
+def one_trade_today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def one_trade_load_risk_state() -> Dict[str, Any]:
+    data = load_json_file(ONE_TRADE_RISK_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    today = one_trade_today_key()
+    if data.get("date") != today:
+        data = {"date": today, "daily_trades": 0, "last_trade_ts": 0}
+        atomic_write_json(ONE_TRADE_RISK_FILE, data)
+    return data
+
+
+def one_trade_save_risk_state(data: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(ONE_TRADE_RISK_FILE, data)
+    except Exception as e:
+        debug(f"ONE TRADE RISK STATE SAVE ERROR | {e}")
+
+
+def one_trade_setup_key(signal: Dict[str, Any]) -> str:
+    ticker = str(signal.get("ticker") or signal.get("underlying") or signal.get("symbol") or "QQQ").upper().strip()
+    direction = str(signal.get("direction") or signal.get("side") or "CALL").upper().strip()
+    setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("trigger") or "GENERIC").upper().strip()
+    pmh = str(signal.get("pm_high") or signal.get("premarket_high") or "")
+    pml = str(signal.get("pm_low") or signal.get("premarket_low") or "")
+    return f"{one_trade_today_key()}:{ticker}:{direction}:{setup}:{pmh}:{pml}"
+
+
+def one_trade_setup_available(signal: Dict[str, Any]) -> Tuple[bool, str]:
+    if not ONE_TRADE_PER_SETUP:
+        return True, "one_trade_per_setup_disabled"
+    locks = load_json_file(ONE_TRADE_LOCK_FILE, {})
+    if not isinstance(locks, dict):
+        locks = {}
+    key = one_trade_setup_key(signal)
+    if key in locks:
+        return False, f"one_trade_per_setup_locked:{key}"
+    return True, "setup_available"
+
+
+def one_trade_record_trade(signal: Dict[str, Any], symbol: str, qty: int) -> None:
+    state = one_trade_load_risk_state()
+    state["daily_trades"] = safe_int(state.get("daily_trades", 0), 0) + 1
+    state["last_trade_ts"] = epoch()
+    state["last_symbol"] = symbol
+    state["last_qty"] = qty
+    state["last_signal_id"] = signal.get("signal_id") or signal.get("id")
+    one_trade_save_risk_state(state)
+    if ONE_TRADE_PER_SETUP:
+        locks = load_json_file(ONE_TRADE_LOCK_FILE, {})
+        if not isinstance(locks, dict):
+            locks = {}
+        key = one_trade_setup_key(signal)
+        locks[key] = {"locked_at": now_ts(), "symbol": symbol, "qty": qty}
+        atomic_write_json(ONE_TRADE_LOCK_FILE, locks)
+
+
+def one_trade_daily_limits_ok() -> Tuple[bool, str]:
+    state = one_trade_load_risk_state()
+    trades = safe_int(state.get("daily_trades", 0), 0)
+    if trades >= MAX_DAILY_TRADES:
+        return False, f"max_daily_trades_reached:{trades}>={MAX_DAILY_TRADES}"
+    last_ts = safe_int(state.get("last_trade_ts", 0), 0)
+    if last_ts > 0:
+        age = epoch() - last_ts
+        if age < COOLDOWN_AFTER_TRADE_SECONDS:
+            return False, f"cooldown_after_trade_active:{age}s<{COOLDOWN_AFTER_TRADE_SECONDS}s"
+    return True, "daily_limits_ok"
+
+
+def one_trade_alpaca_positions() -> List[Dict[str, Any]]:
+    try:
+        r = alpaca_get("/v2/positions")
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, list) else []
+        debug(f"ONE TRADE POSITION READ ERROR | status={r.status_code} body={r.text}")
+    except Exception as e:
+        debug(f"ONE TRADE POSITION READ EXCEPTION | {e}")
+    return []
+
+
+def one_trade_open_qqq_exposure() -> Tuple[bool, int, List[str]]:
+    total_contracts = 0
+    symbols = []
+    for p in one_trade_alpaca_positions():
+        sym = str(p.get("symbol", "")).upper().strip()
+        qty = abs(safe_float(p.get("qty", 0), 0))
+        if qty <= 0:
+            continue
+        if sym == "QQQ" or sym.startswith("QQQ"):
+            symbols.append(sym)
+            if sym != "QQQ":
+                total_contracts += int(qty)
+    return (len(symbols) > 0), total_contracts, symbols
+
+
+def one_trade_local_tp1_green_ok() -> Tuple[bool, str]:
+    positions = load_json_file(POSITIONS_FILE, {})
+    tp1_hit = False
+    green = False
+    try:
+        iterable = positions.values() if isinstance(positions, dict) else positions
+        for p in iterable:
+            if not isinstance(p, dict):
+                continue
+            ticker = str(p.get("ticker") or p.get("underlying") or p.get("symbol") or "QQQ").upper()
+            if ticker != "QQQ":
+                continue
+            tp1_hit = tp1_hit or bool(p.get("tp1_hit") or p.get("TP1_HIT") or p.get("target1_hit"))
+            pnl = safe_float(p.get("unrealized_pnl") or p.get("pnl") or p.get("pnl_dollars") or 0, 0)
+            green = green or pnl >= 0
+    except Exception:
+        pass
+    if SCALE_ONLY_AFTER_TP1 and not tp1_hit:
+        return False, "scale_block_tp1_not_hit"
+    if SCALE_ONLY_IF_GREEN and not green:
+        return False, "scale_block_trade_not_green"
+    return True, "scale_tp1_green_ok"
+
+
+def one_trade_entry_gate(signal: Dict[str, Any]) -> Tuple[bool, str, bool]:
+    if KILL_SWITCH or BOT_PAUSED:
+        return False, "kill_switch_or_bot_paused", False
+    ok, reason = one_trade_daily_limits_ok()
+    if not ok:
+        return False, reason, False
+    exposure_exists, open_contracts, symbols = one_trade_open_qqq_exposure()
+    if exposure_exists:
+        if not ALLOW_SCALING:
+            return False, f"existing_qqq_exposure_no_scaling:{symbols}", False
+        if open_contracts >= MAX_TOTAL_CONTRACTS_PER_TRADE:
+            return False, f"max_total_contracts_reached:{open_contracts}>={MAX_TOTAL_CONTRACTS_PER_TRADE}", False
+        ok, scale_reason = one_trade_local_tp1_green_ok()
+        if not ok:
+            return False, f"existing_qqq_exposure_scale_not_allowed:{scale_reason}:{symbols}", False
+        return True, f"scale_allowed:{scale_reason}:open_contracts={open_contracts}", True
+    ok, setup_reason = one_trade_setup_available(signal)
+    if not ok:
+        return False, setup_reason, False
+    return True, "new_trade_allowed", False
+
+
+def one_trade_options_buying_power() -> float:
+    try:
+        account = alpaca_get_account() or {}
+        bp = safe_float(account.get("options_buying_power"), None)
+        if bp is not None:
+            return bp
+        return safe_float(account.get("buying_power"), 0.0)
+    except Exception:
+        return 0.0
+
+
+def one_trade_dynamic_qty(details: Dict[str, Any], requested_qty: int, is_scale: bool) -> Tuple[int, str]:
+    mid = safe_float(details.get("contract_mid") or details.get("mid"), 0.0)
+    if mid <= 0:
+        return 0, "dynamic_qty_block_missing_mid"
+    bp = one_trade_options_buying_power()
+    affordable = int(bp // (mid * 100.0))
+    exposure_exists, open_contracts, symbols = one_trade_open_qqq_exposure()
+    remaining = max(0, MAX_TOTAL_CONTRACTS_PER_TRADE - open_contracts)
+    desired = SCALE_OPTION_QTY if is_scale else max(1, requested_qty)
+    qty = min(desired, affordable, remaining)
+    reason = f"dynamic_qty mid={mid} bp={round(bp,2)} affordable={affordable} open_contracts={open_contracts} remaining={remaining} desired={desired} final={qty}"
+    if qty < 1:
+        return 0, "dynamic_qty_zero_block:" + reason
+    return int(qty), reason
+
 def alpaca_submit_equity_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Submit a real Alpaca PAPER equity order so it appears in the Alpaca dashboard."""
     if not ENABLE_ALPACA or not USE_ALPACA_PAPER or PAPER_BROKER_MODE != "alpaca":
@@ -5423,9 +5611,18 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         return {"submitted": False, "reason": f"option_selector_block:{selector.get('reason')}", "selector": selector}
 
     symbol = selector["symbol"]
-    qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_OPTION_QTY)), ALPACA_OPTION_QTY)
+    details = selector.get("details", {}) or {}
+
+    gate_ok, gate_reason, is_scale = one_trade_entry_gate(signal)
+    if not gate_ok:
+        debug(f"🛑 ONE TRADE / SCALE GATE BLOCK | {gate_reason}")
+        return {"submitted": False, "reason": f"one_trade_gate_block:{gate_reason}", "selector": selector}
+
+    requested_qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_OPTION_QTY)), ALPACA_OPTION_QTY)
+    qty, qty_reason = one_trade_dynamic_qty(details, requested_qty, is_scale=is_scale)
+    debug(f"📏 ONE TRADE DYNAMIC QTY | {qty_reason}")
     if qty <= 0:
-        qty = max(1, ALPACA_OPTION_QTY)
+        return {"submitted": False, "reason": qty_reason, "selector": selector}
 
     # Prefer market for first paper test if enabled. If disabled, use limit at ask + small offset.
     order_type = "market" if ALPACA_OPTION_ALLOW_MARKET_ORDER else "limit"
@@ -5437,7 +5634,6 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "time_in_force": ALPACA_OPTION_TIME_IN_FORCE,
         "client_order_id": f"ubt-opt-{symbol}-{int(time.time())}"[:48],
     }
-    details = selector.get("details", {}) or {}
     ask = safe_float(details.get("ask"), 0.0)
     if order_type == "limit":
         if ask <= 0:
@@ -5451,11 +5647,15 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
             data = r.json()
             debug(f"✅ ALPACA OPTION ORDER SUBMITTED | {symbol} BUY qty={qty} id={data.get('id')} client={payload['client_order_id']}")
             try:
-                send_to_discord(DISCORD_AI_WEBHOOK, f"✅ ALPACA PAPER OPTION ORDER SUBMITTED\nContract: {symbol}\nUnderlying: QQQ\nDirection: {signal.get('direction')}\nQty: {qty}\nOrder ID: {data.get('id')}\nSetup: {signal.get('setup')}\nScore: {signal.get('execution_score', signal.get('score'))}\nSelector: {details}", "AI_EXECUTION")
+                one_trade_record_trade(signal, symbol, qty)
+            except Exception as e:
+                debug(f"ONE TRADE RECORD ERROR | {e}")
+            try:
+                send_to_discord(DISCORD_AI_WEBHOOK, f"✅ ALPACA PAPER OPTION ORDER SUBMITTED\nContract: {symbol}\nUnderlying: QQQ\nDirection: {signal.get('direction')}\nQty: {qty}\nOrder ID: {data.get('id')}\nSetup: {signal.get('setup')}\nScore: {signal.get('execution_score', signal.get('score'))}\nOne Trade Gate: {'SCALE' if is_scale else 'NEW'}\nSelector: {details}", "AI_EXECUTION")
                 send_to_telegram(f"✅ ALPACA PAPER OPTION ORDER SUBMITTED\n{symbol} BUY qty={qty}\nOrder ID: {data.get('id')}")
             except Exception:
                 pass
-            return {"submitted": True, "reason": "alpaca_option_order_submitted", "order": data, "payload": payload, "selector": selector}
+            return {"submitted": True, "reason": "alpaca_option_order_submitted", "order": data, "payload": payload, "selector": selector, "one_trade_gate": "scale" if is_scale else "new", "qty_reason": qty_reason}
         debug(f"❌ ALPACA OPTION ORDER FAILED | status={r.status_code} body={r.text} payload={payload} selector={selector}")
         return {"submitted": False, "reason": f"alpaca_option_order_failed_{r.status_code}", "body": r.text, "payload": payload, "selector": selector}
     except Exception as e:
