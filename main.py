@@ -13130,6 +13130,18 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     prices = paper_bridge_extract_prices(signal)
     qty = safe_int(signal.get("qty", signal.get("qty_hint", 1)), 1)
+
+    # EXECUTION SCORE + POSITION SIZING CAP for paper bridge/force mode.
+    signal = enrich_signal_with_execution_risk_fields(signal)
+    exec_qty, exec_reason = safe_apply_execution_score_sizing(signal, qty)
+    signal["execution_score_sizing_reason"] = exec_reason
+    if exec_qty <= 0:
+        debug(f"🚫 EXEC SCORE BLOCKED PAPER ORDER | score={signal.get('execution_score')} | reason={exec_reason}")
+        raise RuntimeError("execution_score_block:" + str(exec_reason))
+    qty = min(qty, exec_qty)
+    signal["qty"] = qty
+    debug(f"EXEC SCORE PAPER SIZE | score={signal.get('execution_score')} qty={qty} reason={exec_reason}")
+
     ticker = str(signal.get("ticker") or signal.get("underlying") or "").upper().strip()
     symbol = str(signal.get("symbol") or signal.get("contract_symbol") or ticker).strip()
     direction = normalize_direction(signal.get("direction", "CALL"))
@@ -13587,6 +13599,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     # and one paper position per signal hash/cooldown.
     # =========================================================
     if ENABLE_PAPER_BROKER_BRIDGE and FORCE_EXECUTION_MODE:
+        signal = enrich_signal_with_execution_risk_fields(signal)
         signal = apply_unusual_whales_darkpool_to_signal(signal, stage="force_paper_bridge")
         send_unusual_whales_darkpool_alert(signal)
         maybe_send_live_entry_oil_style_alert(signal, stage="force_paper_bridge")
@@ -13719,8 +13732,10 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not phase35_pre_size_decision["approved"]:
         return
 
+    adaptive_signal = enrich_signal_with_execution_risk_fields(adaptive_signal)
     size_decision = size_signal_by_stop(adaptive_signal)
     size_decision = phase3_apply_size_multiplier_to_decision(size_decision, phase3_decision)
+    size_decision = apply_execution_score_to_size_decision(adaptive_signal, size_decision)
     if not size_decision["approved"]:
         msg = build_block_message("SIZING BLOCKED SIGNAL", regime_signal, size_decision["reject_reasons"], f"Raw Size: {size_decision.get('raw_size')} | Final Size: {size_decision.get('final_size')}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -15110,6 +15125,148 @@ def run_once():
     runtime_housekeeping()
     process_telegram_updates()
     send_heartbeat(force=False)
+
+
+
+
+# =========================================================
+# EXECUTION SCORING + POSITION SIZING OVERRIDE
+# Added final layer for real QQQ strategy signals.
+# Risk-first: can reduce/block size, never increase above risk-approved qty.
+# =========================================================
+def premium_execution_score(signal: Dict[str, Any]) -> int:
+    """Institutional execution score, 0-100."""
+    if not ENABLE_EXECUTION_SCORING_LAYER:
+        return 0
+    try:
+        grade = premium_live_grade(signal)
+        direction = str(signal.get("direction") or "").upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("trigger") or "").lower()
+        entry_type = premium_live_detect_entry_type(signal).lower()
+        trade_reason = str(signal.get("trade_reason") or "").lower()
+        reasons = signal.get("strategy_reasons", [])
+        reasons_text = " ".join([str(x).lower() for x in reasons]) if isinstance(reasons, list) else str(reasons).lower()
+        session = str(signal.get("session") or signal.get("time_window") or premium_live_detect_session()).lower()
+        oil_bias = str(signal.get("oil_bias") or signal.get("oil") or signal.get("oil_trend") or "").lower()
+        level_ctx = signal.get("level_context", {}) if isinstance(signal.get("level_context", {}), dict) else {}
+        level_state = str(level_ctx.get("state") or level_ctx.get("level_state") or "").lower()
+        tech = premium_live_tech_strength(signal).lower()
+        dp = premium_live_darkpool_real_summary(signal).lower()
+        volume = premium_live_get(signal, "volume", default="").lower()
+
+        score = 0
+        score += {"A+": 35, "A": 30, "B+": 22, "B": 15, "C": 5, "AVOID": 0}.get(grade, 15)
+
+        strategy_score = safe_float(signal.get("score"), 0)
+        if strategy_score > 0:
+            score += min(24, int(strategy_score * 4))
+
+        price = safe_float(signal.get("entry") or signal.get("entry_price") or signal.get("price"), 0)
+        vwap_val = safe_float(signal.get("vwap") or signal.get("session_vwap"), 0)
+        vwap_text = str(premium_live_get(signal, "vwap", "vwap_position", default="")).lower()
+        if price > 0 and vwap_val > 0:
+            if direction == "CALL" and price > vwap_val:
+                score += 10
+            elif direction == "PUT" and price < vwap_val:
+                score += 10
+            else:
+                score -= 8
+        else:
+            if direction == "CALL" and any(x in vwap_text for x in ["above", "reclaim", "buyer"]):
+                score += 8
+            elif direction == "PUT" and any(x in vwap_text for x in ["below", "reject", "seller"]):
+                score += 8
+
+        high_quality = [
+            "break_and_hold", "break and hold", "retest_hold", "retest hold",
+            "vwap_reclaim", "vwap reclaim", "rejection", "reject",
+            "failed_bounce", "lower_high", "premarket_high", "premarket_low",
+            "support", "resistance",
+        ]
+        if any(x in setup or x in entry_type or x in reasons_text for x in high_quality):
+            score += 12
+        elif "momentum" in setup or "momentum" in entry_type:
+            score += 6
+
+        pm_high = safe_float(signal.get("premarket_high"), 0)
+        pm_low = safe_float(signal.get("premarket_low"), 0)
+        if pm_high > 0 or pm_low > 0:
+            score += 10 if any(x in setup for x in ["premarket", "pm_high", "pm_low"]) else 4
+
+        if level_state in {"levels_loaded", "at_key_level", "above_support", "below_resistance"}:
+            score += 8
+        if any(x in dp for x in ["support", "resistance", "aligned", "holding", "mapped"]):
+            score += 8
+
+        if direction == "CALL" and any(x in oil_bias for x in ["bullish_for_qqq", "fall", "risk_on", "risk-on", "relief"]):
+            score += 10
+        elif direction == "PUT" and any(x in oil_bias for x in ["bearish_for_qqq", "rise", "risk_off", "risk-off", "pressure"]):
+            score += 10
+        elif oil_bias not in {"", "neutral"}:
+            score -= 6
+
+        if "open" in session or "power" in session:
+            score += 8
+        elif "midday" in session:
+            score -= 5
+
+        if any(x in volume for x in ["confirm", "strong", "spike", "active"]):
+            score += 6
+        if "weak" in volume:
+            score -= 8
+
+        if "not_chasing" in reasons_text or "no chasing" in trade_reason:
+            score += 6
+        if "chasing" in reasons_text and "not_chasing" not in reasons_text:
+            score -= 20
+
+        if "wait" in trade_reason or "incomplete" in trade_reason or "no trade" in trade_reason:
+            score -= 10
+        if "weak" in tech:
+            score -= 8
+
+        return max(0, min(100, int(score)))
+    except Exception as e:
+        try:
+            debug(f"EXECUTION SCORE ERROR | {e}")
+        except Exception:
+            pass
+        return 0
+
+
+def apply_execution_score_to_size_decision(signal: Dict[str, Any], size_decision: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(size_decision, dict):
+        return size_decision
+    try:
+        x = deepcopy(size_decision)
+        base_qty = safe_int(x.get("final_size", 0), 0)
+        signal = enrich_signal_with_execution_risk_fields(signal)
+        final_qty, reason = safe_apply_execution_score_sizing(signal, base_qty)
+        x["execution_score"] = safe_int(signal.get("execution_score", 0), 0)
+        x["execution_score_reason"] = reason
+        x["execution_score_original_size"] = base_qty
+        x["execution_score_final_size"] = final_qty
+        x.setdefault("adjustments", [])
+        x["adjustments"].append(reason)
+        if final_qty <= 0:
+            x["approved"] = False
+            x.setdefault("reject_reasons", [])
+            x["reject_reasons"].append(reason)
+            x["final_size"] = 0
+        else:
+            x["final_size"] = min(base_qty, final_qty)
+            x["approved"] = x["final_size"] >= MIN_POSITION_QTY
+            if not x["approved"]:
+                x.setdefault("reject_reasons", [])
+                x["reject_reasons"].append("execution_score_adjusted_size_below_minimum")
+        debug(f"EXEC SCORE SIZE DECISION | score={x.get('execution_score')} base={base_qty} final={x.get('final_size')} reason={reason}")
+        return x
+    except Exception as e:
+        try:
+            debug(f"EXEC SCORE SIZE DECISION ERROR | {e}")
+        except Exception:
+            pass
+        return size_decision
 
 
 # =========================================================
