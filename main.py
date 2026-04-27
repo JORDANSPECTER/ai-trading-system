@@ -3160,7 +3160,7 @@ def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
 ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
-AUTO_AI_SIGNAL_TICKERS = [x.strip().upper() for x in os.getenv("AUTO_AI_SIGNAL_TICKERS", "QQQ").split(",") if x.strip()]
+AUTO_AI_SIGNAL_TICKERS = ["QQQ"]  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
 AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
 AUTO_AI_SIGNAL_FILE = os.getenv("AUTO_AI_SIGNAL_FILE", "ai_signal.json")
@@ -3177,7 +3177,7 @@ AUTO_AI_DEFAULT_TP2_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP2_OFFSET", "0.80
 # This is for PAPER validation. Keep LIVE_MODE=false and ALLOW_LIVE_BUYS=false.
 # =========================================================
 ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "false").lower() == "true"
-AUTO_SIGNAL_TICKER = os.getenv("AUTO_SIGNAL_TICKER", "QQQ").upper().strip()
+AUTO_SIGNAL_TICKER = "QQQ"  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_SIGNAL_DIRECTION = os.getenv("AUTO_SIGNAL_DIRECTION", "CALL").upper().strip()
 AUTO_SIGNAL_MIN_UNDERLYING_PRICE = float(os.getenv("AUTO_SIGNAL_MIN_UNDERLYING_PRICE", "100"))
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "300"))
@@ -3308,7 +3308,7 @@ def auto_ai_grade_signal(setup: str, ticker: str, direction: str, price: float) 
 
 
 def auto_ai_build_signal_for_ticker(ticker: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    ticker = str(ticker).upper().strip()
+    ticker = "QQQ"  # HARD LOCK: auto AI generator only builds QQQ signals
     price = auto_ai_get_price(snapshot, ticker)
     direction = "CALL"
     setup = "vwap_reclaim"
@@ -3447,7 +3447,8 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         if not force and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
             return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
 
-        ticker = str(AUTO_SIGNAL_TICKER or "QQQ").upper().strip()
+        ticker = "QQQ"  # HARD LOCK: do not allow SPY or any fallback ticker
+        debug("[AUTO SIGNAL DEBUG] internal generator hard_locked_ticker=QQQ")
         direction = normalize_direction(AUTO_SIGNAL_DIRECTION or "CALL")
 
         # Pull live market price through the engine's existing market-data router.
@@ -13290,9 +13291,56 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+
+# =========================================================
+# QQQ CLEAN SIGNAL GUARD
+# Final input cleanup layer. If any old script, old cache, or stale
+# ai_signal.json writes SPY/anything else, this clears it before the
+# engine can keep looping on the contaminated signal.
+# =========================================================
+def clear_contaminated_signal_files(reason: str = "non_qqq_signal") -> None:
+    try:
+        for path in {str(globals().get("SIGNAL_FILE", "signal.json")), str(globals().get("AI_SIGNAL_INPUT_FILE", "ai_signal.json")), str(globals().get("AUTO_AI_SIGNAL_FILE", "ai_signal.json"))}:
+            if path and file_exists(path):
+                try:
+                    atomic_write_json(path, {})
+                    debug(f"🧹 CLEARED CONTAMINATED SIGNAL FILE | file={path} | reason={reason}")
+                except Exception as clear_error:
+                    debug(f"clear_contaminated_signal_file_error | file={path} | error={clear_error}")
+    except Exception as e:
+        debug(f"clear_contaminated_signal_files_error:{e}")
+
+
+def qqq_clean_signal_guard(signal: Dict[str, Any], stage: str = "handle_new_signal") -> Tuple[bool, str]:
+    try:
+        ticker = qqq_lock_get_ticker(signal)
+        if not ticker:
+            clear_contaminated_signal_files(f"{stage}_missing_ticker")
+            return False, f"{stage}_blocked_missing_ticker"
+        if ticker != "QQQ":
+            clear_contaminated_signal_files(f"{stage}_blocked_non_qqq_{ticker}")
+            return False, f"{stage}_blocked_non_qqq_{ticker}"
+        # Force all symbol fields to QQQ so downstream code cannot see SPY.
+        signal["ticker"] = "QQQ"
+        signal["symbol"] = "QQQ"
+        signal["underlying"] = "QQQ"
+        return True, "qqq_clean_signal_ok"
+    except Exception as e:
+        clear_contaminated_signal_files(f"{stage}_guard_error")
+        return False, f"{stage}_guard_error:{e}"
+
 def handle_new_signal(signal: Dict[str, Any]):
     if not signal:
         debug("handle_new_signal skipped: empty signal")
+        return None
+
+    clean_ok, clean_reason = qqq_clean_signal_guard(signal, stage="handle_new_signal")
+    if not clean_ok:
+        debug(f"🚫 QQQ CLEAN GUARD BLOCK | reason={clean_reason}")
+        try:
+            send_to_discord(DISCORD_AI_WEBHOOK, f"🚫 QQQ CLEAN GUARD BLOCK | {clean_reason}", "AI")
+        except Exception:
+            pass
         return None
 
     qqq_ok, qqq_reason = qqq_only_signal_allowed(signal, stage="handle_new_signal")
