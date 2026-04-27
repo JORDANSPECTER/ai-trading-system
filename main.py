@@ -12119,6 +12119,9 @@ def enrich_signal_with_execution_risk_fields(signal: Dict[str, Any]) -> Dict[str
         signal["premium_risk_state"] = premium_risk_state_from_score(score, signal)
         signal["position_plan"] = premium_position_size_plan(score, signal)
         signal["execution_decision"] = premium_execution_decision(score, signal)
+        signal["execution_score_breakdown"] = execution_score_breakdown(signal)
+        signal["execution_score_breakdown_text"] = format_execution_score_breakdown(signal)
+        log_execution_score_breakdown(signal, stage="enrich")
 
     except Exception as e:
         try:
@@ -12205,6 +12208,7 @@ def build_premium_live_execution_alert(signal: Dict[str, Any]) -> str:
         f"• {trade_reason}\n\n"
         f"✅ Decision: {execution_decision}\n"
         f"📐 Execution Score: {exec_score}/100\n"
+        f"{format_execution_score_breakdown(signal)}\n\n"
         f"⏱️ Timing: {timing_quality}\n"
         f"🧪 Entry Quality: {entry_quality}\n"
         f"🚨 Risk State: {risk_state}\n"
@@ -13137,6 +13141,8 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     signal["execution_score_sizing_reason"] = exec_reason
     if exec_qty <= 0:
         debug(f"🚫 EXEC SCORE BLOCKED PAPER ORDER | score={signal.get('execution_score')} | reason={exec_reason}")
+        log_execution_score_breakdown(signal, stage="paper_bridge_block")
+        alert_execution_score_block(signal, exec_reason, stage="paper_bridge_create_order")
         raise RuntimeError("execution_score_block:" + str(exec_reason))
     qty = min(qty, exec_qty)
     signal["qty"] = qty
@@ -13152,6 +13158,9 @@ def paper_bridge_create_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "status": "created",
         "created_at": now_ts(),
         "timestamp": epoch(),
+        "execution_score": signal.get("execution_score"),
+        "execution_score_breakdown": signal.get("execution_score_breakdown", {}),
+        "execution_score_breakdown_text": signal.get("execution_score_breakdown_text", ""),
         "ticker": ticker,
         "symbol": symbol,
         "contract_symbol": str(signal.get("contract_symbol", symbol)).strip(),
@@ -13475,6 +13484,126 @@ def paper_bridge_open_position(order: Dict[str, Any]) -> Dict[str, Any]:
     return position
 
 
+
+# =========================================================
+# EXECUTION SCORE BREAKDOWN -> LOGS + ALERTS
+# Explains WHY score = X and keeps blocked trades from crashing loop.
+# =========================================================
+def execution_score_breakdown(signal: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not isinstance(signal, dict):
+            return {"score": 0, "summary": "invalid_signal", "positive": [], "negative": [], "neutral": [], "verdict": "UNKNOWN"}
+        score = safe_int(signal.get("execution_score", 0), 0)
+        if score <= 0:
+            try:
+                score = premium_execution_score(signal)
+                signal["execution_score"] = score
+            except Exception:
+                score = 0
+        direction = str(signal.get("direction") or "").upper().strip()
+        grade = str(signal.get("grade") or signal.get("confidence") or premium_live_grade(signal)).upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("trigger") or "").lower()
+        session = str(signal.get("session") or signal.get("time_window") or premium_live_detect_session()).lower()
+        reasons_raw = signal.get("strategy_reasons", [])
+        reasons_text = " ".join([str(x).lower() for x in reasons_raw]) if isinstance(reasons_raw, list) else str(reasons_raw).lower()
+        oil_bias = str(signal.get("oil_bias") or signal.get("oil") or signal.get("oil_trend") or "neutral").lower()
+        level_ctx = signal.get("level_context", {}) if isinstance(signal.get("level_context", {}), dict) else {}
+        level_state = str(level_ctx.get("state") or level_ctx.get("level_state") or "unknown").lower()
+        price = safe_float(signal.get("entry") or signal.get("entry_price") or signal.get("price"), 0)
+        vwap = safe_float(signal.get("vwap") or signal.get("session_vwap"), 0)
+        pm_high = safe_float(signal.get("premarket_high"), 0)
+        pm_low = safe_float(signal.get("premarket_low"), 0)
+        strat_score = safe_float(signal.get("score"), 0)
+        positive, negative, neutral = [], [], []
+        if grade in {"A+", "A"}:
+            positive.append(f"grade={grade}")
+        elif grade:
+            neutral.append(f"grade={grade}")
+        if strat_score:
+            (positive if strat_score >= 4 else neutral).append(f"strategy_score={strat_score}")
+        if price and vwap:
+            dist = round(abs(price-vwap), 2)
+            if direction == "CALL" and price > vwap:
+                positive.append(f"CALL price above VWAP by {dist}")
+            elif direction == "PUT" and price < vwap:
+                positive.append(f"PUT price below VWAP by {dist}")
+            else:
+                negative.append(f"price/VWAP not aligned for {direction}")
+        else:
+            neutral.append("VWAP missing or incomplete")
+        if any(x in setup or x in reasons_text for x in ["break", "hold", "retest", "reject", "rejection", "premarket", "support", "resistance", "vwap"]):
+            positive.append("entry type has structure confirmation")
+        else:
+            negative.append("no strong entry-type confirmation")
+        if pm_high or pm_low:
+            positive.append(f"premarket levels loaded high={pm_high or 'NA'} low={pm_low or 'NA'}")
+        else:
+            neutral.append("premarket levels not loaded")
+        if level_state in {"levels_loaded", "at_key_level", "above_support", "below_resistance"}:
+            positive.append(f"key levels loaded ({level_state})")
+        else:
+            neutral.append(f"key level state={level_state}")
+        if direction == "CALL" and any(x in oil_bias for x in ["bullish_for_qqq", "fall", "risk_on", "risk-on", "relief"]):
+            positive.append("oil/macro aligned bullish for QQQ")
+        elif direction == "PUT" and any(x in oil_bias for x in ["bearish_for_qqq", "rise", "risk_off", "risk-off", "pressure"]):
+            positive.append("oil/macro aligned bearish for QQQ")
+        elif oil_bias in {"", "neutral"}:
+            neutral.append("oil/macro neutral")
+        else:
+            negative.append(f"oil/macro not aligned ({oil_bias})")
+        if "open" in session or "power" in session:
+            positive.append(f"priority session={session}")
+        elif "midday" in session:
+            negative.append("midday/chop session penalty")
+        else:
+            neutral.append(f"session={session}")
+        if "not_chasing" in reasons_text or "no chasing" in str(signal.get("trade_reason", "")).lower():
+            positive.append("anti-chasing check passed")
+        elif "chasing" in reasons_text:
+            negative.append("chasing risk detected")
+        if score >= EXEC_SCORE_FULL_SIZE:
+            verdict = "FULL SIZE ALLOWED"
+        elif score >= EXEC_SCORE_HALF_SIZE:
+            verdict = "HALF SIZE / STANDARD RISK"
+        elif score >= EXEC_SCORE_REDUCED_SIZE:
+            verdict = "STARTER SIZE ONLY"
+        elif score < EXEC_SCORE_BLOCK_BELOW:
+            verdict = "BLOCKED — score below execution threshold"
+        else:
+            verdict = "WATCHLIST / REDUCED RISK"
+        return {"score": score, "summary": f"score={score}/100 | {verdict}", "positive": positive, "negative": negative, "neutral": neutral, "verdict": verdict}
+    except Exception as e:
+        return {"score": safe_int(signal.get("execution_score", 0), 0) if isinstance(signal, dict) else 0, "summary": f"breakdown_failed:{e}", "positive": [], "negative": [], "neutral": [], "verdict": "UNKNOWN"}
+
+
+def format_execution_score_breakdown(signal: Dict[str, Any]) -> str:
+    b = execution_score_breakdown(signal)
+    pos = "\n".join([f"✅ {x}" for x in b.get("positive", [])[:6]]) or "✅ None yet"
+    neg = "\n".join([f"⚠️ {x}" for x in b.get("negative", [])[:5]]) or "⚠️ None"
+    neu = "\n".join([f"• {x}" for x in b.get("neutral", [])[:5]]) or "• None"
+    return f"📐 Execution Score Breakdown\n{b.get('summary')}\n\nWhat helped:\n{pos}\n\nWhat hurt / blocked:\n{neg}\n\nNeutral / missing:\n{neu}"
+
+
+def log_execution_score_breakdown(signal: Dict[str, Any], stage: str = "execution") -> None:
+    try:
+        b = execution_score_breakdown(signal)
+        debug("EXEC SCORE BREAKDOWN | " + f"stage={stage} score={b.get('score')} verdict={b.get('verdict')} | " + f"positive={'; '.join(b.get('positive', [])[:6]) or 'none'} | " + f"negative={'; '.join(b.get('negative', [])[:5]) or 'none'} | " + f"neutral={'; '.join(b.get('neutral', [])[:5]) or 'none'}")
+    except Exception as e:
+        try: debug(f"EXEC SCORE BREAKDOWN LOG FAILED | {e}")
+        except Exception: pass
+
+
+def alert_execution_score_block(signal: Dict[str, Any], reason: str, stage: str = "paper_bridge") -> None:
+    try:
+        ticker = str(signal.get("ticker") or signal.get("underlying") or "UNKNOWN").upper()
+        direction = str(signal.get("direction") or "UNKNOWN").upper()
+        msg = f"🚫 EXECUTION SCORE BLOCKED\nTicker: {ticker}\nDirection: {direction}\nStage: {stage}\nReason: {reason}\n\n{format_execution_score_breakdown(signal)}\n\nRule: No execution when score is below threshold. Engine continues running."
+        send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        send_to_telegram(msg)
+    except Exception as e:
+        try: debug(f"EXEC SCORE BLOCK ALERT FAILED | {e}")
+        except Exception: pass
+
 def paper_bridge_alert(order: Dict[str, Any], position: Dict[str, Any]) -> None:
     msg = (
         "✅ PAPER BROKER BRIDGE EXECUTED\n"
@@ -13486,7 +13615,8 @@ def paper_bridge_alert(order: Dict[str, Any], position: Dict[str, Any]) -> None:
         f"Stop: {order.get('stop')}\n"
         f"Target: {order.get('target')}\n"
         f"Order: {order.get('order_id')}\n"
-        f"Position: {position.get('position_id')}"
+        f"Position: {position.get('position_id')}\n\n"
+        f"{order.get('execution_score_breakdown_text', '')}"
     )
     try:
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -13507,7 +13637,15 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not gate.get("approved"):
         return {"executed": False, "reason": gate.get("reason"), "hash": gate.get("hash")}
 
-    order = paper_bridge_create_order(signal)
+    try:
+        order = paper_bridge_create_order(signal)
+    except Exception as e:
+        reason = str(e)
+        if "execution_score_block" in reason:
+            debug(f"🛑 PAPER BRIDGE EXEC SCORE BLOCKED CLEANLY | {reason}")
+            return {"executed": False, "reason": "paper_bridge_execution_score_blocked", "error": reason}
+        raise
+
     filled = paper_bridge_fill_order(order)
     try:
         position = paper_bridge_open_position(filled)
@@ -13516,6 +13654,9 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
         if "duplicate_position_cap_block" in reason:
             debug(f"🛑 PAPER BRIDGE DUPLICATE CAP BLOCKED | {reason}")
             return {"executed": False, "reason": "paper_bridge_duplicate_cap_blocked", "error": reason, "order": filled}
+        if "execution_score_block" in reason:
+            debug(f"🛑 PAPER BRIDGE EXEC SCORE BLOCKED CLEANLY | {reason}")
+            return {"executed": False, "reason": "paper_bridge_execution_score_blocked", "error": reason, "order": filled}
         raise
 
     paper_bridge_mark_executed(gate.get("hash", ""))
