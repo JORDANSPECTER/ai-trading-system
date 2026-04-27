@@ -225,6 +225,11 @@ ALPACA_OPTION_LIMIT_PRICE_OFFSET = float(os.getenv("ALPACA_OPTION_LIMIT_PRICE_OF
 ALPACA_OPTION_TIME_IN_FORCE = os.getenv("ALPACA_OPTION_TIME_IN_FORCE", "day").lower().strip()
 LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
 
+# Manual / Render safety switches used by one-trade gate.
+# These were added to prevent NameError: KILL_SWITCH is not defined.
+KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
+BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
+
 # =========================================================
 # ONE TRADE PER SETUP + SCALING HARDLOCKS
 # Prevents stacking multiple QQQ/options positions.
@@ -5179,7 +5184,14 @@ def one_trade_local_tp1_green_ok() -> Tuple[bool, str]:
 
 
 def one_trade_entry_gate(signal: Dict[str, Any]) -> Tuple[bool, str, bool]:
-    if KILL_SWITCH or BOT_PAUSED:
+    kill_switch_active = bool(globals().get("KILL_SWITCH", False))
+    bot_paused_active = bool(globals().get("BOT_PAUSED", False))
+    try:
+        kill_switch_active = kill_switch_active or bool(GLOBAL_STATE.get("kill_switch", False))
+        bot_paused_active = bot_paused_active or bool(GLOBAL_STATE.get("bot_paused", False))
+    except Exception:
+        pass
+    if kill_switch_active or bot_paused_active:
         return False, "kill_switch_or_bot_paused", False
     ok, reason = one_trade_daily_limits_ok()
     if not ok:
