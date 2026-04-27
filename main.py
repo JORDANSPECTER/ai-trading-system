@@ -13,6 +13,8 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 
+print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
+
 # =========================================================
 # MACRO BRIDGE IMPORTS
 # Safe import so main engine still runs even if macro_bridge fails.
@@ -140,6 +142,11 @@ def debug_alpaca_urls_once() -> None:
 # =========================================================
 # ENV VARS
 # =========================================================
+# Global manual pause / kill controls
+KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
+BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
+MAX_OPEN_POSITIONS_TOTAL = int(os.getenv("MAX_OPEN_POSITIONS_TOTAL", os.getenv("MAX_OPEN_POSITIONS", "1")))
+
 DISCORD_AI_WEBHOOK = os.getenv("DISCORD_AI_WEBHOOK", "").strip()
 DISCORD_FREE_WEBHOOK = os.getenv("DISCORD_FREE_WEBHOOK", "").strip()
 DISCORD_FREE_DAILY_LEVELS_WEBHOOK = os.getenv("DISCORD_FREE_DAILY_LEVELS_WEBHOOK", DISCORD_FREE_WEBHOOK).strip()
@@ -224,11 +231,6 @@ ALPACA_OPTION_ALLOW_MARKET_ORDER = os.getenv("ALPACA_OPTION_ALLOW_MARKET_ORDER",
 ALPACA_OPTION_LIMIT_PRICE_OFFSET = float(os.getenv("ALPACA_OPTION_LIMIT_PRICE_OFFSET", "0.03"))
 ALPACA_OPTION_TIME_IN_FORCE = os.getenv("ALPACA_OPTION_TIME_IN_FORCE", "day").lower().strip()
 LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
-
-# Manual / Render safety switches used by one-trade gate.
-# These were added to prevent NameError: KILL_SWITCH is not defined.
-KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
-BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
 
 # =========================================================
 # ONE TRADE PER SETUP + SCALING HARDLOCKS
@@ -5184,31 +5186,51 @@ def one_trade_local_tp1_green_ok() -> Tuple[bool, str]:
 
 
 def one_trade_entry_gate(signal: Dict[str, Any]) -> Tuple[bool, str, bool]:
-    kill_switch_active = bool(globals().get("KILL_SWITCH", False))
-    bot_paused_active = bool(globals().get("BOT_PAUSED", False))
+    """
+    1-trade-per-setup master gate.
+    SAFE FIX: never references KILL_SWITCH/BOT_PAUSED directly because older deployments
+    crashed with NameError when those globals were missing.
+    """
+    kill_switch_active = str(os.getenv("KILL_SWITCH", str(globals().get("KILL_SWITCH", False)))).lower() == "true"
+    bot_paused_active = str(os.getenv("BOT_PAUSED", str(globals().get("BOT_PAUSED", False)))).lower() == "true"
+
     try:
         kill_switch_active = kill_switch_active or bool(GLOBAL_STATE.get("kill_switch", False))
         bot_paused_active = bot_paused_active or bool(GLOBAL_STATE.get("bot_paused", False))
     except Exception:
         pass
+
     if kill_switch_active or bot_paused_active:
         return False, "kill_switch_or_bot_paused", False
+
     ok, reason = one_trade_daily_limits_ok()
     if not ok:
         return False, reason, False
+
     exposure_exists, open_contracts, symbols = one_trade_open_qqq_exposure()
+
     if exposure_exists:
         if not ALLOW_SCALING:
             return False, f"existing_qqq_exposure_no_scaling:{symbols}", False
+
         if open_contracts >= MAX_TOTAL_CONTRACTS_PER_TRADE:
-            return False, f"max_total_contracts_reached:{open_contracts}>={MAX_TOTAL_CONTRACTS_PER_TRADE}", False
-        ok, scale_reason = one_trade_local_tp1_green_ok()
-        if not ok:
-            return False, f"existing_qqq_exposure_scale_not_allowed:{scale_reason}:{symbols}", False
-        return True, f"scale_allowed:{scale_reason}:open_contracts={open_contracts}", True
-    ok, setup_reason = one_trade_setup_available(signal)
-    if not ok:
-        return False, setup_reason, False
+            return False, f"max_contracts_reached:{open_contracts}/{MAX_TOTAL_CONTRACTS_PER_TRADE}", False
+
+        scale_ok, scale_reason = one_trade_scaling_allowed(signal)
+        if not scale_ok:
+            return False, scale_reason, False
+
+        return True, f"scale_allowed:{scale_reason}", True
+
+    if MAX_OPEN_POSITIONS_TOTAL <= 0:
+        return False, "max_open_positions_total_zero", False
+
+    if not one_trade_setup_not_used(signal):
+        return False, "one_trade_per_setup_locked", False
+
+    if not one_trade_cooldown_ok():
+        return False, "cooldown_after_trade_active", False
+
     return True, "new_trade_allowed", False
 
 
