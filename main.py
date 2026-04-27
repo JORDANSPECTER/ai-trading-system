@@ -282,6 +282,10 @@ TWELVE_DATA_VWAP_OUTPUTSIZE = int(os.getenv("TWELVE_DATA_VWAP_OUTPUTSIZE", "500"
 TWELVE_DATA_PREMARKET_START = os.getenv("TWELVE_DATA_PREMARKET_START", "04:00").strip()
 TWELVE_DATA_PREMARKET_END = os.getenv("TWELVE_DATA_PREMARKET_END", "09:29").strip()
 MARKET_DATA_WRITE_PREMARKET_LEVELS = os.getenv("MARKET_DATA_WRITE_PREMARKET_LEVELS", "true").lower() == "true"
+TWELVE_DATA_TIMEZONE = os.getenv("TWELVE_DATA_TIMEZONE", "America/New_York").strip()
+TWELVE_DATA_PREPOST = os.getenv("TWELVE_DATA_PREPOST", "true").lower() == "true"
+MARKET_DATA_PREMARKET_FALLBACK_MODE = os.getenv("MARKET_DATA_PREMARKET_FALLBACK_MODE", "levels_or_range").strip().lower()
+MARKET_DATA_PREMARKET_FALLBACK_RANGE = float(os.getenv("MARKET_DATA_PREMARKET_FALLBACK_RANGE", "2.50"))
 MARKET_DATA_WRITE_LIVE_SNAPSHOT = os.getenv("MARKET_DATA_WRITE_LIVE_SNAPSHOT", "true").lower() == "true"
 AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
 AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
@@ -7319,6 +7323,63 @@ def extract_price_from_payload(payload: Any) -> float:
     return 0.0
 
 
+
+def market_data_existing_premarket_levels(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """Reuse previously saved PM levels if TwelveData returns regular-session bars only."""
+    try:
+        data = load_json_file(MARKET_DATA_FILE, {})
+        item = data.get(symbol, {}) if isinstance(data, dict) else {}
+        if not isinstance(item, dict):
+            return None, None
+        high = safe_float(item.get("premarket_high") or item.get("pm_high") or item.get("pre_market_high"), 0)
+        low = safe_float(item.get("premarket_low") or item.get("pm_low") or item.get("pre_market_low"), 0)
+        return (high if high > 0 else None), (low if low > 0 else None)
+    except Exception:
+        return None, None
+
+
+def market_data_fallback_premarket_levels(symbol: str, price: float, vwap: float) -> Tuple[Optional[float], Optional[float], str]:
+    """Last-resort paper-safe fallback so the strategy is not blind when PM bars are unavailable.
+    Real premarket bars still take priority. This fallback is labeled in market_prices.json.
+    """
+    try:
+        old_high, old_low = market_data_existing_premarket_levels(symbol)
+        if old_high and old_low:
+            return round(old_high, 6), round(old_low, 6), "cached_previous_premarket"
+
+        levels_data = load_json_file("darkpool_levels.json", {})
+        raw = []
+        if isinstance(levels_data, dict):
+            raw = levels_data.get(symbol) or levels_data.get("levels") or levels_data.get("darkpool_levels") or []
+        elif isinstance(levels_data, list):
+            raw = levels_data
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        levels = []
+        for x in raw:
+            if isinstance(x, dict):
+                lvl = safe_float(x.get("price") or x.get("level") or x.get("value"), 0)
+            else:
+                lvl = safe_float(x, 0)
+            if lvl and lvl > 100:
+                levels.append(lvl)
+        if levels:
+            above = min([x for x in levels if x >= price], default=None)
+            below = max([x for x in levels if x <= price], default=None)
+            if above and below and above > below:
+                return round(above, 6), round(below, 6), "fallback_key_levels"
+
+        if MARKET_DATA_PREMARKET_FALLBACK_MODE in {"range", "levels_or_range", "true", "1"} and price > 0:
+            anchor_high = max(price, vwap if vwap > 0 else price)
+            anchor_low = min(price, vwap if vwap > 0 else price)
+            return round(anchor_high + MARKET_DATA_PREMARKET_FALLBACK_RANGE, 6), round(anchor_low - MARKET_DATA_PREMARKET_FALLBACK_RANGE, 6), "fallback_estimated_range"
+    except Exception as e:
+        try:
+            debug(f"PREMARKET FALLBACK FAILED | {symbol} | {e}")
+        except Exception:
+            pass
+    return None, None, "unavailable"
+
 def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
     """
     Fetches Twelve Data intraday candles, computes session VWAP, and auto-calculates
@@ -7346,6 +7407,8 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
                 "symbol": symbol,
                 "interval": TWELVE_DATA_VWAP_INTERVAL,
                 "outputsize": TWELVE_DATA_VWAP_OUTPUTSIZE,
+                "timezone": TWELVE_DATA_TIMEZONE,
+                "prepost": str(TWELVE_DATA_PREPOST).lower(),
                 "apikey": TWELVE_DATA_API_KEY,
             },
             timeout=10,
@@ -7435,6 +7498,17 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
 
         vwap = (pv_sum / vol_sum) if vol_sum > 0 else last_price
 
+        premarket_source = "twelvedata_premarket_bars"
+        if MARKET_DATA_WRITE_PREMARKET_LEVELS and (pm_high is None or pm_low is None):
+            fb_high, fb_low, fb_source = market_data_fallback_premarket_levels(symbol, last_price, vwap)
+            if pm_high is None and fb_high is not None:
+                pm_high = fb_high
+            if pm_low is None and fb_low is not None:
+                pm_low = fb_low
+            if fb_high is not None or fb_low is not None:
+                premarket_source = fb_source
+                debug(f"PREMARKET LEVELS FALLBACK | {symbol} source={fb_source} pm_high={pm_high} pm_low={pm_low}")
+
         snapshot = {
             "price": round(float(last_price), 6),
             "last": round(float(last_price), 6),
@@ -7453,11 +7527,16 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
         if MARKET_DATA_WRITE_PREMARKET_LEVELS:
             if pm_high is not None and pm_high > 0:
                 snapshot["premarket_high"] = round(float(pm_high), 6)
+                snapshot["pm_high"] = round(float(pm_high), 6)
+                snapshot["pre_market_high"] = round(float(pm_high), 6)
             if pm_low is not None and pm_low > 0:
                 snapshot["premarket_low"] = round(float(pm_low), 6)
+                snapshot["pm_low"] = round(float(pm_low), 6)
+                snapshot["pre_market_low"] = round(float(pm_low), 6)
             if (pm_high is not None and pm_high > 0) or (pm_low is not None and pm_low > 0):
                 snapshot["premarket_updated_at"] = epoch()
                 snapshot["premarket_window"] = f"{TWELVE_DATA_PREMARKET_START}-{TWELVE_DATA_PREMARKET_END}"
+                snapshot["premarket_source"] = premarket_source
                 debug(
                     f"PREMARKET LEVELS UPDATED | {symbol} "
                     f"pm_high={snapshot.get('premarket_high')} pm_low={snapshot.get('premarket_low')}"
