@@ -3415,11 +3415,212 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
         return {"generated": False, "reason": "error", "error": str(e)}
 
 
+# =========================================================
+# DARK POOL → QQQ SIGNAL ENGINE
+# Uses institutional dark pool levels as the decision layer for
+# the internal QQQ signal generator. Free daily levels stay informational;
+# this layer controls whether a paper/execution signal is created.
+# =========================================================
+ENABLE_DARKPOOL_QQQ_SIGNAL_ENGINE = os.getenv("ENABLE_DARKPOOL_QQQ_SIGNAL_ENGINE", "true").lower() == "true"
+DARKPOOL_QQQ_REQUIRE_LEVEL = os.getenv("DARKPOOL_QQQ_REQUIRE_LEVEL", "true").lower() == "true"
+DARKPOOL_QQQ_ALLOW_CALLS = os.getenv("DARKPOOL_QQQ_ALLOW_CALLS", "true").lower() == "true"
+DARKPOOL_QQQ_ALLOW_PUTS = os.getenv("DARKPOOL_QQQ_ALLOW_PUTS", "true").lower() == "true"
+DARKPOOL_QQQ_MIN_GRADE = os.getenv("DARKPOOL_QQQ_MIN_GRADE", "A").upper().strip()
+DARKPOOL_QQQ_NEAR_LEVEL_PCT = float(os.getenv("DARKPOOL_QQQ_NEAR_LEVEL_PCT", str(globals().get("UW_DARKPOOL_NEAR_LEVEL_PCT", 0.006))))
+DARKPOOL_QQQ_ACCEPTANCE_PCT = float(os.getenv("DARKPOOL_QQQ_ACCEPTANCE_PCT", str(globals().get("UW_DARKPOOL_ACCEPTANCE_PCT", 0.0015))))
+DARKPOOL_QQQ_SEND_DEBUG_ALERTS = os.getenv("DARKPOOL_QQQ_SEND_DEBUG_ALERTS", "true").lower() == "true"
+
+
+def dp_qqq_level_price(level: Any) -> float:
+    if isinstance(level, dict):
+        return safe_float(level.get("price", 0), 0.0)
+    return 0.0
+
+
+def dp_qqq_level_strength(level: Any) -> str:
+    if isinstance(level, dict):
+        return str(level.get("strength", "normal")).lower().strip()
+    return "normal"
+
+
+def dp_qqq_get_vwap_from_market_snapshot(snapshot: Dict[str, Any], ticker: str = "QQQ") -> float:
+    try:
+        row = snapshot.get(ticker) if isinstance(snapshot, dict) else None
+        if isinstance(row, dict):
+            return safe_float(row.get("vwap") or row.get("VWAP") or row.get("session_vwap") or row.get("anchored_vwap"), 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def dp_qqq_grade_up(base: str, boost: int = 0) -> str:
+    ladder = ["AVOID", "C", "B", "B+", "A", "A+"]
+    g = str(base or "B").upper().strip()
+    if g not in ladder:
+        g = "B"
+    return ladder[min(len(ladder) - 1, ladder.index(g) + max(0, int(boost)))]
+
+
+def dp_qqq_meets_min_grade(grade: str) -> bool:
+    try:
+        return ai_grade_rank(grade) >= ai_grade_rank(DARKPOOL_QQQ_MIN_GRADE)
+    except Exception:
+        order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1, "AVOID": 0}
+        return order.get(str(grade).upper().strip(), 0) >= order.get(DARKPOOL_QQQ_MIN_GRADE, 4)
+
+
+def dp_qqq_build_decision(current_price: float, vwap: float = 0.0, force: bool = False) -> Dict[str, Any]:
+    """
+    Converts dark pool levels into one of four actionable QQQ plans:
+    - CALL: support hold near a resource level
+    - CALL: acceptance through resistance
+    - PUT: rejection near resistance
+    - PUT: acceptance below support
+    If no clean level reaction exists, returns NO_TRADE.
+    """
+    if not ENABLE_DARKPOOL_QQQ_SIGNAL_ENGINE:
+        return {"action": "NO_TRADE", "reason": "darkpool_qqq_engine_disabled"}
+
+    if current_price <= 0:
+        return {"action": "NO_TRADE", "reason": "missing_current_price"}
+
+    try:
+        levels = uw_dp_build_levels("QQQ", current_price=current_price, force=force) if "uw_dp_build_levels" in globals() else {}
+    except Exception as e:
+        levels = {"ok": False, "reason": f"uw_build_error:{e}"}
+
+    if not isinstance(levels, dict) or not levels.get("ok"):
+        if DARKPOOL_QQQ_REQUIRE_LEVEL:
+            return {
+                "action": "NO_TRADE",
+                "reason": f"darkpool_levels_required_unavailable:{levels.get('reason') if isinstance(levels, dict) else 'unknown'}",
+                "levels": levels,
+            }
+        return {
+            "action": "CALL" if DARKPOOL_QQQ_ALLOW_CALLS else "NO_TRADE",
+            "direction": "CALL",
+            "grade": "B",
+            "setup": "vwap_reclaim",
+            "trigger": "vwap_reclaim",
+            "confirmation": "vwap",
+            "reason": "fallback_vwap_signal_no_darkpool_levels",
+            "levels": levels,
+            "darkpool_actions": ["fallback_no_darkpool_levels"],
+        }
+
+    support = levels.get("nearest_support")
+    resistance = levels.get("nearest_resistance")
+    support_px = dp_qqq_level_price(support)
+    resistance_px = dp_qqq_level_price(resistance)
+
+    def near(px: float) -> bool:
+        if not px or current_price <= 0:
+            return False
+        return abs(current_price - px) / current_price <= DARKPOOL_QQQ_NEAR_LEVEL_PCT
+
+    def accepted_above(px: float) -> bool:
+        return bool(px and current_price >= px * (1 + DARKPOOL_QQQ_ACCEPTANCE_PCT))
+
+    def accepted_below(px: float) -> bool:
+        return bool(px and current_price <= px * (1 - DARKPOOL_QQQ_ACCEPTANCE_PCT))
+
+    decisions = []
+
+    if DARKPOOL_QQQ_ALLOW_CALLS and support_px and near(support_px) and current_price >= support_px:
+        boost = 1 if dp_qqq_level_strength(support) == "major" else 0
+        if vwap and current_price > vwap:
+            boost += 1
+        decisions.append({
+            "action": "CALL",
+            "direction": "CALL",
+            "grade": dp_qqq_grade_up("A", boost),
+            "setup": "support_hold",
+            "trigger": "support_hold",
+            "confirmation": "hold",
+            "reason": f"QQQ holding dark pool support/resource level near {support_px}",
+            "decision_level": support_px,
+            "darkpool_actions": ["call_supported_by_darkpool_support", "support_hold"],
+        })
+
+    if DARKPOOL_QQQ_ALLOW_CALLS and resistance_px and accepted_above(resistance_px):
+        boost = 1 if dp_qqq_level_strength(resistance) == "major" else 0
+        if vwap and current_price > vwap:
+            boost += 1
+        decisions.append({
+            "action": "CALL",
+            "direction": "CALL",
+            "grade": dp_qqq_grade_up("A", boost),
+            "setup": "break_and_hold",
+            "trigger": "break_and_hold",
+            "confirmation": "vwap" if vwap else "momentum",
+            "reason": f"QQQ accepted above dark pool resistance/resource level {resistance_px}",
+            "decision_level": resistance_px,
+            "darkpool_actions": ["call_accepted_through_darkpool_resistance", "break_and_hold"],
+        })
+
+    if DARKPOOL_QQQ_ALLOW_PUTS and resistance_px and near(resistance_px) and current_price <= resistance_px:
+        boost = 1 if dp_qqq_level_strength(resistance) == "major" else 0
+        if vwap and current_price < vwap:
+            boost += 1
+        decisions.append({
+            "action": "PUT",
+            "direction": "PUT",
+            "grade": dp_qqq_grade_up("A", boost),
+            "setup": "resistance_rejection",
+            "trigger": "resistance_rejection",
+            "confirmation": "reject",
+            "reason": f"QQQ rejecting dark pool resistance/resource level near {resistance_px}",
+            "decision_level": resistance_px,
+            "darkpool_actions": ["put_supported_by_darkpool_resistance", "resistance_rejection"],
+        })
+
+    if DARKPOOL_QQQ_ALLOW_PUTS and support_px and accepted_below(support_px):
+        boost = 1 if dp_qqq_level_strength(support) == "major" else 0
+        if vwap and current_price < vwap:
+            boost += 1
+        decisions.append({
+            "action": "PUT",
+            "direction": "PUT",
+            "grade": dp_qqq_grade_up("A", boost),
+            "setup": "vwap_reject",
+            "trigger": "vwap_reject",
+            "confirmation": "vwap" if vwap else "structure",
+            "reason": f"QQQ accepted below dark pool support/resource level {support_px}",
+            "decision_level": support_px,
+            "darkpool_actions": ["put_accepted_below_darkpool_support", "support_break"],
+        })
+
+    if not decisions:
+        return {
+            "action": "NO_TRADE",
+            "reason": "no_darkpool_level_reaction",
+            "current_price": current_price,
+            "vwap": vwap,
+            "nearest_support": support,
+            "nearest_resistance": resistance,
+            "levels": levels,
+        }
+
+    decisions.sort(key=lambda d: (ai_grade_rank(d.get("grade", "B")), "accepted" in " ".join(d.get("darkpool_actions", []))), reverse=True)
+    best = decisions[0]
+    best["current_price"] = current_price
+    best["vwap"] = vwap
+    best["nearest_support"] = support
+    best["nearest_resistance"] = resistance
+    best["levels"] = levels
+
+    if not dp_qqq_meets_min_grade(best.get("grade")):
+        best["action"] = "NO_TRADE"
+        best["reason"] = f"grade_below_darkpool_min:{best.get('grade')}<{DARKPOOL_QQQ_MIN_GRADE}"
+
+    return best
+
+
 def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
     """
-    Simple paper-mode signal driver.
-    Writes a fresh ai_signal.json and signal.json using current market price.
-    It does not place live trades by itself; normal engine risk + paper routing still control execution.
+    QQQ dark-pool-driven signal generator.
+    Writes fresh ai_signal.json and signal.json only when QQQ reacts to institutional resource levels.
+    Normal engine risk, QQQ lock, macro, portfolio heat, duplicate caps, and paper/live controls still gate execution.
     """
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         return {"generated": False, "reason": "disabled"}
@@ -3430,7 +3631,6 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Never generate new entries while a position is open.
         try:
             open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
             if open_positions:
@@ -3447,46 +3647,61 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         if not force and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
             return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
 
-        ticker = "QQQ"  # HARD LOCK: do not allow SPY or any fallback ticker
-        debug("[AUTO SIGNAL DEBUG] internal generator hard_locked_ticker=QQQ")
-        direction = normalize_direction(AUTO_SIGNAL_DIRECTION or "CALL")
+        ticker = "QQQ"
+        debug("[AUTO SIGNAL DEBUG] darkpool QQQ signal engine loaded | hard_locked_ticker=QQQ")
 
-        # Pull live market price through the engine's existing market-data router.
         underlying_price = 0.0
+        market_snapshot = {}
+        vwap = 0.0
         try:
-            prices = load_market_prices([ticker])
-            underlying_price, _ts = get_market_price_for_symbol(ticker, prices)
+            market_snapshot = load_market_prices([ticker])
+            underlying_price, _ts = get_market_price_for_symbol(ticker, market_snapshot)
+            vwap = dp_qqq_get_vwap_from_market_snapshot(market_snapshot, ticker)
         except Exception as price_error:
-            debug(f"AUTO SIGNAL PRICE ERROR | {price_error}")
+            debug(f"DARKPOOL QQQ SIGNAL PRICE ERROR | {price_error}")
             underlying_price = 0.0
 
         if underlying_price < AUTO_SIGNAL_MIN_UNDERLYING_PRICE:
             return {"generated": False, "reason": "invalid_underlying_price", "ticker": ticker, "price": underlying_price}
 
+        decision = dp_qqq_build_decision(underlying_price, vwap=vwap, force=force)
+        if decision.get("action") == "NO_TRADE":
+            try:
+                debug(f"DARKPOOL QQQ SIGNAL NO TRADE | reason={decision.get('reason')} price={underlying_price} vwap={vwap}")
+            except Exception:
+                pass
+            return {"generated": False, "reason": decision.get("reason", "no_trade"), "decision": decision}
+
+        direction = normalize_direction(decision.get("direction", "CALL"))
         entry = round(max(0.01, AUTO_SIGNAL_CONTRACT_PRICE), 2)
         if direction == "PUT":
             stop = round(entry + AUTO_SIGNAL_STOP_OFFSET, 2)
             tp1 = round(max(0.01, entry - AUTO_SIGNAL_TP1_OFFSET), 2)
             tp2 = round(max(0.01, entry - AUTO_SIGNAL_TP2_OFFSET), 2)
             targets = [tp1, tp2]
-            public_reason = f"{ticker} auto paper PUT signal generated from live price validation."
         else:
             stop = round(max(0.01, entry - AUTO_SIGNAL_STOP_OFFSET), 2)
             tp1 = round(entry + AUTO_SIGNAL_TP1_OFFSET, 2)
             tp2 = round(entry + AUTO_SIGNAL_TP2_OFFSET, 2)
             targets = [tp1, tp2]
-            public_reason = f"{ticker} auto paper CALL signal generated from live price validation."
+
+        grade = str(decision.get("grade") or AUTO_SIGNAL_GRADE or "A").upper().strip()
+        setup = str(decision.get("setup") or AUTO_SIGNAL_SETUP or "break_and_hold").lower().strip()
+        trigger = str(decision.get("trigger") or setup).lower().strip()
+        confirmation = str(decision.get("confirmation") or "vwap").lower().strip()
+        decision_level = safe_float(decision.get("decision_level", 0), 0.0)
+        public_reason = str(decision.get("reason") or f"QQQ {direction} dark pool level reaction").strip()
 
         signal = {
             "ticker": ticker,
             "symbol": ticker,
             "direction": direction,
-            "grade": AUTO_SIGNAL_GRADE,
-            "confidence": AUTO_SIGNAL_GRADE,
-            "setup": AUTO_SIGNAL_SETUP,
-            "strategy": AUTO_SIGNAL_SETUP,
-            "trigger": AUTO_SIGNAL_TRIGGER,
-            "confirmation": "auto_price_refresh",
+            "grade": grade,
+            "confidence": grade,
+            "setup": setup,
+            "strategy": setup,
+            "trigger": trigger,
+            "confirmation": confirmation,
             "regime": "clean",
             "entry": entry,
             "stop": stop,
@@ -3499,11 +3714,25 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
             "tp2_contract": tp2,
             "qty": safe_int(os.getenv("DEFAULT_PAPER_QTY", "1"), 1),
             "underlying_price": underlying_price,
+            "price": underlying_price,
+            "vwap": vwap,
+            "key_level": decision_level,
+            "decision_level": decision_level,
             "reason": public_reason,
             "public_reason": public_reason,
-            "source": "simple_auto_signal_generator",
+            "source": "darkpool_qqq_signal_engine",
             "timestamp": now,
             "auto_generated": True,
+            "dark_pool_signal": {
+                "enabled": True,
+                "decision": decision.get("action"),
+                "actions": decision.get("darkpool_actions", []),
+                "nearest_support": decision.get("nearest_support"),
+                "nearest_resistance": decision.get("nearest_resistance"),
+                "decision_level": decision_level,
+                "current_price": underlying_price,
+                "vwap": vwap,
+            },
         }
 
         try:
@@ -3511,7 +3740,13 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Keep both files fresh. signal.json is what the execution loop reads.
+        try:
+            signal = apply_unusual_whales_darkpool_to_signal(signal, stage="auto_signal_generator")
+            if unusual_whales_darkpool_blocks_signal(signal):
+                return {"generated": False, "reason": "darkpool_confluence_blocked", "signal": signal}
+        except Exception as dp_apply_error:
+            debug(f"DARKPOOL QQQ SIGNAL APPLY WARNING | {dp_apply_error}")
+
         if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(AUTO_AI_SIGNAL_FILE):
             atomic_write_json(AUTO_AI_SIGNAL_FILE, signal)
         if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(SIGNAL_FILE):
@@ -3521,18 +3756,23 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         state["last_signal"] = {
             "ticker": ticker,
             "direction": direction,
-            "entry": entry,
+            "grade": signal.get("grade"),
+            "setup": setup,
+            "decision_level": decision_level,
             "underlying_price": underlying_price,
             "timestamp": now,
         }
         state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
         atomic_write_json(AUTO_SIGNAL_STATE_FILE, state)
 
-        debug(f"[AUTO SIGNAL] Generated fresh {ticker} {direction} | underlying={underlying_price} | contract={entry} | ts={now}")
-        return {"generated": True, "reason": "fresh_signal_written", "signal": signal}
+        debug(
+            f"[AUTO SIGNAL] DARKPOOL QQQ {direction} | grade={signal.get('grade')} "
+            f"setup={setup} level={decision_level} underlying={underlying_price} contract={entry} ts={now}"
+        )
+        return {"generated": True, "reason": "darkpool_qqq_signal_written", "signal": signal}
 
     except Exception as e:
-        log(f"❌ AUTO SIGNAL GENERATOR ERROR | {e}")
+        log(f"❌ DARKPOOL QQQ SIGNAL GENERATOR ERROR | {e}")
         log(traceback.format_exc())
         return {"generated": False, "reason": "error", "error": str(e)}
 
