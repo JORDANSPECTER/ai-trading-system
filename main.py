@@ -14,6 +14,20 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 # =========================================================
+# REAL QQQ STRATEGY GENERATOR IMPORT
+# Single-source signal engine: external auto_signal_generator.py only.
+# This replaces/removes the older internal/simple/fallback generators from runtime.
+# =========================================================
+try:
+    from auto_signal_generator import generate_signal as real_qqq_strategy_generate_signal
+    REAL_QQQ_STRATEGY_GENERATOR_AVAILABLE = True
+    print("[REAL QQQ STRATEGY IMPORT OK] auto_signal_generator.generate_signal loaded", flush=True)
+except Exception as real_strategy_import_error:
+    real_qqq_strategy_generate_signal = None
+    REAL_QQQ_STRATEGY_GENERATOR_AVAILABLE = False
+    print(f"[REAL QQQ STRATEGY IMPORT WARNING] unavailable: {real_strategy_import_error}", flush=True)
+
+# =========================================================
 # MACRO BRIDGE IMPORTS
 # Safe import so main engine still runs even if macro_bridge fails.
 # Supports BOTH versions:
@@ -3162,7 +3176,7 @@ def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
-ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
+ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "false").lower() == "true"
 AUTO_AI_SIGNAL_TICKERS = ["QQQ"]  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
 AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
@@ -14854,6 +14868,52 @@ def reset_kill_switch_for_testing():
 
 
 
+
+# =========================================================
+# REAL QQQ STRATEGY RUNTIME HOOK
+# This is the ONLY auto-signal source allowed in the live loop.
+# It calls auto_signal_generator.py, which must be QQQ-only and strategy-based.
+# =========================================================
+def real_qqq_strategy_tick(force: bool = False) -> Dict[str, Any]:
+    try:
+        if not ENABLE_AUTO_SIGNAL_GENERATOR:
+            return {"generated": False, "reason": "disabled"}
+
+        if not REAL_QQQ_STRATEGY_GENERATOR_AVAILABLE or real_qqq_strategy_generate_signal is None:
+            debug("REAL QQQ STRATEGY unavailable; no signal generated")
+            return {"generated": False, "reason": "strategy_generator_unavailable"}
+
+        try:
+            ensure_globals_initialized()
+            open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+            if open_positions:
+                return {"generated": False, "reason": "open_position_exists", "open_count": len(open_positions)}
+        except Exception:
+            pass
+
+        sig = real_qqq_strategy_generate_signal(force=force)
+        if not sig:
+            return {"generated": False, "reason": "no_strategy_signal"}
+
+        ticker = str(sig.get("ticker") or sig.get("symbol") or sig.get("underlying") or "").upper().strip()
+        if ticker != "QQQ":
+            debug(f"REAL QQQ STRATEGY BLOCKED NON-QQQ | ticker={ticker}")
+            try:
+                if file_exists(AI_SIGNAL_INPUT_FILE):
+                    atomic_write_json(AI_SIGNAL_ARCHIVE_FILE, sig)
+                    os.remove(AI_SIGNAL_INPUT_FILE)
+            except Exception:
+                pass
+            return {"generated": False, "reason": f"blocked_non_qqq_{ticker}", "signal": sig}
+
+        debug(f"REAL QQQ STRATEGY GENERATED | ticker=QQQ direction={sig.get('direction')} grade={sig.get('grade')} source={sig.get('source')}")
+        return {"generated": True, "reason": "real_qqq_strategy_signal", "signal": sig}
+
+    except Exception as e:
+        log(f"❌ REAL QQQ STRATEGY LOOP ERROR | {e}")
+        log(traceback.format_exc())
+        return {"generated": False, "reason": "error", "error": str(e)}
+
 def main_loop():
     try:
         debug_alpaca_urls_once()
@@ -14867,8 +14927,8 @@ def main_loop():
 
     boot()
     macro_bridge_fred_refresh(force=False)
-    auto_signal_generator_tick(force=True)
-    auto_generate_ai_signal_if_ready()
+    # Single-source signal generation: REAL QQQ strategy only.
+    real_qqq_strategy_tick(force=True)
     ai_bridge_write_signal_if_ready()
 
     # =========================================================
@@ -14888,21 +14948,7 @@ def main_loop():
         log(traceback.format_exc())
 
     if not file_exists(SIGNAL_FILE):
-        log(f"❌ No signal file found on boot: {SIGNAL_FILE}")
-        if fallback_signal_enabled():
-            if fallback_signal_enabled():
-
-                debug("Routing fallback test signal once.")
-
-                sig = fallback_signal()
-
-                handle_new_signal(sig)
-
-            else:
-
-                debug("No signal file and fallback disabled — idle cycle.")
-        else:
-            debug("No signal file and fallback disabled — idle cycle.")
+        debug(f"No live signal file on boot: {SIGNAL_FILE} — waiting for REAL QQQ strategy generator")
 
     while True:
         # FREE DAILY LEVELS AUTO — ROOT LOOP HOOK
@@ -14926,14 +14972,13 @@ def main_loop():
             debug(f"FINAL ELITE ROUTING FLAGS | force={FORCE_EXECUTION_MODE} | bypass_routing={FORCE_BYPASS_SIGNAL_ROUTING} | treat_fresh={FORCE_TREAT_SIGNAL_AS_FRESH}")
 
             # =========================================================
-            # SIMPLE AUTO SIGNAL GENERATOR
-            # Runs before the signal listener so signal.json stays fresh.
-            # Cooldown + open-position guard prevent constant re-entry.
+            # REAL QQQ STRATEGY GENERATOR — SINGLE AUTO SIGNAL SOURCE
+            # No old/simple/fallback generators are allowed in the loop.
             # =========================================================
             try:
-                auto_signal_generator_tick(force=False)
+                real_qqq_strategy_tick(force=False)
             except Exception as auto_signal_loop_error:
-                debug(f"AUTO SIGNAL LOOP ERROR | {auto_signal_loop_error}")
+                debug(f"REAL QQQ STRATEGY LOOP ERROR | {auto_signal_loop_error}")
 
             try:
                 ai_bridge_write_signal_if_ready()
@@ -15052,8 +15097,16 @@ def main_loop():
 
 def run_once():
     boot()
-    sig = load_live_signal() or fallback_signal()
-    handle_new_signal(sig)
+    real_qqq_strategy_tick(force=True)
+    try:
+        ai_bridge_write_signal_if_ready()
+    except Exception as bridge_error:
+        debug(f"AI SIGNAL BRIDGE RUN_ONCE ERROR | {bridge_error}")
+    sig = load_live_signal()
+    if sig:
+        handle_new_signal(sig)
+    else:
+        debug("RUN_ONCE: no QQQ strategy signal generated")
     runtime_housekeeping()
     process_telegram_updates()
     send_heartbeat(force=False)
