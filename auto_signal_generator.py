@@ -1,6 +1,7 @@
 # =========================================================
 # UnBiased Trades — QQQ ONLY AUTO SIGNAL GENERATOR
-# Creates ai_signal.json for main.py
+# FIXED PATH + UNIQUE SIGNAL ID
+# Writes directly to /opt/render/project/src/ai_signal.json
 # HARD LOCK: QQQ only, no SPY
 # =========================================================
 
@@ -9,11 +10,12 @@ import json
 import time
 from datetime import datetime, timezone
 
-SIGNAL_FILE = os.getenv("SIGNAL_FILE", "ai_signal.json").strip()
-MARKET_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
-STATE_FILE = "auto_signal_generator_state.json"
+SIGNAL_FILE = "/opt/render/project/src/ai_signal.json"
+MARKET_FILE = "/opt/render/project/src/market_prices.json"
+STATE_FILE = "/opt/render/project/src/auto_signal_generator_state.json"
 
 TICKER = "QQQ"
+
 ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "true").lower() == "true"
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "60"))
 
@@ -135,7 +137,12 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
         stop = round(price + STOP_DISTANCE, 2)
         targets = [round(price - TARGET_1, 2), round(price - TARGET_2, 2)]
 
+    unique_id = f"QQQ-{direction}-{setup}-{now_ts()}-{time.time()}"
+
     return {
+        "signal_id": unique_id,
+        "id": unique_id,
+
         "ticker": "QQQ",
         "symbol": "QQQ",
         "underlying": "QQQ",
@@ -178,7 +185,7 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
 
 
 def generate_signal(force=False):
-    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded", flush=True)
+    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded | fixed path enabled", flush=True)
 
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         print("[AUTO SIGNAL] disabled", flush=True)
@@ -221,12 +228,14 @@ def generate_signal(force=False):
         "last_entry": signal["entry"],
         "last_setup": setup,
         "last_grade": grade,
+        "last_signal_id": signal["signal_id"],
     })
 
     print(
         f"[AUTO SIGNAL] GENERATED QQQ {direction} | setup={setup} "
         f"entry={signal['entry']} vwap={signal['vwap']} "
-        f"pm_high={pm_high} pm_low={pm_low}",
+        f"pm_high={pm_high} pm_low={pm_low} "
+        f"signal_id={signal['signal_id']}",
         flush=True,
     )
 
