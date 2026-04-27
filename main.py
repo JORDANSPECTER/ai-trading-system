@@ -14,20 +14,6 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 # =========================================================
-# REAL QQQ STRATEGY GENERATOR IMPORT
-# Single-source signal engine: external auto_signal_generator.py only.
-# This replaces/removes the older internal/simple/fallback generators from runtime.
-# =========================================================
-try:
-    from auto_signal_generator import generate_signal as real_qqq_strategy_generate_signal
-    REAL_QQQ_STRATEGY_GENERATOR_AVAILABLE = True
-    print("[REAL QQQ STRATEGY IMPORT OK] auto_signal_generator.generate_signal loaded", flush=True)
-except Exception as real_strategy_import_error:
-    real_qqq_strategy_generate_signal = None
-    REAL_QQQ_STRATEGY_GENERATOR_AVAILABLE = False
-    print(f"[REAL QQQ STRATEGY IMPORT WARNING] unavailable: {real_strategy_import_error}", flush=True)
-
-# =========================================================
 # MACRO BRIDGE IMPORTS
 # Safe import so main engine still runs even if macro_bridge fails.
 # Supports BOTH versions:
@@ -292,7 +278,10 @@ TWELVE_DATA_BASE_URL = os.getenv("TWELVE_DATA_BASE_URL", "https://api.twelvedata
 ALPACA_DATA_BASE_URL = normalize_alpaca_data_base_url(os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")).rstrip("/")
 LIVE_PRICE_CACHE_SECONDS = int(os.getenv("LIVE_PRICE_CACHE_SECONDS", str(MARKET_DATA_REFRESH_SECONDS)))
 TWELVE_DATA_VWAP_INTERVAL = os.getenv("TWELVE_DATA_VWAP_INTERVAL", "1min").strip()
-TWELVE_DATA_VWAP_OUTPUTSIZE = int(os.getenv("TWELVE_DATA_VWAP_OUTPUTSIZE", "390"))
+TWELVE_DATA_VWAP_OUTPUTSIZE = int(os.getenv("TWELVE_DATA_VWAP_OUTPUTSIZE", "500"))
+TWELVE_DATA_PREMARKET_START = os.getenv("TWELVE_DATA_PREMARKET_START", "04:00").strip()
+TWELVE_DATA_PREMARKET_END = os.getenv("TWELVE_DATA_PREMARKET_END", "09:29").strip()
+MARKET_DATA_WRITE_PREMARKET_LEVELS = os.getenv("MARKET_DATA_WRITE_PREMARKET_LEVELS", "true").lower() == "true"
 MARKET_DATA_WRITE_LIVE_SNAPSHOT = os.getenv("MARKET_DATA_WRITE_LIVE_SNAPSHOT", "true").lower() == "true"
 AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
 AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
@@ -3176,7 +3165,7 @@ def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
-ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "false").lower() == "true"
+ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
 AUTO_AI_SIGNAL_TICKERS = ["QQQ"]  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
 AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
@@ -7332,9 +7321,19 @@ def extract_price_from_payload(payload: Any) -> float:
 
 def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
     """
-    Fetches Twelve Data intraday candles and computes session VWAP.
+    Fetches Twelve Data intraday candles, computes session VWAP, and auto-calculates
+    premarket high/low from the configured premarket window.
+
     Writes a snapshot shape compatible with market_prices.json:
-      {"price": ..., "vwap": ..., "volume": ..., "timestamp": ..., "source": "twelvedata"}
+      {
+        "price": ...,
+        "vwap": ...,
+        "session_vwap": ...,
+        "premarket_high": ...,
+        "premarket_low": ...,
+        "volume": ...,
+        "source": "twelvedata"
+      }
     """
     symbol = str(symbol or "").upper().strip()
     if not TWELVE_DATA_API_KEY or not symbol:
@@ -7374,6 +7373,23 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
         last_price = 0.0
         last_volume = 0.0
         last_datetime = ""
+        pm_high = None
+        pm_low = None
+
+        def _extract_hhmm(raw_dt: Any) -> str:
+            """Extract HH:MM from TwelveData datetime strings like '2026-04-27 08:15:00'."""
+            try:
+                s = str(raw_dt or "").strip()
+                if not s:
+                    return ""
+                # Handles 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DDTHH:MM:SS', or plain HH:MM.
+                if "T" in s:
+                    s = s.split("T")[-1]
+                elif " " in s:
+                    s = s.split(" ")[-1]
+                return s[:5]
+            except Exception:
+                return ""
 
         for candle in candles:
             if not isinstance(candle, dict):
@@ -7389,6 +7405,15 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
             high = safe_float(candle.get("high") or candle.get("h"), 0.0)
             low = safe_float(candle.get("low") or candle.get("l"), 0.0)
             volume = safe_float(candle.get("volume") or candle.get("v"), 0.0)
+            candle_dt = str(candle.get("datetime") or candle.get("timestamp") or "")
+            hhmm = _extract_hhmm(candle_dt)
+
+            # Auto premarket levels: 4:00am through 9:29am ET/vendor-local time.
+            if MARKET_DATA_WRITE_PREMARKET_LEVELS and hhmm and TWELVE_DATA_PREMARKET_START <= hhmm <= TWELVE_DATA_PREMARKET_END:
+                if high > 0:
+                    pm_high = high if pm_high is None else max(pm_high, high)
+                if low > 0:
+                    pm_low = low if pm_low is None else min(pm_low, low)
 
             if close <= 0:
                 continue
@@ -7403,14 +7428,14 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
                 last_volume = volume
 
             last_price = close
-            last_datetime = str(candle.get("datetime") or candle.get("timestamp") or "")
+            last_datetime = candle_dt
 
         if last_price <= 0:
             return {}
 
         vwap = (pv_sum / vol_sum) if vol_sum > 0 else last_price
 
-        return {
+        snapshot = {
             "price": round(float(last_price), 6),
             "last": round(float(last_price), 6),
             "vwap": round(float(vwap), 6),
@@ -7425,10 +7450,24 @@ def fetch_twelve_data_intraday_snapshot(symbol: str) -> Dict[str, Any]:
             "interval": TWELVE_DATA_VWAP_INTERVAL,
         }
 
-    except Exception as e:
-        debug(f"Twelve Data VWAP exception for {symbol}: {e}")
-        return {}
+        if MARKET_DATA_WRITE_PREMARKET_LEVELS:
+            if pm_high is not None and pm_high > 0:
+                snapshot["premarket_high"] = round(float(pm_high), 6)
+            if pm_low is not None and pm_low > 0:
+                snapshot["premarket_low"] = round(float(pm_low), 6)
+            if (pm_high is not None and pm_high > 0) or (pm_low is not None and pm_low > 0):
+                snapshot["premarket_updated_at"] = epoch()
+                snapshot["premarket_window"] = f"{TWELVE_DATA_PREMARKET_START}-{TWELVE_DATA_PREMARKET_END}"
+                debug(
+                    f"PREMARKET LEVELS UPDATED | {symbol} "
+                    f"pm_high={snapshot.get('premarket_high')} pm_low={snapshot.get('premarket_low')}"
+                )
 
+        return snapshot
+
+    except Exception as e:
+        debug(f"Twelve Data VWAP/premarket exception for {symbol}: {e}")
+        return {}
 
 def fetch_twelve_data_price(symbol: str) -> float:
     """Fetches a quote/price from Twelve Data. Falls back safely if unsupported."""
@@ -14868,52 +14907,6 @@ def reset_kill_switch_for_testing():
 
 
 
-
-# =========================================================
-# REAL QQQ STRATEGY RUNTIME HOOK
-# This is the ONLY auto-signal source allowed in the live loop.
-# It calls auto_signal_generator.py, which must be QQQ-only and strategy-based.
-# =========================================================
-def real_qqq_strategy_tick(force: bool = False) -> Dict[str, Any]:
-    try:
-        if not ENABLE_AUTO_SIGNAL_GENERATOR:
-            return {"generated": False, "reason": "disabled"}
-
-        if not REAL_QQQ_STRATEGY_GENERATOR_AVAILABLE or real_qqq_strategy_generate_signal is None:
-            debug("REAL QQQ STRATEGY unavailable; no signal generated")
-            return {"generated": False, "reason": "strategy_generator_unavailable"}
-
-        try:
-            ensure_globals_initialized()
-            open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
-            if open_positions:
-                return {"generated": False, "reason": "open_position_exists", "open_count": len(open_positions)}
-        except Exception:
-            pass
-
-        sig = real_qqq_strategy_generate_signal(force=force)
-        if not sig:
-            return {"generated": False, "reason": "no_strategy_signal"}
-
-        ticker = str(sig.get("ticker") or sig.get("symbol") or sig.get("underlying") or "").upper().strip()
-        if ticker != "QQQ":
-            debug(f"REAL QQQ STRATEGY BLOCKED NON-QQQ | ticker={ticker}")
-            try:
-                if file_exists(AI_SIGNAL_INPUT_FILE):
-                    atomic_write_json(AI_SIGNAL_ARCHIVE_FILE, sig)
-                    os.remove(AI_SIGNAL_INPUT_FILE)
-            except Exception:
-                pass
-            return {"generated": False, "reason": f"blocked_non_qqq_{ticker}", "signal": sig}
-
-        debug(f"REAL QQQ STRATEGY GENERATED | ticker=QQQ direction={sig.get('direction')} grade={sig.get('grade')} source={sig.get('source')}")
-        return {"generated": True, "reason": "real_qqq_strategy_signal", "signal": sig}
-
-    except Exception as e:
-        log(f"❌ REAL QQQ STRATEGY LOOP ERROR | {e}")
-        log(traceback.format_exc())
-        return {"generated": False, "reason": "error", "error": str(e)}
-
 def main_loop():
     try:
         debug_alpaca_urls_once()
@@ -14927,8 +14920,8 @@ def main_loop():
 
     boot()
     macro_bridge_fred_refresh(force=False)
-    # Single-source signal generation: REAL QQQ strategy only.
-    real_qqq_strategy_tick(force=True)
+    auto_signal_generator_tick(force=True)
+    auto_generate_ai_signal_if_ready()
     ai_bridge_write_signal_if_ready()
 
     # =========================================================
@@ -14948,7 +14941,21 @@ def main_loop():
         log(traceback.format_exc())
 
     if not file_exists(SIGNAL_FILE):
-        debug(f"No live signal file on boot: {SIGNAL_FILE} — waiting for REAL QQQ strategy generator")
+        log(f"❌ No signal file found on boot: {SIGNAL_FILE}")
+        if fallback_signal_enabled():
+            if fallback_signal_enabled():
+
+                debug("Routing fallback test signal once.")
+
+                sig = fallback_signal()
+
+                handle_new_signal(sig)
+
+            else:
+
+                debug("No signal file and fallback disabled — idle cycle.")
+        else:
+            debug("No signal file and fallback disabled — idle cycle.")
 
     while True:
         # FREE DAILY LEVELS AUTO — ROOT LOOP HOOK
@@ -14972,13 +14979,14 @@ def main_loop():
             debug(f"FINAL ELITE ROUTING FLAGS | force={FORCE_EXECUTION_MODE} | bypass_routing={FORCE_BYPASS_SIGNAL_ROUTING} | treat_fresh={FORCE_TREAT_SIGNAL_AS_FRESH}")
 
             # =========================================================
-            # REAL QQQ STRATEGY GENERATOR — SINGLE AUTO SIGNAL SOURCE
-            # No old/simple/fallback generators are allowed in the loop.
+            # SIMPLE AUTO SIGNAL GENERATOR
+            # Runs before the signal listener so signal.json stays fresh.
+            # Cooldown + open-position guard prevent constant re-entry.
             # =========================================================
             try:
-                real_qqq_strategy_tick(force=False)
+                auto_signal_generator_tick(force=False)
             except Exception as auto_signal_loop_error:
-                debug(f"REAL QQQ STRATEGY LOOP ERROR | {auto_signal_loop_error}")
+                debug(f"AUTO SIGNAL LOOP ERROR | {auto_signal_loop_error}")
 
             try:
                 ai_bridge_write_signal_if_ready()
@@ -15097,16 +15105,8 @@ def main_loop():
 
 def run_once():
     boot()
-    real_qqq_strategy_tick(force=True)
-    try:
-        ai_bridge_write_signal_if_ready()
-    except Exception as bridge_error:
-        debug(f"AI SIGNAL BRIDGE RUN_ONCE ERROR | {bridge_error}")
-    sig = load_live_signal()
-    if sig:
-        handle_new_signal(sig)
-    else:
-        debug("RUN_ONCE: no QQQ strategy signal generated")
+    sig = load_live_signal() or fallback_signal()
+    handle_new_signal(sig)
     runtime_housekeeping()
     process_telegram_updates()
     send_heartbeat(force=False)
