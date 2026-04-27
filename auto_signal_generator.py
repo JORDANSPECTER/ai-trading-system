@@ -1,7 +1,6 @@
 # =========================================================
 # UnBiased Trades — QQQ ONLY AUTO SIGNAL GENERATOR
-# FIXED PATH + UNIQUE SIGNAL ID
-# Writes directly to /opt/render/project/src/ai_signal.json
+# FIXED PATH + UNIQUE SIGNAL ID + SMART SCORE BOOST
 # HARD LOCK: QQQ only, no SPY
 # =========================================================
 
@@ -129,6 +128,27 @@ def decide_direction(price, vwap, pm_high, pm_low):
     return None, None, None
 
 
+def calculate_score(price, vwap, pm_high, pm_low, direction, grade):
+    base_score = 60
+
+    if grade == "A":
+        base_score += 10
+
+    if direction == "CALL" and price > vwap:
+        base_score += 5
+
+    if direction == "PUT" and price < vwap:
+        base_score += 5
+
+    if price > pm_high:
+        base_score += 10
+
+    if price < pm_low:
+        base_score += 10
+
+    return min(base_score, 85)
+
+
 def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
     if direction == "CALL":
         stop = round(price - STOP_DISTANCE, 2)
@@ -137,11 +157,13 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
         stop = round(price + STOP_DISTANCE, 2)
         targets = [round(price - TARGET_1, 2), round(price - TARGET_2, 2)]
 
+    score = calculate_score(price, vwap, pm_high, pm_low, direction, grade)
     unique_id = f"QQQ-{direction}-{setup}-{now_ts()}-{time.time()}"
 
     return {
         "signal_id": unique_id,
         "id": unique_id,
+        "nonce": time.time(),
 
         "ticker": "QQQ",
         "symbol": "QQQ",
@@ -159,7 +181,8 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
 
         "confidence": grade,
         "grade": grade,
-        "score": 70 if grade == "A" else 60,
+        "score": score,
+        "execution_score": score,
 
         "setup": setup,
         "setup_type": "qqq_vwap_premarket_generator",
@@ -173,19 +196,20 @@ def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
 
         "session": "auto",
         "time_window": "auto",
-        "trade_reason": "QQQ-only signal generated from premarket levels and VWAP trend continuation.",
+        "trade_reason": "QQQ-only signal generated from premarket levels and VWAP trend continuation with smart execution-score boost.",
+
+        "execution_override": True,
+        "force_execution": True,
+        "paper_only": True,
 
         "timestamp": now_ts(),
         "created_at": now_iso(),
         "source": "auto_signal_generator",
-
-        "force_execution": True,
-        "paper_only": True,
     }
 
 
 def generate_signal(force=False):
-    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded | fixed path enabled", flush=True)
+    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded | smart score boost enabled", flush=True)
 
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         print("[AUTO SIGNAL] disabled", flush=True)
@@ -228,13 +252,14 @@ def generate_signal(force=False):
         "last_entry": signal["entry"],
         "last_setup": setup,
         "last_grade": grade,
+        "last_score": signal["score"],
         "last_signal_id": signal["signal_id"],
     })
 
     print(
         f"[AUTO SIGNAL] GENERATED QQQ {direction} | setup={setup} "
-        f"entry={signal['entry']} vwap={signal['vwap']} "
-        f"pm_high={pm_high} pm_low={pm_low} "
+        f"grade={grade} score={signal['score']} entry={signal['entry']} "
+        f"vwap={signal['vwap']} pm_high={pm_high} pm_low={pm_low} "
         f"signal_id={signal['signal_id']}",
         flush=True,
     )
