@@ -12122,6 +12122,10 @@ EXEC_SCORE_BLOCK_BELOW = int(os.getenv("EXEC_SCORE_BLOCK_BELOW", "55"))
 EXEC_SCORE_MAX_FULL_QTY = float(os.getenv("EXEC_SCORE_MAX_FULL_QTY", "1.0"))
 EXEC_SCORE_MAX_HALF_QTY = float(os.getenv("EXEC_SCORE_MAX_HALF_QTY", "0.5"))
 EXEC_SCORE_MAX_STARTER_QTY = float(os.getenv("EXEC_SCORE_MAX_STARTER_QTY", "0.25"))
+# Paper/options contracts cannot be fractional.
+# If risk engine approves qty=1 and score is in starter bucket, allow 1 contract instead of zeroing it.
+EXEC_SCORE_ALLOW_STARTER_QTY_ONE = os.getenv("EXEC_SCORE_ALLOW_STARTER_QTY_ONE", "true").lower() == "true"
+EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED = os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true"
 
 
 def apply_execution_score_to_order_qty(signal: Dict[str, Any], approved_qty: Any) -> Tuple[int, str]:
@@ -12169,12 +12173,23 @@ def apply_execution_score_to_order_qty(signal: Dict[str, Any], approved_qty: Any
 
     capped = int(max(1, min(base_qty, max(1, round(base_qty * cap_fraction)))))
 
-    # If base_qty is 1, do not allow fraction contracts. Use 1 only for score >= half threshold.
+    # Options contracts cannot be fractional.
+    # Previous behavior turned starter bucket (example score 62) into qty=0 when base_qty=1.
+    # That blocked valid approved paper trades. This preserves risk-first rules while allowing
+    # the minimum contract only when the score already cleared EXEC_SCORE_BLOCK_BELOW.
     if base_qty == 1:
         if score >= EXEC_SCORE_HALF_SIZE:
             capped = 1
+        elif score >= EXEC_SCORE_REDUCED_SIZE and EXEC_SCORE_ALLOW_STARTER_QTY_ONE:
+            capped = 1
         else:
             capped = 0
+
+    # Final safety fallback: if the signal is approved by score and risk engine allowed at least
+    # one contract, do not let rounding/fraction caps turn it into zero in paper mode.
+    if capped <= 0 and EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED and score >= EXEC_SCORE_REDUCED_SIZE and base_qty >= 1:
+        capped = 1
+        bucket = f"{bucket}_min_qty_fallback"
 
     if capped <= 0:
         return 0, f"execution_score_qty_zero:{score}:{bucket}"
