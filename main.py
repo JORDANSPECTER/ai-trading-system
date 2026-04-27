@@ -3169,7 +3169,7 @@ def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
-ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
+ENABLE_AUTO_AI_SIGNAL_GENERATOR = False  # DISABLED: external auto_signal_generator.py is the only signal source
 AUTO_AI_SIGNAL_TICKERS = ["QQQ"]  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
 AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
@@ -3186,7 +3186,7 @@ AUTO_AI_DEFAULT_TP2_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP2_OFFSET", "0.80
 # reject entries with "Signal skipped: stale timestamp".
 # This is for PAPER validation. Keep LIVE_MODE=false and ALLOW_LIVE_BUYS=false.
 # =========================================================
-ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "false").lower() == "true"
+ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "true").lower() == "true"  # external generator loop enabled
 AUTO_SIGNAL_TICKER = "QQQ"  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_SIGNAL_DIRECTION = os.getenv("AUTO_SIGNAL_DIRECTION", "CALL").upper().strip()
 AUTO_SIGNAL_MIN_UNDERLYING_PRICE = float(os.getenv("AUTO_SIGNAL_MIN_UNDERLYING_PRICE", "100"))
@@ -3427,9 +3427,9 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
 
 def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
     """
-    Simple paper-mode signal driver.
-    Writes a fresh ai_signal.json and signal.json using current market price.
-    It does not place live trades by itself; normal engine risk + paper routing still control execution.
+    SINGLE SOURCE AUTO SIGNAL DRIVER.
+    Old internal/test signal generation is disabled here. This function now calls
+    external auto_signal_generator.generate_signal(), which is hard-locked to QQQ.
     """
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         return {"generated": False, "reason": "disabled"}
@@ -3440,7 +3440,7 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Never generate new entries while a position is open.
+        # Do not generate a new signal while a position is open.
         try:
             open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
             if open_positions:
@@ -3448,102 +3448,43 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
-        state = load_json_file(AUTO_SIGNAL_STATE_FILE, {})
-        if not isinstance(state, dict):
-            state = {}
-
-        now = epoch()
-        last_ts = safe_int(state.get("last_signal_ts", 0), 0)
-        if not force and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
-            return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
-
-        ticker = "QQQ"  # HARD LOCK: do not allow SPY or any fallback ticker
-        debug("[AUTO SIGNAL DEBUG] internal generator hard_locked_ticker=QQQ")
-        direction = normalize_direction(AUTO_SIGNAL_DIRECTION or "CALL")
-
-        # Pull live market price through the engine's existing market-data router.
-        underlying_price = 0.0
         try:
-            prices = load_market_prices([ticker])
-            underlying_price, _ts = get_market_price_for_symbol(ticker, prices)
-        except Exception as price_error:
-            debug(f"AUTO SIGNAL PRICE ERROR | {price_error}")
-            underlying_price = 0.0
+            from auto_signal_generator import generate_signal as external_generate_signal
+        except Exception as import_error:
+            debug(f"AUTO SIGNAL EXTERNAL IMPORT ERROR | {import_error}")
+            return {"generated": False, "reason": "external_import_error", "error": str(import_error)}
 
-        if underlying_price < AUTO_SIGNAL_MIN_UNDERLYING_PRICE:
-            return {"generated": False, "reason": "invalid_underlying_price", "ticker": ticker, "price": underlying_price}
+        sig = external_generate_signal(force=force)
+        if not sig:
+            return {"generated": False, "reason": "no_strategy_signal"}
 
-        entry = round(max(0.01, AUTO_SIGNAL_CONTRACT_PRICE), 2)
-        if direction == "PUT":
-            stop = round(entry + AUTO_SIGNAL_STOP_OFFSET, 2)
-            tp1 = round(max(0.01, entry - AUTO_SIGNAL_TP1_OFFSET), 2)
-            tp2 = round(max(0.01, entry - AUTO_SIGNAL_TP2_OFFSET), 2)
-            targets = [tp1, tp2]
-            public_reason = f"{ticker} auto paper PUT signal generated from live price validation."
-        else:
-            stop = round(max(0.01, entry - AUTO_SIGNAL_STOP_OFFSET), 2)
-            tp1 = round(entry + AUTO_SIGNAL_TP1_OFFSET, 2)
-            tp2 = round(entry + AUTO_SIGNAL_TP2_OFFSET, 2)
-            targets = [tp1, tp2]
-            public_reason = f"{ticker} auto paper CALL signal generated from live price validation."
+        ticker = str(sig.get("ticker") or sig.get("symbol") or sig.get("underlying") or "").upper().strip()
+        if ticker != "QQQ":
+            try:
+                if file_exists(AUTO_AI_SIGNAL_FILE):
+                    os.remove(AUTO_AI_SIGNAL_FILE)
+                if file_exists(SIGNAL_FILE):
+                    bad = load_json_file(SIGNAL_FILE, {})
+                    if str(bad.get("ticker", "")).upper() != "QQQ":
+                        os.remove(SIGNAL_FILE)
+            except Exception:
+                pass
+            debug(f"[AUTO SIGNAL HARD BLOCK] external generator attempted non-QQQ ticker={ticker}")
+            return {"generated": False, "reason": "non_qqq_blocked", "ticker": ticker}
 
-        signal = {
-            "ticker": ticker,
-            "symbol": ticker,
-            "direction": direction,
-            "grade": AUTO_SIGNAL_GRADE,
-            "confidence": AUTO_SIGNAL_GRADE,
-            "setup": AUTO_SIGNAL_SETUP,
-            "strategy": AUTO_SIGNAL_SETUP,
-            "trigger": AUTO_SIGNAL_TRIGGER,
-            "confirmation": "auto_price_refresh",
-            "regime": "clean",
-            "entry": entry,
-            "stop": stop,
-            "target": tp1,
-            "targets": targets,
-            "entry_contract": entry,
-            "contract_price": entry,
-            "stop_contract": stop,
-            "tp1_contract": tp1,
-            "tp2_contract": tp2,
-            "qty": safe_int(os.getenv("DEFAULT_PAPER_QTY", "1"), 1),
-            "underlying_price": underlying_price,
-            "reason": public_reason,
-            "public_reason": public_reason,
-            "source": "simple_auto_signal_generator",
-            "timestamp": now,
-            "auto_generated": True,
-        }
-
-        try:
-            signal = apply_macro_context_to_ai_signal(signal)
-        except Exception:
-            pass
-
-        # Keep both files fresh. signal.json is what the execution loop reads.
-        if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(AUTO_AI_SIGNAL_FILE):
-            atomic_write_json(AUTO_AI_SIGNAL_FILE, signal)
-        if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(SIGNAL_FILE):
-            atomic_write_json(SIGNAL_FILE, signal)
-
-        state["last_signal_ts"] = now
-        state["last_signal"] = {
-            "ticker": ticker,
-            "direction": direction,
-            "entry": entry,
-            "underlying_price": underlying_price,
-            "timestamp": now,
-        }
-        state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
-        atomic_write_json(AUTO_SIGNAL_STATE_FILE, state)
-
-        debug(f"[AUTO SIGNAL] Generated fresh {ticker} {direction} | underlying={underlying_price} | contract={entry} | ts={now}")
-        return {"generated": True, "reason": "fresh_signal_written", "signal": signal}
+        debug(
+            f"[AUTO SIGNAL] External QQQ strategy wrote signal | "
+            f"direction={sig.get('direction')} setup={sig.get('setup')} "
+            f"score={sig.get('score')} entry={sig.get('entry')}"
+        )
+        return {"generated": True, "reason": "external_strategy_signal_written", "signal": sig}
 
     except Exception as e:
         log(f"❌ AUTO SIGNAL GENERATOR ERROR | {e}")
-        log(traceback.format_exc())
+        try:
+            log(traceback.format_exc())
+        except Exception:
+            pass
         return {"generated": False, "reason": "error", "error": str(e)}
 
 
