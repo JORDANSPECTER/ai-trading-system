@@ -15597,6 +15597,336 @@ if "--exec-size-test" in sys.argv:
     sys.exit(0)
 
 
+
+
+# =========================================================
+# FINAL PATCH: FORCE PREMARKET LEVELS INTO EXECUTION SCORING
+# Fixes: market_prices.json has pm_high/pm_low, but execution score
+# still says "premarket levels not loaded" because signal lacked fields.
+# This helper pulls QQQ PM levels directly from market_prices.json and
+# attaches them to the signal before scoring/breakdown/alerts.
+# =========================================================
+def exec_score_force_load_premarket_levels(signal: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not isinstance(signal, dict):
+            return signal
+
+        # Already present on signal? Keep it, but also add aliases.
+        pm_high = safe_float(
+            signal.get("premarket_high")
+            or signal.get("pm_high")
+            or signal.get("pre_market_high"),
+            0,
+        )
+        pm_low = safe_float(
+            signal.get("premarket_low")
+            or signal.get("pm_low")
+            or signal.get("pre_market_low"),
+            0,
+        )
+
+        # Force load from market_prices.json when missing from signal.
+        if pm_high <= 0 or pm_low <= 0:
+            try:
+                market_data = load_json_file(MARKET_DATA_FILE, {})
+            except Exception:
+                try:
+                    market_data = load_json_file("market_prices.json", {})
+                except Exception:
+                    market_data = {}
+
+            qqq_data = {}
+            if isinstance(market_data, dict):
+                qqq_data = market_data.get("QQQ", {}) or market_data.get("qqq", {}) or {}
+
+            if isinstance(qqq_data, dict):
+                if pm_high <= 0:
+                    pm_high = safe_float(
+                        qqq_data.get("premarket_high")
+                        or qqq_data.get("pm_high")
+                        or qqq_data.get("pre_market_high"),
+                        0,
+                    )
+                if pm_low <= 0:
+                    pm_low = safe_float(
+                        qqq_data.get("premarket_low")
+                        or qqq_data.get("pm_low")
+                        or qqq_data.get("pre_market_low"),
+                        0,
+                    )
+
+        if pm_high and pm_high > 0:
+            signal["premarket_high"] = float(pm_high)
+            signal["pm_high"] = float(pm_high)
+            signal["pre_market_high"] = float(pm_high)
+        if pm_low and pm_low > 0:
+            signal["premarket_low"] = float(pm_low)
+            signal["pm_low"] = float(pm_low)
+            signal["pre_market_low"] = float(pm_low)
+
+        try:
+            debug(f"[PM LEVELS FIXED] high={signal.get('premarket_high')} low={signal.get('premarket_low')}")
+        except Exception:
+            print(f"[PM LEVELS FIXED] high={signal.get('premarket_high')} low={signal.get('premarket_low')}", flush=True)
+
+        return signal
+    except Exception as e:
+        try:
+            debug(f"PM LEVEL FORCE LOAD FAILED | {e}")
+        except Exception:
+            print(f"PM LEVEL FORCE LOAD FAILED | {e}", flush=True)
+        return signal
+
+
+def exec_score_premarket_bias(signal: Dict[str, Any], price: float) -> Tuple[str, int, str]:
+    try:
+        signal = exec_score_force_load_premarket_levels(signal)
+        pm_high = safe_float(signal.get("premarket_high") or signal.get("pm_high"), 0)
+        pm_low = safe_float(signal.get("premarket_low") or signal.get("pm_low"), 0)
+        if not price or price <= 0:
+            price = safe_float(signal.get("entry") or signal.get("entry_price") or signal.get("price"), 0)
+
+        interaction_buffer = safe_float(os.getenv("EXEC_SCORE_PM_INTERACTION_BUFFER", "0.50"), 0.50)
+
+        if pm_high and price and price > pm_high:
+            return "break_high", 20, f"premarket breakout above high {pm_high}"
+        if pm_low and price and price < pm_low:
+            return "break_low", 20, f"premarket breakdown below low {pm_low}"
+        if pm_high and price and abs(price - pm_high) <= interaction_buffer:
+            return "near_high", 10, f"near premarket high {pm_high}"
+        if pm_low and price and abs(price - pm_low) <= interaction_buffer:
+            return "near_low", 10, f"near premarket low {pm_low}"
+        if pm_high or pm_low:
+            return "loaded_no_interaction", 0, f"premarket levels loaded high={pm_high or 'NA'} low={pm_low or 'NA'} but no interaction"
+        return "missing", 0, "premarket levels not loaded"
+    except Exception as e:
+        return "error", 0, f"premarket bias error:{e}"
+
+
+# Override execution score with PM-level force-read and PM interaction scoring.
+def premium_execution_score(signal: Dict[str, Any]) -> int:
+    if not ENABLE_EXECUTION_SCORING_LAYER:
+        return 0
+    try:
+        signal = exec_score_force_load_premarket_levels(signal)
+
+        grade = premium_live_grade(signal)
+        direction = str(signal.get("direction") or "").upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("trigger") or "").lower()
+        entry_type = premium_live_detect_entry_type(signal).lower()
+        trade_reason = str(signal.get("trade_reason") or "").lower()
+        reasons = signal.get("strategy_reasons", [])
+        reasons_text = " ".join([str(x).lower() for x in reasons]) if isinstance(reasons, list) else str(reasons).lower()
+        session = str(signal.get("session") or signal.get("time_window") or premium_live_detect_session()).lower()
+        oil_bias = str(signal.get("oil_bias") or signal.get("oil") or signal.get("oil_trend") or "").lower()
+        level_ctx = signal.get("level_context", {}) if isinstance(signal.get("level_context", {}), dict) else {}
+        level_state = str(level_ctx.get("state") or level_ctx.get("level_state") or "").lower()
+        tech = premium_live_tech_strength(signal).lower()
+        dp = premium_live_darkpool_real_summary(signal).lower()
+        volume = premium_live_get(signal, "volume", default="").lower()
+
+        score = 0
+        score += {"A+": 35, "A": 30, "B+": 22, "B": 15, "C": 5, "AVOID": 0}.get(grade, 15)
+
+        strategy_score = safe_float(signal.get("score"), 0)
+        if strategy_score > 0:
+            score += min(24, int(strategy_score * 4))
+
+        price = safe_float(signal.get("entry") or signal.get("entry_price") or signal.get("price"), 0)
+        vwap_val = safe_float(signal.get("vwap") or signal.get("session_vwap"), 0)
+        vwap_text = str(premium_live_get(signal, "vwap", "vwap_position", default="")).lower()
+        if price > 0 and vwap_val > 0:
+            if direction == "CALL" and price > vwap_val:
+                score += 10
+            elif direction == "PUT" and price < vwap_val:
+                score += 10
+            else:
+                score -= 8
+        else:
+            if direction == "CALL" and any(x in vwap_text for x in ["above", "reclaim", "buyer"]):
+                score += 8
+            elif direction == "PUT" and any(x in vwap_text for x in ["below", "reject", "seller"]):
+                score += 8
+
+        high_quality = [
+            "break_and_hold", "break and hold", "retest_hold", "retest hold",
+            "vwap_reclaim", "vwap reclaim", "rejection", "reject",
+            "failed_bounce", "lower_high", "premarket_high", "premarket_low",
+            "premarket", "pm_high", "pm_low", "support", "resistance",
+        ]
+        if any(x in setup or x in entry_type or x in reasons_text for x in high_quality):
+            score += 12
+        elif "momentum" in setup or "momentum" in entry_type:
+            score += 6
+
+        # PM levels are pulled from market_prices.json even if signal lacks them.
+        pm_bias, pm_points, pm_reason = exec_score_premarket_bias(signal, price)
+        score += pm_points
+        signal["premarket_bias"] = pm_bias
+        signal["premarket_score_reason"] = pm_reason
+
+        # Small credit just for valid PM map being present, even without interaction.
+        if pm_bias == "loaded_no_interaction":
+            score += 4
+
+        if level_state in {"levels_loaded", "at_key_level", "above_support", "below_resistance"}:
+            score += 8
+        if any(x in dp for x in ["support", "resistance", "aligned", "holding", "mapped"]):
+            score += 8
+
+        if direction == "CALL" and any(x in oil_bias for x in ["bullish_for_qqq", "fall", "risk_on", "risk-on", "relief"]):
+            score += 10
+        elif direction == "PUT" and any(x in oil_bias for x in ["bearish_for_qqq", "rise", "risk_off", "risk-off", "pressure"]):
+            score += 10
+        elif oil_bias not in {"", "neutral"}:
+            score -= 6
+
+        if "open" in session or "power" in session:
+            score += 8
+        elif "midday" in session:
+            score -= 5
+
+        if any(x in volume for x in ["confirm", "strong", "spike", "active"]):
+            score += 6
+        if "weak" in volume:
+            score -= 8
+
+        if "not_chasing" in reasons_text or "no chasing" in trade_reason:
+            score += 6
+        if "chasing" in reasons_text and "not_chasing" not in reasons_text:
+            score -= 20
+
+        if "wait" in trade_reason or "incomplete" in trade_reason or "no trade" in trade_reason:
+            score -= 10
+        if "weak" in tech:
+            score -= 8
+
+        return max(0, min(100, int(score)))
+    except Exception as e:
+        try:
+            debug(f"EXEC SCORE FAILED | {e}")
+        except Exception:
+            pass
+        return 0
+
+
+# Override breakdown so logs/alerts explain the PM data correctly.
+def execution_score_breakdown(signal: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not isinstance(signal, dict):
+            return {"score": 0, "summary": "invalid_signal", "positive": [], "negative": [], "neutral": [], "verdict": "UNKNOWN"}
+
+        signal = exec_score_force_load_premarket_levels(signal)
+        score = safe_int(signal.get("execution_score", 0), 0)
+        if score <= 0:
+            try:
+                score = premium_execution_score(signal)
+                signal["execution_score"] = score
+            except Exception:
+                score = 0
+
+        direction = str(signal.get("direction") or "").upper().strip()
+        grade = str(signal.get("grade") or signal.get("confidence") or premium_live_grade(signal)).upper().strip()
+        setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("trigger") or "").lower()
+        session = str(signal.get("session") or signal.get("time_window") or premium_live_detect_session()).lower()
+        reasons_raw = signal.get("strategy_reasons", [])
+        reasons_text = " ".join([str(x).lower() for x in reasons_raw]) if isinstance(reasons_raw, list) else str(reasons_raw).lower()
+        oil_bias = str(signal.get("oil_bias") or signal.get("oil") or signal.get("oil_trend") or "neutral").lower()
+        level_ctx = signal.get("level_context", {}) if isinstance(signal.get("level_context", {}), dict) else {}
+        level_state = str(level_ctx.get("state") or level_ctx.get("level_state") or "unknown").lower()
+        price = safe_float(signal.get("entry") or signal.get("entry_price") or signal.get("price"), 0)
+        vwap = safe_float(signal.get("vwap") or signal.get("session_vwap"), 0)
+        pm_high = safe_float(signal.get("premarket_high") or signal.get("pm_high"), 0)
+        pm_low = safe_float(signal.get("premarket_low") or signal.get("pm_low"), 0)
+        strat_score = safe_float(signal.get("score"), 0)
+        positive, negative, neutral = [], [], []
+
+        if grade in {"A+", "A"}:
+            positive.append(f"grade={grade}")
+        elif grade:
+            neutral.append(f"grade={grade}")
+        if strat_score:
+            (positive if strat_score >= 4 else neutral).append(f"strategy_score={strat_score}")
+
+        if price and vwap:
+            dist = round(abs(price - vwap), 2)
+            if direction == "CALL" and price > vwap:
+                positive.append(f"CALL price above VWAP by {dist}")
+            elif direction == "PUT" and price < vwap:
+                positive.append(f"PUT price below VWAP by {dist}")
+            else:
+                negative.append(f"price/VWAP not aligned for {direction}")
+        else:
+            neutral.append("VWAP missing or incomplete")
+
+        if any(x in setup or x in reasons_text for x in ["break", "hold", "retest", "reject", "rejection", "premarket", "support", "resistance", "vwap"]):
+            positive.append("entry type has structure confirmation")
+        else:
+            negative.append("no strong entry-type confirmation")
+
+        pm_bias, pm_points, pm_reason = exec_score_premarket_bias(signal, price)
+        if pm_bias in {"break_high", "break_low", "near_high", "near_low"}:
+            positive.append(f"{pm_reason} (+{pm_points})")
+        elif pm_bias == "loaded_no_interaction":
+            neutral.append(pm_reason)
+        else:
+            neutral.append(pm_reason)
+
+        if level_state in {"levels_loaded", "at_key_level", "above_support", "below_resistance"}:
+            positive.append(f"key levels loaded ({level_state})")
+        else:
+            neutral.append(f"key level state={level_state}")
+
+        if direction == "CALL" and any(x in oil_bias for x in ["bullish_for_qqq", "fall", "risk_on", "risk-on", "relief"]):
+            positive.append("oil/macro aligned bullish for QQQ")
+        elif direction == "PUT" and any(x in oil_bias for x in ["bearish_for_qqq", "rise", "risk_off", "risk-off", "pressure"]):
+            positive.append("oil/macro aligned bearish for QQQ")
+        elif oil_bias in {"", "neutral"}:
+            neutral.append("oil/macro neutral")
+        else:
+            negative.append(f"oil/macro not aligned ({oil_bias})")
+
+        if "open" in session or "power" in session:
+            positive.append(f"priority session={session}")
+        elif "midday" in session:
+            negative.append("midday/chop session penalty")
+        else:
+            neutral.append(f"session={session}")
+
+        if "not_chasing" in reasons_text or "no chasing" in str(signal.get("trade_reason", "")).lower():
+            positive.append("anti-chasing check passed")
+
+        verdict = "EXECUTE" if score >= EXEC_SCORE_BLOCK_BELOW else "BLOCKED"
+        if score >= EXEC_SCORE_FULL_SIZE:
+            summary = "elite execution score"
+        elif score >= EXEC_SCORE_HALF_SIZE:
+            summary = "solid execution score"
+        elif score >= EXEC_SCORE_REDUCED_SIZE:
+            summary = "starter/watchlist execution score"
+        else:
+            summary = "score below execution threshold"
+
+        return {
+            "score": score,
+            "verdict": verdict,
+            "summary": summary,
+            "positive": positive,
+            "negative": negative,
+            "neutral": neutral,
+            "pm_high": pm_high or None,
+            "pm_low": pm_low or None,
+            "pm_bias": pm_bias,
+        }
+    except Exception as e:
+        return {
+            "score": safe_int(signal.get("execution_score", 0), 0) if isinstance(signal, dict) else 0,
+            "summary": f"breakdown_failed:{e}",
+            "positive": [],
+            "negative": [],
+            "neutral": [],
+            "verdict": "UNKNOWN",
+        }
+
 if __name__ == "__main__":
     if "--macro-test" in sys.argv:
         cli_macro_test()
