@@ -184,11 +184,17 @@ MACRO_SEND_TO_TELEGRAM = os.getenv("MACRO_SEND_TO_TELEGRAM", "false").lower() ==
 MACRO_SEND_ON_BOOT = os.getenv("MACRO_SEND_ON_BOOT", "true").lower() == "true"
 
 # ALPACA
-ENABLE_ALPACA = os.getenv("ENABLE_ALPACA", "false").lower() == "true"
+ENABLE_ALPACA = (os.getenv("ENABLE_ALPACA", os.getenv("ALPACA_ENABLED", "false")).lower() == "true")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 ALPACA_BASE_URL = normalize_alpaca_base_url(os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
 ALPACA_ORDER_TIMEOUT = int(os.getenv("ALPACA_ORDER_TIMEOUT", "20"))
+ALPACA_EQUITY_PAPER_TEST = os.getenv("ALPACA_EQUITY_PAPER_TEST", "false").lower() == "true"
+PAPER_BROKER_MODE = os.getenv("PAPER_BROKER_MODE", "local").lower().strip()
+USE_ALPACA_PAPER = os.getenv("USE_ALPACA_PAPER", "false").lower() == "true"
+ALPACA_EQUITY_SYMBOL = os.getenv("ALPACA_EQUITY_SYMBOL", "QQQ").upper().strip()
+ALPACA_EQUITY_ORDER_QTY = int(float(os.getenv("ALPACA_EQUITY_ORDER_QTY", "1")))
+ALPACA_EQUITY_ALLOW_SHORT = os.getenv("ALPACA_EQUITY_ALLOW_SHORT", "false").lower() == "true"
 ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "true"
 ALPACA_ENABLE_OPTIONS = os.getenv("ALPACA_ENABLE_OPTIONS", "true").lower() == "true"
 ALPACA_LIVE_OPTIONS_APPROVED = os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", "false").lower() == "true"
@@ -3169,7 +3175,7 @@ def risk_state_manual_unlock(reason: str = "manual_unlock") -> Dict[str, Any]:
 # AUTO ANALYZER → AI_SIGNAL.JSON GENERATOR
 # Generates ai_signal.json from analyzer/rule conditions.
 # =========================================================
-ENABLE_AUTO_AI_SIGNAL_GENERATOR = False  # DISABLED: external auto_signal_generator.py is the only signal source
+ENABLE_AUTO_AI_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_AI_SIGNAL_GENERATOR", "true").lower() == "true"
 AUTO_AI_SIGNAL_TICKERS = ["QQQ"]  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_AI_SIGNAL_MIN_GRADE = os.getenv("AUTO_AI_SIGNAL_MIN_GRADE", "A").upper().strip()
 AUTO_AI_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_AI_SIGNAL_COOLDOWN_SECONDS", "300"))
@@ -3186,7 +3192,7 @@ AUTO_AI_DEFAULT_TP2_OFFSET = float(os.getenv("AUTO_AI_DEFAULT_TP2_OFFSET", "0.80
 # reject entries with "Signal skipped: stale timestamp".
 # This is for PAPER validation. Keep LIVE_MODE=false and ALLOW_LIVE_BUYS=false.
 # =========================================================
-ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "true").lower() == "true"  # external generator loop enabled
+ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "false").lower() == "true"
 AUTO_SIGNAL_TICKER = "QQQ"  # HARD LOCK: QQQ only, ignores env to prevent SPY contamination
 AUTO_SIGNAL_DIRECTION = os.getenv("AUTO_SIGNAL_DIRECTION", "CALL").upper().strip()
 AUTO_SIGNAL_MIN_UNDERLYING_PRICE = float(os.getenv("AUTO_SIGNAL_MIN_UNDERLYING_PRICE", "100"))
@@ -3427,9 +3433,9 @@ def auto_generate_ai_signal_if_ready() -> Dict[str, Any]:
 
 def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
     """
-    SINGLE SOURCE AUTO SIGNAL DRIVER.
-    Old internal/test signal generation is disabled here. This function now calls
-    external auto_signal_generator.generate_signal(), which is hard-locked to QQQ.
+    Simple paper-mode signal driver.
+    Writes a fresh ai_signal.json and signal.json using current market price.
+    It does not place live trades by itself; normal engine risk + paper routing still control execution.
     """
     if not ENABLE_AUTO_SIGNAL_GENERATOR:
         return {"generated": False, "reason": "disabled"}
@@ -3440,7 +3446,7 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Do not generate a new signal while a position is open.
+        # Never generate new entries while a position is open.
         try:
             open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
             if open_positions:
@@ -3448,43 +3454,102 @@ def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
+        state = load_json_file(AUTO_SIGNAL_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+
+        now = epoch()
+        last_ts = safe_int(state.get("last_signal_ts", 0), 0)
+        if not force and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
+            return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
+
+        ticker = "QQQ"  # HARD LOCK: do not allow SPY or any fallback ticker
+        debug("[AUTO SIGNAL DEBUG] internal generator hard_locked_ticker=QQQ")
+        direction = normalize_direction(AUTO_SIGNAL_DIRECTION or "CALL")
+
+        # Pull live market price through the engine's existing market-data router.
+        underlying_price = 0.0
         try:
-            from auto_signal_generator import generate_signal as external_generate_signal
-        except Exception as import_error:
-            debug(f"AUTO SIGNAL EXTERNAL IMPORT ERROR | {import_error}")
-            return {"generated": False, "reason": "external_import_error", "error": str(import_error)}
+            prices = load_market_prices([ticker])
+            underlying_price, _ts = get_market_price_for_symbol(ticker, prices)
+        except Exception as price_error:
+            debug(f"AUTO SIGNAL PRICE ERROR | {price_error}")
+            underlying_price = 0.0
 
-        sig = external_generate_signal(force=force)
-        if not sig:
-            return {"generated": False, "reason": "no_strategy_signal"}
+        if underlying_price < AUTO_SIGNAL_MIN_UNDERLYING_PRICE:
+            return {"generated": False, "reason": "invalid_underlying_price", "ticker": ticker, "price": underlying_price}
 
-        ticker = str(sig.get("ticker") or sig.get("symbol") or sig.get("underlying") or "").upper().strip()
-        if ticker != "QQQ":
-            try:
-                if file_exists(AUTO_AI_SIGNAL_FILE):
-                    os.remove(AUTO_AI_SIGNAL_FILE)
-                if file_exists(SIGNAL_FILE):
-                    bad = load_json_file(SIGNAL_FILE, {})
-                    if str(bad.get("ticker", "")).upper() != "QQQ":
-                        os.remove(SIGNAL_FILE)
-            except Exception:
-                pass
-            debug(f"[AUTO SIGNAL HARD BLOCK] external generator attempted non-QQQ ticker={ticker}")
-            return {"generated": False, "reason": "non_qqq_blocked", "ticker": ticker}
+        entry = round(max(0.01, AUTO_SIGNAL_CONTRACT_PRICE), 2)
+        if direction == "PUT":
+            stop = round(entry + AUTO_SIGNAL_STOP_OFFSET, 2)
+            tp1 = round(max(0.01, entry - AUTO_SIGNAL_TP1_OFFSET), 2)
+            tp2 = round(max(0.01, entry - AUTO_SIGNAL_TP2_OFFSET), 2)
+            targets = [tp1, tp2]
+            public_reason = f"{ticker} auto paper PUT signal generated from live price validation."
+        else:
+            stop = round(max(0.01, entry - AUTO_SIGNAL_STOP_OFFSET), 2)
+            tp1 = round(entry + AUTO_SIGNAL_TP1_OFFSET, 2)
+            tp2 = round(entry + AUTO_SIGNAL_TP2_OFFSET, 2)
+            targets = [tp1, tp2]
+            public_reason = f"{ticker} auto paper CALL signal generated from live price validation."
 
-        debug(
-            f"[AUTO SIGNAL] External QQQ strategy wrote signal | "
-            f"direction={sig.get('direction')} setup={sig.get('setup')} "
-            f"score={sig.get('score')} entry={sig.get('entry')}"
-        )
-        return {"generated": True, "reason": "external_strategy_signal_written", "signal": sig}
+        signal = {
+            "ticker": ticker,
+            "symbol": ticker,
+            "direction": direction,
+            "grade": AUTO_SIGNAL_GRADE,
+            "confidence": AUTO_SIGNAL_GRADE,
+            "setup": AUTO_SIGNAL_SETUP,
+            "strategy": AUTO_SIGNAL_SETUP,
+            "trigger": AUTO_SIGNAL_TRIGGER,
+            "confirmation": "auto_price_refresh",
+            "regime": "clean",
+            "entry": entry,
+            "stop": stop,
+            "target": tp1,
+            "targets": targets,
+            "entry_contract": entry,
+            "contract_price": entry,
+            "stop_contract": stop,
+            "tp1_contract": tp1,
+            "tp2_contract": tp2,
+            "qty": safe_int(os.getenv("DEFAULT_PAPER_QTY", "1"), 1),
+            "underlying_price": underlying_price,
+            "reason": public_reason,
+            "public_reason": public_reason,
+            "source": "simple_auto_signal_generator",
+            "timestamp": now,
+            "auto_generated": True,
+        }
+
+        try:
+            signal = apply_macro_context_to_ai_signal(signal)
+        except Exception:
+            pass
+
+        # Keep both files fresh. signal.json is what the execution loop reads.
+        if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(AUTO_AI_SIGNAL_FILE):
+            atomic_write_json(AUTO_AI_SIGNAL_FILE, signal)
+        if AUTO_SIGNAL_FORCE_OVERWRITE or not file_exists(SIGNAL_FILE):
+            atomic_write_json(SIGNAL_FILE, signal)
+
+        state["last_signal_ts"] = now
+        state["last_signal"] = {
+            "ticker": ticker,
+            "direction": direction,
+            "entry": entry,
+            "underlying_price": underlying_price,
+            "timestamp": now,
+        }
+        state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
+        atomic_write_json(AUTO_SIGNAL_STATE_FILE, state)
+
+        debug(f"[AUTO SIGNAL] Generated fresh {ticker} {direction} | underlying={underlying_price} | contract={entry} | ts={now}")
+        return {"generated": True, "reason": "fresh_signal_written", "signal": signal}
 
     except Exception as e:
         log(f"❌ AUTO SIGNAL GENERATOR ERROR | {e}")
-        try:
-            log(traceback.format_exc())
-        except Exception:
-            pass
+        log(traceback.format_exc())
         return {"generated": False, "reason": "error", "error": str(e)}
 
 
@@ -4948,6 +5013,53 @@ def alpaca_get(path: str, params: Optional[Dict[str, Any]] = None):
 
 def alpaca_post(path: str, payload: Dict[str, Any]):
     return requests.post(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
+
+def alpaca_submit_equity_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Submit a real Alpaca PAPER equity order so it appears in the Alpaca dashboard."""
+    if not ENABLE_ALPACA or not USE_ALPACA_PAPER or PAPER_BROKER_MODE != "alpaca":
+        return {"submitted": False, "reason": "alpaca_paper_routing_disabled"}
+    if not alpaca_ready():
+        return {"submitted": False, "reason": "alpaca_not_ready_missing_keys_or_base_url"}
+
+    ticker = str(signal.get("ticker") or signal.get("underlying") or ALPACA_EQUITY_SYMBOL or "QQQ").upper().strip()
+    if ticker != "QQQ":
+        return {"submitted": False, "reason": f"blocked_non_qqq_{ticker}"}
+
+    direction = normalize_direction(signal.get("direction", "CALL"))
+    side = "buy" if direction == "CALL" else "sell"
+    if side == "sell" and not ALPACA_EQUITY_ALLOW_SHORT:
+        return {"submitted": False, "reason": "put_signal_sell_blocked_set_ALPACA_EQUITY_ALLOW_SHORT_true_to_test_shorts"}
+
+    qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_EQUITY_ORDER_QTY)), ALPACA_EQUITY_ORDER_QTY)
+    if qty <= 0:
+        qty = max(1, ALPACA_EQUITY_ORDER_QTY)
+
+    client_order_id = f"ubt-paper-{ticker}-{direction}-{int(time.time())}"
+    payload = {
+        "symbol": ticker,
+        "qty": str(qty),
+        "side": side,
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": client_order_id[:48],
+    }
+
+    try:
+        r = alpaca_post("/v2/orders", payload)
+        if r.status_code in (200, 201):
+            data = r.json()
+            debug(f"✅ ALPACA ORDER SUBMITTED | {ticker} {side.upper()} qty={qty} id={data.get('id')} client={payload['client_order_id']}")
+            try:
+                send_to_discord(DISCORD_AI_WEBHOOK, f"✅ ALPACA PAPER ORDER SUBMITTED\nTicker: {ticker}\nSide: {side.upper()}\nQty: {qty}\nOrder ID: {data.get('id')}\nSetup: {signal.get('setup')}\nScore: {signal.get('execution_score', signal.get('score'))}", "AI_EXECUTION")
+                send_to_telegram(f"✅ ALPACA PAPER ORDER SUBMITTED\n{ticker} {side.upper()} qty={qty}\nOrder ID: {data.get('id')}")
+            except Exception:
+                pass
+            return {"submitted": True, "reason": "alpaca_order_submitted", "order": data, "payload": payload}
+        debug(f"❌ ALPACA ORDER FAILED | status={r.status_code} body={r.text} payload={payload}")
+        return {"submitted": False, "reason": f"alpaca_order_failed_{r.status_code}", "body": r.text, "payload": payload}
+    except Exception as e:
+        debug(f"❌ ALPACA ORDER EXCEPTION | {e}")
+        return {"submitted": False, "reason": f"alpaca_order_exception:{e}", "payload": payload}
 
 
 def alpaca_delete(path: str):
@@ -13672,8 +13784,32 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not gate.get("approved"):
         return {"executed": False, "reason": gate.get("reason"), "hash": gate.get("hash")}
 
+    # ALPACA PAPER EQUITY TEST ROUTE
+    # Sends a real QQQ equity paper order to Alpaca so it appears in the Alpaca dashboard.
+    if ALPACA_EQUITY_PAPER_TEST and PAPER_BROKER_MODE == "alpaca" and USE_ALPACA_PAPER:
+        signal = enrich_signal_with_execution_risk_fields(signal)
+        start_qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_EQUITY_ORDER_QTY)), ALPACA_EQUITY_ORDER_QTY)
+        exec_qty, exec_reason = safe_apply_execution_score_sizing(signal, start_qty)
+        if exec_qty <= 0 and os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true":
+            exec_qty = 1
+            exec_reason = f"alpaca_equity_force_min_qty_after_score:{signal.get('execution_score')}"
+        signal["qty"] = max(1, safe_int(exec_qty, 1))
+        debug(f"ALPACA PAPER EQUITY ROUTE | ticker={signal.get('ticker')} direction={signal.get('direction')} qty={signal.get('qty')} score={signal.get('execution_score')} reason={exec_reason}")
+        alpaca_result = alpaca_submit_equity_paper_order(signal)
+        if alpaca_result.get("submitted"):
+            paper_bridge_mark_executed(gate.get("hash", ""))
+            if PAPER_BRIDGE_CLEAR_SIGNAL_AFTER_EXECUTION:
+                try:
+                    atomic_write_json(SIGNAL_FILE, {})
+                    debug(f"🧹 ALPACA PAPER ROUTE CLEARED SIGNAL FILE | {SIGNAL_FILE}")
+                except Exception as e:
+                    debug(f"alpaca_paper_route_clear_signal_error:{e}")
+            return {"executed": True, "reason": "alpaca_paper_equity_order_submitted", "alpaca": alpaca_result}
+        return {"executed": False, "reason": alpaca_result.get("reason", "alpaca_submit_failed"), "alpaca": alpaca_result}
+
     try:
         order = paper_bridge_create_order(signal)
+
     except Exception as e:
         reason = str(e)
         if "execution_score_block" in reason:
