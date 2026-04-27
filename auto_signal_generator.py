@@ -1,94 +1,236 @@
+# =========================================================
+# UnBiased Trades — QQQ ONLY AUTO SIGNAL GENERATOR
+# Creates ai_signal.json for main.py
+# HARD LOCK: QQQ only, no SPY
+# =========================================================
+
+import os
 import json
 import time
-import os
+from datetime import datetime, timezone
 
-SIGNAL_FILE = "ai_signal.json"
-MARKET_FILE = "market_prices.json"
+SIGNAL_FILE = os.getenv("SIGNAL_FILE", "ai_signal.json").strip()
+MARKET_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
+STATE_FILE = "auto_signal_generator_state.json"
 
-def load_json(path):
+TICKER = "QQQ"
+ENABLE_AUTO_SIGNAL_GENERATOR = os.getenv("ENABLE_AUTO_SIGNAL_GENERATOR", "true").lower() == "true"
+AUTO_SIGNAL_COOLDOWN_SECONDS = int(os.getenv("AUTO_SIGNAL_COOLDOWN_SECONDS", "60"))
+
+STOP_DISTANCE = float(os.getenv("AUTO_STOP_DISTANCE", "1.50"))
+TARGET_1 = float(os.getenv("AUTO_TARGET_1", "1.50"))
+TARGET_2 = float(os.getenv("AUTO_TARGET_2", "3.00"))
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
     try:
-        with open(path, "r") as f:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
-        return {}
+    except Exception:
+        return default
 
-def save_signal(signal):
-    with open(SIGNAL_FILE, "w") as f:
-        json.dump(signal, f)
 
-def safe_float(x):
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def safe_float(value, default=None):
     try:
-        return float(x)
-    except:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def now_ts():
+    return int(time.time())
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def cooldown_ready(force=False):
+    if force:
+        return True
+
+    state = load_json(STATE_FILE, {})
+    last = int(state.get("last_signal_ts", 0) or 0)
+
+    if last <= 0:
+        return True
+
+    return now_ts() - last >= AUTO_SIGNAL_COOLDOWN_SECONDS
+
+
+def get_market_data():
+    data = load_json(MARKET_FILE, {})
+    qqq = data.get("QQQ", {})
+    return qqq if isinstance(qqq, dict) else {}
+
+
+def get_price():
+    q = get_market_data()
+    price = safe_float(q.get("price") or q.get("last") or q.get("close"))
+    return price if price and price > 100 else None
+
+
+def get_vwap(price):
+    q = get_market_data()
+    vwap = safe_float(q.get("vwap") or q.get("session_vwap") or q.get("close"))
+    return vwap if vwap and vwap > 100 else price
+
+
+def get_premarket_levels(price):
+    q = get_market_data()
+
+    pm_high = safe_float(
+        q.get("premarket_high")
+        or q.get("pm_high")
+        or q.get("pre_market_high")
+    )
+
+    pm_low = safe_float(
+        q.get("premarket_low")
+        or q.get("pm_low")
+        or q.get("pre_market_low")
+    )
+
+    if not pm_high:
+        pm_high = round(price + 1.50, 2)
+
+    if not pm_low:
+        pm_low = round(price - 1.50, 2)
+
+    return pm_high, pm_low
+
+
+def decide_direction(price, vwap, pm_high, pm_low):
+    if price > pm_high:
+        return "CALL", "BREAK_AND_HOLD_PREMARKET_HIGH", "A"
+
+    if price < pm_low:
+        return "PUT", "BREAK_AND_HOLD_PREMARKET_LOW", "A"
+
+    if price > vwap:
+        return "CALL", "VWAP_TREND_CONTINUATION", "B+"
+
+    if price < vwap:
+        return "PUT", "VWAP_TREND_CONTINUATION", "B+"
+
+    return None, None, None
+
+
+def build_signal(price, vwap, pm_high, pm_low, direction, setup, grade):
+    if direction == "CALL":
+        stop = round(price - STOP_DISTANCE, 2)
+        targets = [round(price + TARGET_1, 2), round(price + TARGET_2, 2)]
+    else:
+        stop = round(price + STOP_DISTANCE, 2)
+        targets = [round(price - TARGET_1, 2), round(price - TARGET_2, 2)]
+
+    return {
+        "ticker": "QQQ",
+        "symbol": "QQQ",
+        "underlying": "QQQ",
+
+        "direction": direction,
+        "side": direction,
+
+        "entry": round(price, 2),
+        "entry_price": round(price, 2),
+        "stop": stop,
+        "stop_loss": stop,
+        "targets": targets,
+        "target": targets[0],
+
+        "confidence": grade,
+        "grade": grade,
+        "score": 70 if grade == "A" else 60,
+
+        "setup": setup,
+        "setup_type": "qqq_vwap_premarket_generator",
+        "trigger": setup,
+
+        "vwap": round(vwap, 2),
+        "premarket_high": pm_high,
+        "premarket_low": pm_low,
+        "pm_high": pm_high,
+        "pm_low": pm_low,
+
+        "session": "auto",
+        "time_window": "auto",
+        "trade_reason": "QQQ-only signal generated from premarket levels and VWAP trend continuation.",
+
+        "timestamp": now_ts(),
+        "created_at": now_iso(),
+        "source": "auto_signal_generator",
+
+        "force_execution": True,
+        "paper_only": True,
+    }
+
+
+def generate_signal(force=False):
+    print("[AUTO SIGNAL DEBUG] QQQ ONLY generator loaded", flush=True)
+
+    if not ENABLE_AUTO_SIGNAL_GENERATOR:
+        print("[AUTO SIGNAL] disabled", flush=True)
         return None
 
-def generate_signal():
-    data = load_json(MARKET_FILE)
-    q = data.get("QQQ", {})
+    if not cooldown_ready(force=force):
+        print("[AUTO SIGNAL] cooldown active", flush=True)
+        return None
 
-    price = safe_float(q.get("price"))
-    vwap = safe_float(q.get("vwap") or q.get("session_vwap") or q.get("close"))
+    price = get_price()
+    if not price:
+        print("[AUTO SIGNAL] skipped: no valid QQQ price", flush=True)
+        return None
 
-    pm_high = safe_float(q.get("premarket_high") or q.get("pm_high"))
-    pm_low = safe_float(q.get("premarket_low") or q.get("pm_low"))
+    vwap = get_vwap(price)
+    pm_high, pm_low = get_premarket_levels(price)
 
-    if not price or not vwap:
-        print("[AUTO SIGNAL] missing price or vwap")
-        return
+    direction, setup, grade = decide_direction(price, vwap, pm_high, pm_low)
 
-    # fallback levels
-    if not pm_high or not pm_low:
-        pm_high = price + 1.5
-        pm_low = price - 1.5
+    if not direction:
+        print(
+            f"[AUTO SIGNAL] no trade | ticker=QQQ price={price} vwap={vwap} "
+            f"pm_high={pm_high} pm_low={pm_low}",
+            flush=True,
+        )
+        return None
 
-    signal = None
+    signal = build_signal(price, vwap, pm_high, pm_low, direction, setup, grade)
 
-    # =========================
-    # 1. BREAKOUT
-    # =========================
-    if price > pm_high:
-        signal = {
-            "ticker": "QQQ",
-            "direction": "CALL",
-            "entry_type": "BREAKOUT",
-            "confidence": "A"
-        }
+    if signal.get("ticker") != "QQQ":
+        print("[GENERATOR BLOCK] Non-QQQ prevented", flush=True)
+        return None
 
-    elif price < pm_low:
-        signal = {
-            "ticker": "QQQ",
-            "direction": "PUT",
-            "entry_type": "BREAKDOWN",
-            "confidence": "A"
-        }
+    save_json(SIGNAL_FILE, signal)
 
-    # =========================
-    # 2. VWAP TREND (NEW FIX 🔥)
-    # =========================
-    elif price > vwap:
-        signal = {
-            "ticker": "QQQ",
-            "direction": "CALL",
-            "entry_type": "VWAP_TREND",
-            "confidence": "B+"
-        }
+    save_json(STATE_FILE, {
+        "last_signal_ts": now_ts(),
+        "last_ticker": "QQQ",
+        "last_direction": direction,
+        "last_entry": signal["entry"],
+        "last_setup": setup,
+        "last_grade": grade,
+    })
 
-    elif price < vwap:
-        signal = {
-            "ticker": "QQQ",
-            "direction": "PUT",
-            "entry_type": "VWAP_TREND",
-            "confidence": "B+"
-        }
+    print(
+        f"[AUTO SIGNAL] GENERATED QQQ {direction} | setup={setup} "
+        f"entry={signal['entry']} vwap={signal['vwap']} "
+        f"pm_high={pm_high} pm_low={pm_low}",
+        flush=True,
+    )
 
-    # =========================
-    # OUTPUT
-    # =========================
-    if signal:
-        save_signal(signal)
-        print(f"[AUTO SIGNAL] GENERATED: {signal}", flush=True)
-    else:
-        print("[AUTO SIGNAL] no trade", flush=True)
+    return signal
 
 
 if __name__ == "__main__":
@@ -96,7 +238,7 @@ if __name__ == "__main__":
 
     while True:
         try:
-            generate_signal()
+            generate_signal(force=False)
         except Exception as e:
             print(f"[AUTO SIGNAL ERROR] {e}", flush=True)
 
