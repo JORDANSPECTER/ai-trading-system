@@ -16,6 +16,8 @@ import requests
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
 print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enabled", flush=True)
+print("[OLD IDEMPOTENCY BYPASS ACTIVE] Smart Execution controls replay/block", flush=True)
+print("[INSTITUTIONAL SAFETY SURFACE ACTIVE] hard lock + exit-only + degraded + pending ACK", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
@@ -426,6 +428,31 @@ SMART_EXECUTION_LIMIT_MID_SCORE = int(float(os.getenv("SMART_EXECUTION_LIMIT_MID
 SMART_EXECUTION_MAX_LIMIT_OFFSET = float(os.getenv("SMART_EXECUTION_MAX_LIMIT_OFFSET", "0.03"))
 SMART_EXECUTION_RETRY_PRICE_STEP = float(os.getenv("SMART_EXECUTION_RETRY_PRICE_STEP", "0.02"))
 SMART_EXECUTION_LOG_FILE = os.getenv("SMART_EXECUTION_LOG_FILE", "execution_log.jsonl").strip()
+
+
+# =========================================================
+# INSTITUTIONAL SAFETY SURFACE
+# Global hard lock, exit-only, degraded-mode, pending-ACK, review-required.
+# =========================================================
+ENABLE_SAFETY_SURFACE = os.getenv("ENABLE_SAFETY_SURFACE", "true").lower() == "true"
+GLOBAL_HARD_LOCK = os.getenv("GLOBAL_HARD_LOCK", "false").lower() == "true"
+GLOBAL_HARD_LOCK_FILE = os.getenv("GLOBAL_HARD_LOCK_FILE", "global_hard_lock.json").strip()
+EXIT_ONLY_MODE = os.getenv("EXIT_ONLY_MODE", "false").lower() == "true"
+REVIEW_REQUIRED_FILE = os.getenv("REVIEW_REQUIRED_FILE", "review_required.json").strip()
+DEGRADED_MODE_FILE = os.getenv("DEGRADED_MODE_FILE", "degraded_mode.json").strip()
+PENDING_ACK_FILE = os.getenv("PENDING_ACK_FILE", "pending_ack_orders.json").strip()
+DECISION_EVENT_LOG_FILE = os.getenv("DECISION_EVENT_LOG_FILE", "decision_events.jsonl").strip()
+SAFETY_TEST_REPORT_FILE = os.getenv("SAFETY_TEST_REPORT_FILE", "safety_test_report.json").strip()
+
+SAFETY_MARKET_MAX_AGE_SECONDS = int(float(os.getenv("SAFETY_MARKET_MAX_AGE_SECONDS", "180")))
+SAFETY_MACRO_MAX_AGE_SECONDS = int(float(os.getenv("SAFETY_MACRO_MAX_AGE_SECONDS", "86400")))
+SAFETY_PENDING_ACK_SECONDS = int(float(os.getenv("SAFETY_PENDING_ACK_SECONDS", "12")))
+SAFETY_MAX_NEW_NOTIONAL_5MIN = float(os.getenv("SAFETY_MAX_NEW_NOTIONAL_5MIN", "2500"))
+SAFETY_MAX_OPEN_QQQ_NOTIONAL = float(os.getenv("SAFETY_MAX_OPEN_QQQ_NOTIONAL", "5000"))
+SAFETY_BLOCK_ON_UNKNOWN_MACRO = os.getenv("SAFETY_BLOCK_ON_UNKNOWN_MACRO", "false").lower() == "true"
+SAFETY_BLOCK_ON_STALE_MARKET = os.getenv("SAFETY_BLOCK_ON_STALE_MARKET", "true").lower() == "true"
+SAFETY_BLOCK_ON_PENDING_ACK = os.getenv("SAFETY_BLOCK_ON_PENDING_ACK", "true").lower() == "true"
+SAFETY_DEFAULT_TO_DEGRADED_ON_UNKNOWN = os.getenv("SAFETY_DEFAULT_TO_DEGRADED_ON_UNKNOWN", "true").lower() == "true"
 
 # =========================================================
 ENABLE_UNIFIED_DECISION_ENGINE = os.getenv("ENABLE_UNIFIED_DECISION_ENGINE", "true").lower() == "true"
@@ -5815,6 +5842,419 @@ def select_institutional_qqq_option_contract(signal: Dict[str, Any]) -> Dict[str
 # SMART EXECUTION SYSTEM
 # =========================================================
 
+
+
+# =========================================================
+# INSTITUTIONAL SAFETY SURFACE
+# =========================================================
+
+def safety_now_ts() -> int:
+    try:
+        return int(time.time())
+    except Exception:
+        return 0
+
+
+def safety_iso() -> str:
+    try:
+        return datetime.now().isoformat()
+    except Exception:
+        return str(time.time())
+
+
+def safety_load_json(path: str, default=None):
+    if default is None:
+        default = {}
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                return json.loads(raw) if raw else default
+        return default
+    except Exception:
+        return default
+
+
+def safety_save_json(path: str, data):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception as e:
+        try:
+            debug(f"SAFETY SAVE ERROR | file={path} err={e}")
+        except Exception:
+            print(f"SAFETY SAVE ERROR | file={path} err={e}", flush=True)
+
+
+def safety_debug(msg: str):
+    try:
+        debug(msg)
+    except Exception:
+        print(msg, flush=True)
+
+
+def safety_global_lock_active() -> Tuple[bool, str]:
+    if not ENABLE_SAFETY_SURFACE:
+        return False, "safety_surface_disabled"
+
+    if GLOBAL_HARD_LOCK:
+        return True, "GLOBAL_HARD_LOCK env=true"
+
+    st = safety_load_json(GLOBAL_HARD_LOCK_FILE, {})
+    if isinstance(st, dict) and st.get("locked") is True:
+        return True, f"GLOBAL_HARD_LOCK file=true reason={st.get('reason','manual')}"
+
+    return False, "global_lock_clear"
+
+
+def safety_set_global_lock(locked: bool, reason: str = "manual"):
+    safety_save_json(GLOBAL_HARD_LOCK_FILE, {
+        "locked": bool(locked),
+        "reason": reason,
+        "updated_at": safety_iso(),
+    })
+
+
+def safety_review_required_active() -> Tuple[bool, str]:
+    st = safety_load_json(REVIEW_REQUIRED_FILE, {})
+    if isinstance(st, dict) and st.get("review_required") is True:
+        return True, st.get("reason", "review_required")
+    return False, "review_clear"
+
+
+def safety_set_review_required(reason: str, snapshot=None):
+    safety_save_json(REVIEW_REQUIRED_FILE, {
+        "review_required": True,
+        "reason": reason,
+        "snapshot": snapshot or {},
+        "updated_at": safety_iso(),
+        "checklist": [
+            "Check Alpaca positions and open orders",
+            "Confirm market data freshness",
+            "Clear pending ACK state if broker confirms no order",
+            "Send /resume only after review",
+        ],
+    })
+    try:
+        tg_dash_send(f"🧑‍✈️ <b>REVIEW REQUIRED</b>\nReason: {reason}\n\nUse /status and /positions before /resume.")
+    except Exception:
+        pass
+
+
+def safety_clear_review_required():
+    safety_save_json(REVIEW_REQUIRED_FILE, {
+        "review_required": False,
+        "reason": "cleared",
+        "updated_at": safety_iso(),
+    })
+
+
+def safety_set_degraded(reason: str, source: str = "unknown", severity: str = "degraded", details=None):
+    st = safety_load_json(DEGRADED_MODE_FILE, {})
+    if not isinstance(st, dict):
+        st = {}
+    st.update({
+        "degraded": True,
+        "severity": severity,
+        "source": source,
+        "reason": reason,
+        "details": details or {},
+        "updated_at": safety_iso(),
+    })
+    safety_save_json(DEGRADED_MODE_FILE, st)
+
+
+def safety_clear_degraded():
+    safety_save_json(DEGRADED_MODE_FILE, {
+        "degraded": False,
+        "updated_at": safety_iso(),
+    })
+
+
+def safety_get_file_age(path: str) -> Optional[int]:
+    try:
+        if not os.path.exists(path):
+            return None
+        return int(time.time() - os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def safety_market_state() -> Dict[str, Any]:
+    market_file = globals().get("MARKET_FILE", globals().get("MARKET_DATA_FILE", "market_prices.json"))
+    age = safety_get_file_age(market_file)
+    data = safety_load_json(market_file, {})
+    qqq = data.get("QQQ", {}) if isinstance(data, dict) else {}
+    px = None
+    try:
+        px = float(qqq.get("price") or qqq.get("last") or qqq.get("close") or 0)
+    except Exception:
+        px = 0.0
+
+    stale = age is None or age > SAFETY_MARKET_MAX_AGE_SECONDS
+    valid_px = px and px > 100
+
+    if stale or not valid_px:
+        safety_set_degraded(
+            reason="market_data_stale_or_invalid",
+            source="market_prices",
+            details={"age": age, "price": px, "file": market_file},
+        )
+        state = "DEGRADED_MARKET"
+    else:
+        state = "OK"
+
+    return {
+        "state": state,
+        "age_seconds": age,
+        "price": px,
+        "valid_price": bool(valid_px),
+        "stale": bool(stale),
+        "file": market_file,
+    }
+
+
+def safety_macro_state() -> Dict[str, Any]:
+    macro_candidates = ["macro_snapshot.json", "macro_latest.json", "macro_store.json"]
+    existing = [p for p in macro_candidates if os.path.exists(p)]
+    if not existing:
+        if SAFETY_DEFAULT_TO_DEGRADED_ON_UNKNOWN:
+            safety_set_degraded("macro_missing", source="macro", severity="unknown")
+        return {"state": "UNKNOWN_MACRO", "age_seconds": None, "file": None}
+
+    newest = min(existing, key=lambda p: safety_get_file_age(p) if safety_get_file_age(p) is not None else 10**9)
+    age = safety_get_file_age(newest)
+    stale = age is None or age > SAFETY_MACRO_MAX_AGE_SECONDS
+
+    if stale:
+        safety_set_degraded("macro_stale", source="macro", details={"file": newest, "age": age})
+        state = "DEGRADED_MACRO"
+    else:
+        state = "OK"
+
+    return {"state": state, "age_seconds": age, "file": newest, "stale": stale}
+
+
+def safety_pending_ack_state(symbol_hint: str = "QQQ") -> Tuple[bool, str]:
+    state = safety_load_json(PENDING_ACK_FILE, {})
+    if not isinstance(state, dict):
+        return False, "no_pending_ack_state"
+
+    now = safety_now_ts()
+    pending = state.get("pending", {})
+    if not isinstance(pending, dict):
+        return False, "no_pending_ack"
+
+    for key, rec in list(pending.items()):
+        if not isinstance(rec, dict):
+            continue
+        sym = str(rec.get("symbol", "")).upper()
+        created = int(rec.get("created_ts", now) or now)
+        age = now - created
+        status = str(rec.get("status", "pending")).lower()
+
+        if status in {"confirmed", "filled", "canceled", "rejected", "closed"}:
+            continue
+
+        if symbol_hint and symbol_hint.upper() not in sym and not sym.startswith(symbol_hint.upper()):
+            continue
+
+        if age > SAFETY_PENDING_ACK_SECONDS:
+            safety_set_review_required(
+                "pending_ack_timeout_unknown_broker_state",
+                snapshot={"key": key, "symbol": sym, "age": age, "record": rec},
+            )
+            return True, f"pending_ack_timeout:{sym}:age={age}s"
+
+        return True, f"pending_ack_active:{sym}:age={age}s"
+
+    return False, "no_active_pending_ack"
+
+
+def safety_mark_pending_ack(key: str, symbol: str, payload=None):
+    state = safety_load_json(PENDING_ACK_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    pending = state.get("pending", {})
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[key] = {
+        "symbol": symbol,
+        "status": "pending",
+        "created_ts": safety_now_ts(),
+        "created_at": safety_iso(),
+        "payload": payload or {},
+    }
+    state["pending"] = pending
+    state["updated_at"] = safety_iso()
+    safety_save_json(PENDING_ACK_FILE, state)
+
+
+def safety_mark_ack_resolved(key: str, status: str, response=None):
+    state = safety_load_json(PENDING_ACK_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    pending = state.get("pending", {})
+    if isinstance(pending, dict) and key in pending:
+        pending[key]["status"] = status
+        pending[key]["resolved_at"] = safety_iso()
+        pending[key]["response"] = response or {}
+    state["pending"] = pending
+    state["updated_at"] = safety_iso()
+    safety_save_json(PENDING_ACK_FILE, state)
+
+
+def safety_recent_notional_ok(new_notional: float) -> Tuple[bool, str]:
+    log_file = "execution_log.jsonl"
+    cutoff = safety_now_ts() - 300
+    total = 0.0
+    try:
+        if os.path.exists(log_file):
+            with open(log_file, "r", encoding="utf-8") as f:
+                for line in f.readlines()[-200:]:
+                    try:
+                        rec = json.loads(line)
+                        t = rec.get("ts") or rec.get("created_ts") or rec.get("time_ts")
+                        if t is None:
+                            continue
+                        if int(float(t)) < cutoff:
+                            continue
+                        payload = rec.get("payload", {})
+                        qty = float(payload.get("qty", 0) or 0)
+                        limit_price = payload.get("limit_price")
+                        price = float(limit_price or payload.get("price") or rec.get("mid") or 0)
+                        total += qty * price * 100
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    if total + float(new_notional or 0) > SAFETY_MAX_NEW_NOTIONAL_5MIN:
+        return False, f"5min_notional_budget_exceeded:{round(total + float(new_notional or 0),2)}>{SAFETY_MAX_NEW_NOTIONAL_5MIN}"
+    return True, f"5min_notional_ok:{round(total + float(new_notional or 0),2)}"
+
+
+def safety_surface_gate(intent: str, symbol: str = "QQQ", signal=None, selected=None, notional: float = 0.0) -> Tuple[bool, str]:
+    """
+    Master safety gate.
+    intent examples: new_entry, scale_entry, exit, cancel, status.
+    Hard lock blocks everything that can modify orders.
+    Exit-only allows exits/cancels but blocks new/scaling entries.
+    """
+    if not ENABLE_SAFETY_SURFACE:
+        return True, "safety_surface_disabled"
+
+    intent = str(intent or "new_entry").lower()
+    is_entry = intent in {"new_entry", "scale_entry", "entry", "buy", "open"}
+
+    locked, lock_reason = safety_global_lock_active()
+    if locked and intent not in {"status"}:
+        return False, f"global_hard_lock:{lock_reason}"
+
+    review, review_reason = safety_review_required_active()
+    if review and is_entry:
+        return False, f"review_required:{review_reason}"
+
+    exit_only = EXIT_ONLY_MODE or tg_dash_control_bool("exit_only_mode", "EXIT_ONLY_MODE", False) if "tg_dash_control_bool" in globals() else EXIT_ONLY_MODE
+    if exit_only and is_entry:
+        return False, "exit_only_mode_blocks_new_entries"
+
+    market = safety_market_state()
+    if SAFETY_BLOCK_ON_STALE_MARKET and is_entry and market.get("state") != "OK":
+        return False, f"market_degraded:{market}"
+
+    macro = safety_macro_state()
+    if SAFETY_BLOCK_ON_UNKNOWN_MACRO and is_entry and macro.get("state") != "OK":
+        return False, f"macro_degraded_or_unknown:{macro}"
+
+    pending, pending_reason = safety_pending_ack_state(symbol)
+    if SAFETY_BLOCK_ON_PENDING_ACK and is_entry and pending:
+        return False, pending_reason
+
+    if is_entry and notional:
+        ok, budget_reason = safety_recent_notional_ok(notional)
+        if not ok:
+            return False, budget_reason
+
+    return True, "safety_surface_ok"
+
+
+def safety_write_decision_event(stage: str, signal=None, decision=None, selected=None, result=None, gates=None):
+    try:
+        payload = {
+            "time": safety_iso(),
+            "ts": safety_now_ts(),
+            "stage": stage,
+            "signal": signal or {},
+            "decision": decision or {},
+            "selected_contract": selected or {},
+            "result": result or {},
+            "gates": gates or {},
+            "env_snapshot": {
+                "MODE": globals().get("MODE", os.getenv("MODE", "")),
+                "GLOBAL_HARD_LOCK": GLOBAL_HARD_LOCK,
+                "EXIT_ONLY_MODE": EXIT_ONLY_MODE,
+                "ENABLE_SAFETY_SURFACE": ENABLE_SAFETY_SURFACE,
+                "ENABLE_SMART_EXECUTION_SYSTEM": globals().get("ENABLE_SMART_EXECUTION_SYSTEM", None),
+                "ENABLE_UNIFIED_DECISION_ENGINE": globals().get("ENABLE_UNIFIED_DECISION_ENGINE", None),
+            },
+            "market_state": safety_market_state(),
+            "macro_state": safety_macro_state(),
+        }
+        with open(DECISION_EVENT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception as e:
+        safety_debug(f"DECISION EVENT WRITE ERROR | {e}")
+
+
+def safety_replay_decision_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic replay shell: re-runs safety gate + current unified decision if available.
+    Does not send orders.
+    """
+    sig = event.get("signal", {}) if isinstance(event, dict) else {}
+    selected = event.get("selected_contract", {}) if isinstance(event, dict) else {}
+    notional = 0.0
+    try:
+        notional = float(selected.get("notional") or selected.get("mid", 0) * 100)
+    except Exception:
+        notional = 0.0
+    gate_ok, gate_reason = safety_surface_gate("new_entry", "QQQ", sig, selected, notional)
+    decision = {}
+    try:
+        if "evaluate_trade_opportunity" in globals():
+            decision = evaluate_trade_opportunity(sig, selected)
+    except Exception as e:
+        decision = {"error": str(e)}
+    return {"gate_ok": gate_ok, "gate_reason": gate_reason, "decision": decision}
+
+
+def safety_run_chaos_selftest() -> Dict[str, Any]:
+    """
+    Lightweight safety tests. This does not place orders.
+    """
+    tests = []
+    old_market_age = safety_get_file_age(globals().get("MARKET_FILE", "market_prices.json"))
+    gate_ok, reason = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+    tests.append({"name": "basic_gate_runs", "passed": isinstance(gate_ok, bool), "reason": reason})
+
+    safety_set_global_lock(True, "selftest")
+    gate_ok2, reason2 = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+    tests.append({"name": "global_hard_lock_blocks_entry", "passed": gate_ok2 is False and "global_hard_lock" in reason2, "reason": reason2})
+    safety_set_global_lock(False, "selftest_clear")
+
+    safety_set_review_required("selftest_review")
+    gate_ok3, reason3 = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+    tests.append({"name": "review_required_blocks_entry", "passed": gate_ok3 is False and "review_required" in reason3, "reason": reason3})
+    safety_clear_review_required()
+
+    report = {"time": safety_iso(), "tests": tests, "passed": all(t["passed"] for t in tests), "market_file_age_before": old_market_age}
+    safety_save_json(SAFETY_TEST_REPORT_FILE, report)
+    return report
+
+
 def smart_exec_now() -> str:
     try:
         return datetime.now().isoformat()
@@ -6093,11 +6533,15 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
 
         if code < 300:
             smart_exec_mark(key, "submitted", {"code": code, "body": body, "payload": payload})
+            safety_mark_ack_resolved(key, "submitted", {"code": code, "body": body})
+            safety_write_decision_event("order_submitted", signal=signal, decision=signal.get("unified_decision", {}), selected=selected, result={"code": code, "body": body, "payload": payload}, gates={"smart_exec": "submitted"})
             debug(f"✅ SMART EXEC ORDER SUBMITTED | attempt={attempt} body={body}")
             return {"executed": True, "reason": "smart_exec_submitted", "attempt": attempt, "response": body, "payload": payload, "key": key}
 
         # Retry only on failed/rejected order; do not retry if position opened after response delay.
         smart_exec_mark(key, "failed", {"code": code, "body": body, "payload": payload})
+        safety_mark_ack_resolved(key, "failed", {"code": code, "body": body})
+        safety_write_decision_event("order_failed", signal=signal, decision=signal.get("unified_decision", {}), selected=selected, result={"code": code, "body": body, "payload": payload}, gates={"smart_exec": "failed"})
 
         if smart_exec_position_exists("QQQ"):
             smart_exec_mark(key, "position_opened", {"code": code, "body": body})
@@ -15237,6 +15681,7 @@ def evaluate_trade_opportunity(signal: Dict[str, Any], selected_contract: Option
         print(f"UNIFIED DECISION | {explanation}", flush=True)
 
     unified_decision_append_log(decision)
+    safety_write_decision_event("unified_decision", signal=signal, decision=decision, selected=selected_contract, result={"approved": approved})
     return decision
 
 
@@ -16810,6 +17255,8 @@ def tg_dash_keyboard():
         [{"text": "🛑 Kill", "callback_data": "dash_kill"}, {"text": "✅ Resume", "callback_data": "dash_resume"}],
         [{"text": "📉 Positions", "callback_data": "dash_positions"}, {"text": "🧹 Clear Signal", "callback_data": "dash_clear_signal"}],
         [{"text": "⚠️ Flatten", "callback_data": "dash_flatten"}, {"text": "🔄 Refresh", "callback_data": "dash_home"}],
+        [{"text": "🔒 Hard Lock", "callback_data": "dash_hard_lock"}, {"text": "🔓 Unlock", "callback_data": "dash_unlock"}],
+        [{"text": "🚪 Exit Only", "callback_data": "dash_exit_only"}, {"text": "✅ Entries On", "callback_data": "dash_entries_on"}],
     ]}
 
 
@@ -16952,6 +17399,26 @@ def tg_dash_handle_command(text, chat_id):
         tg_dash_send(tg_dash_decision_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
     if cmd == "/positions":
         tg_dash_send(tg_dash_positions_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/hard_lock":
+        safety_set_global_lock(True, "telegram_hard_lock")
+        tg_dash_send("🔒 <b>GLOBAL HARD LOCK ENABLED</b>\nNo order path can send/modify orders.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/unlock":
+        safety_set_global_lock(False, "telegram_unlock")
+        safety_clear_review_required()
+        tg_dash_send("🔓 <b>GLOBAL HARD LOCK CLEARED</b>\nReview flag also cleared.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/exit_only":
+        tg_dash_control_set("exit_only_mode", True)
+        tg_dash_send("🚪 <b>EXIT ONLY MODE ENABLED</b>\nNew/scaling entries blocked. Exits/cancels allowed.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/entries_on":
+        tg_dash_control_set("exit_only_mode", False)
+        tg_dash_send("✅ <b>ENTRIES ENABLED</b>\nExit-only mode cleared.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/review_clear":
+        safety_clear_review_required()
+        tg_dash_send("✅ <b>REVIEW REQUIRED CLEARED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/safety_test":
+        report = safety_run_chaos_selftest()
+        tg_dash_send(f"🧪 <b>SAFETY SELFTEST</b>\nPassed: <b>{report.get('passed')}</b>\n<code>{json.dumps(report, default=str)[:2500]}</code>", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+
     if cmd == "/kill":
         tg_dash_control_set("kill_switch", True); tg_dash_control_set("bot_paused", True)
         tg_dash_send("🛑 <b>KILL SWITCH ENABLED</b>\nTrading paused.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
@@ -16984,6 +17451,19 @@ def tg_dash_handle_callback(cq):
             tg_dash_control_set("kill_switch", False); tg_dash_control_set("bot_paused", False)
             tg_dash_send("✅ <b>TRADING RESUMED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
         elif data == "dash_flatten": tg_dash_send(tg_dash_flatten_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_hard_lock":
+            safety_set_global_lock(True, "telegram_button_hard_lock")
+            tg_dash_send("🔒 <b>GLOBAL HARD LOCK ENABLED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_unlock":
+            safety_set_global_lock(False, "telegram_button_unlock")
+            safety_clear_review_required()
+            tg_dash_send("🔓 <b>GLOBAL HARD LOCK CLEARED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_exit_only":
+            tg_dash_control_set("exit_only_mode", True)
+            tg_dash_send("🚪 <b>EXIT ONLY MODE ENABLED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_entries_on":
+            tg_dash_control_set("exit_only_mode", False)
+            tg_dash_send("✅ <b>ENTRIES ENABLED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
         elif data == "dash_clear_signal": tg_dash_send(tg_dash_clear_signal(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
         else: tg_dash_send("Unknown dashboard command.", chat_id=chat_id, reply_markup=tg_dash_keyboard())
         return True
