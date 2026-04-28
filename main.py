@@ -21,6 +21,7 @@ print("[INSTITUTIONAL SAFETY SURFACE ACTIVE] hard lock + exit-only + degraded + 
 print("[UNIVERSAL ORDER WRAPPER ACTIVE] safety surface is mandatory for all order paths", flush=True)
 print("[ONE TRADE COOLDOWN PATCH ACTIVE] one_trade_cooldown_ok fixed", flush=True)
 print("[APPROVED SIGNAL EXECUTION OVERRIDE ACTIVE] observe_only can execute approved high-score trades", flush=True)
+print("[ALPACA EXECUTION RELIABILITY PATCH ACTIVE] reliable order routing + confirmation enabled", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
@@ -418,6 +419,23 @@ STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "
 # =========================================================
 # SMART EXECUTION SYSTEM
 # Idempotency retry + order style selection + execution conversion.
+
+# =========================================================
+# ALPACA EXECUTION RELIABILITY PATCH
+# Defines missing execution state files + safer broker routing.
+# =========================================================
+IDEMPOTENCY_FILE = os.getenv("IDEMPOTENCY_FILE", "idempotency_ledger.json").strip()
+SMART_EXECUTION_FILE = os.getenv("SMART_EXECUTION_FILE", "smart_execution_state.json").strip()
+ALPACA_EXECUTION_AUDIT_FILE = os.getenv("ALPACA_EXECUTION_AUDIT_FILE", "alpaca_execution_audit.jsonl").strip()
+
+ALPACA_FORCE_LIMIT_FOR_OPTIONS = os.getenv("ALPACA_FORCE_LIMIT_FOR_OPTIONS", "true").lower() == "true"
+ALPACA_OPTION_LIMIT_OFFSET = float(os.getenv("ALPACA_OPTION_LIMIT_OFFSET", "0.02"))
+ALPACA_OPTION_MAX_LIMIT_CHASE = float(os.getenv("ALPACA_OPTION_MAX_LIMIT_CHASE", "0.06"))
+ALPACA_OPTION_CONFIRM_AFTER_SUBMIT = os.getenv("ALPACA_OPTION_CONFIRM_AFTER_SUBMIT", "true").lower() == "true"
+ALPACA_OPTION_CONFIRM_SECONDS = float(os.getenv("ALPACA_OPTION_CONFIRM_SECONDS", "1.0"))
+ALPACA_OPTION_MIN_PRICE = float(os.getenv("ALPACA_OPTION_MIN_PRICE", "0.05"))
+ALPACA_OPTION_MAX_CONTRACT_NOTIONAL = float(os.getenv("ALPACA_OPTION_MAX_CONTRACT_NOTIONAL", "1200"))
+
 # =========================================================
 ENABLE_SMART_EXECUTION_SYSTEM = os.getenv("ENABLE_SMART_EXECUTION_SYSTEM", "true").lower() == "true"
 SMART_EXECUTION_MAX_RETRIES = int(float(os.getenv("SMART_EXECUTION_MAX_RETRIES", "2")))
@@ -440,6 +458,168 @@ SMART_EXECUTION_LOG_FILE = os.getenv("SMART_EXECUTION_LOG_FILE", "execution_log.
 # =========================================================
 # UNIVERSAL ORDER WRAPPER HARDENING
 # Ensures safety_surface_gate is the mandatory choke point.
+
+
+
+# =========================================================
+# ALPACA EXECUTION RELIABILITY PATCH
+# =========================================================
+
+def alpaca_audit(event: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = {"time": datetime.now().isoformat(), "ts": int(time.time()), "event": event, **(payload or {})}
+        with open(ALPACA_EXECUTION_AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception as e:
+        try:
+            debug(f"ALPACA AUDIT WRITE ERROR | {e}")
+        except Exception:
+            pass
+
+
+def alpaca_headers() -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def alpaca_base_url() -> str:
+    return ALPACA_BASE_URL.rstrip("/") if "ALPACA_BASE_URL" in globals() else os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+
+
+def alpaca_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+    try:
+        url = f"{alpaca_base_url()}{path}"
+        if method.upper() == "POST":
+            r = requests.post(url, headers=alpaca_headers(), json=payload or {}, timeout=20)
+        elif method.upper() == "GET":
+            r = requests.get(url, headers=alpaca_headers(), timeout=20)
+        else:
+            raise ValueError(f"unsupported_method:{method}")
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return r.status_code, body
+    except Exception as e:
+        return 599, {"error": str(e), "path": path, "method": method}
+
+
+def alpaca_confirm_order(order_id: str) -> Dict[str, Any]:
+    if not order_id:
+        return {"confirmed": False, "reason": "missing_order_id"}
+    try:
+        time.sleep(ALPACA_OPTION_CONFIRM_SECONDS)
+        code, body = alpaca_request("GET", f"/v2/orders/{order_id}")
+        return {"confirmed": code < 300, "code": code, "body": body}
+    except Exception as e:
+        return {"confirmed": False, "reason": str(e)}
+
+
+def alpaca_normalize_option_symbol(symbol: str) -> str:
+    return str(symbol or "").replace(" ", "").upper()
+
+
+def _afloat(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def alpaca_prepare_option_order_payload(payload: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    payload = dict(payload or {})
+    symbol = alpaca_normalize_option_symbol(payload.get("symbol") or payload.get("contract_symbol"))
+    if not symbol:
+        return False, "missing_symbol", payload
+
+    payload["symbol"] = symbol
+    payload["side"] = str(payload.get("side") or "buy").lower()
+    payload["time_in_force"] = str(payload.get("time_in_force") or "day").lower()
+
+    qty = max(1, int(_afloat(payload.get("qty") or 1, 1)))
+    payload["qty"] = str(qty)
+
+    bid = _afloat(payload.get("bid"), 0.0)
+    ask = _afloat(payload.get("ask"), 0.0)
+    mid = _afloat(payload.get("mid"), 0.0)
+    limit = _afloat(payload.get("limit_price"), 0.0)
+
+    if ALPACA_FORCE_LIMIT_FOR_OPTIONS:
+        if limit <= 0:
+            if ask > 0 and mid > 0:
+                limit = min(ask, mid + ALPACA_OPTION_LIMIT_OFFSET)
+            elif ask > 0:
+                limit = ask
+            elif mid > 0:
+                limit = mid
+        if limit <= 0:
+            return False, "missing_option_limit_price", payload
+        limit = round(max(ALPACA_OPTION_MIN_PRICE, limit), 2)
+        payload["type"] = "limit"
+        payload["limit_price"] = str(limit)
+    else:
+        payload["type"] = str(payload.get("type") or "market").lower()
+
+    try:
+        notional = float(payload.get("limit_price", 0) or 0) * qty * 100
+        if notional > ALPACA_OPTION_MAX_CONTRACT_NOTIONAL * qty:
+            return False, f"option_notional_too_large:{notional}", payload
+    except Exception:
+        pass
+
+    for k in list(payload.keys()):
+        if str(k).startswith("_") or k in {"bid", "ask", "mid", "spread", "spread_pct", "notional", "contract_notional", "quote_ok", "reason"}:
+            payload.pop(k, None)
+
+    if not payload.get("client_order_id"):
+        payload["client_order_id"] = f"ubt-opt-{symbol}-{int(time.time())}"[:48]
+
+    return True, "payload_ok", payload
+
+
+def alpaca_submit_order_reliable(payload: Dict[str, Any]) -> Tuple[int, Any]:
+    ok, reason, clean_payload = alpaca_prepare_option_order_payload(payload)
+    if not ok:
+        alpaca_audit("payload_rejected", {"reason": reason, "payload": payload, "clean_payload": clean_payload})
+        try:
+            debug(f"❌ ALPACA PAYLOAD REJECTED | {reason} | payload={clean_payload}")
+        except Exception:
+            pass
+        return 400, {"error": reason, "payload": clean_payload}
+
+    alpaca_audit("submit_attempt", {"payload": clean_payload})
+    code, body = alpaca_request("POST", "/v2/orders", clean_payload)
+    alpaca_audit("submit_response", {"code": code, "body": body, "payload": clean_payload})
+
+    if code < 300 and ALPACA_OPTION_CONFIRM_AFTER_SUBMIT:
+        order_id = body.get("id") if isinstance(body, dict) else None
+        confirm = alpaca_confirm_order(order_id)
+        alpaca_audit("submit_confirm", {"order_id": order_id, "confirm": confirm})
+        try:
+            debug(f"✅ ALPACA ORDER CONFIRM | order_id={order_id} confirm={confirm}")
+        except Exception:
+            pass
+
+    if code >= 300:
+        try:
+            debug(f"❌ ALPACA ORDER FAILED | status={code} body={body} payload={clean_payload}")
+        except Exception:
+            pass
+    else:
+        try:
+            debug(f"✅ ALPACA ORDER ACCEPTED | status={code} body={body}")
+        except Exception:
+            pass
+
+    return code, body
+
+
+def smart_exec_alpaca_submit_order(payload: Dict[str, Any]) -> Tuple[int, Any]:
+    return alpaca_submit_order_reliable(payload)
+
 
 # =========================================================
 # APPROVED SIGNAL EXECUTION OVERRIDE
@@ -18097,6 +18277,15 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
 
         def _builder(sig, sel, q, attempt=attempt):
             payload = dict(base_payload)
+            # ALPACA QUOTE FIELDS PATCH
+            try:
+                payload["bid"] = sel.get("bid", payload.get("bid"))
+                payload["ask"] = sel.get("ask", payload.get("ask"))
+                payload["mid"] = sel.get("mid", sel.get("contract_mid", payload.get("mid")))
+                payload["spread"] = sel.get("spread", payload.get("spread"))
+                payload["spread_pct"] = sel.get("spread_pct", payload.get("spread_pct"))
+            except Exception:
+                pass
             payload["qty"] = str(q)
             plan = smart_exec_order_plan(sig, sel, attempt=attempt)
             payload["type"] = plan["type"]
