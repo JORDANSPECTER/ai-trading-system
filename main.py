@@ -16,6 +16,7 @@ import requests
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
 print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enabled", flush=True)
+print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
@@ -159,6 +160,14 @@ DISCORD_EXECUTION_WEBHOOK = os.getenv("DISCORD_EXECUTION_WEBHOOK", os.getenv("DI
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# =========================================================
+# TELEGRAM COMMAND DASHBOARD
+# =========================================================
+ENABLE_TELEGRAM_COMMAND_DASHBOARD = os.getenv("ENABLE_TELEGRAM_COMMAND_DASHBOARD", "true").lower() == "true"
+TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+TELEGRAM_COMMAND_STATE_FILE = os.getenv("TELEGRAM_COMMAND_STATE_FILE", "telegram_command_state.json").strip()
+TELEGRAM_CONTROL_STATE_FILE = os.getenv("TELEGRAM_CONTROL_STATE_FILE", "control_state.json").strip()
 
 BOT_NAME = os.getenv("BOT_NAME", "UnBiased Trades Engine").strip()
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
@@ -16620,6 +16629,269 @@ def reset_kill_switch_for_testing():
         debug(f"reset_kill_switch_error:{e}")
         return False
 
+
+
+
+
+# =========================================================
+# TELEGRAM COMMAND DASHBOARD
+# =========================================================
+
+def tg_dash_load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                return json.loads(raw) if raw else default
+        return default
+    except Exception:
+        return default
+
+
+def tg_dash_save_json(path, data):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"TELEGRAM DASH SAVE ERROR | {e}", flush=True)
+
+
+def tg_dash_send(text, chat_id=None, reply_markup=None):
+    try:
+        cid = str(chat_id or TELEGRAM_CHAT_ID or TELEGRAM_ADMIN_CHAT_ID).strip()
+        if not TELEGRAM_BOT_TOKEN or not cid:
+            return False
+        payload = {"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+        return r.status_code < 300
+    except Exception as e:
+        print(f"TELEGRAM DASH SEND ERROR | {e}", flush=True)
+        return False
+
+
+def tg_dash_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📊 Status", "callback_data": "dash_status"}, {"text": "🧠 Decision", "callback_data": "dash_decision"}],
+        [{"text": "🛑 Kill", "callback_data": "dash_kill"}, {"text": "✅ Resume", "callback_data": "dash_resume"}],
+        [{"text": "📉 Positions", "callback_data": "dash_positions"}, {"text": "🧹 Clear Signal", "callback_data": "dash_clear_signal"}],
+        [{"text": "⚠️ Flatten", "callback_data": "dash_flatten"}, {"text": "🔄 Refresh", "callback_data": "dash_home"}],
+    ]}
+
+
+def tg_dash_allowed(chat_id):
+    allowed = str(TELEGRAM_ADMIN_CHAT_ID or TELEGRAM_CHAT_ID).strip()
+    return str(chat_id).strip() == allowed
+
+
+def tg_dash_control_set(key, value):
+    st = tg_dash_load_json(TELEGRAM_CONTROL_STATE_FILE, {})
+    if not isinstance(st, dict):
+        st = {}
+    st[key] = value
+    st["updated_at"] = datetime.now().isoformat()
+    tg_dash_save_json(TELEGRAM_CONTROL_STATE_FILE, st)
+    tg_dash_save_json("control_state.json", st)
+
+
+def tg_dash_control_bool(key, env_name, default=False):
+    st = tg_dash_load_json(TELEGRAM_CONTROL_STATE_FILE, {})
+    if isinstance(st, dict) and key in st:
+        return bool(st.get(key))
+    return str(os.getenv(env_name, str(default))).lower() == "true"
+
+
+def tg_dash_status_text():
+    market_file = globals().get("MARKET_FILE", "market_prices.json")
+    market = tg_dash_load_json(market_file, {})
+    qqq = market.get("QQQ", {}) if isinstance(market, dict) else {}
+    price = qqq.get("price") or qqq.get("last") or "n/a"
+    vwap = qqq.get("vwap") or qqq.get("session_vwap") or "n/a"
+    kill = tg_dash_control_bool("kill_switch", "KILL_SWITCH", False)
+    paused = tg_dash_control_bool("bot_paused", "BOT_PAUSED", False)
+    risk = tg_dash_load_json("one_trade_risk_state.json", tg_dash_load_json("risk_state.json", {}))
+
+    last_decision = "No decision yet"
+    try:
+        if os.path.exists("decision_log.jsonl"):
+            lines = [x.strip() for x in open("decision_log.jsonl", "r", encoding="utf-8").readlines() if x.strip()]
+            if lines:
+                d = json.loads(lines[-1])
+                last_decision = f"{'✅ APPROVED' if d.get('approved') else '🚫 BLOCKED'} | Score {d.get('score')} | {d.get('ticker')} {d.get('direction')}"
+    except Exception:
+        pass
+
+    return (
+        "🧠 <b>UnBiased Command Center</b>\n\n"
+        f"Mode: <b>{globals().get('MODE', os.getenv('MODE','paper'))}</b>\n"
+        f"Kill Switch: <b>{kill}</b>\n"
+        f"Bot Paused: <b>{paused}</b>\n"
+        f"QQQ: <b>{price}</b> | VWAP: <b>{vwap}</b>\n"
+        f"Daily Trades: <b>{risk.get('daily_trades', risk.get('trades_today', 0))}</b>\n\n"
+        f"Last Decision:\n<code>{last_decision}</code>"
+    )
+
+
+def tg_dash_positions_text():
+    try:
+        if "get_alpaca_positions_safe" in globals():
+            positions = get_alpaca_positions_safe()
+        elif "get_alpaca_positions" in globals():
+            positions = get_alpaca_positions()
+        elif "alpaca_get_positions" in globals():
+            positions = alpaca_get_positions()
+        else:
+            positions = []
+    except Exception as e:
+        return f"📉 <b>Positions</b>\nError: {e}"
+
+    if not positions:
+        return "📉 <b>Positions</b>\nNo open positions."
+
+    rows = ["📉 <b>Open Positions</b>"]
+    for p in positions[:12]:
+        rows.append(f"<code>{p.get('symbol','')}</code> qty={p.get('qty','')} mv={p.get('market_value','')} pnl={p.get('unrealized_pl', p.get('unrealized_intraday_pl',''))}")
+    return "\n".join(rows)
+
+
+def tg_dash_decision_text():
+    try:
+        if not os.path.exists("decision_log.jsonl"):
+            return "🧠 <b>Last Decision</b>\nNo decision log yet."
+        lines = [x.strip() for x in open("decision_log.jsonl", "r", encoding="utf-8").readlines() if x.strip()]
+        if not lines:
+            return "🧠 <b>Last Decision</b>\nNo decision log yet."
+        d = json.loads(lines[-1])
+        return (
+            "🧠 <b>Last Unified Decision</b>\n\n"
+            f"Approved: <b>{d.get('approved')}</b>\n"
+            f"Score: <b>{d.get('score')}</b>\n"
+            f"Ticker: <b>{d.get('ticker')}</b> {d.get('direction')}\n"
+            f"Edge: {d.get('edge_score')} | Regime: {d.get('regime_score')}\n"
+            f"Liquidity: {d.get('liquidity_score')} | Execution: {d.get('execution_score')}\n"
+            f"Learning: {d.get('learning_score')} | Risk: {d.get('risk_score')}\n\n"
+            f"<code>{d.get('explanation','')}</code>"
+        )
+    except Exception as e:
+        return f"🧠 <b>Last Decision</b>\nError: {e}"
+
+
+def tg_dash_clear_signal():
+    removed = []
+    for fp in ["ai_signal.json", "ai_signal.json.bak"]:
+        try:
+            if os.path.exists(fp):
+                os.remove(fp)
+                removed.append(fp)
+        except Exception:
+            pass
+    return "🧹 Signal cleared: " + (", ".join(removed) if removed else "nothing to clear")
+
+
+def tg_dash_flatten_text():
+    try:
+        if "flatten_all_positions" in globals():
+            res = flatten_all_positions()
+            return f"⚠️ Flatten requested.\n<code>{res}</code>"
+    except Exception as e:
+        return f"⚠️ Flatten function failed: {e}"
+    return "⚠️ Flatten requested, but no flatten_all_positions() function was found in this build."
+
+
+def tg_dash_home(chat_id=None):
+    tg_dash_send(tg_dash_status_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+
+
+def tg_dash_handle_command(text, chat_id):
+    if not ENABLE_TELEGRAM_COMMAND_DASHBOARD:
+        return False
+    if not tg_dash_allowed(chat_id):
+        tg_dash_send("🚫 Not authorized.", chat_id=chat_id)
+        return True
+
+    cmd = (text or "").strip().lower()
+    if cmd in ["/start", "/help", "/menu", "/dashboard", "/commandcenter", "/commands"]:
+        tg_dash_home(chat_id); return True
+    if cmd == "/status":
+        tg_dash_send(tg_dash_status_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/decision":
+        tg_dash_send(tg_dash_decision_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/positions":
+        tg_dash_send(tg_dash_positions_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/kill":
+        tg_dash_control_set("kill_switch", True); tg_dash_control_set("bot_paused", True)
+        tg_dash_send("🛑 <b>KILL SWITCH ENABLED</b>\nTrading paused.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/resume":
+        tg_dash_control_set("kill_switch", False); tg_dash_control_set("bot_paused", False)
+        tg_dash_send("✅ <b>TRADING RESUMED</b>\nKill switch off. Bot unpaused.", chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/flatten":
+        tg_dash_send(tg_dash_flatten_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    if cmd == "/clear_signal":
+        tg_dash_send(tg_dash_clear_signal(), chat_id=chat_id, reply_markup=tg_dash_keyboard()); return True
+    return False
+
+
+def tg_dash_handle_callback(cq):
+    try:
+        data = cq.get("data", "")
+        cbid = cq.get("id")
+        chat_id = cq.get("message", {}).get("chat", {}).get("id")
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cbid, "text": "OK"}, timeout=8)
+        if not tg_dash_allowed(chat_id):
+            tg_dash_send("🚫 Not authorized.", chat_id=chat_id); return True
+        if data == "dash_home": tg_dash_home(chat_id)
+        elif data == "dash_status": tg_dash_send(tg_dash_status_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_decision": tg_dash_send(tg_dash_decision_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_positions": tg_dash_send(tg_dash_positions_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_kill":
+            tg_dash_control_set("kill_switch", True); tg_dash_control_set("bot_paused", True)
+            tg_dash_send("🛑 <b>KILL SWITCH ENABLED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_resume":
+            tg_dash_control_set("kill_switch", False); tg_dash_control_set("bot_paused", False)
+            tg_dash_send("✅ <b>TRADING RESUMED</b>", chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_flatten": tg_dash_send(tg_dash_flatten_text(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        elif data == "dash_clear_signal": tg_dash_send(tg_dash_clear_signal(), chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        else: tg_dash_send("Unknown dashboard command.", chat_id=chat_id, reply_markup=tg_dash_keyboard())
+        return True
+    except Exception as e:
+        print(f"TELEGRAM DASH CALLBACK ERROR | {e}", flush=True)
+        return False
+
+
+def tg_dash_poll_once():
+    if not ENABLE_TELEGRAM_COMMAND_DASHBOARD or not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        state = tg_dash_load_json(TELEGRAM_COMMAND_STATE_FILE, {})
+        offset = int(state.get("offset", 0) or 0)
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params={"timeout": 1, "offset": offset}, timeout=8)
+        data = r.json()
+        if not data.get("ok"):
+            return
+        max_offset = offset
+        for upd in data.get("result", []):
+            uid = int(upd.get("update_id", 0))
+            max_offset = max(max_offset, uid + 1)
+            if "callback_query" in upd:
+                tg_dash_handle_callback(upd["callback_query"]); continue
+            msg = upd.get("message") or {}
+            chat_id = (msg.get("chat") or {}).get("id")
+            txt = msg.get("text", "")
+            if txt:
+                handled = tg_dash_handle_command(txt, chat_id)
+                if handled:
+                    try: debug(f"TELEGRAM DASH COMMAND HANDLED | chat={chat_id} text={txt}")
+                    except Exception: pass
+        state["offset"] = max_offset
+        state["updated_at"] = datetime.now().isoformat()
+        tg_dash_save_json(TELEGRAM_COMMAND_STATE_FILE, state)
+    except Exception as e:
+        print(f"TELEGRAM DASH POLL ERROR | {e}", flush=True)
 
 
 def main_loop():
