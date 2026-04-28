@@ -15,6 +15,7 @@ import requests
 
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
+print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enabled", flush=True)
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
@@ -398,6 +399,24 @@ STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "
 # =========================================================
 # UNIFIED TRADE DECISION ENGINE
 # Single institutional policy score before execution.
+
+# =========================================================
+# SMART EXECUTION SYSTEM
+# Idempotency retry + order style selection + execution conversion.
+# =========================================================
+ENABLE_SMART_EXECUTION_SYSTEM = os.getenv("ENABLE_SMART_EXECUTION_SYSTEM", "true").lower() == "true"
+SMART_EXECUTION_MAX_RETRIES = int(float(os.getenv("SMART_EXECUTION_MAX_RETRIES", "2")))
+SMART_EXECUTION_RETRY_DELAY_SECONDS = float(os.getenv("SMART_EXECUTION_RETRY_DELAY_SECONDS", "1.5"))
+SMART_EXECUTION_ALLOW_RETRY_AFTER_FAILED_ORDER = os.getenv("SMART_EXECUTION_ALLOW_RETRY_AFTER_FAILED_ORDER", "true").lower() == "true"
+SMART_EXECUTION_BLOCK_ONLY_FILLED_OR_POSITION = os.getenv("SMART_EXECUTION_BLOCK_ONLY_FILLED_OR_POSITION", "true").lower() == "true"
+SMART_EXECUTION_USE_LIMIT_ORDERS = os.getenv("SMART_EXECUTION_USE_LIMIT_ORDERS", "true").lower() == "true"
+SMART_EXECUTION_MARKET_SCORE = int(float(os.getenv("SMART_EXECUTION_MARKET_SCORE", "82")))
+SMART_EXECUTION_LIMIT_ASK_SCORE = int(float(os.getenv("SMART_EXECUTION_LIMIT_ASK_SCORE", "72")))
+SMART_EXECUTION_LIMIT_MID_SCORE = int(float(os.getenv("SMART_EXECUTION_LIMIT_MID_SCORE", "65")))
+SMART_EXECUTION_MAX_LIMIT_OFFSET = float(os.getenv("SMART_EXECUTION_MAX_LIMIT_OFFSET", "0.03"))
+SMART_EXECUTION_RETRY_PRICE_STEP = float(os.getenv("SMART_EXECUTION_RETRY_PRICE_STEP", "0.02"))
+SMART_EXECUTION_LOG_FILE = os.getenv("SMART_EXECUTION_LOG_FILE", "execution_log.jsonl").strip()
+
 # =========================================================
 ENABLE_UNIFIED_DECISION_ENGINE = os.getenv("ENABLE_UNIFIED_DECISION_ENGINE", "true").lower() == "true"
 UNIFIED_DECISION_MIN_SCORE = int(float(os.getenv("UNIFIED_DECISION_MIN_SCORE", "65")))
@@ -5652,6 +5671,306 @@ def select_institutional_qqq_option_contract(signal: Dict[str, Any]) -> Dict[str
 
     return {"selected": True, "symbol": symbol, "contract": best, "details": best_details, "rejected": rejected[:5]}
 
+
+
+# =========================================================
+# SMART EXECUTION SYSTEM
+# =========================================================
+
+def smart_exec_now() -> str:
+    try:
+        return datetime.now().isoformat()
+    except Exception:
+        return str(time.time())
+
+
+def smart_exec_append_log(payload: Dict[str, Any]) -> None:
+    try:
+        with open(SMART_EXECUTION_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception as e:
+        try:
+            debug(f"SMART EXEC LOG ERROR | {e}")
+        except Exception:
+            print(f"SMART EXEC LOG ERROR | {e}", flush=True)
+
+
+def smart_exec_signal_key(signal: Dict[str, Any], selected: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        ticker = str(signal.get("ticker") or signal.get("symbol") or "QQQ").upper()
+        direction = str(signal.get("direction") or signal.get("side") or "CALL").upper()
+        setup = str(signal.get("setup") or signal.get("setup_type") or "setup").upper()
+        sig_id = str(signal.get("signal_id") or signal.get("id") or "")
+        contract = ""
+        if isinstance(selected, dict):
+            contract = str(selected.get("symbol") or selected.get("contract") or selected.get("contract_symbol") or "")
+        return f"{ticker}:{direction}:{setup}:{sig_id}:{contract}"
+    except Exception:
+        return f"unknown:{time.time()}"
+
+
+def smart_exec_load_state() -> Dict[str, Any]:
+    try:
+        return load_json_file(IDEMPOTENCY_FILE, {}) if "load_json_file" in globals() else load_json(IDEMPOTENCY_FILE, {})
+    except Exception:
+        return {}
+
+
+def smart_exec_save_state(state: Dict[str, Any]) -> None:
+    try:
+        if "save_json_file" in globals():
+            save_json_file(IDEMPOTENCY_FILE, state)
+        elif "save_json" in globals():
+            save_json(IDEMPOTENCY_FILE, state)
+        else:
+            with open(IDEMPOTENCY_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+    except Exception as e:
+        try:
+            debug(f"SMART EXEC STATE SAVE ERROR | {e}")
+        except Exception:
+            pass
+
+
+def smart_exec_position_exists(symbol_hint: str = "QQQ") -> bool:
+    try:
+        if "active_qqq_exposure_exists" in globals():
+            return bool(active_qqq_exposure_exists())
+    except Exception:
+        pass
+
+    try:
+        if "unified_decision_existing_qqq_exposure" in globals():
+            exists, _ = unified_decision_existing_qqq_exposure()
+            return bool(exists)
+    except Exception:
+        pass
+
+    try:
+        if "get_alpaca_positions_safe" in globals():
+            positions = get_alpaca_positions_safe()
+        elif "get_alpaca_positions" in globals():
+            positions = get_alpaca_positions()
+        elif "alpaca_get_positions" in globals():
+            positions = alpaca_get_positions()
+        else:
+            positions = []
+        for p in positions or []:
+            sym = str(p.get("symbol", "")).upper()
+            qty = float(p.get("qty", 0) or 0)
+            if abs(qty) > 0 and (sym == "QQQ" or sym.startswith("QQQ")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def smart_exec_gate(signal: Dict[str, Any], selected: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, str]:
+    """
+    Replacement behavior for strict idempotency:
+    - Block if position exists or prior order filled/submitted successfully.
+    - Allow retry if last order failed/rejected and retry count is under cap.
+    """
+    key = smart_exec_signal_key(signal, selected)
+    state = smart_exec_load_state()
+    rec = state.get(key, {}) if isinstance(state, dict) else {}
+
+    if SMART_EXECUTION_BLOCK_ONLY_FILLED_OR_POSITION and smart_exec_position_exists("QQQ"):
+        return False, "smart_exec_position_exists_block", key
+
+    status = str(rec.get("status", "")).lower()
+    retry_count = int(rec.get("retry_count", 0) or 0)
+
+    if status in {"filled", "submitted", "accepted", "open", "position_opened"}:
+        return False, f"smart_exec_already_{status}", key
+
+    if status in {"failed", "rejected", "blocked", "error"}:
+        if SMART_EXECUTION_ALLOW_RETRY_AFTER_FAILED_ORDER and retry_count < SMART_EXECUTION_MAX_RETRIES:
+            return True, f"smart_exec_retry_allowed:{status}:{retry_count}/{SMART_EXECUTION_MAX_RETRIES}", key
+        return False, f"smart_exec_retry_limit:{status}:{retry_count}/{SMART_EXECUTION_MAX_RETRIES}", key
+
+    return True, "smart_exec_new_intent_allowed", key
+
+
+def smart_exec_mark(key: str, status: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    state = smart_exec_load_state()
+    if not isinstance(state, dict):
+        state = {}
+    rec = state.get(key, {})
+    if not isinstance(rec, dict):
+        rec = {}
+
+    old_status = str(rec.get("status", "")).lower()
+    retry_count = int(rec.get("retry_count", 0) or 0)
+    if status in {"failed", "rejected", "blocked", "error"}:
+        retry_count += 1
+
+    rec.update({
+        "status": status,
+        "updated_at": smart_exec_now(),
+        "retry_count": retry_count,
+        "last_payload": payload or {},
+        "previous_status": old_status,
+    })
+    state[key] = rec
+    smart_exec_save_state(state)
+
+
+def smart_exec_selected_metrics(selected: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    selected = selected or {}
+    def f(*names, default=0.0):
+        for n in names:
+            try:
+                v = selected.get(n)
+                if v is not None and v != "":
+                    return float(v)
+            except Exception:
+                pass
+        return default
+
+    bid = f("bid", "bid_price")
+    ask = f("ask", "ask_price")
+    mid = f("mid", "contract_mid", default=((bid + ask) / 2 if bid and ask else 0.0))
+    spread = f("spread", default=(ask - bid if bid and ask else 0.0))
+    spread_pct = f("spread_pct", default=(spread / mid if mid else 0.0))
+    return {"bid": bid, "ask": ask, "mid": mid, "spread": spread, "spread_pct": spread_pct}
+
+
+def smart_exec_order_plan(signal: Dict[str, Any], selected: Optional[Dict[str, Any]], attempt: int = 0) -> Dict[str, Any]:
+    """
+    Uses unified decision score to choose market vs limit behavior.
+    Score 82+ = market if spread is tight.
+    Score 72–81 = limit near ask.
+    Score 65–71 = limit around midpoint.
+    Retry attempts walk the limit up slightly, capped near ask.
+    """
+    decision = signal.get("unified_decision") or signal.get("unified_pre_decision") or {}
+    score = float(decision.get("score", signal.get("execution_score") or signal.get("score") or 0) or 0)
+    m = smart_exec_selected_metrics(selected)
+
+    bid, ask, mid, spread_pct = m["bid"], m["ask"], m["mid"], m["spread_pct"]
+
+    if not SMART_EXECUTION_USE_LIMIT_ORDERS:
+        return {"type": "market", "limit_price": None, "reason": "limit_orders_disabled", "score": score}
+
+    if score >= SMART_EXECUTION_MARKET_SCORE and spread_pct <= UNIFIED_DECISION_MAX_SPREAD_PCT:
+        return {"type": "market", "limit_price": None, "reason": "high_score_tight_spread_market", "score": score}
+
+    limit_price = None
+    reason = ""
+
+    if score >= SMART_EXECUTION_LIMIT_ASK_SCORE:
+        # Controlled near ask, but not blindly through the spread.
+        if ask > 0 and mid > 0:
+            limit_price = min(ask, mid + max(SMART_EXECUTION_MAX_LIMIT_OFFSET, (ask - mid) * 0.50))
+        else:
+            limit_price = ask or mid
+        reason = "controlled_limit_near_ask"
+    elif score >= SMART_EXECUTION_LIMIT_MID_SCORE:
+        limit_price = mid if mid > 0 else ask
+        reason = "conservative_limit_mid"
+    else:
+        limit_price = bid if bid > 0 else mid
+        reason = "weak_score_bid_or_mid"
+
+    if limit_price and attempt > 0:
+        limit_price = limit_price + (SMART_EXECUTION_RETRY_PRICE_STEP * attempt)
+
+    if ask and limit_price:
+        limit_price = min(limit_price, ask)
+
+    if limit_price:
+        limit_price = round(float(limit_price), 2)
+
+    if not limit_price or limit_price <= 0:
+        return {"type": "market", "limit_price": None, "reason": "missing_quote_fallback_market", "score": score}
+
+    return {"type": "limit", "limit_price": limit_price, "reason": reason, "score": score}
+
+
+def smart_exec_alpaca_submit_order(payload: Dict[str, Any]) -> Tuple[int, Any]:
+    try:
+        if "alpaca_post" in globals():
+            return alpaca_post("/v2/orders", payload)
+    except Exception:
+        pass
+
+    try:
+        url = f"{ALPACA_BASE_URL.rstrip('/')}/v2/orders"
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "Content-Type": "application/json",
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return r.status_code, body
+    except Exception as e:
+        return 599, {"error": str(e)}
+
+
+def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any], qty: int, base_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Main retry loop.
+    Replaces one-shot execution with: plan order → submit → mark result → retry if failed/rejected.
+    """
+    gate_ok, gate_reason, key = smart_exec_gate(signal, selected)
+    if not gate_ok:
+        debug(f"🛑 SMART EXECUTION GATE BLOCK | {gate_reason}")
+        smart_exec_append_log({"event": "gate_block", "key": key, "reason": gate_reason, "signal": signal, "time": smart_exec_now()})
+        return {"executed": False, "reason": gate_reason, "key": key}
+
+    last_body = None
+    for attempt in range(0, SMART_EXECUTION_MAX_RETRIES + 1):
+        plan = smart_exec_order_plan(signal, selected, attempt=attempt)
+        payload = dict(base_payload)
+        payload["qty"] = str(qty)
+        payload["type"] = plan["type"]
+        if plan["type"] == "limit":
+            payload["limit_price"] = str(plan["limit_price"])
+        else:
+            payload.pop("limit_price", None)
+
+        payload["client_order_id"] = f"ubt-smart-{smart_exec_signal_key(signal, selected).replace(':','-')[:36]}-{int(time.time())}-{attempt}"
+
+        debug(f"🚀 SMART EXEC SEND | attempt={attempt} type={payload.get('type')} limit={payload.get('limit_price')} reason={plan.get('reason')}")
+
+        code, body = smart_exec_alpaca_submit_order(payload)
+        last_body = body
+
+        event = {
+            "event": "submit_attempt",
+            "attempt": attempt,
+            "status_code": code,
+            "payload": payload,
+            "response": body,
+            "plan": plan,
+            "key": key,
+            "time": smart_exec_now(),
+        }
+        smart_exec_append_log(event)
+
+        if code < 300:
+            smart_exec_mark(key, "submitted", {"code": code, "body": body, "payload": payload})
+            debug(f"✅ SMART EXEC ORDER SUBMITTED | attempt={attempt} body={body}")
+            return {"executed": True, "reason": "smart_exec_submitted", "attempt": attempt, "response": body, "payload": payload, "key": key}
+
+        # Retry only on failed/rejected order; do not retry if position opened after response delay.
+        smart_exec_mark(key, "failed", {"code": code, "body": body, "payload": payload})
+
+        if smart_exec_position_exists("QQQ"):
+            smart_exec_mark(key, "position_opened", {"code": code, "body": body})
+            return {"executed": True, "reason": "position_detected_after_submit", "attempt": attempt, "response": body, "key": key}
+
+        if attempt < SMART_EXECUTION_MAX_RETRIES:
+            time.sleep(SMART_EXECUTION_RETRY_DELAY_SECONDS)
+
+    return {"executed": False, "reason": "smart_exec_all_retries_failed", "response": last_body, "key": key}
+
+
 def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Submit a real Alpaca PAPER option order with institutional contract selection."""
     if not ENABLE_ALPACA or not USE_ALPACA_PAPER or PAPER_BROKER_MODE != "alpaca":
@@ -5712,6 +6031,20 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         debug(f"ALPACA PAPER OPTIONS ROUTE | contract={symbol} qty={qty} details={details}")
+
+    # Smart execution system: idempotency retry + limit/market planning.
+    if ENABLE_SMART_EXECUTION_SYSTEM:
+        try:
+            selected_for_exec = selected if isinstance(selected, dict) else {}
+        except Exception:
+            selected_for_exec = {}
+        try:
+            qty_for_exec = int(float(payload.get("qty", qty if "qty" in locals() else 1)))
+        except Exception:
+            qty_for_exec = 1
+        smart_result = smart_exec_submit_with_retry(signal, selected_for_exec, qty_for_exec, payload)
+        return smart_result
+
         r = alpaca_post("/v2/orders", payload)
         if r.status_code in (200, 201):
             data = r.json()
