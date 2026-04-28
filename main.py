@@ -20,6 +20,7 @@ print("[OLD IDEMPOTENCY BYPASS ACTIVE] Smart Execution controls replay/block", f
 print("[INSTITUTIONAL SAFETY SURFACE ACTIVE] hard lock + exit-only + degraded + pending ACK", flush=True)
 print("[UNIVERSAL ORDER WRAPPER ACTIVE] safety surface is mandatory for all order paths", flush=True)
 print("[ONE TRADE COOLDOWN PATCH ACTIVE] one_trade_cooldown_ok fixed", flush=True)
+print("[APPROVED SIGNAL EXECUTION OVERRIDE ACTIVE] observe_only can execute approved high-score trades", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
@@ -439,6 +440,16 @@ SMART_EXECUTION_LOG_FILE = os.getenv("SMART_EXECUTION_LOG_FILE", "execution_log.
 # =========================================================
 # UNIVERSAL ORDER WRAPPER HARDENING
 # Ensures safety_surface_gate is the mandatory choke point.
+
+# =========================================================
+# APPROVED SIGNAL EXECUTION OVERRIDE
+# Allows high-quality approved signals to bypass observe_only routing.
+# =========================================================
+ALLOW_APPROVED_SIGNAL_EXECUTION = os.getenv("ALLOW_APPROVED_SIGNAL_EXECUTION", "true").lower() == "true"
+APPROVED_SIGNAL_EXECUTION_MIN_SCORE = float(os.getenv("APPROVED_SIGNAL_EXECUTION_MIN_SCORE", "70"))
+APPROVED_SIGNAL_EXECUTION_REQUIRE_UNIFIED_APPROVAL = os.getenv("APPROVED_SIGNAL_EXECUTION_REQUIRE_UNIFIED_APPROVAL", "true").lower() == "true"
+BLOCK_OBSERVE_ONLY_BELOW_SCORE = os.getenv("BLOCK_OBSERVE_ONLY_BELOW_SCORE", "true").lower() == "true"
+
 # =========================================================
 ENABLE_UNIVERSAL_ORDER_WRAPPER = os.getenv("ENABLE_UNIVERSAL_ORDER_WRAPPER", "true").lower() == "true"
 UNIVERSAL_WRAPPER_FAIL_CLOSED = os.getenv("UNIVERSAL_WRAPPER_FAIL_CLOSED", "true").lower() == "true"
@@ -14507,6 +14518,10 @@ def apply_unusual_whales_darkpool_to_signal(signal: Dict[str, Any], stage: str =
         if not x.get("confidence") or str(x.get("confidence")).upper() == old_grade:
             x["confidence"] = new_grade
     try:
+        # UW DARKPOOL ACTION NORMALIZATION PATCH
+
+        actions = normalize_routing_actions_for_execution(signal, actions, stage if "stage" in locals() else "")
+
         debug(f"UW DARKPOOL | stage={stage} ticker={x.get('ticker')} direction={x.get('direction')} approved={decision.get('approved')} boost={decision.get('grade_boost')} actions={decision.get('actions')}")
     except Exception:
         pass
@@ -17610,6 +17625,103 @@ def tg_dash_poll_once():
         print(f"TELEGRAM DASH POLL ERROR | {e}", flush=True)
 
 
+
+
+
+
+# =========================================================
+# APPROVED SIGNAL EXECUTION OVERRIDE
+# Converts observe_only to executable only when unified decision approves.
+# =========================================================
+
+def approved_signal_score(signal: Dict[str, Any]) -> float:
+    try:
+        ud = signal.get("unified_decision") or signal.get("unified_pre_decision") or {}
+        if isinstance(ud, dict) and ud.get("score") is not None:
+            return float(ud.get("score") or 0)
+    except Exception:
+        pass
+    try:
+        return float(signal.get("score") or signal.get("execution_score") or signal.get("grade_score") or 0)
+    except Exception:
+        return 0.0
+
+
+def approved_signal_unified_ok(signal: Dict[str, Any]) -> bool:
+    if not APPROVED_SIGNAL_EXECUTION_REQUIRE_UNIFIED_APPROVAL:
+        return True
+    try:
+        ud = signal.get("unified_decision") or signal.get("unified_pre_decision") or {}
+        if isinstance(ud, dict):
+            if ud.get("approved") is True:
+                return True
+            # Some older builds store final decision as text.
+            if str(ud.get("verdict", "")).upper() in {"APPROVED", "EXECUTE"}:
+                return True
+    except Exception:
+        pass
+
+    # If unified decision is not inside the signal but logs already show approved,
+    # let the live signal use current score if the feature is explicitly enabled.
+    return not APPROVED_SIGNAL_EXECUTION_REQUIRE_UNIFIED_APPROVAL
+
+
+def should_override_observe_only(signal: Dict[str, Any], actions=None, stage: str = "") -> Tuple[bool, str]:
+    """
+    Final behavior layer:
+    - observe_only stays blocked for low-score / unapproved signals.
+    - approved score >= threshold converts observe_only to execute_trade.
+    """
+    if not ALLOW_APPROVED_SIGNAL_EXECUTION:
+        return False, "approved_execution_override_disabled"
+
+    score = approved_signal_score(signal)
+    unified_ok = approved_signal_unified_ok(signal)
+
+    if not unified_ok:
+        return False, "unified_decision_not_approved"
+
+    if score < APPROVED_SIGNAL_EXECUTION_MIN_SCORE:
+        return False, f"score_below_execution_threshold:{score}<{APPROVED_SIGNAL_EXECUTION_MIN_SCORE}"
+
+    return True, f"approved_signal_execution_override:score={score}:stage={stage}"
+
+
+def normalize_routing_actions_for_execution(signal: Dict[str, Any], actions, stage: str = ""):
+    """
+    Takes actions from darkpool/routing layer and removes observe_only when the
+    unified decision says the trade is approved and score is high enough.
+    """
+    try:
+        if actions is None:
+            actions = []
+        if isinstance(actions, str):
+            actions = [actions]
+        actions = list(actions)
+
+        if "observe_only" in actions:
+            ok, reason = should_override_observe_only(signal, actions, stage)
+            if ok:
+                actions = [a for a in actions if a != "observe_only"]
+                if "execute_trade" not in actions:
+                    actions.append("execute_trade")
+                try:
+                    debug(f"✅ OBSERVE_ONLY OVERRIDDEN → EXECUTE | {reason}")
+                except Exception:
+                    print(f"OBSERVE_ONLY OVERRIDDEN → EXECUTE | {reason}", flush=True)
+            else:
+                try:
+                    debug(f"🟡 OBSERVE_ONLY KEPT | {reason}")
+                except Exception:
+                    pass
+
+        return actions
+    except Exception as e:
+        try:
+            debug(f"OBSERVE_ONLY NORMALIZATION ERROR | {e}")
+        except Exception:
+            pass
+        return actions
 
 
 # =========================================================
