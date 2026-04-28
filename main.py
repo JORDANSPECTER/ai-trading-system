@@ -19,6 +19,7 @@ print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enable
 print("[OLD IDEMPOTENCY BYPASS ACTIVE] Smart Execution controls replay/block", flush=True)
 print("[INSTITUTIONAL SAFETY SURFACE ACTIVE] hard lock + exit-only + degraded + pending ACK", flush=True)
 print("[UNIVERSAL ORDER WRAPPER ACTIVE] safety surface is mandatory for all order paths", flush=True)
+print("[ONE TRADE COOLDOWN PATCH ACTIVE] one_trade_cooldown_ok fixed", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
@@ -5405,6 +5406,97 @@ def one_trade_lock_setup(signal):
             pass
 
 
+
+
+# =========================================================
+# ONE TRADE COOLDOWN COMPATIBILITY PATCH
+# Fixes: NameError: one_trade_cooldown_ok is not defined
+# Prevents rapid re-entries / duplicate spam trades.
+# =========================================================
+
+ONE_TRADE_COOLDOWN_SECONDS = int(float(os.getenv("ONE_TRADE_COOLDOWN_SECONDS", "60")))
+ONE_TRADE_COOLDOWN_FILE = os.getenv("ONE_TRADE_COOLDOWN_FILE", "one_trade_cooldown_state.json").strip()
+
+
+def _one_trade_cd_load() -> Dict[str, Any]:
+    try:
+        if os.path.exists(ONE_TRADE_COOLDOWN_FILE):
+            with open(ONE_TRADE_COOLDOWN_FILE, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                return json.loads(raw) if raw else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _one_trade_cd_save(data: Dict[str, Any]) -> None:
+    try:
+        tmp = ONE_TRADE_COOLDOWN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, ONE_TRADE_COOLDOWN_FILE)
+    except Exception as e:
+        try:
+            debug(f"ONE TRADE COOLDOWN SAVE ERROR | {e}")
+        except Exception:
+            print(f"ONE TRADE COOLDOWN SAVE ERROR | {e}", flush=True)
+
+
+def one_trade_cooldown_ok() -> bool:
+    """
+    Compatibility function called by one_trade_entry_gate().
+    Uses file-backed state so cooldown survives Render restarts.
+    """
+    try:
+        st = _one_trade_cd_load()
+        last_ts = int(float(st.get("last_trade_ts", 0) or 0))
+        now = int(time.time())
+
+        if last_ts <= 0:
+            return True
+
+        elapsed = now - last_ts
+        if elapsed >= ONE_TRADE_COOLDOWN_SECONDS:
+            return True
+
+        wait = ONE_TRADE_COOLDOWN_SECONDS - elapsed
+        try:
+            debug(f"⏳ COOLDOWN BLOCK | wait {wait}s")
+        except Exception:
+            print(f"COOLDOWN BLOCK | wait {wait}s", flush=True)
+        return False
+    except Exception as e:
+        try:
+            debug(f"ONE TRADE COOLDOWN CHECK ERROR - allowing | {e}")
+        except Exception:
+            pass
+        return True
+
+
+def mark_trade_timestamp(reason: str = "executed") -> None:
+    """
+    Marks successful order/execution time for cooldown.
+    Safe to call repeatedly.
+    """
+    try:
+        now = int(time.time())
+        _one_trade_cd_save({
+            "last_trade_ts": now,
+            "last_trade_at": datetime.now().isoformat(),
+            "reason": reason,
+            "cooldown_seconds": ONE_TRADE_COOLDOWN_SECONDS,
+        })
+        try:
+            debug(f"✅ COOLDOWN TIMESTAMP MARKED | reason={reason}")
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            debug(f"MARK TRADE TIMESTAMP ERROR | {e}")
+        except Exception:
+            pass
+
+
 def one_trade_entry_gate(signal: Dict[str, Any]) -> Tuple[bool, str, bool]:
     """
     1-trade-per-setup master gate.
@@ -6550,6 +6642,7 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
             safety_mark_ack_resolved(key, "submitted", {"code": code, "body": body})
             safety_write_decision_event("order_submitted", signal=signal, decision=signal.get("unified_decision", {}), selected=selected, result={"code": code, "body": body, "payload": payload}, gates={"smart_exec": "submitted"})
             debug(f"✅ SMART EXEC ORDER SUBMITTED | attempt={attempt} body={body}")
+            mark_trade_timestamp("smart_exec_order_submitted")
             return {"executed": True, "reason": "smart_exec_submitted", "attempt": attempt, "response": body, "payload": payload, "key": key}
 
         # Retry only on failed/rejected order; do not retry if position opened after response delay.
@@ -17855,6 +17948,8 @@ def authorize_and_route_order(intent, signal, selected, qty, notional, route_fn,
     safety_mark_ack_resolved(key, status, {"code": code, "body": body, "payload": payload})
     safety_write_decision_event("broker_submit_result", signal=signal, selected=selected, result={"code": code, "body": body, "payload": payload, "ack_status": status}, gates=permission_snapshot)
 
+    if int(code) < 300:
+        mark_trade_timestamp("universal_wrapper_submitted")
     return {"executed": int(code) < 300, "code": code, "response": body, "payload": payload, "ack_key": key, "ack_status": status}
 
 
@@ -17908,6 +18003,7 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
                 smart_exec_mark(key, "submitted", result)
             except Exception:
                 pass
+            mark_trade_timestamp("smart_exec_submitted")
             return result
 
         try:
