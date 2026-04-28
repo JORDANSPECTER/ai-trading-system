@@ -6170,18 +6170,18 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     try:
         debug(f"ALPACA PAPER OPTIONS ROUTE | contract={symbol} qty={qty} details={details}")
 
-    # Smart execution system: idempotency retry + limit/market planning.
-    if ENABLE_SMART_EXECUTION_SYSTEM:
-        try:
-            selected_for_exec = selected if isinstance(selected, dict) else {}
-        except Exception:
-            selected_for_exec = {}
-        try:
-            qty_for_exec = int(float(payload.get("qty", qty if "qty" in locals() else 1)))
-        except Exception:
-            qty_for_exec = 1
-        smart_result = smart_exec_submit_with_retry(signal, selected_for_exec, qty_for_exec, payload)
-        return smart_result
+        # Smart execution system: idempotency retry + limit/market planning.
+        if ENABLE_SMART_EXECUTION_SYSTEM:
+            try:
+                selected_for_exec = selected if isinstance(selected, dict) else {}
+            except Exception:
+                selected_for_exec = {}
+            try:
+                qty_for_exec = int(float(payload.get("qty", qty if "qty" in locals() else 1)))
+            except Exception:
+                qty_for_exec = 1
+            smart_result = smart_exec_submit_with_retry(signal, selected_for_exec, qty_for_exec, payload)
+            return smart_result
 
         r = alpaca_post("/v2/orders", payload)
         if r.status_code in (200, 201):
