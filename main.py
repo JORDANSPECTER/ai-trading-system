@@ -18,6 +18,7 @@ print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy ena
 print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enabled", flush=True)
 print("[OLD IDEMPOTENCY BYPASS ACTIVE] Smart Execution controls replay/block", flush=True)
 print("[INSTITUTIONAL SAFETY SURFACE ACTIVE] hard lock + exit-only + degraded + pending ACK", flush=True)
+print("[UNIVERSAL ORDER WRAPPER ACTIVE] safety surface is mandatory for all order paths", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
@@ -433,6 +434,19 @@ SMART_EXECUTION_LOG_FILE = os.getenv("SMART_EXECUTION_LOG_FILE", "execution_log.
 # =========================================================
 # INSTITUTIONAL SAFETY SURFACE
 # Global hard lock, exit-only, degraded-mode, pending-ACK, review-required.
+
+# =========================================================
+# UNIVERSAL ORDER WRAPPER HARDENING
+# Ensures safety_surface_gate is the mandatory choke point.
+# =========================================================
+ENABLE_UNIVERSAL_ORDER_WRAPPER = os.getenv("ENABLE_UNIVERSAL_ORDER_WRAPPER", "true").lower() == "true"
+UNIVERSAL_WRAPPER_FAIL_CLOSED = os.getenv("UNIVERSAL_WRAPPER_FAIL_CLOSED", "true").lower() == "true"
+UNIVERSAL_WRAPPER_REQUIRE_PENDING_ACK = os.getenv("UNIVERSAL_WRAPPER_REQUIRE_PENDING_ACK", "true").lower() == "true"
+UNIVERSAL_WRAPPER_ABORT_ON_ACK_PERSIST_FAIL = os.getenv("UNIVERSAL_WRAPPER_ABORT_ON_ACK_PERSIST_FAIL", "true").lower() == "true"
+SAFETY_REQUIRE_RECON_FOR_REVIEW_CLEAR = os.getenv("SAFETY_REQUIRE_RECON_FOR_REVIEW_CLEAR", "true").lower() == "true"
+SAFETY_RECON_MAX_AGE_SECONDS = int(float(os.getenv("SAFETY_RECON_MAX_AGE_SECONDS", "120")))
+SAFETY_ACK_PRUNE_SECONDS = int(float(os.getenv("SAFETY_ACK_PRUNE_SECONDS", "86400")))
+
 # =========================================================
 ENABLE_SAFETY_SURFACE = os.getenv("ENABLE_SAFETY_SURFACE", "true").lower() == "true"
 GLOBAL_HARD_LOCK = os.getenv("GLOBAL_HARD_LOCK", "false").lower() == "true"
@@ -449,7 +463,7 @@ SAFETY_MACRO_MAX_AGE_SECONDS = int(float(os.getenv("SAFETY_MACRO_MAX_AGE_SECONDS
 SAFETY_PENDING_ACK_SECONDS = int(float(os.getenv("SAFETY_PENDING_ACK_SECONDS", "12")))
 SAFETY_MAX_NEW_NOTIONAL_5MIN = float(os.getenv("SAFETY_MAX_NEW_NOTIONAL_5MIN", "2500"))
 SAFETY_MAX_OPEN_QQQ_NOTIONAL = float(os.getenv("SAFETY_MAX_OPEN_QQQ_NOTIONAL", "5000"))
-SAFETY_BLOCK_ON_UNKNOWN_MACRO = os.getenv("SAFETY_BLOCK_ON_UNKNOWN_MACRO", "false").lower() == "true"
+SAFETY_BLOCK_ON_UNKNOWN_MACRO = os.getenv("SAFETY_BLOCK_ON_UNKNOWN_MACRO", "true").lower() == "true"
 SAFETY_BLOCK_ON_STALE_MARKET = os.getenv("SAFETY_BLOCK_ON_STALE_MARKET", "true").lower() == "true"
 SAFETY_BLOCK_ON_PENDING_ACK = os.getenv("SAFETY_BLOCK_ON_PENDING_ACK", "true").lower() == "true"
 SAFETY_DEFAULT_TO_DEGRADED_ON_UNKNOWN = os.getenv("SAFETY_DEFAULT_TO_DEGRADED_ON_UNKNOWN", "true").lower() == "true"
@@ -17501,6 +17515,511 @@ def tg_dash_poll_once():
         tg_dash_save_json(TELEGRAM_COMMAND_STATE_FILE, state)
     except Exception as e:
         print(f"TELEGRAM DASH POLL ERROR | {e}", flush=True)
+
+
+
+
+# =========================================================
+# UNIVERSAL ORDER WRAPPER OVERRIDES
+# This block intentionally overrides existing order-capable helpers
+# without editing their internals. Safety surface becomes mandatory.
+# =========================================================
+
+# Preserve originals for audit/compatibility
+try:
+    _ORIG_smart_exec_submit_with_retry = smart_exec_submit_with_retry
+except Exception:
+    _ORIG_smart_exec_submit_with_retry = None
+
+try:
+    _ORIG_open_position_if_missing = open_position_if_missing
+except Exception:
+    _ORIG_open_position_if_missing = None
+
+try:
+    _ORIG_open_live_position = open_live_position
+except Exception:
+    _ORIG_open_live_position = None
+
+try:
+    _ORIG_open_paper_position = open_paper_position
+except Exception:
+    _ORIG_open_paper_position = None
+
+
+def safety_pending_ack_records() -> Dict[str, Any]:
+    st = safety_load_json(PENDING_ACK_FILE, {})
+    pending = st.get("pending", {}) if isinstance(st, dict) else {}
+    return pending if isinstance(pending, dict) else {}
+
+
+def safety_unresolved_pending_ack_exists(symbol_hint: str = "QQQ") -> Tuple[bool, str, Dict[str, Any]]:
+    pending = safety_pending_ack_records()
+    now = safety_now_ts()
+    for key, rec in pending.items():
+        if not isinstance(rec, dict):
+            continue
+        status = str(rec.get("status", "pending")).lower()
+        if status in {"submitted", "accepted", "filled", "canceled", "cancelled", "rejected", "failed", "closed", "resolved"}:
+            continue
+        sym = str(rec.get("symbol", "")).upper()
+        if symbol_hint and symbol_hint.upper() not in sym and not sym.startswith(symbol_hint.upper()):
+            continue
+        age = now - int(rec.get("created_ts", now) or now)
+        return True, f"unresolved_pending_ack:{sym}:age={age}s:key={key}", rec
+    return False, "no_unresolved_pending_ack", {}
+
+
+def safety_prune_ack_records() -> None:
+    try:
+        st = safety_load_json(PENDING_ACK_FILE, {})
+        if not isinstance(st, dict):
+            return
+        pending = st.get("pending", {})
+        if not isinstance(pending, dict):
+            return
+        now = safety_now_ts()
+        keep = {}
+        for key, rec in pending.items():
+            if not isinstance(rec, dict):
+                continue
+            status = str(rec.get("status", "")).lower()
+            updated = int(rec.get("updated_ts", rec.get("created_ts", now)) or now)
+            if status in {"submitted", "accepted", "filled", "canceled", "cancelled", "rejected", "failed", "closed", "resolved"} and now - updated > SAFETY_ACK_PRUNE_SECONDS:
+                continue
+            keep[key] = rec
+        st["pending"] = keep
+        st["updated_at"] = safety_iso()
+        safety_save_json(PENDING_ACK_FILE, st)
+    except Exception as e:
+        safety_debug(f"ACK PRUNE ERROR | {e}")
+
+
+def safety_mark_pending_ack(key: str, symbol: str, payload=None):
+    """
+    Fail-closed pending ACK creation.
+    If this cannot persist, the order must not be submitted.
+    """
+    state = safety_load_json(PENDING_ACK_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    pending = state.get("pending", {})
+    if not isinstance(pending, dict):
+        pending = {}
+
+    pending[key] = {
+        "symbol": symbol,
+        "status": "pending",
+        "created_ts": safety_now_ts(),
+        "updated_ts": safety_now_ts(),
+        "created_at": safety_iso(),
+        "updated_at": safety_iso(),
+        "payload": payload or {},
+    }
+    state["pending"] = pending
+    state["updated_at"] = safety_iso()
+    safety_save_json(PENDING_ACK_FILE, state)
+
+    verify = safety_load_json(PENDING_ACK_FILE, {})
+    if key not in (verify.get("pending", {}) if isinstance(verify, dict) else {}):
+        raise RuntimeError(f"pending_ack_persistence_failed:{key}")
+
+
+def safety_mark_ack_resolved(key: str, status: str, response=None):
+    state = safety_load_json(PENDING_ACK_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    pending = state.get("pending", {})
+    if not isinstance(pending, dict):
+        pending = {}
+    rec = pending.get(key, {})
+    if not isinstance(rec, dict):
+        rec = {}
+    rec.update({
+        "status": status,
+        "resolved_at": safety_iso(),
+        "updated_at": safety_iso(),
+        "updated_ts": safety_now_ts(),
+        "response": response or {},
+    })
+    pending[key] = rec
+    state["pending"] = pending
+    state["updated_at"] = safety_iso()
+    safety_save_json(PENDING_ACK_FILE, state)
+
+
+def safety_reconciliation_recent() -> Tuple[bool, str]:
+    recon_file = globals().get("RECON_FILE", "reconciliation.json")
+    age = safety_get_file_age(recon_file)
+    if age is None:
+        return False, "reconciliation_file_missing"
+    if age > SAFETY_RECON_MAX_AGE_SECONDS:
+        return False, f"reconciliation_stale:{age}s>{SAFETY_RECON_MAX_AGE_SECONDS}s"
+    return True, f"reconciliation_fresh:{age}s"
+
+
+def safety_clear_review_required():
+    """
+    Review clear is separate from unlock and is blocked by unresolved ACK or stale recon.
+    """
+    unresolved, reason, _ = safety_unresolved_pending_ack_exists("QQQ")
+    if unresolved:
+        raise RuntimeError(f"review_clear_blocked_pending_ack:{reason}")
+
+    if SAFETY_REQUIRE_RECON_FOR_REVIEW_CLEAR:
+        recon_ok, recon_reason = safety_reconciliation_recent()
+        if not recon_ok:
+            raise RuntimeError(f"review_clear_blocked_recon:{recon_reason}")
+
+    safety_save_json(REVIEW_REQUIRED_FILE, {
+        "review_required": False,
+        "reason": "cleared_after_ack_and_recon_checks",
+        "updated_at": safety_iso(),
+    })
+
+
+def safety_degraded_active() -> Tuple[bool, str, Dict[str, Any]]:
+    st = safety_load_json(DEGRADED_MODE_FILE, {})
+    if isinstance(st, dict) and st.get("degraded") is True:
+        return True, str(st.get("reason", "degraded")), st
+    return False, "not_degraded", st if isinstance(st, dict) else {}
+
+
+def safety_try_clear_degraded_if_recovered() -> bool:
+    market = safety_market_state()
+    macro = safety_macro_state()
+    if market.get("state") == "OK" and (macro.get("state") == "OK" or not SAFETY_BLOCK_ON_UNKNOWN_MACRO):
+        safety_clear_degraded()
+        return True
+    return False
+
+
+def safety_canonical_order_permission(intent: str, symbol: str = "QQQ", signal=None, selected=None, notional: float = 0.0) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Canonical answer to: may this engine modify orders right now?
+    """
+    snapshot = {"intent": intent, "symbol": symbol, "notional": notional, "time": safety_iso()}
+    intent_l = str(intent or "").lower()
+    entry_like = intent_l in {"new_entry", "scale_entry", "entry", "buy", "open", "replace"}
+
+    # Step 15 / GLOBAL_STATE / kill family
+    try:
+        gs = globals().get("GLOBAL_STATE", {})
+        if isinstance(gs, dict) and (gs.get("kill_switch") or gs.get("step15_global_kill") or gs.get("engine_enabled") is False):
+            return False, "canonical_lock:GLOBAL_STATE_or_STEP15_kill", snapshot
+    except Exception:
+        pass
+
+    locked, lock_reason = safety_global_lock_active()
+    if locked and intent_l not in {"status"}:
+        return False, f"canonical_lock:{lock_reason}", snapshot
+
+    if str(os.getenv("BOT_PAUSED", str(globals().get("BOT_PAUSED", False)))).lower() == "true" and intent_l not in {"status"}:
+        return False, "canonical_lock:BOT_PAUSED", snapshot
+
+    review, review_reason = safety_review_required_active()
+    if review and entry_like:
+        return False, f"review_required:{review_reason}", snapshot
+
+    exit_only = EXIT_ONLY_MODE
+    try:
+        if "tg_dash_control_bool" in globals():
+            exit_only = exit_only or tg_dash_control_bool("exit_only_mode", "EXIT_ONLY_MODE", False)
+    except Exception:
+        pass
+    if exit_only and entry_like:
+        return False, "exit_only_mode_blocks_entry", snapshot
+
+    safety_try_clear_degraded_if_recovered()
+    degraded, degraded_reason, degraded_state = safety_degraded_active()
+    snapshot["degraded_state"] = degraded_state
+    if degraded and entry_like:
+        return False, f"degraded_mode:{degraded_reason}", snapshot
+
+    market = safety_market_state()
+    snapshot["market_state"] = market
+    if SAFETY_BLOCK_ON_STALE_MARKET and entry_like and market.get("state") != "OK":
+        return False, f"market_state_block:{market}", snapshot
+
+    macro = safety_macro_state()
+    snapshot["macro_state"] = macro
+    if SAFETY_BLOCK_ON_UNKNOWN_MACRO and entry_like and macro.get("state") != "OK":
+        return False, f"macro_state_block:{macro}", snapshot
+
+    unresolved, ack_reason, ack_rec = safety_unresolved_pending_ack_exists(symbol)
+    snapshot["pending_ack"] = {"unresolved": unresolved, "reason": ack_reason, "record": ack_rec}
+    if SAFETY_BLOCK_ON_PENDING_ACK and entry_like and unresolved:
+        return False, ack_reason, snapshot
+
+    if entry_like and notional:
+        budget_ok, budget_reason = safety_recent_notional_ok(notional)
+        snapshot["notional_budget"] = budget_reason
+        if not budget_ok:
+            return False, budget_reason, snapshot
+
+    return True, "canonical_permission_ok", snapshot
+
+
+def safety_surface_gate(intent: str, symbol: str = "QQQ", signal=None, selected=None, notional: float = 0.0) -> Tuple[bool, str]:
+    """
+    Final authoritative safety gate.
+    """
+    if not ENABLE_SAFETY_SURFACE:
+        return True, "safety_surface_disabled"
+
+    ok, reason, snapshot = safety_canonical_order_permission(intent, symbol, signal, selected, notional)
+    if not ok:
+        safety_write_decision_event("safety_surface_block", signal=signal or {}, decision={}, selected=selected or {}, result={"approved": False, "reason": reason}, gates=snapshot)
+    return ok, reason
+
+
+def universal_default_payload_builder(signal: Dict[str, Any], selected: Dict[str, Any], qty: int) -> Dict[str, Any]:
+    symbol = str(selected.get("symbol") or selected.get("contract_symbol") or signal.get("contract_symbol") or signal.get("symbol") or "QQQ").upper()
+    return {
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": globals().get("ALPACA_OPTION_TIME_IN_FORCE", "day"),
+        "client_order_id": f"ubt-auth-{symbol}-{int(time.time())}"[:48],
+    }
+
+
+def authorize_and_route_order(intent, signal, selected, qty, notional, route_fn, payload_builder=None):
+    """
+    THE ONLY APPROVED WAY TO SEND/RETRY/SCALE/REPLACE/CANCEL ORDERS.
+    """
+    if not ENABLE_UNIVERSAL_ORDER_WRAPPER:
+        if UNIVERSAL_WRAPPER_FAIL_CLOSED:
+            return {"executed": False, "reason": "universal_wrapper_disabled_fail_closed"}
+        return route_fn({})
+
+    signal = signal or {}
+    selected = selected or {}
+    qty = int(float(qty or 0))
+    notional = float(notional or 0)
+    symbol = str(selected.get("symbol") or selected.get("contract_symbol") or signal.get("symbol") or "QQQ").upper()
+
+    ok, reason, permission_snapshot = safety_canonical_order_permission(intent, symbol, signal, selected, notional)
+    if not ok:
+        safety_write_decision_event("blocked_by_universal_wrapper", signal=signal, selected=selected, result={"reason": reason}, gates=permission_snapshot)
+        safety_debug(f"🛑 UNIVERSAL WRAPPER SAFETY BLOCK | {reason}")
+        return {"executed": False, "reason": reason, "safety_snapshot": permission_snapshot}
+
+    try:
+        payload = payload_builder(signal, selected, qty) if payload_builder else universal_default_payload_builder(signal, selected, qty)
+    except Exception as e:
+        return {"executed": False, "reason": f"payload_builder_failed:{e}"}
+
+    try:
+        key = smart_exec_signal_key(signal, selected) if "smart_exec_signal_key" in globals() else f"{symbol}:{intent}:{signal.get('signal_id') or signal.get('id') or int(time.time())}"
+    except Exception:
+        key = f"{symbol}:{intent}:{int(time.time())}"
+
+    try:
+        safety_mark_pending_ack(key, payload.get("symbol", symbol), payload)
+    except Exception as e:
+        if UNIVERSAL_WRAPPER_ABORT_ON_ACK_PERSIST_FAIL:
+            safety_write_decision_event("pending_ack_persist_failed", signal=signal, selected=selected, result={"error": str(e)}, gates=permission_snapshot)
+            return {"executed": False, "reason": f"pending_ack_persist_failed:{e}"}
+
+    if UNIVERSAL_WRAPPER_REQUIRE_PENDING_ACK:
+        if key not in safety_pending_ack_records():
+            return {"executed": False, "reason": "pending_ack_missing_after_write"}
+
+    safety_write_decision_event("pre_broker_submit", signal=signal, selected=selected, result={"qty": qty, "notional": notional, "payload": payload}, gates=permission_snapshot)
+
+    try:
+        route_result = route_fn(payload)
+        if isinstance(route_result, tuple) and len(route_result) == 2:
+            code, body = route_result
+        elif isinstance(route_result, dict):
+            code = int(route_result.get("code", route_result.get("status_code", 200 if route_result.get("executed") else 500)))
+            body = route_result
+        else:
+            code, body = 200, route_result
+    except Exception as e:
+        safety_mark_ack_resolved(key, "failed", {"error": str(e)})
+        safety_write_decision_event("broker_submit_exception", signal=signal, selected=selected, result={"error": str(e), "payload": payload}, gates=permission_snapshot)
+        return {"executed": False, "reason": f"route_exception:{e}", "key": key}
+
+    status = "submitted" if int(code) < 300 else "failed"
+    try:
+        if isinstance(body, dict):
+            broker_status = str(body.get("status") or "").lower()
+            if broker_status in {"accepted", "new", "filled", "partially_filled", "canceled", "cancelled", "rejected"}:
+                status = broker_status
+    except Exception:
+        pass
+
+    safety_mark_ack_resolved(key, status, {"code": code, "body": body, "payload": payload})
+    safety_write_decision_event("broker_submit_result", signal=signal, selected=selected, result={"code": code, "body": body, "payload": payload, "ack_status": status}, gates=permission_snapshot)
+
+    return {"executed": int(code) < 300, "code": code, "response": body, "payload": payload, "ack_key": key, "ack_status": status}
+
+
+def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any], qty: int, base_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Safety-wrapper smart execution.
+    Every retry re-checks canonical safety and uses pending ACK.
+    """
+    selected = selected or {}
+    base_payload = base_payload or {}
+    qty = int(float(qty or 0))
+    if qty <= 0:
+        return {"executed": False, "reason": "qty_zero"}
+
+    gate_ok, gate_reason, key = smart_exec_gate(signal, selected)
+    if not gate_ok:
+        safety_write_decision_event("smart_exec_gate_block", signal=signal, selected=selected, result={"reason": gate_reason}, gates={"smart_exec_key": key})
+        return {"executed": False, "reason": gate_reason, "key": key}
+
+    last = None
+    for attempt in range(0, SMART_EXECUTION_MAX_RETRIES + 1):
+        plan_preview = smart_exec_order_plan(signal, selected, attempt=attempt)
+        try:
+            metrics = smart_exec_selected_metrics(selected)
+            price = plan_preview.get("limit_price") or metrics.get("ask") or metrics.get("mid") or 0
+            notional = float(price or 0) * qty * 100
+        except Exception:
+            notional = 0.0
+
+        ok, reason = safety_surface_gate("new_entry", "QQQ", signal, selected, notional)
+        if not ok:
+            return {"executed": False, "reason": f"safety_block_before_retry:{reason}", "attempt": attempt}
+
+        def _builder(sig, sel, q, attempt=attempt):
+            payload = dict(base_payload)
+            payload["qty"] = str(q)
+            plan = smart_exec_order_plan(sig, sel, attempt=attempt)
+            payload["type"] = plan["type"]
+            if plan["type"] == "limit":
+                payload["limit_price"] = str(plan["limit_price"])
+            else:
+                payload.pop("limit_price", None)
+            payload["client_order_id"] = f"ubt-smart-{smart_exec_signal_key(sig, sel).replace(':','-')[:30]}-{int(time.time())}-{attempt}"[:48]
+            return payload
+
+        result = authorize_and_route_order("new_entry", signal, selected, qty, notional, smart_exec_alpaca_submit_order, _builder)
+        last = result
+
+        if result.get("executed"):
+            try:
+                smart_exec_mark(key, "submitted", result)
+            except Exception:
+                pass
+            return result
+
+        try:
+            smart_exec_mark(key, "failed", result)
+        except Exception:
+            pass
+
+        if smart_exec_position_exists("QQQ"):
+            return {"executed": True, "reason": "position_detected_after_failed_response", "attempt": attempt, "response": result}
+
+        if attempt < SMART_EXECUTION_MAX_RETRIES:
+            time.sleep(SMART_EXECUTION_RETRY_DELAY_SECONDS)
+
+    return {"executed": False, "reason": "smart_exec_all_retries_failed", "response": last, "key": key}
+
+
+def open_position_if_missing(symbol: str, signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Override: hard safety gate before delegating to original open_position_if_missing.
+    """
+    ok, reason = safety_surface_gate("new_entry", "QQQ", signal, {}, 0.0)
+    if not ok:
+        debug(f"🛑 open_position_if_missing SAFETY BLOCK | {reason}")
+        return None
+    if _ORIG_open_position_if_missing:
+        return _ORIG_open_position_if_missing(symbol, signal)
+    return None
+
+
+def open_live_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ok, reason = safety_surface_gate("new_entry", "QQQ", signal, {}, 0.0)
+    if not ok:
+        debug(f"🛑 open_live_position SAFETY BLOCK | {reason}")
+        return None
+    if _ORIG_open_live_position:
+        return _ORIG_open_live_position(signal)
+    return None
+
+
+def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ok, reason = safety_surface_gate("new_entry", "QQQ", signal, {}, 0.0)
+    if not ok:
+        debug(f"🛑 open_paper_position SAFETY BLOCK | {reason}")
+        return None
+    if _ORIG_open_paper_position:
+        return _ORIG_open_paper_position(signal)
+    return None
+
+
+def safety_run_chaos_selftest() -> Dict[str, Any]:
+    tests = []
+
+    def add(name, passed, reason):
+        tests.append({"name": name, "passed": bool(passed), "reason": str(reason)})
+
+    gate_ok, reason = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+    add("basic_gate_runs", isinstance(gate_ok, bool), reason)
+
+    safety_set_global_lock(True, "selftest")
+    gate_ok2, reason2 = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+    add("global_hard_lock_blocks_entry", gate_ok2 is False and "global" in reason2.lower(), reason2)
+    safety_set_global_lock(False, "selftest_clear")
+
+    safety_set_review_required("selftest_review")
+    gate_ok3, reason3 = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+    add("review_required_blocks_entry", gate_ok3 is False and "review_required" in reason3, reason3)
+    safety_save_json(REVIEW_REQUIRED_FILE, {"review_required": False, "reason": "selftest_clear", "updated_at": safety_iso()})
+
+    try:
+        if "tg_dash_control_set" in globals():
+            tg_dash_control_set("exit_only_mode", True)
+        gate_ok4, reason4 = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+        gate_ok5, reason5 = safety_surface_gate("exit", "QQQ", {"ticker": "QQQ"}, {"notional": 0}, 0)
+        add("exit_only_blocks_entry", gate_ok4 is False and "exit_only" in reason4, reason4)
+        add("exit_only_allows_exit", gate_ok5 is True, reason5)
+    finally:
+        try:
+            if "tg_dash_control_set" in globals():
+                tg_dash_control_set("exit_only_mode", False)
+        except Exception:
+            pass
+
+    key = f"selftest_ack_{int(time.time())}"
+    try:
+        safety_mark_pending_ack(key, "QQQTEST", {"selftest": True})
+        gate_ok6, reason6 = safety_surface_gate("new_entry", "QQQ", {"ticker": "QQQ"}, {"notional": 100}, 100)
+        add("pending_ack_blocks_entry", gate_ok6 is False and "pending_ack" in reason6, reason6)
+        st = safety_load_json(PENDING_ACK_FILE, {})
+        st["pending"][key]["created_ts"] = safety_now_ts() - (SAFETY_PENDING_ACK_SECONDS + 5)
+        safety_save_json(PENDING_ACK_FILE, st)
+        pending, pending_reason = safety_pending_ack_state("QQQ")
+        review, review_reason = safety_review_required_active()
+        add("pending_ack_timeout_triggers_review", pending is True and review is True, f"{pending_reason} | {review_reason}")
+        safety_mark_ack_resolved(key, "failed", {"selftest": True})
+        safety_save_json(REVIEW_REQUIRED_FILE, {"review_required": False, "reason": "selftest_clear", "updated_at": safety_iso()})
+    except Exception as e:
+        add("pending_ack_tests", False, e)
+
+    safety_set_global_lock(True, "selftest_force")
+    forced_signal = {"ticker": "QQQ", "force_execution": True, "execution_override": True}
+    ok_force, reason_force = safety_surface_gate("new_entry", "QQQ", forced_signal, {}, 100)
+    add("force_cannot_bypass_global_lock", ok_force is False, reason_force)
+    safety_set_global_lock(False, "selftest_force_clear")
+
+    report = {
+        "time": safety_iso(),
+        "tests": tests,
+        "passed": all(t["passed"] for t in tests),
+        "summary": {"passed": sum(1 for t in tests if t["passed"]), "total": len(tests)},
+    }
+    safety_save_json(SAFETY_TEST_REPORT_FILE, report)
+    return report
 
 
 def main_loop():
