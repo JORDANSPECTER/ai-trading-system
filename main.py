@@ -17,6 +17,7 @@ print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", fl
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
 print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enabled", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
+print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
@@ -5233,6 +5234,134 @@ def one_trade_local_tp1_green_ok() -> Tuple[bool, str]:
     if SCALE_ONLY_IF_GREEN and not green:
         return False, "scale_block_trade_not_green"
     return True, "scale_tp1_green_ok"
+
+
+
+
+# =========================================================
+# ONE TRADE SETUP LOCK COMPATIBILITY PATCH
+# Fixes: name 'one_trade_setup_not_used' is not defined
+# =========================================================
+
+def _one_trade_lock_load(path="one_trade_risk_state.json"):
+    try:
+        if "load_json_file" in globals():
+            return load_json_file(path, {})
+        if "load_json" in globals():
+            return load_json(path, {})
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                return json.loads(raw) if raw else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _one_trade_lock_save(data, path="one_trade_risk_state.json"):
+    try:
+        if "save_json_file" in globals():
+            save_json_file(path, data)
+            return
+        if "save_json" in globals():
+            save_json(path, data)
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception as e:
+        try:
+            debug(f"ONE TRADE LOCK SAVE ERROR | {e}")
+        except Exception:
+            print(f"ONE TRADE LOCK SAVE ERROR | {e}", flush=True)
+
+
+def one_trade_setup_key(signal):
+    try:
+        ticker = str(signal.get("ticker") or signal.get("symbol") or "QQQ").upper()
+        direction = str(signal.get("direction") or signal.get("side") or "CALL").upper()
+        setup = str(signal.get("setup") or signal.get("setup_type") or signal.get("entry_type") or "UNKNOWN").upper()
+        pmh = str(signal.get("pm_high") or signal.get("premarket_high") or "")
+        pml = str(signal.get("pm_low") or signal.get("premarket_low") or "")
+        today = datetime.now().strftime("%Y-%m-%d")
+        return f"{today}:{ticker}:{direction}:{setup}:PMH={pmh}:PML={pml}"
+    except Exception:
+        return f"{datetime.now().strftime('%Y-%m-%d')}:QQQ:UNKNOWN"
+
+
+def one_trade_setup_not_used(signal):
+    """
+    Compatibility function used by one_trade_entry_gate().
+    Returns False only when ONE_TRADE_PER_SETUP is enabled and this exact setup was already locked today.
+    """
+    try:
+        enabled = str(os.getenv("ONE_TRADE_PER_SETUP", str(globals().get("ONE_TRADE_PER_SETUP", True)))).lower() == "true"
+        if not enabled:
+            return True
+
+        state = _one_trade_lock_load()
+        locks = state.get("setup_locks", {})
+        if not isinstance(locks, dict):
+            locks = {}
+
+        key = one_trade_setup_key(signal)
+        if locks.get(key):
+            try:
+                debug(f"🛑 ONE TRADE SETUP LOCK BLOCK | key={key}")
+            except Exception:
+                pass
+            return False
+
+        return True
+    except Exception as e:
+        try:
+            debug(f"ONE TRADE SETUP LOCK ERROR - allowing trade safely | {e}")
+        except Exception:
+            pass
+        return True
+
+
+def one_trade_lock_setup(signal):
+    """
+    Locks the setup after an order is successfully submitted/opened.
+    Safe to call even if the old code never calls it.
+    """
+    try:
+        enabled = str(os.getenv("ONE_TRADE_PER_SETUP", str(globals().get("ONE_TRADE_PER_SETUP", True)))).lower() == "true"
+        if not enabled:
+            return
+
+        state = _one_trade_lock_load()
+        if not isinstance(state, dict):
+            state = {}
+
+        locks = state.get("setup_locks", {})
+        if not isinstance(locks, dict):
+            locks = {}
+
+        key = one_trade_setup_key(signal)
+        locks[key] = {
+            "locked_at": datetime.now().isoformat(),
+            "signal_id": signal.get("signal_id") or signal.get("id"),
+            "ticker": signal.get("ticker") or signal.get("symbol") or "QQQ",
+            "direction": signal.get("direction") or signal.get("side") or "CALL",
+            "setup": signal.get("setup") or signal.get("setup_type") or signal.get("entry_type"),
+        }
+
+        state["setup_locks"] = locks
+        state["updated_at"] = datetime.now().isoformat()
+        _one_trade_lock_save(state)
+
+        try:
+            debug(f"✅ ONE TRADE SETUP LOCKED | key={key}")
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            debug(f"ONE TRADE SETUP LOCK WRITE ERROR | {e}")
+        except Exception:
+            pass
 
 
 def one_trade_entry_gate(signal: Dict[str, Any]) -> Tuple[bool, str, bool]:
