@@ -22,6 +22,7 @@ print("[UNIVERSAL ORDER WRAPPER ACTIVE] safety surface is mandatory for all orde
 print("[ONE TRADE COOLDOWN PATCH ACTIVE] one_trade_cooldown_ok fixed", flush=True)
 print("[APPROVED SIGNAL EXECUTION OVERRIDE ACTIVE] observe_only can execute approved high-score trades", flush=True)
 print("[ALPACA EXECUTION RELIABILITY PATCH ACTIVE] reliable order routing + confirmation enabled", flush=True)
+print("[IDEMPOTENCY EXECUTION BYPASS ACTIVE] approved trades bypass stale replay blocks", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 
@@ -423,6 +424,16 @@ STEP15_ALERT_COOLDOWN_SECONDS = int(os.getenv("STEP15_ALERT_COOLDOWN_SECONDS", "
 # =========================================================
 # ALPACA EXECUTION RELIABILITY PATCH
 # Defines missing execution state files + safer broker routing.
+
+# =========================================================
+# IDEMPOTENCY LIVE/PAPER EXECUTION BYPASS PATCH
+# Keeps duplicate protection, but stops old idempotency from blocking approved broker routes.
+# =========================================================
+ENABLE_IDEMPOTENCY_EXECUTION_BYPASS = os.getenv("ENABLE_IDEMPOTENCY_EXECUTION_BYPASS", "true").lower() == "true"
+IDEMPOTENCY_BLOCK_ONLY_EXACT_OPEN_ORDER = os.getenv("IDEMPOTENCY_BLOCK_ONLY_EXACT_OPEN_ORDER", "true").lower() == "true"
+IDEMPOTENCY_ALLOW_APPROVED_RETRY_SECONDS = int(float(os.getenv("IDEMPOTENCY_ALLOW_APPROVED_RETRY_SECONDS", "20")))
+IDEMPOTENCY_APPROVED_SCORE_MIN = float(os.getenv("IDEMPOTENCY_APPROVED_SCORE_MIN", "70"))
+
 # =========================================================
 IDEMPOTENCY_FILE = os.getenv("IDEMPOTENCY_FILE", "idempotency_ledger.json").strip()
 SMART_EXECUTION_FILE = os.getenv("SMART_EXECUTION_FILE", "smart_execution_state.json").strip()
@@ -8659,8 +8670,11 @@ def validate_live_signal_for_alpaca(signal: Dict[str, Any]) -> bool:
 def open_paper_position(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     idem_gate = idempotency_pre_order_gate(signal, side="buy", qty=safe_int(signal.get("qty", 0), 0), mode="PAPER", order_type="market", limit_price=None)
     if not idem_gate.get("approved", False):
-        log(f"🧷 PAPER ORDER IDEMPOTENCY BLOCK | {idem_gate.get('reason')} | key={idempotency_short(idem_gate.get('order_key',''))}")
-        return None
+        _bypass_ok, _bypass_reason = idem_should_bypass_legacy_block(signal, str(idem_gate.get("reason", "")))
+        if not _bypass_ok:
+            log(f"🧷 PAPER ORDER IDEMPOTENCY BLOCK | {idem_gate.get('reason')} | key={idempotency_short(idem_gate.get('order_key',''))}")
+            return None
+        debug(f"✅ PAPER ORDER IDEMPOTENCY BYPASSED | {_bypass_reason}")
     phase35_exec_decision = phase35_execution_layer_gate(signal, mode="PAPER")
     if not phase35_exec_decision.get("approved", False):
         return None
@@ -16014,6 +16028,134 @@ def unified_decision_apply_size(signal: Dict[str, Any], decision: Dict[str, Any]
         return signal
 
 
+
+
+# =========================================================
+# IDEMPOTENCY LIVE/PAPER EXECUTION BYPASS PATCH
+# =========================================================
+
+def idem_approved_signal_score(signal: Dict[str, Any]) -> float:
+    try:
+        ud = signal.get("unified_decision") or signal.get("unified_pre_decision") or {}
+        if isinstance(ud, dict) and ud.get("score") is not None:
+            return float(ud.get("score") or 0)
+    except Exception:
+        pass
+    try:
+        return float(signal.get("score") or signal.get("execution_score") or signal.get("grade_score") or 0)
+    except Exception:
+        return 0.0
+
+
+def idem_signal_approved_for_execution(signal: Dict[str, Any]) -> bool:
+    if not isinstance(signal, dict):
+        return False
+    score = idem_approved_signal_score(signal)
+    if score < IDEMPOTENCY_APPROVED_SCORE_MIN:
+        return False
+
+    try:
+        ud = signal.get("unified_decision") or signal.get("unified_pre_decision") or {}
+        if isinstance(ud, dict):
+            if ud.get("approved") is True:
+                return True
+            if str(ud.get("verdict", "")).upper() in {"APPROVED", "EXECUTE"}:
+                return True
+    except Exception:
+        pass
+
+    # If unified decision is not embedded, but the signal has a high score and FORCE mode is enabled,
+    # allow Smart Execution / safety surface to make final decision.
+    try:
+        if str(signal.get("force_execution") or signal.get("force") or "").lower() in {"true", "1", "yes"}:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def idem_open_order_exists_for_signal(signal: Dict[str, Any], symbol_hint: str = "QQQ") -> bool:
+    """
+    True only if broker/order file shows an active open order for this symbol.
+    This is the only duplicate state that should hard-block a broker submit.
+    """
+    # 1) local orders.json
+    try:
+        orders = safety_load_json("orders.json", [])
+        if isinstance(orders, dict):
+            orders = orders.get("orders", orders.get("open_orders", []))
+        if isinstance(orders, list):
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                sym = str(o.get("symbol") or o.get("contract_symbol") or "").upper()
+                status = str(o.get("status") or "").lower()
+                if symbol_hint.upper() in sym and status in {"new", "open", "accepted", "pending_new", "partially_filled", "pending"}:
+                    return True
+    except Exception:
+        pass
+
+    # 2) Alpaca open orders if helper exists
+    try:
+        if "alpaca_request" in globals():
+            code, body = alpaca_request("GET", "/v2/orders?status=open&limit=50")
+            if code < 300 and isinstance(body, list):
+                for o in body:
+                    sym = str(o.get("symbol") or "").upper()
+                    status = str(o.get("status") or "").lower()
+                    if symbol_hint.upper() in sym and status in {"new", "accepted", "partially_filled", "pending_new"}:
+                        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def idem_should_bypass_legacy_block(signal: Dict[str, Any], reason: str = "") -> Tuple[bool, str]:
+    if not ENABLE_IDEMPOTENCY_EXECUTION_BYPASS:
+        return False, "idempotency_execution_bypass_disabled"
+
+    if not idem_signal_approved_for_execution(signal):
+        return False, "signal_not_approved_for_idempotency_bypass"
+
+    if IDEMPOTENCY_BLOCK_ONLY_EXACT_OPEN_ORDER:
+        if idem_open_order_exists_for_signal(signal, "QQQ"):
+            return False, "exact_open_order_exists_keep_block"
+
+    return True, f"legacy_idempotency_bypassed_for_approved_execution:{reason}"
+
+
+def idem_bypass_result_if_approved(signal: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Converts legacy idempotency block into an allow-through marker.
+    The actual broker order still must pass:
+      safety_surface_gate -> universal wrapper -> pending ACK -> Alpaca routing
+    """
+    if not isinstance(result, dict):
+        return result
+    reason = str(result.get("reason") or "")
+    if "idempotency" not in reason.lower():
+        return result
+
+    ok, why = idem_should_bypass_legacy_block(signal, reason)
+    if not ok:
+        return result
+
+    try:
+        debug(f"✅ IDEMPOTENCY BYPASS | {why}")
+    except Exception:
+        pass
+
+    return {
+        "executed": None,
+        "submitted": None,
+        "bypass_idempotency": True,
+        "reason": why,
+        "original_idempotency_result": result,
+    }
+
+
 def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     # Unified decision pre-check. Option route runs a second pass with selected contract.
@@ -18417,6 +18559,44 @@ def safety_run_chaos_selftest() -> Dict[str, Any]:
     }
     safety_save_json(SAFETY_TEST_REPORT_FILE, report)
     return report
+
+
+
+
+# =========================================================
+# PAPER BRIDGE IDEMPOTENCY BYPASS OVERRIDE
+# =========================================================
+try:
+    _ORIG_paper_broker_bridge_execute = paper_broker_bridge_execute
+except Exception:
+    _ORIG_paper_broker_bridge_execute = None
+
+def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if _ORIG_paper_broker_bridge_execute is None:
+        return {"executed": False, "reason": "paper_bridge_missing"}
+
+    result = _ORIG_paper_broker_bridge_execute(signal)
+    if isinstance(result, dict):
+        reason = str(result.get("reason") or "")
+        if "idempotency" in reason.lower():
+            bypass = idem_bypass_result_if_approved(signal, result)
+            if bypass.get("bypass_idempotency"):
+                try:
+                    debug(f"✅ PAPER BRIDGE RESULT IDEMPOTENCY BYPASSED | {bypass.get('reason')}")
+                except Exception:
+                    pass
+                # Send directly through Alpaca option route if available.
+                try:
+                    alpaca_result = alpaca_submit_option_paper_order(signal)
+                    return {
+                        "executed": bool(alpaca_result.get("submitted") or alpaca_result.get("executed")),
+                        "reason": alpaca_result.get("reason", "idempotency_bypass_alpaca_route"),
+                        "alpaca_result": alpaca_result,
+                        "bypassed_idempotency": True,
+                    }
+                except Exception as e:
+                    return {"executed": False, "reason": f"idempotency_bypass_route_error:{e}", "bypassed_idempotency": True}
+    return result
 
 
 def main_loop():
