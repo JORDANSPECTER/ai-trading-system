@@ -33,6 +33,10 @@ os.environ["ENABLE_PORTFOLIO_ALLOCATOR"] = "true"
 os.environ["FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST"] = "true"
 os.environ["ALLOW_DUPLICATE_SIGNALS"] = "true"
 print("[TEMP ALLOCATOR TEST OVERRIDES ACTIVE] FORCE_REGIME_ALLOW=true symbols=QQQ,SPY,NVDA,TSLA duplicate_bypass=true", flush=True)
+# TEMP ALLOCATOR WIRING TEST OVERRIDES — execution must only consume allocator-selected signals.
+os.environ["REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION"] = "true"
+os.environ["BLOCK_DIRECT_AI_SIGNAL_EXECUTION"] = "true"
+print("[ALLOCATOR EXECUTION WIRING TEST ACTIVE] only allocator-selected candidates can reach execution", flush=True)
 
 try:
     import websocket  # pip package: websocket-client
@@ -2487,6 +2491,56 @@ PHASE35_MIN_CONFIDENCE_TO_EXECUTE = os.getenv("PHASE35_MIN_CONFIDENCE_TO_EXECUTE
 
 # =========================================================
 # PHASE 3.5 CONTROLLED OVERRIDE / FORCE EXECUTION MODE
+# =========================================================
+# ALLOCATOR OUTPUT -> EXECUTION HARD WIRING
+# Test/transition guard: when enabled, the execution loop refuses to
+# process any signal that was not selected by the portfolio allocator.
+# This prevents the old ai_signal.json/direct auto-generator route from
+# bypassing candidate_pool -> allocator -> selected_signal.
+# =========================================================
+REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION = os.getenv("REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION", "true").lower() == "true"
+BLOCK_DIRECT_AI_SIGNAL_EXECUTION = os.getenv("BLOCK_DIRECT_AI_SIGNAL_EXECUTION", "true").lower() == "true"
+ALLOCATOR_ALLOWED_DECISIONS = {"FULL_ALLOCATION", "STARTER_ALLOCATION", "REDUCED_ALLOCATION"}
+
+def allocator_selected_signal_ok(signal: Dict[str, Any]) -> Tuple[bool, str]:
+    try:
+        if not REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION:
+            return True, "allocator_required_disabled"
+        if not isinstance(signal, dict) or not signal:
+            return False, "empty_or_invalid_signal"
+        src = str(signal.get("source") or "").lower().strip()
+        allocator = signal.get("portfolio_allocator", {}) if isinstance(signal.get("portfolio_allocator", {}), dict) else {}
+        decision = str(allocator.get("decision") or signal.get("allocator_decision") or "").upper().strip()
+        pool_id = str(signal.get("candidate_pool_id") or "").strip()
+        score = signal.get("scanner_score", signal.get("score"))
+        if BLOCK_DIRECT_AI_SIGNAL_EXECUTION and src in {"ai_signal_bridge", "auto_ai_signal_generator", "auto_ai_signal", "auto_price_signal"}:
+            return False, f"blocked_direct_signal_source:{src}"
+        if src != "multi_candidate_allocator":
+            return False, f"not_allocator_selected_source:{src or 'missing'}"
+        if not pool_id:
+            return False, "missing_candidate_pool_id"
+        if decision not in ALLOCATOR_ALLOWED_DECISIONS:
+            return False, f"allocator_decision_not_executable:{decision or 'missing'}"
+        if signal.get("execution_blocked_by_portfolio_allocator") is True:
+            return False, "execution_blocked_by_portfolio_allocator"
+        if signal.get("observe_only") is True:
+            return False, "observe_only_signal"
+        return True, f"allocator_selected:{decision}:pool={pool_id}:score={score}"
+    except Exception as e:
+        return False, f"allocator_selected_signal_check_error:{e}"
+
+def allocator_guard_before_execution(signal: Dict[str, Any], context: str = "signal_listener") -> bool:
+    ok, reason = allocator_selected_signal_ok(signal)
+    try:
+        if ok:
+            debug(f"ALLOCATOR EXECUTION GUARD PASS | context={context} | {reason} | ticker={signal.get('ticker')} direction={signal.get('direction')}")
+        else:
+            debug(f"ALLOCATOR EXECUTION GUARD BLOCK | context={context} | reason={reason} | source={signal.get('source') if isinstance(signal, dict) else None}")
+            if "portfolio_allocator_event" in globals():
+                portfolio_allocator_event("execution_guard_block", {"context": context, "reason": reason, "signal": signal if isinstance(signal, dict) else {}})
+    except Exception:
+        pass
+    return ok
 # Use for testing execution pipeline only. Keep false for live production.
 # =========================================================
 ALLOW_DUPLICATE_SIGNALS = os.getenv("ALLOW_DUPLICATE_SIGNALS", "true").lower() == "true"
@@ -21869,7 +21923,17 @@ def main_loop():
                             debug(f"⚠️ DUPLICATE SIGNAL BYPASSED FOR ALLOCATOR TEST | hash={live_hash[:12]}")
                         else:
                             debug(f"NEW SIGNAL DETECTED | file={SIGNAL_FILE} | hash={live_hash[:12]}")
-                        handle_new_signal(live_signal_poll)
+                        if allocator_guard_before_execution(live_signal_poll, context="persistent_signal_listener"):
+                            handle_new_signal(live_signal_poll)
+                        else:
+                            try:
+                                auto_signal_generator_tick(force=True)
+                            except Exception as _allocator_force_error:
+                                debug(f"ALLOCATOR FORCE GENERATE ERROR | {_allocator_force_error}")
+                            runtime_housekeeping()
+                            flush_dirty_stores(force=False)
+                            time.sleep(POLL_SECONDS)
+                            continue
                         if FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
                             GLOBAL_STATE["last_signal_hash"] = ""
                         elif not ALLOW_DUPLICATE_SIGNALS:
@@ -21935,7 +21999,17 @@ def main_loop():
                         debug(f"⚠️ SIGNAL FILE DUPLICATE BYPASSED FOR ALLOCATOR TEST | hash={sig_hash[:12]}")
                     else:
                         debug(f"SIGNAL FILE PICKUP OK | file={SIGNAL_FILE} | hash={sig_hash[:12]}")
-                    handle_new_signal(live_signal)
+                    if allocator_guard_before_execution(live_signal, context="signal_file_routing"):
+                        handle_new_signal(live_signal)
+                    else:
+                        try:
+                            auto_signal_generator_tick(force=True)
+                        except Exception as _allocator_force_error:
+                            debug(f"ALLOCATOR FORCE GENERATE ERROR | {_allocator_force_error}")
+                        runtime_housekeeping()
+                        flush_dirty_stores(force=False)
+                        time.sleep(POLL_SECONDS)
+                        continue
                     if FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
                         GLOBAL_STATE["last_signal_hash"] = ""
                     else:
