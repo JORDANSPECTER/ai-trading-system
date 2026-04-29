@@ -28,7 +28,11 @@ os.environ["SCANNER_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
 os.environ["MULTI_TICKER_SCAN_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
 os.environ["PORTFOLIO_ALLOCATOR_ENABLED"] = "true"
 os.environ["ENABLE_PORTFOLIO_ALLOCATOR"] = "true"
-print("[TEMP ALLOCATOR TEST OVERRIDES ACTIVE] FORCE_REGIME_ALLOW=true symbols=QQQ,SPY,NVDA,TSLA", flush=True)
+# Force allocator validation to process repeated runtime-generated signals.
+# REMOVE AFTER TEST: this bypasses duplicate hash skipping so the allocator can rank fresh candidates.
+os.environ["FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST"] = "true"
+os.environ["ALLOW_DUPLICATE_SIGNALS"] = "true"
+print("[TEMP ALLOCATOR TEST OVERRIDES ACTIVE] FORCE_REGIME_ALLOW=true symbols=QQQ,SPY,NVDA,TSLA duplicate_bypass=true", flush=True)
 
 try:
     import websocket  # pip package: websocket-client
@@ -2486,6 +2490,7 @@ PHASE35_MIN_CONFIDENCE_TO_EXECUTE = os.getenv("PHASE35_MIN_CONFIDENCE_TO_EXECUTE
 # Use for testing execution pipeline only. Keep false for live production.
 # =========================================================
 ALLOW_DUPLICATE_SIGNALS = os.getenv("ALLOW_DUPLICATE_SIGNALS", "true").lower() == "true"
+FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST = os.getenv("FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST", "false").lower() == "true"
 FORCE_EXECUTION_MODE = os.getenv("FORCE_EXECUTION_MODE", "true").lower() == "true"
 FORCE_EXECUTION_KEEP_RISK_GATES = os.getenv("FORCE_EXECUTION_KEEP_RISK_GATES", "true").lower() == "true"
 
@@ -21859,13 +21864,15 @@ def main_loop():
                 if live_signal_poll:
                     live_hash = signal_hash(live_signal_poll)
                     last_hash = str(GLOBAL_STATE.get("last_signal_hash", ""))
-                    if live_hash != last_hash or ALLOW_DUPLICATE_SIGNALS or elite_force_routing_enabled():
-                        if live_hash == last_hash and ALLOW_DUPLICATE_SIGNALS:
-                            debug(f"⚠️ DUPLICATE SIGNAL ALLOWED | hash={live_hash[:12]}")
+                    if live_hash != last_hash or ALLOW_DUPLICATE_SIGNALS or elite_force_routing_enabled() or FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
+                        if live_hash == last_hash and (ALLOW_DUPLICATE_SIGNALS or FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST):
+                            debug(f"⚠️ DUPLICATE SIGNAL BYPASSED FOR ALLOCATOR TEST | hash={live_hash[:12]}")
                         else:
                             debug(f"NEW SIGNAL DETECTED | file={SIGNAL_FILE} | hash={live_hash[:12]}")
                         handle_new_signal(live_signal_poll)
-                        if not ALLOW_DUPLICATE_SIGNALS:
+                        if FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
+                            GLOBAL_STATE["last_signal_hash"] = ""
+                        elif not ALLOW_DUPLICATE_SIGNALS:
                             GLOBAL_STATE["last_signal_hash"] = live_hash
                         else:
                             GLOBAL_STATE["last_signal_hash"] = ""
@@ -21923,10 +21930,16 @@ def main_loop():
             if live_signal:
                 sig_hash = active_signal_hash(live_signal)
                 last_hash = str(GLOBAL_STATE.get("last_signal_hash", ""))
-                if sig_hash != last_hash:
-                    debug(f"SIGNAL FILE PICKUP OK | file={SIGNAL_FILE} | hash={sig_hash[:12]}")
+                if sig_hash != last_hash or FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
+                    if sig_hash == last_hash and FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
+                        debug(f"⚠️ SIGNAL FILE DUPLICATE BYPASSED FOR ALLOCATOR TEST | hash={sig_hash[:12]}")
+                    else:
+                        debug(f"SIGNAL FILE PICKUP OK | file={SIGNAL_FILE} | hash={sig_hash[:12]}")
                     handle_new_signal(live_signal)
-                    GLOBAL_STATE["last_signal_hash"] = sig_hash
+                    if FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
+                        GLOBAL_STATE["last_signal_hash"] = ""
+                    else:
+                        GLOBAL_STATE["last_signal_hash"] = sig_hash
                     GLOBAL_STATE["last_signal_time"] = epoch()
                     GLOBAL_STATE["last_signal_file_mtime"] = int(os.path.getmtime(SIGNAL_FILE)) if file_exists(SIGNAL_FILE) else epoch()
                     append_recent_signal_hash(GLOBAL_STATE, sig_hash)
