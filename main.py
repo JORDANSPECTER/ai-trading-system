@@ -19117,6 +19117,325 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+
+# =========================================================
+# DAILY ALPACA BOT PERFORMANCE REPORT - 5PM ET
+# Reports ONLY orders owned by this bot using ORDER_OWNERSHIP_CLIENT_PREFIX.
+# =========================================================
+ENABLE_DAILY_ALPACA_PERFORMANCE_REPORT = os.getenv("ENABLE_DAILY_ALPACA_PERFORMANCE_REPORT", "true").lower() == "true"
+DAILY_REPORT_TIME_HHMM = os.getenv("DAILY_REPORT_TIME_HHMM", "17:00").strip()
+DAILY_REPORT_TIMEZONE = os.getenv("DAILY_REPORT_TIMEZONE", "America/New_York").strip()
+DAILY_REPORT_SEND_TO_TELEGRAM = os.getenv("DAILY_REPORT_SEND_TO_TELEGRAM", "true").lower() == "true"
+DAILY_REPORT_SEND_TO_DISCORD = os.getenv("DAILY_REPORT_SEND_TO_DISCORD", "true").lower() == "true"
+DAILY_REPORT_FILE = os.getenv("DAILY_REPORT_FILE", "daily_alpaca_bot_reports.json").strip()
+DAILY_REPORT_ORDER_LIMIT = int(float(os.getenv("DAILY_REPORT_ORDER_LIMIT", "500")))
+DAILY_REPORT_CLIENT_PREFIX = os.getenv("DAILY_REPORT_CLIENT_PREFIX", os.getenv("ORDER_OWNERSHIP_CLIENT_PREFIX", "ubtmain")).strip().replace(" ", "-")[:16] or "ubtmain"
+
+
+def _daily_report_now_et():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(DAILY_REPORT_TIMEZONE))
+    except Exception:
+        return datetime.utcnow() - timedelta(hours=4)
+
+
+def _daily_report_day_bounds_et(now_et=None) -> Tuple[str, str, str]:
+    now_et = now_et or _daily_report_now_et()
+    day = now_et.date()
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(DAILY_REPORT_TIMEZONE)
+        start = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=tz)
+        end = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=tz)
+        return day.isoformat(), start.isoformat(), end.isoformat()
+    except Exception:
+        start = datetime(day.year, day.month, day.day, 0, 0, 0)
+        end = datetime(day.year, day.month, day.day, 23, 59, 59)
+        return day.isoformat(), start.isoformat(), end.isoformat()
+
+
+def _daily_report_bot_order(order: Dict[str, Any]) -> bool:
+    cid = str(order.get("client_order_id") or "")
+    prefix = str(globals().get("DAILY_REPORT_CLIENT_PREFIX", "ubtmain")).strip()
+    return cid.startswith(prefix + "-") or cid.startswith(prefix)
+
+
+def _daily_report_alpaca_get(path: str) -> Any:
+    try:
+        code, body = alpaca_request("GET", path)
+        if code >= 300:
+            return {"error": f"alpaca_status_{code}", "body": body}
+        return body
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _daily_report_fetch_orders(start_iso: str, end_iso: str) -> List[Dict[str, Any]]:
+    try:
+        from urllib.parse import urlencode
+        q = urlencode({
+            "status": "all",
+            "after": start_iso,
+            "until": end_iso,
+            "limit": str(DAILY_REPORT_ORDER_LIMIT),
+            "direction": "asc",
+            "nested": "false",
+        })
+        body = _daily_report_alpaca_get(f"/v2/orders?{q}")
+        if isinstance(body, list):
+            return [o for o in body if isinstance(o, dict)]
+        return []
+    except Exception as e:
+        try:
+            debug(f"DAILY REPORT fetch orders error: {e}")
+        except Exception:
+            pass
+        return []
+
+
+def _daily_report_fetch_positions() -> List[Dict[str, Any]]:
+    body = _daily_report_alpaca_get("/v2/positions")
+    return [p for p in body if isinstance(p, dict)] if isinstance(body, list) else []
+
+
+def _daily_report_num(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _daily_report_contract_multiplier(symbol: str) -> int:
+    s = str(symbol or "").upper()
+    return 100 if len(s) >= 15 and any(ch.isdigit() for ch in s) else 1
+
+
+def build_daily_alpaca_bot_performance_report(force: bool = False) -> Dict[str, Any]:
+    now_et = _daily_report_now_et()
+    report_date, start_iso, end_iso = _daily_report_day_bounds_et(now_et)
+    raw_orders = _daily_report_fetch_orders(start_iso, end_iso)
+    bot_orders = [o for o in raw_orders if _daily_report_bot_order(o)]
+    filled_orders = [o for o in bot_orders if str(o.get("status", "")).lower() == "filled" or _daily_report_num(o.get("filled_qty"), 0) > 0]
+    failed_orders = [o for o in bot_orders if str(o.get("status", "")).lower() in {"rejected", "canceled", "expired", "failed"}]
+
+    lots: Dict[str, List[Dict[str, float]]] = {}
+    closed_trades: List[Dict[str, Any]] = []
+    contracts_traded = 0
+    shares_traded = 0
+
+    for o in filled_orders:
+        symbol = str(o.get("symbol", "UNKNOWN")).upper()
+        side = str(o.get("side", "")).lower()
+        qty = _daily_report_num(o.get("filled_qty") or o.get("qty"), 0)
+        price = _daily_report_num(o.get("filled_avg_price") or o.get("limit_price"), 0)
+        if qty <= 0 or price <= 0:
+            continue
+        mult = _daily_report_contract_multiplier(symbol)
+        if mult == 100:
+            contracts_traded += int(qty)
+        else:
+            shares_traded += int(qty)
+        lots.setdefault(symbol, [])
+        if side == "buy":
+            lots[symbol].append({"qty": qty, "price": price, "mult": mult})
+        elif side == "sell":
+            sell_qty = qty
+            realized = 0.0
+            closed_qty = 0.0
+            entry_value = 0.0
+            while sell_qty > 0 and lots[symbol]:
+                lot = lots[symbol][0]
+                take = min(sell_qty, lot["qty"])
+                realized += (price - lot["price"]) * take * lot.get("mult", mult)
+                entry_value += lot["price"] * take * lot.get("mult", mult)
+                lot["qty"] -= take
+                sell_qty -= take
+                closed_qty += take
+                if lot["qty"] <= 0.000001:
+                    lots[symbol].pop(0)
+            if closed_qty > 0:
+                closed_trades.append({
+                    "symbol": symbol,
+                    "qty": closed_qty,
+                    "exit_price": price,
+                    "realized_pnl": round(realized, 2),
+                    "return_pct_est": round((realized / entry_value) * 100, 2) if entry_value > 0 else 0.0,
+                    "client_order_id": o.get("client_order_id"),
+                    "filled_at": o.get("filled_at") or o.get("updated_at") or o.get("submitted_at"),
+                })
+
+    symbols = sorted({str(o.get("symbol", "UNKNOWN")).upper() for o in bot_orders if o.get("symbol")})
+    positions = _daily_report_fetch_positions()
+    bot_position_symbols = {str(o.get("symbol", "")).upper() for o in bot_orders if o.get("symbol")}
+    open_positions = [p for p in positions if str(p.get("symbol", "")).upper() in bot_position_symbols]
+
+    realized_pnl = round(sum(_daily_report_num(t.get("realized_pnl"), 0) for t in closed_trades), 2)
+    wins = [t for t in closed_trades if _daily_report_num(t.get("realized_pnl"), 0) > 0]
+    losses = [t for t in closed_trades if _daily_report_num(t.get("realized_pnl"), 0) < 0]
+    best_trade = max(closed_trades, key=lambda x: _daily_report_num(x.get("realized_pnl"), 0), default=None)
+    worst_trade = min(closed_trades, key=lambda x: _daily_report_num(x.get("realized_pnl"), 0), default=None)
+
+    open_position_details = [{
+        "symbol": p.get("symbol"),
+        "qty": p.get("qty"),
+        "side": p.get("side"),
+        "avg_entry_price": p.get("avg_entry_price"),
+        "market_value": p.get("market_value"),
+        "unrealized_pl": p.get("unrealized_pl"),
+        "unrealized_plpc": p.get("unrealized_plpc"),
+    } for p in open_positions]
+
+    failed_details = [{
+        "symbol": o.get("symbol"),
+        "side": o.get("side"),
+        "status": o.get("status"),
+        "client_order_id": o.get("client_order_id"),
+        "submitted_at": o.get("submitted_at"),
+    } for o in failed_orders[:10]]
+
+    notes = []
+    if not bot_orders:
+        notes.append("ℹ️ No bot-owned Alpaca orders found for today.")
+    else:
+        notes.append("✅ Report counted only this bot's Alpaca client_order_id prefix.")
+    if failed_orders:
+        notes.append(f"⚠️ {len(failed_orders)} rejected/canceled/failed bot orders found.")
+    if closed_trades:
+        notes.append("✅ Closed trade P/L estimated from bot-owned filled orders only.")
+    if open_position_details:
+        notes.append("📌 Bot-owned symbols still have open Alpaca exposure.")
+
+    report = {
+        "report_date": report_date,
+        "generated_at": now_et.isoformat(),
+        "timezone": DAILY_REPORT_TIMEZONE,
+        "bot_client_prefix": DAILY_REPORT_CLIENT_PREFIX,
+        "alpaca_raw_orders_today": len(raw_orders),
+        "bot_orders_today": len(bot_orders),
+        "filled_bot_orders": len(filled_orders),
+        "closed_trades_estimated": len(closed_trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round((len(wins) / len(closed_trades)) * 100, 1) if closed_trades else 0.0,
+        "realized_pnl_est": realized_pnl,
+        "contracts_traded": contracts_traded,
+        "shares_traded": shares_traded,
+        "symbols_traded": symbols,
+        "open_positions": open_position_details,
+        "closed_trades": closed_trades,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "failed_or_canceled_orders": failed_details,
+        "rule_notes": notes,
+    }
+    try:
+        existing = load_json_file(DAILY_REPORT_FILE, {}) if "load_json_file" in globals() else {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing[report_date] = report
+        atomic_write_json(DAILY_REPORT_FILE, existing)
+    except Exception as e:
+        try:
+            debug(f"DAILY REPORT save error: {e}")
+        except Exception:
+            pass
+    return report
+
+
+def format_daily_alpaca_bot_performance_report(report: Dict[str, Any]) -> str:
+    date = report.get("report_date", "today")
+    symbols = ", ".join(report.get("symbols_traded", []) or []) or "None"
+    best = report.get("best_trade") or {}
+    worst = report.get("worst_trade") or {}
+    best_line = "None" if not best else f"{best.get('symbol')} P/L ${best.get('realized_pnl')} ({best.get('return_pct_est')}%)"
+    worst_line = "None" if not worst else f"{worst.get('symbol')} P/L ${worst.get('realized_pnl')} ({worst.get('return_pct_est')}%)"
+    open_lines = [f"• {p.get('symbol')} qty={p.get('qty')} avg={p.get('avg_entry_price')} uPnL={p.get('unrealized_pl')}" for p in (report.get("open_positions", []) or [])[:8]]
+    fail_lines = [f"• {f.get('symbol')} {f.get('side')} status={f.get('status')} cid={f.get('client_order_id')}" for f in (report.get("failed_or_canceled_orders", []) or [])[:5]]
+    note_lines = "\n".join([f"• {n}" for n in (report.get("rule_notes", []) or [])]) or "• No rule notes"
+    return (
+        f"📊 DAILY BOT PERFORMANCE REPORT\n"
+        f"Date: {date}\n"
+        f"Bot Prefix: {report.get('bot_client_prefix')}\n\n"
+        f"Orders Today: {report.get('bot_orders_today')} bot-owned / {report.get('alpaca_raw_orders_today')} total Alpaca orders\n"
+        f"Filled Orders: {report.get('filled_bot_orders')}\n"
+        f"Closed Trades: {report.get('closed_trades_estimated')}\n"
+        f"Wins/Losses: {report.get('wins')}W / {report.get('losses')}L\n"
+        f"Win Rate: {report.get('win_rate_pct')}%\n"
+        f"Realized P/L Estimate: ${report.get('realized_pnl_est')}\n"
+        f"Contracts Traded: {report.get('contracts_traded')}\n"
+        f"Shares Traded: {report.get('shares_traded')}\n"
+        f"Symbols: {symbols}\n\n"
+        f"🏆 Best Trade: {best_line}\n"
+        f"🧯 Worst Trade: {worst_line}\n\n"
+        f"📌 Open Positions:\n{chr(10).join(open_lines) if open_lines else 'None'}\n\n"
+        f"⚠️ Failed/Canceled Orders:\n{chr(10).join(fail_lines) if fail_lines else 'None'}\n\n"
+        f"🧠 Rule Check:\n{note_lines}\n\n"
+        f"⏰ Generated: {report.get('generated_at')}"
+    )
+
+
+def send_daily_alpaca_bot_performance_report(force: bool = False) -> Dict[str, Any]:
+    report = build_daily_alpaca_bot_performance_report(force=force)
+    msg = format_daily_alpaca_bot_performance_report(report)
+    if DAILY_REPORT_SEND_TO_DISCORD:
+        try:
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        except Exception as e:
+            try:
+                debug(f"DAILY REPORT discord send error: {e}")
+            except Exception:
+                pass
+    if DAILY_REPORT_SEND_TO_TELEGRAM:
+        try:
+            send_to_telegram(msg)
+        except Exception as e:
+            try:
+                debug(f"DAILY REPORT telegram send error: {e}")
+            except Exception:
+                pass
+    try:
+        log(f"✅ DAILY ALPACA BOT PERFORMANCE REPORT SENT | date={report.get('report_date')} pnl={report.get('realized_pnl_est')}")
+    except Exception:
+        pass
+    return report
+
+
+def daily_alpaca_report_due() -> bool:
+    if not ENABLE_DAILY_ALPACA_PERFORMANCE_REPORT:
+        return False
+    now_et = _daily_report_now_et()
+    report_date = now_et.date().isoformat()
+    try:
+        hh, mm = DAILY_REPORT_TIME_HHMM.split(":", 1)
+        due_h, due_m = int(hh), int(mm)
+    except Exception:
+        due_h, due_m = 17, 0
+    if now_et.hour < due_h or (now_et.hour == due_h and now_et.minute < due_m):
+        return False
+    try:
+        ensure_globals_initialized()
+        return str(GLOBAL_STATE.get("last_daily_alpaca_report_date", "")) != report_date
+    except Exception:
+        return True
+
+
+def maybe_send_daily_alpaca_bot_report(force: bool = False) -> Optional[Dict[str, Any]]:
+    if not ENABLE_DAILY_ALPACA_PERFORMANCE_REPORT and not force:
+        return None
+    if not force and not daily_alpaca_report_due():
+        return None
+    report = send_daily_alpaca_bot_performance_report(force=force)
+    try:
+        ensure_globals_initialized()
+        GLOBAL_STATE["last_daily_alpaca_report_date"] = report.get("report_date") or _daily_report_now_et().date().isoformat()
+        GLOBAL_STATE["last_daily_alpaca_report_ts"] = epoch()
+        save_state(GLOBAL_STATE)
+    except Exception:
+        pass
+    return report
+
+
 def main_loop():
     try:
         start_twelve_websocket_feed()
@@ -19189,6 +19508,7 @@ def main_loop():
         try:
             intel_periodic_snapshot()
             process_telegram_updates()
+            maybe_send_daily_alpaca_bot_report(force=False)
             # PAPER TP/SL LOOP CHECK
             tpsl_loop_result = paper_tpsl_manage_positions()
             if tpsl_loop_result.get("events") or tpsl_loop_result.get("closed_count", 0) > 0:
@@ -19327,6 +19647,7 @@ def run_once():
     handle_new_signal(sig)
     runtime_housekeeping()
     process_telegram_updates()
+    maybe_send_daily_alpaca_bot_report(force="--daily-report-now" in sys.argv)
     send_heartbeat(force=False)
 
 
