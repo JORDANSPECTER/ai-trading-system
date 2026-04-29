@@ -8,6 +8,7 @@ import tempfile
 import traceback
 import re
 import threading
+import contextvars
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
@@ -60,6 +61,18 @@ ENABLE_PHASE1_STATE_VISIBILITY = os.getenv("ENABLE_PHASE1_STATE_VISIBILITY", "tr
 ENABLE_PHASE1_OPERATOR_SNAPSHOT = os.getenv("ENABLE_PHASE1_OPERATOR_SNAPSHOT", "true").lower() == "true"
 PHASE1_DASHBOARD_EVERY_SECONDS = int(float(os.getenv("PHASE1_DASHBOARD_EVERY_SECONDS", "30")))
 print("[PHASE 1 ARCHITECTURE VISIBILITY ACTIVE] trace-only decision/state snapshots enabled", flush=True)
+
+# =========================================================
+# PHASE 2 STATE ENFORCEMENT + TRACE-AWARE ORDERS
+# Behavior-changing safety gate. Set ENABLE_PHASE2_STATE_ENFORCEMENT=false to temporarily disable.
+# =========================================================
+ENABLE_PHASE2_STATE_ENFORCEMENT = os.getenv("ENABLE_PHASE2_STATE_ENFORCEMENT", "true").lower() == "true"
+PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN = os.getenv("PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN", "true").lower() == "true"
+PHASE2_ATTACH_TRACE_ID_TO_ORDERS = os.getenv("PHASE2_ATTACH_TRACE_ID_TO_ORDERS", "true").lower() == "true"
+PHASE2_TRACE_ID_CLIENT_ORDER_LEN = int(float(os.getenv("PHASE2_TRACE_ID_CLIENT_ORDER_LEN", "8")))
+PHASE2_ENFORCEMENT_LOG_FILE = os.getenv("PHASE2_ENFORCEMENT_LOG_FILE", "phase2_enforcement_events.jsonl").strip()
+_PHASE2_TRACE_CONTEXT = contextvars.ContextVar("phase2_trace_id", default="")
+print("[PHASE 2 ENFORCEMENT ACTIVE] engine-state gate + trace-aware client_order_id enabled", flush=True)
 
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
@@ -275,6 +288,9 @@ def phase1_create_trace_for_signal(signal: dict, source: str = "main_loop"):
         try:
             if isinstance(signal, dict):
                 signal["_phase1_trace_id"] = trace.trace_id
+                signal["trace_id"] = trace.trace_id
+            if globals().get("PHASE2_ATTACH_TRACE_ID_TO_ORDERS", True):
+                phase2_set_trace_context(trace.trace_id)
         except Exception:
             pass
         write_trace_event(trace, event_type="trace_created")
@@ -394,6 +410,156 @@ def phase1_write_operator_snapshot(extra: dict = None) -> None:
         write_operator_dashboard_snapshot(payload)
     except Exception as e:
         phase1_log(f"PHASE1 OPERATOR SNAPSHOT ERROR | {e}")
+
+
+
+# =========================================================
+# PHASE 2 ENFORCEMENT HELPERS
+# These turn Phase 1 visibility into a live safety gate and attach trace IDs to orders.
+# =========================================================
+def phase2_enforcement_event(event: str, payload: dict = None) -> None:
+    try:
+        row = {"timestamp": phase1_now_string(), "event": event, **(payload or {})}
+        with open(globals().get("PHASE2_ENFORCEMENT_LOG_FILE", "phase2_enforcement_events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception as e:
+        phase1_log(f"PHASE2 ENFORCEMENT LOG ERROR | {e}")
+
+
+def phase2_set_trace_context(trace_id: str) -> None:
+    try:
+        _PHASE2_TRACE_CONTEXT.set(str(trace_id or ""))
+        globals()["_PHASE2_LAST_TRACE_ID"] = str(trace_id or "")
+    except Exception:
+        pass
+
+
+def phase2_get_trace_id_from_payload(payload: dict = None, signal: dict = None) -> str:
+    try:
+        for src in (payload or {}, signal or {}):
+            if isinstance(src, dict):
+                tid = str(src.get("trace_id") or src.get("_phase1_trace_id") or src.get("_phase2_trace_id") or "").strip()
+                if tid:
+                    return tid
+        return str(_PHASE2_TRACE_CONTEXT.get("") or globals().get("_PHASE2_LAST_TRACE_ID", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def phase2_trace_short(trace_id: str = "") -> str:
+    try:
+        tid = str(trace_id or phase2_get_trace_id_from_payload() or "").strip()
+        if not tid:
+            return "notrace"
+        return hashlib.sha256(tid.encode("utf-8")).hexdigest()[:max(4, int(globals().get("PHASE2_TRACE_ID_CLIENT_ORDER_LEN", 8)))]
+    except Exception:
+        return "notrace"
+
+
+def phase2_is_protective_order(payload: dict = None, context: str = "") -> bool:
+    try:
+        payload = payload or {}
+        cid = str(payload.get("client_order_id") or "").lower()
+        ctx = str(context or payload.get("_phase2_order_intent") or payload.get("intent") or "").lower()
+        side = str(payload.get("side") or "").lower()
+        protective_words = ("close", "flatten", "exit", "protect", "xforeign", "cancel", "reduce")
+        if any(w in cid for w in protective_words) or any(w in ctx for w in protective_words):
+            return True
+        if side == "sell" and ("new" not in ctx and "entry" not in ctx):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def phase2_get_engine_snapshot_for_enforcement():
+    try:
+        return phase1_safe_write_engine_state_visibility()
+    except Exception as e:
+        phase2_enforcement_event("state_snapshot_error", {"error": str(e)})
+        return None
+
+
+def phase2_engine_allows_order(payload: dict = None, context: str = "new_entry") -> tuple:
+    if not globals().get("ENABLE_PHASE2_STATE_ENFORCEMENT", False):
+        return True, "phase2_disabled", None
+    payload = payload or {}
+    protective = phase2_is_protective_order(payload, context)
+    snapshot = phase2_get_engine_snapshot_for_enforcement()
+    if snapshot is None:
+        if globals().get("PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN", True) and not protective:
+            return False, "phase2_state_unknown_fail_closed", None
+        return True, "phase2_state_unknown_protective_allowed", None
+    try:
+        state = str(getattr(snapshot, "current_state", "") or "")
+        allow_new = bool(getattr(snapshot, "allow_new_entries", False))
+        allow_flatten = bool(getattr(snapshot, "allow_flatten", True))
+        allow_manage = bool(getattr(snapshot, "allow_position_management", True))
+        if protective:
+            if allow_flatten or allow_manage:
+                return True, f"protective_order_allowed_in_{state}", snapshot
+            return False, f"protective_order_blocked_in_{state}", snapshot
+        if allow_new:
+            return True, f"new_entry_allowed_in_{state}", snapshot
+        return False, f"new_entry_blocked_by_engine_state_{state}", snapshot
+    except Exception as e:
+        if globals().get("PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN", True) and not protective:
+            return False, f"phase2_state_eval_error_fail_closed:{e}", snapshot
+        return True, f"phase2_state_eval_error_protective_allowed:{e}", snapshot
+
+
+def phase2_enforce_new_entry_or_block(signal: dict, trace=None, stage: str = "new_entry") -> bool:
+    payload = {"ticker": (signal or {}).get("ticker"), "symbol": (signal or {}).get("symbol"), "side": "buy", "_phase2_order_intent": "new_entry"}
+    allowed, reason, snapshot = phase2_engine_allows_order(payload, context=stage)
+    event = {
+        "stage": stage,
+        "allowed": allowed,
+        "reason": reason,
+        "trace_id": getattr(trace, "trace_id", "") or phase2_get_trace_id_from_payload(signal=signal),
+        "engine_state": snapshot.to_dict() if hasattr(snapshot, "to_dict") else {},
+        "ticker": (signal or {}).get("ticker"),
+    }
+    phase2_enforcement_event("new_entry_gate", event)
+    try:
+        phase1_trace_section(trace, "phase2_engine_state_gate", event, event_type="phase2_enforcement")
+    except Exception:
+        pass
+    if not allowed:
+        msg = f"🚫 PHASE 2 STATE BLOCK | stage={stage} | reason={reason} | ticker={(signal or {}).get('ticker')}"
+        phase1_log(msg)
+        try:
+            send_to_discord(globals().get("DISCORD_AI_WEBHOOK", ""), msg, "AI")
+            send_to_telegram(msg)
+        except Exception:
+            pass
+    return allowed
+
+
+def phase2_prepare_order_payload(payload: dict, context: str = "order", signal: dict = None) -> tuple:
+    clean = dict(payload or {})
+    trace_id = phase2_get_trace_id_from_payload(clean, signal)
+    if globals().get("PHASE2_ATTACH_TRACE_ID_TO_ORDERS", True):
+        clean["_phase2_trace_id"] = trace_id
+        clean["trace_id"] = trace_id
+        cid = str(clean.get("client_order_id") or "")
+        if cid and is_owned_client_order_id(cid) and "-t" not in cid.lower():
+            base = cid[:32].rstrip("-")
+            clean["client_order_id"] = f"{base}-t{phase2_trace_short(trace_id)}"[:48]
+    allowed, reason, snapshot = phase2_engine_allows_order(clean, context=context)
+    phase2_enforcement_event("order_gate", {
+        "allowed": allowed,
+        "reason": reason,
+        "context": context,
+        "trace_id": trace_id,
+        "client_order_id": clean.get("client_order_id"),
+        "symbol": clean.get("symbol") or clean.get("contract_symbol"),
+        "side": clean.get("side"),
+        "engine_state": snapshot.to_dict() if hasattr(snapshot, "to_dict") else {},
+    })
+    if trace_id:
+        phase1_trace_by_id(trace_id, "phase2_order_gate", {"allowed": allowed, "reason": reason, "payload_preview": {k: clean.get(k) for k in ("symbol", "side", "qty", "type", "limit_price", "client_order_id")}}, event_type="phase2_enforcement")
+    return allowed, reason, clean
+
 
 
 # TODO PHASE 2 ENFORCEMENT:
@@ -906,7 +1072,7 @@ def alpaca_prepare_option_order_payload(payload: Dict[str, Any]) -> Tuple[bool, 
         pass
 
     for k in list(payload.keys()):
-        if str(k).startswith("_") or k in {"bid", "ask", "mid", "spread", "spread_pct", "notional", "contract_notional", "quote_ok", "reason"}:
+        if str(k).startswith("_") or k in {"trace_id", "bid", "ask", "mid", "spread", "spread_pct", "notional", "contract_notional", "quote_ok", "reason"}:
             payload.pop(k, None)
 
     if not payload.get("client_order_id"):
@@ -916,6 +1082,15 @@ def alpaca_prepare_option_order_payload(payload: Dict[str, Any]) -> Tuple[bool, 
 
 
 def alpaca_submit_order_reliable(payload: Dict[str, Any]) -> Tuple[int, Any]:
+    allowed, gate_reason, gated_payload = phase2_prepare_order_payload(payload, context=str((payload or {}).get("_phase2_order_intent") or "new_entry"))
+    if not allowed:
+        alpaca_audit("phase2_order_blocked", {"reason": gate_reason, "payload": gated_payload})
+        try:
+            debug(f"🚫 PHASE 2 ORDER BLOCK | {gate_reason} | payload={gated_payload}")
+        except Exception:
+            pass
+        return 423, {"error": gate_reason, "payload": gated_payload}
+    payload = gated_payload
     ok, reason, clean_payload = alpaca_prepare_option_order_payload(payload)
     if not ok:
         alpaca_audit("payload_rejected", {"reason": reason, "payload": payload, "clean_payload": clean_payload})
@@ -5014,8 +5189,10 @@ def idempotency_order_intent_id(signal: Dict[str, Any], side: str, qty: int, mod
 def idempotency_client_order_id(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str = "market", limit_price: Optional[float] = None) -> str:
     key = idempotency_order_intent_id(signal, side, qty, mode, order_type, limit_price)
     prefix = str(globals().get("ORDER_OWNERSHIP_CLIENT_PREFIX", globals().get("IDEMPOTENCY_CLIENT_PREFIX", "ubtmain"))).strip()[:16] or "ubtmain"
-    # Alpaca client_order_id limit is 48 chars; keep stable + compact.
-    return f"{prefix}-idem-{side[:1].lower()}-{idempotency_short(key, 26)}"[:48]
+    trace_id = phase2_get_trace_id_from_payload(signal=signal) if globals().get("PHASE2_ATTACH_TRACE_ID_TO_ORDERS", True) else ""
+    trace_part = f"-t{phase2_trace_short(trace_id)}" if trace_id else "-tnotrace"
+    # Alpaca client_order_id limit is 48 chars; keep stable + compact + trace-searchable.
+    return f"{prefix}-idem{trace_part}-{side[:1].lower()}-{idempotency_short(key, 18)}"[:48]
 
 
 def idempotency_fill_event_id(order_or_fill: Dict[str, Any]) -> str:
@@ -5704,8 +5881,17 @@ def _ownership_clean_part(value: Any, max_len: int = 18) -> str:
 def make_owned_client_order_id(kind: str = "ord", *parts: Any) -> str:
     prefix = str(globals().get("ORDER_OWNERSHIP_CLIENT_PREFIX", "ubtmain")).strip()[:16] or "ubtmain"
     kind_clean = _ownership_clean_part(kind, 8).lower()
-    clean_parts = [_ownership_clean_part(x, 12) for x in parts if str(x or "").strip()]
-    raw = "-".join([prefix, kind_clean] + clean_parts + [str(int(time.time()))])
+    clean_parts = [_ownership_clean_part(x, 10) for x in parts if str(x or "").strip()]
+    trace_part = ""
+    try:
+        if globals().get("PHASE2_ATTACH_TRACE_ID_TO_ORDERS", True):
+            trace_part = "t" + phase2_trace_short()
+    except Exception:
+        trace_part = "tnotrace"
+    raw_parts = [prefix, kind_clean]
+    if trace_part:
+        raw_parts.append(trace_part)
+    raw = "-".join(raw_parts + clean_parts + [str(int(time.time()))])
     return raw[:48]
 
 
@@ -7615,8 +7801,14 @@ def alpaca_submit_order(symbol: str, qty: int, side: str, order_type: str = "mar
         return None
     payload = {"symbol": symbol, "qty": str(int(qty)), "side": side, "type": order_type, "time_in_force": tif}
     payload["client_order_id"] = client_order_id or make_owned_client_order_id("direct", symbol, side)
+    allowed, gate_reason, payload = phase2_prepare_order_payload(payload, context="direct_order")
+    if not allowed:
+        debug(f"🚫 PHASE 2 DIRECT ORDER BLOCK | {gate_reason} | symbol={symbol} side={side}")
+        return {"status": "phase2_blocked", "error": gate_reason, "client_order_id": payload.get("client_order_id"), "symbol": symbol}
     if order_type == "limit" and limit_price is not None:
         payload["limit_price"] = str(limit_price)
+    payload.pop("_phase2_trace_id", None)
+    payload.pop("trace_id", None)
     try:
         r = alpaca_post("/v2/orders", payload)
         if r.status_code in (200, 201):
@@ -7677,6 +7869,7 @@ def make_order_record(signal: Dict[str, Any], side: str, qty: int, mode: str, or
     return {
         "local_order_id": local_id,
         "signal_id": signal.get("signal_id", ""),
+        "trace_id": phase2_get_trace_id_from_payload(signal=signal),
         "position_id": None,
         "ticker": signal.get("ticker", ""),
         "symbol": symbol,
@@ -18034,9 +18227,11 @@ def handle_new_signal(signal: Dict[str, Any]):
     )
     phase1_write_operator_snapshot({"event": "signal_received", "ticker": signal.get("ticker") if isinstance(signal, dict) else None})
 
-    # TODO PHASE 2 ENFORCEMENT:
-    # if not PHASE1_TRACE_ONLY and phase1_state_snapshot and not phase1_state_snapshot.allow_new_entries:
-    #     return None
+    # PHASE 2 ENFORCEMENT:
+    # Engine state is now a real pre-entry gate. Protective/flattening orders remain handled deeper by the order gate.
+    if not phase2_enforce_new_entry_or_block(signal, trace, stage="handle_new_signal"):
+        phase1_close_trace(trace, status="BLOCKED_PHASE2_STATE")
+        return None
 
     # MARKET REGIME ENGINE: classify current conditions and block chop/event/stale-data before any entry path.
     try:
