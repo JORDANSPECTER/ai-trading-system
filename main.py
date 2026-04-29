@@ -23448,6 +23448,212 @@ try:
     print("[PORTFOLIO ALLOCATOR ACTIVE] rank + capital allocation layer enabled", flush=True)
 except Exception:
     pass
+
+# =========================================================
+# MULTI-CANDIDATE SCANNER GENERATOR PATCH
+# Converts the simple single-signal generator into:
+#   scan symbols -> build candidate_pool.json -> allocator ranks -> write only selected signal.
+# TEMP TEST MODE: intended for allocator validation. Remove FORCE_* overrides after validation.
+# =========================================================
+ENABLE_MULTI_CANDIDATE_GENERATOR = os.getenv("ENABLE_MULTI_CANDIDATE_GENERATOR", "true").lower() == "true"
+MULTI_CANDIDATE_POOL_FILE = os.getenv("MULTI_CANDIDATE_POOL_FILE", "candidate_pool.json").strip()
+MULTI_CANDIDATE_POOL_LOG_FILE = os.getenv("MULTI_CANDIDATE_POOL_LOG_FILE", "candidate_pool_events.jsonl").strip()
+MULTI_CANDIDATE_MIN_SCORE = float(os.getenv("MULTI_CANDIDATE_MIN_SCORE", os.getenv("MULTI_TICKER_SCAN_MIN_SCORE", "60")))
+MULTI_CANDIDATE_FORCE_EVERY_LOOP = os.getenv("MULTI_CANDIDATE_FORCE_EVERY_LOOP", "true").lower() == "true"
+
+
+def multi_candidate_event(event: str, payload: Dict[str, Any]) -> None:
+    try:
+        _elite_event(MULTI_CANDIDATE_POOL_LOG_FILE, {"event": event, **(payload or {})})
+    except Exception:
+        pass
+
+
+def multi_candidate_symbol_to_signal(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Builds a normal engine-compatible signal from a raw scanner candidate."""
+    sig = multi_ticker_scanner_build_signal(candidate)
+    sig["source"] = "multi_candidate_allocator"
+    sig["candidate_pool_id"] = f"pool_{int(time.time())}"
+    sig["scanner_score"] = candidate.get("score")
+    sig["scanner_reasons"] = candidate.get("reasons", [])
+    sig["allocator_test_mode"] = True
+    return sig
+
+
+def build_multi_candidate_pool(force: bool = False) -> Dict[str, Any]:
+    """
+    Builds multiple candidates at once. This is the missing bridge between
+    the scanner and the allocator. It does NOT directly execute anything.
+    """
+    now = int(time.time())
+    symbols = list(MULTI_TICKER_SCAN_SYMBOLS) if "MULTI_TICKER_SCAN_SYMBOLS" in globals() else ["QQQ", "SPY", "NVDA", "TSLA"]
+    candidates: List[Dict[str, Any]] = []
+    for sym in symbols:
+        try:
+            c = multi_ticker_score_symbol(sym)
+            if not isinstance(c, dict):
+                continue
+            score = safe_float(c.get("score", 0), 0)
+            direction = str(c.get("direction", "")).upper()
+            if score >= MULTI_CANDIDATE_MIN_SCORE and direction in {"CALL", "PUT"}:
+                c["candidate_pool_symbol"] = sym
+                c["candidate_pool_ts"] = now
+                candidates.append(c)
+        except Exception as e:
+            multi_candidate_event("candidate_score_error", {"symbol": sym, "error": str(e)})
+
+    ranked_preview = sorted(candidates, key=lambda x: safe_float(x.get("score", 0), 0), reverse=True)
+    payload = {
+        "pool_id": f"pool_{now}",
+        "created_at": now,
+        "symbols": symbols,
+        "candidate_count": len(candidates),
+        "candidates": ranked_preview,
+    }
+    try:
+        _elite_write_json(MULTI_CANDIDATE_POOL_FILE, payload)
+    except Exception:
+        try:
+            atomic_write_json(MULTI_CANDIDATE_POOL_FILE, payload)
+        except Exception:
+            pass
+    multi_candidate_event("candidate_pool_built", payload)
+    try:
+        debug(f"PORTFOLIO ALLOCATOR START | candidate_pool={payload['pool_id']}")
+        debug(f"CANDIDATES FOUND: {len(candidates)} | symbols={','.join(symbols)}")
+        for idx, c in enumerate(ranked_preview, start=1):
+            debug(f"CANDIDATE {idx}: {c.get('symbol')} {c.get('direction')} scanner_score={c.get('score')} reasons={c.get('reasons')}")
+    except Exception:
+        pass
+    return payload
+
+
+_base_auto_signal_generator_tick_single_signal = auto_signal_generator_tick if "auto_signal_generator_tick" in globals() else None
+
+
+def auto_signal_generator_tick(force: bool = False) -> Dict[str, Any]:
+    """
+    Allocator-test replacement for the old single QQQ auto generator.
+    Instead of writing one hard-coded QQQ signal, it builds a pool across
+    QQQ/SPY/NVDA/TSLA, lets the allocator rank them, then writes ONLY the
+    selected candidate into ai_signal.json/signal.json.
+    """
+    if not ENABLE_MULTI_CANDIDATE_GENERATOR:
+        if _base_auto_signal_generator_tick_single_signal:
+            return _base_auto_signal_generator_tick_single_signal(force=force)
+        return {"generated": False, "reason": "multi_candidate_disabled"}
+
+    if not ENABLE_AUTO_SIGNAL_GENERATOR:
+        return {"generated": False, "reason": "auto_signal_generator_disabled"}
+
+    try:
+        try:
+            ensure_globals_initialized()
+        except Exception:
+            pass
+
+        try:
+            open_positions = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+            if open_positions:
+                return {"generated": False, "reason": "open_position_exists", "open_count": len(open_positions)}
+        except Exception:
+            pass
+
+        state = load_json_file(AUTO_SIGNAL_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+
+        now = epoch()
+        last_ts = safe_int(state.get("last_signal_ts", 0), 0)
+        if not force and not MULTI_CANDIDATE_FORCE_EVERY_LOOP and last_ts > 0 and (now - last_ts) < AUTO_SIGNAL_COOLDOWN_SECONDS:
+            return {"generated": False, "reason": "cooldown_active", "seconds_left": AUTO_SIGNAL_COOLDOWN_SECONDS - (now - last_ts)}
+
+        pool = build_multi_candidate_pool(force=force)
+        candidates = pool.get("candidates", []) if isinstance(pool, dict) else []
+        if not candidates:
+            return {"generated": False, "reason": "no_candidates", "pool": pool}
+
+        allocator = portfolio_allocator_rank_candidates(candidates) if "portfolio_allocator_rank_candidates" in globals() else {}
+        decisions = allocator.get("decisions", []) if isinstance(allocator, dict) else []
+        selected = allocator.get("selected") if isinstance(allocator, dict) else None
+
+        try:
+            debug("RANKED CANDIDATES:")
+            for d in decisions:
+                debug(f"{d.get('rank')}. {d.get('symbol')} {d.get('direction')} allocator_score={d.get('allocator_score')} decision={d.get('decision')} reasons={d.get('skip_reasons')}")
+        except Exception:
+            pass
+
+        pool["allocator"] = allocator
+        try:
+            _elite_write_json(MULTI_CANDIDATE_POOL_FILE, pool)
+        except Exception:
+            pass
+        multi_candidate_event("allocator_ranked_pool", {"pool_id": pool.get("pool_id"), "allocator": allocator})
+
+        if not selected:
+            try:
+                debug("PORTFOLIO ALLOCATOR SKIPPED ALL CANDIDATES | no selected allocation")
+            except Exception:
+                pass
+            return {"generated": False, "reason": "allocator_selected_none", "pool": pool, "allocator": allocator}
+
+        candidate = selected.get("candidate", {}) if isinstance(selected, dict) and isinstance(selected.get("candidate"), dict) else {}
+        if not candidate:
+            return {"generated": False, "reason": "selected_missing_candidate", "allocator": allocator}
+
+        sig = multi_candidate_symbol_to_signal(candidate)
+        sig = portfolio_allocator_apply_to_signal(sig, selected) if "portfolio_allocator_apply_to_signal" in globals() else sig
+        sig["candidate_pool_id"] = pool.get("pool_id")
+        sig["timestamp"] = now
+
+        atomic_write_json(AUTO_AI_SIGNAL_FILE, sig)
+        atomic_write_json(SIGNAL_FILE, sig)
+
+        try:
+            if FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST:
+                GLOBAL_STATE["last_signal_hash"] = ""
+                GLOBAL_STATE["recent_signal_hashes"] = []
+                save_state(GLOBAL_STATE)
+        except Exception:
+            pass
+
+        state["last_signal_ts"] = now
+        state["last_signal"] = {
+            "ticker": sig.get("ticker"),
+            "direction": sig.get("direction"),
+            "entry": sig.get("entry"),
+            "underlying_price": sig.get("underlying_price"),
+            "timestamp": now,
+            "allocator": sig.get("portfolio_allocator", {}),
+            "candidate_pool_id": pool.get("pool_id"),
+        }
+        state["candidate_pool_id"] = pool.get("pool_id")
+        state["signals_generated"] = safe_int(state.get("signals_generated", 0), 0) + 1
+        atomic_write_json(AUTO_SIGNAL_STATE_FILE, state)
+
+        skipped = [d for d in decisions if isinstance(d, dict) and d.get("decision") not in {"FULL_ALLOCATION", "STARTER_ALLOCATION", "REDUCED_ALLOCATION"}]
+        try:
+            debug(f"ALLOCATOR SELECTED: {sig.get('ticker')} {sig.get('direction')} | decision={selected.get('decision')} | allocator_score={selected.get('allocator_score')} | pool={pool.get('pool_id')}")
+            for d in skipped:
+                debug(f"SKIPPED: {d.get('symbol')} | decision={d.get('decision')} | reasons={d.get('skip_reasons')}")
+            debug(f"MULTI-CANDIDATE SIGNAL WRITTEN | {sig.get('ticker')} {sig.get('direction')} | file={SIGNAL_FILE}")
+        except Exception:
+            pass
+
+        return {"generated": True, "reason": "allocator_selected_signal_written", "signal": sig, "pool": pool, "allocator": allocator}
+
+    except Exception as e:
+        log(f"❌ MULTI-CANDIDATE AUTO SIGNAL GENERATOR ERROR | {e}")
+        log(traceback.format_exc())
+        if _base_auto_signal_generator_tick_single_signal:
+            return _base_auto_signal_generator_tick_single_signal(force=force)
+        return {"generated": False, "reason": "error", "error": str(e)}
+
+try:
+    print("[MULTI-CANDIDATE SCANNER GENERATOR ACTIVE] pool -> allocator -> selected signal enabled", flush=True)
+except Exception:
+    pass
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
