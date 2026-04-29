@@ -23061,6 +23061,360 @@ try:
 except Exception:
     pass
 
+
+# =========================================================
+# PORTFOLIO ALLOCATOR LAYER: RANK + CAPITAL ALLOCATION
+# =========================================================
+# Institutional allocation brain. This layer does NOT replace the existing
+# risk engines. It sits above execution and decides which valid scanner
+# candidates deserve marginal risk right now.
+ENABLE_PORTFOLIO_ALLOCATOR = os.getenv("ENABLE_PORTFOLIO_ALLOCATOR", "true").lower() == "true"
+PORTFOLIO_ALLOCATOR_FILE = os.getenv("PORTFOLIO_ALLOCATOR_FILE", "portfolio_allocator_state.json").strip()
+PORTFOLIO_ALLOCATOR_LOG_FILE = os.getenv("PORTFOLIO_ALLOCATOR_LOG_FILE", "portfolio_allocator_decisions.jsonl").strip()
+PORTFOLIO_ALLOCATOR_MIN_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_MIN_SCORE", "72"))
+PORTFOLIO_ALLOCATOR_FULL_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_FULL_SCORE", "86"))
+PORTFOLIO_ALLOCATOR_STARTER_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_STARTER_SCORE", "76"))
+PORTFOLIO_ALLOCATOR_MAX_CANDIDATES = int(float(os.getenv("PORTFOLIO_ALLOCATOR_MAX_CANDIDATES", "10")))
+PORTFOLIO_ALLOCATOR_MAX_NEW_TRADES_PER_SCAN = int(float(os.getenv("PORTFOLIO_ALLOCATOR_MAX_NEW_TRADES_PER_SCAN", "1")))
+PORTFOLIO_ALLOCATOR_REMAINING_RISK_PCT_DEFAULT = float(os.getenv("PORTFOLIO_ALLOCATOR_REMAINING_RISK_PCT_DEFAULT", "0.01"))
+PORTFOLIO_ALLOCATOR_STARTER_RISK_MULT = float(os.getenv("PORTFOLIO_ALLOCATOR_STARTER_RISK_MULT", "0.50"))
+PORTFOLIO_ALLOCATOR_REDUCED_RISK_MULT = float(os.getenv("PORTFOLIO_ALLOCATOR_REDUCED_RISK_MULT", "0.35"))
+PORTFOLIO_ALLOCATOR_CORRELATION_PENALTY = float(os.getenv("PORTFOLIO_ALLOCATOR_CORRELATION_PENALTY", "12"))
+PORTFOLIO_ALLOCATOR_HEAT_PENALTY_MULT = float(os.getenv("PORTFOLIO_ALLOCATOR_HEAT_PENALTY_MULT", "250"))
+PORTFOLIO_ALLOCATOR_BLOCK_IF_STATE_NOT_TRADEABLE = os.getenv("PORTFOLIO_ALLOCATOR_BLOCK_IF_STATE_NOT_TRADEABLE", "true").lower() == "true"
+PORTFOLIO_ALLOCATOR_WRITE_SIGNAL = os.getenv("PORTFOLIO_ALLOCATOR_WRITE_SIGNAL", os.getenv("MULTI_TICKER_SCAN_WRITE_SIGNAL", "true")).lower() == "true"
+
+
+def portfolio_allocator_event(event: str, payload: Dict[str, Any]) -> None:
+    try:
+        _elite_event(PORTFOLIO_ALLOCATOR_LOG_FILE, {"event": event, **(payload or {})})
+    except Exception:
+        pass
+
+
+def portfolio_allocator_current_state() -> Dict[str, Any]:
+    try:
+        if "phase1_safe_write_engine_state_visibility" in globals():
+            snap = phase1_safe_write_engine_state_visibility()
+            if hasattr(snap, "to_dict"):
+                return snap.to_dict()
+            if isinstance(snap, dict):
+                return snap
+    except Exception:
+        pass
+    try:
+        data = _elite_load_json("engine_state_machine.json", {})
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"current_state": "UNKNOWN", "allowed_to_trade": True, "allow_new_entries": True, "reasons": []}
+
+
+def portfolio_allocator_open_exposure_snapshot() -> Dict[str, Any]:
+    try:
+        ensure_globals_initialized()
+    except Exception:
+        pass
+    opens = []
+    try:
+        if isinstance(GLOBAL_POSITIONS, dict):
+            opens = GLOBAL_POSITIONS.get("open_positions", []) or []
+    except Exception:
+        opens = []
+    symbols = []
+    directions = []
+    heat_pct = 0.0
+    for p in opens:
+        if not isinstance(p, dict):
+            continue
+        sym = str(p.get("ticker") or p.get("underlying") or p.get("symbol") or "").upper().strip()
+        if sym:
+            symbols.append(sym)
+        direction = str(p.get("direction") or "").upper().strip()
+        if direction:
+            directions.append(direction)
+        try:
+            heat_pct += safe_float(p.get("risk_pct", p.get("heat_pct", 0)), 0)
+        except Exception:
+            pass
+    try:
+        risk_state = _elite_load_json(globals().get("ONE_TRADE_RISK_FILE", "one_trade_risk_state.json"), {})
+        if isinstance(risk_state, dict):
+            heat_pct = max(heat_pct, safe_float(risk_state.get("portfolio_heat_pct", risk_state.get("heat_pct", 0)), 0))
+    except Exception:
+        pass
+    return {
+        "open_count": len(opens),
+        "symbols": symbols,
+        "directions": directions,
+        "portfolio_heat_pct": round(heat_pct, 6),
+        "tech_count": sum(1 for s in symbols if s in {"QQQ", "SPY", "NVDA", "TSLA", "AAPL", "AMD", "META", "MSFT"}),
+    }
+
+
+def portfolio_allocator_remaining_budget(exposure: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    exposure = exposure or portfolio_allocator_open_exposure_snapshot()
+    max_heat = safe_float(globals().get("MAX_PROJECTED_PORTFOLIO_HEAT_PCT", globals().get("MAX_PORTFOLIO_HEAT_PCT", 0.03)), 0.03)
+    current_heat = safe_float(exposure.get("portfolio_heat_pct", 0), 0)
+    remaining = max(0.0, max_heat - current_heat)
+    if remaining <= 0 and current_heat <= 0:
+        remaining = PORTFOLIO_ALLOCATOR_REMAINING_RISK_PCT_DEFAULT
+    return {"max_heat_pct": max_heat, "current_heat_pct": current_heat, "remaining_risk_pct": round(remaining, 6)}
+
+
+def portfolio_allocator_candidate_features(candidate: Dict[str, Any], exposure: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    exposure = exposure or portfolio_allocator_open_exposure_snapshot()
+    symbol = str(candidate.get("symbol") or candidate.get("ticker") or "").upper().strip()
+    scanner_score = safe_float(candidate.get("score", candidate.get("scanner_score", 0)), 0)
+    reasons = candidate.get("reasons", []) if isinstance(candidate.get("reasons"), list) else []
+    snap = candidate.get("snapshot", {}) if isinstance(candidate.get("snapshot"), dict) else {}
+    regime = str(snap.get("market_regime") or candidate.get("regime") or "NORMAL").upper().strip()
+    try:
+        rule = safe_multi_ticker_get_rule(symbol) if "safe_multi_ticker_get_rule" in globals() else {}
+    except Exception:
+        rule = {}
+    min_score = safe_float(rule.get("min_score", PORTFOLIO_ALLOCATOR_MIN_SCORE), PORTFOLIO_ALLOCATOR_MIN_SCORE) if isinstance(rule, dict) else PORTFOLIO_ALLOCATOR_MIN_SCORE
+    edge_score = max(0.0, min(100.0, scanner_score + max(0.0, scanner_score - min_score) * 0.25))
+
+    regime_quality = 60.0
+    if regime == "TREND":
+        regime_quality = 92.0
+    elif regime == "EXPANSION":
+        regime_quality = 86.0
+    elif regime == "NORMAL":
+        regime_quality = 72.0
+    elif regime == "CHOP":
+        regime_quality = 30.0
+    elif regime == "EVENT":
+        regime_quality = 20.0
+
+    timing_score = 70.0
+    try:
+        hhmm = datetime.now().strftime("%H:%M")
+        if "09:30" <= hhmm <= "10:45":
+            timing_score = 88.0
+        elif "15:00" <= hhmm <= "16:10":
+            timing_score = 84.0
+        elif "11:00" <= hhmm <= "14:30":
+            timing_score = 58.0
+    except Exception:
+        pass
+
+    max_spread = safe_float(rule.get("max_spread_pct", 0.18), 0.18) if isinstance(rule, dict) else 0.18
+    execution_quality = 82.0 if max_spread <= 0.18 else 68.0
+    if "scan_only_not_execution_enabled" in reasons or not bool(rule.get("can_execute", True)):
+        execution_quality -= 25.0
+
+    adaptive_score = 70.0
+    try:
+        stats_payload = _elite_load_json(globals().get("PHASE3_ADAPTIVE_STATS_FILE", "adaptive_setup_stats.json"), {})
+        stats = stats_payload.get("stats", {}) if isinstance(stats_payload, dict) else {}
+        matches = [v for k, v in stats.items() if str(k).upper().startswith(symbol + "_") and isinstance(v, dict)]
+        if matches:
+            avg_wr = sum(safe_float(m.get("win_rate", 0), 0) for m in matches) / max(len(matches), 1)
+            avg_r = sum(safe_float(m.get("avg_r", 0), 0) for m in matches) / max(len(matches), 1)
+            adaptive_score = max(25.0, min(95.0, 45.0 + avg_wr * 45.0 + max(-10.0, min(10.0, avg_r * 10.0))))
+    except Exception:
+        pass
+
+    open_symbols = exposure.get("symbols", []) if isinstance(exposure, dict) else []
+    tech_basket = {"QQQ", "SPY", "NVDA", "TSLA", "AAPL", "AMD", "META", "MSFT"}
+    correlation_penalty = 0.0
+    if symbol in open_symbols:
+        correlation_penalty += PORTFOLIO_ALLOCATOR_CORRELATION_PENALTY * 2
+    if symbol in tech_basket and any(s in tech_basket for s in open_symbols):
+        correlation_penalty += PORTFOLIO_ALLOCATOR_CORRELATION_PENALTY
+    heat_penalty = safe_float(exposure.get("portfolio_heat_pct", 0), 0) * PORTFOLIO_ALLOCATOR_HEAT_PENALTY_MULT
+
+    allocator_score = (
+        edge_score * 0.30
+        + execution_quality * 0.20
+        + regime_quality * 0.15
+        + adaptive_score * 0.15
+        + timing_score * 0.10
+        + 80.0 * 0.10
+        - correlation_penalty
+        - heat_penalty
+    )
+    return {
+        "symbol": symbol,
+        "direction": str(candidate.get("direction") or "NO_TRADE").upper(),
+        "scanner_score": round(scanner_score, 2),
+        "edge_score": round(edge_score, 2),
+        "execution_quality_score": round(max(0.0, min(100.0, execution_quality)), 2),
+        "regime_quality_score": round(regime_quality, 2),
+        "adaptive_history_score": round(adaptive_score, 2),
+        "timing_score": round(timing_score, 2),
+        "liquidity_score": 80.0,
+        "correlation_penalty": round(correlation_penalty, 2),
+        "heat_penalty": round(heat_penalty, 2),
+        "allocator_score": round(max(0.0, min(100.0, allocator_score)), 2),
+        "regime": regime,
+        "rule": rule if isinstance(rule, dict) else {},
+        "reasons": reasons,
+    }
+
+
+def portfolio_allocator_rank_candidates(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    exposure = portfolio_allocator_open_exposure_snapshot()
+    budget = portfolio_allocator_remaining_budget(exposure)
+    engine_state = portfolio_allocator_current_state()
+    state_name = str(engine_state.get("current_state", "UNKNOWN")).upper()
+    allow_entries = bool(engine_state.get("allow_new_entries", engine_state.get("allowed_to_trade", True)))
+
+    ranked = []
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        f = portfolio_allocator_candidate_features(c, exposure)
+        c2 = deepcopy(c)
+        c2["portfolio_allocator_features"] = f
+        c2["allocator_score"] = f.get("allocator_score", 0)
+        ranked.append(c2)
+    ranked = sorted(ranked, key=lambda x: safe_float(x.get("allocator_score", 0), 0), reverse=True)[:PORTFOLIO_ALLOCATOR_MAX_CANDIDATES]
+
+    decisions = []
+    allocations_used = 0
+    remaining_risk = safe_float(budget.get("remaining_risk_pct", 0), 0)
+    for idx, c in enumerate(ranked):
+        f = c.get("portfolio_allocator_features", {}) if isinstance(c.get("portfolio_allocator_features"), dict) else {}
+        score = safe_float(f.get("allocator_score", 0), 0)
+        decision = "SKIP"
+        risk_mult = 0.0
+        reasons = []
+        if PORTFOLIO_ALLOCATOR_BLOCK_IF_STATE_NOT_TRADEABLE and not allow_entries:
+            reasons.append(f"engine_state_not_allowing_entries:{state_name}")
+        if str(c.get("direction", "")).upper() not in {"CALL", "PUT"}:
+            reasons.append("candidate_direction_not_tradeable")
+        if score < PORTFOLIO_ALLOCATOR_MIN_SCORE:
+            reasons.append(f"allocator_score_below_min:{score}<{PORTFOLIO_ALLOCATOR_MIN_SCORE}")
+        if remaining_risk <= 0:
+            reasons.append("no_remaining_risk_budget")
+        if allocations_used >= PORTFOLIO_ALLOCATOR_MAX_NEW_TRADES_PER_SCAN:
+            reasons.append("max_new_trades_per_scan_reached")
+        if not reasons:
+            if idx == 0 and score >= PORTFOLIO_ALLOCATOR_FULL_SCORE:
+                decision = "FULL_ALLOCATION"
+                risk_mult = 1.0
+            elif score >= PORTFOLIO_ALLOCATOR_STARTER_SCORE:
+                decision = "STARTER_ALLOCATION"
+                risk_mult = PORTFOLIO_ALLOCATOR_STARTER_RISK_MULT
+            else:
+                decision = "REDUCED_ALLOCATION"
+                risk_mult = PORTFOLIO_ALLOCATOR_REDUCED_RISK_MULT
+            allocations_used += 1
+            remaining_risk = max(0.0, remaining_risk - (safe_float(globals().get("MAX_RISK_PER_TRADE_PCT", 0.005), 0.005) * risk_mult))
+        decisions.append({"rank": idx + 1, "symbol": f.get("symbol"), "direction": f.get("direction"), "allocator_score": score, "decision": decision, "risk_multiplier": risk_mult, "skip_reasons": reasons, "features": f, "candidate": c})
+
+    selected = next((d for d in decisions if d.get("decision") in {"FULL_ALLOCATION", "STARTER_ALLOCATION", "REDUCED_ALLOCATION"}), None)
+    return {
+        "allocator_id": f"alloc_{int(time.time())}",
+        "timestamp": now_ts() if "now_ts" in globals() else datetime.now().isoformat(),
+        "enabled": ENABLE_PORTFOLIO_ALLOCATOR,
+        "engine_state": engine_state,
+        "exposure": exposure,
+        "budget": budget,
+        "candidate_count": len(candidates or []),
+        "ranked_count": len(ranked),
+        "selected": selected,
+        "decisions": decisions,
+    }
+
+
+def portfolio_allocator_apply_to_signal(signal: Dict[str, Any], allocation_decision: Dict[str, Any]) -> Dict[str, Any]:
+    x = deepcopy(signal or {})
+    decision = str(allocation_decision.get("decision", "SKIP"))
+    risk_mult = safe_float(allocation_decision.get("risk_multiplier", 0), 0)
+    x["portfolio_allocator"] = {"allocator_score": allocation_decision.get("allocator_score"), "decision": decision, "risk_multiplier": risk_mult, "rank": allocation_decision.get("rank"), "features": allocation_decision.get("features", {}), "skip_reasons": allocation_decision.get("skip_reasons", [])}
+    if decision == "STARTER_ALLOCATION":
+        x["allocator_size_mode"] = "starter"
+        x["qty"] = max(1, min(safe_int(x.get("qty", x.get("quantity", 1)), 1), 1))
+        x["quantity"] = x["qty"]
+    elif decision == "REDUCED_ALLOCATION":
+        x["allocator_size_mode"] = "reduced"
+        x["qty"] = max(1, min(safe_int(x.get("qty", x.get("quantity", 1)), 1), 1))
+        x["quantity"] = x["qty"]
+    elif decision == "FULL_ALLOCATION":
+        x["allocator_size_mode"] = "full"
+    else:
+        x["observe_only"] = True
+        x["execution_blocked_by_portfolio_allocator"] = True
+    return x
+
+
+_base_multi_ticker_scanner_tick_for_allocator = multi_ticker_scanner_tick if "multi_ticker_scanner_tick" in globals() else None
+if _base_multi_ticker_scanner_tick_for_allocator:
+    def multi_ticker_scanner_tick(force: bool = False) -> Dict[str, Any]:
+        if not ENABLE_PORTFOLIO_ALLOCATOR:
+            return _base_multi_ticker_scanner_tick_for_allocator(force=force)
+        if not ENABLE_MULTI_TICKER_SCANNER:
+            return {"ran": False, "reason": "scanner_disabled_allocator_active"}
+        state = _elite_load_json(MULTI_TICKER_SCAN_FILE, {"last_scan_ts": 0})
+        now = int(time.time())
+        if not force and now - safe_int(state.get("last_scan_ts", 0), 0) < MULTI_TICKER_SCAN_INTERVAL_SECONDS:
+            return {"ran": False, "reason": "cooldown"}
+        try:
+            ensure_globals_initialized()
+            opens = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+            if MULTI_TICKER_SCAN_REQUIRE_NO_OPEN_POSITION and opens:
+                return {"ran": False, "reason": "open_position_exists", "open_count": len(opens)}
+        except Exception:
+            pass
+        raw_candidates = [multi_ticker_score_symbol(sym) for sym in MULTI_TICKER_SCAN_SYMBOLS]
+        allocator = portfolio_allocator_rank_candidates(raw_candidates)
+        selected = allocator.get("selected") if isinstance(allocator, dict) else None
+        decisions = allocator.get("decisions", []) if isinstance(allocator, dict) else []
+        best = decisions[0].get("candidate", {}) if decisions and isinstance(decisions[0], dict) else (raw_candidates[0] if raw_candidates else {})
+        state.update({"last_scan_ts": now, "allocator": allocator, "best": best, "candidates": raw_candidates[:10]})
+        _elite_write_json(MULTI_TICKER_SCAN_FILE, state)
+        portfolio_allocator_event("scan_ranked", {"allocator": allocator})
+        _elite_event(MULTI_TICKER_SCAN_LOG_FILE, {"event": "allocator_scan", "allocator": allocator})
+        if selected and isinstance(selected, dict):
+            candidate = selected.get("candidate", {}) if isinstance(selected.get("candidate"), dict) else {}
+            sig = multi_ticker_scanner_build_signal(candidate)
+            sig = portfolio_allocator_apply_to_signal(sig, selected)
+            if PORTFOLIO_ALLOCATOR_WRITE_SIGNAL:
+                write_auto_signal(sig)
+                state["last_signal_ts"] = now
+                state["last_signal"] = sig
+                _elite_write_json(MULTI_TICKER_SCAN_FILE, state)
+                portfolio_allocator_event("signal_written", {"signal": sig, "selected": selected})
+                try:
+                    debug(f"PORTFOLIO ALLOCATOR SIGNAL | {sig.get('ticker')} {sig.get('direction')} decision={selected.get('decision')} score={selected.get('allocator_score')}")
+                except Exception:
+                    pass
+            return {"ran": True, "signal": sig, "best": best, "allocator": allocator}
+        try:
+            debug("PORTFOLIO ALLOCATOR SKIPPED ALL CANDIDATES")
+        except Exception:
+            pass
+        return {"ran": True, "signal": None, "best": best, "allocator": allocator}
+
+
+_base_evaluate_trade_opportunity_for_allocator = evaluate_trade_opportunity if "evaluate_trade_opportunity" in globals() else None
+if _base_evaluate_trade_opportunity_for_allocator:
+    def evaluate_trade_opportunity(signal: Dict[str, Any], selected_contract: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        x = deepcopy(signal or {})
+        alloc = x.get("portfolio_allocator", {}) if isinstance(x.get("portfolio_allocator"), dict) else {}
+        if x.get("execution_blocked_by_portfolio_allocator"):
+            decision = {"approved": False, "stage": "portfolio_allocator", "ticker": str(x.get("ticker", "")).upper(), "direction": str(x.get("direction", "")).upper(), "score": 0, "size_multiplier": 0, "reject_reasons": alloc.get("skip_reasons", ["blocked_by_portfolio_allocator"]), "portfolio_allocator": alloc, "selected_contract": selected_contract}
+            try:
+                safety_write_decision_event("portfolio_allocator_block", signal=x, decision=decision, selected=selected_contract, result={"approved": False})
+            except Exception:
+                pass
+            return decision
+        base = _base_evaluate_trade_opportunity_for_allocator(x, selected_contract)
+        if isinstance(base, dict) and alloc:
+            base["portfolio_allocator"] = alloc
+            # TODO PHASE 3 ENFORCEMENT: multiply final risk budget by allocator risk_multiplier
+            # once sizing is fully trace_id-aware and allocator-owned risk budgets are persisted.
+        return base
+
+try:
+    print("[PORTFOLIO ALLOCATOR ACTIVE] rank + capital allocation layer enabled", flush=True)
+except Exception:
+    pass
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
