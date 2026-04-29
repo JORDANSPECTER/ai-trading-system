@@ -15,6 +15,21 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 
+# =========================================================
+# TEMP ALLOCATOR VALIDATION OVERRIDES
+# Purpose: bypass Render ENV save failures and force allocator test mode.
+# Remove these lines after allocator validation passes.
+# =========================================================
+os.environ["FORCE_REGIME_ALLOW"] = "true"
+os.environ["BLOCK_CHOP_REGIME"] = "false"
+os.environ["MARKET_REGIME_BLOCK_CHOP"] = "false"
+os.environ["SAFE_MULTI_TICKER_BLOCK_CHOP"] = "false"
+os.environ["SCANNER_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
+os.environ["MULTI_TICKER_SCAN_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
+os.environ["PORTFOLIO_ALLOCATOR_ENABLED"] = "true"
+os.environ["ENABLE_PORTFOLIO_ALLOCATOR"] = "true"
+print("[TEMP ALLOCATOR TEST OVERRIDES ACTIVE] FORCE_REGIME_ALLOW=true symbols=QQQ,SPY,NVDA,TSLA", flush=True)
+
 try:
     import websocket  # pip package: websocket-client
     WEBSOCKET_CLIENT_AVAILABLE = True
@@ -21405,6 +21420,7 @@ MARKET_REGIME_EVENT_LOG_FILE = os.getenv("MARKET_REGIME_EVENT_LOG_FILE", "market
 MARKET_REGIME_SYMBOLS = [s.strip().upper() for s in os.getenv("MARKET_REGIME_SYMBOLS", "QQQ,SPY,USO").split(",") if s.strip()]
 MARKET_REGIME_PRIMARY_SYMBOL = os.getenv("MARKET_REGIME_PRIMARY_SYMBOL", "QQQ").upper().strip()
 MARKET_REGIME_REFRESH_SECONDS = int(float(os.getenv("MARKET_REGIME_REFRESH_SECONDS", "15")))
+FORCE_REGIME_ALLOW = os.getenv("FORCE_REGIME_ALLOW", "false").lower() == "true"
 MARKET_REGIME_BLOCK_CHOP = os.getenv("MARKET_REGIME_BLOCK_CHOP", "true").lower() == "true"
 MARKET_REGIME_BLOCK_EVENT = os.getenv("MARKET_REGIME_BLOCK_EVENT", "false").lower() == "true"
 MARKET_REGIME_REQUIRE_FRESH_DATA = os.getenv("MARKET_REGIME_REQUIRE_FRESH_DATA", "true").lower() == "true"
@@ -21708,10 +21724,14 @@ def market_regime_pretrade_gate(signal: Dict[str, Any]) -> Dict[str, Any]:
     reasons = []
     if MARKET_REGIME_REQUIRE_FRESH_DATA and not bool(state.get("fresh_data_ok", True)):
         reasons.append(state.get("fresh_data_reason", "market_regime_stale_data"))
-    if MARKET_REGIME_BLOCK_CHOP and regime == "CHOP":
-        reasons.append("market_regime_chop_block")
-    if MARKET_REGIME_BLOCK_EVENT and regime == "EVENT":
-        reasons.append("market_regime_event_block")
+    if FORCE_REGIME_ALLOW:
+        # TEMP allocator validation override: keep regime visible but do not block.
+        reasons = []
+    else:
+        if MARKET_REGIME_BLOCK_CHOP and regime == "CHOP":
+            reasons.append("market_regime_chop_block")
+        if MARKET_REGIME_BLOCK_EVENT and regime == "EVENT":
+            reasons.append("market_regime_event_block")
     approved = len(reasons) == 0
     if not approved:
         try:
