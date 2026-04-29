@@ -17080,6 +17080,351 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+
+# =========================================================
+# REAL-TIME ADAPTIVE RISK ENGINE
+# Dynamically changes risk while the trading day is unfolding.
+# - cuts size after losses / drawdown acceleration
+# - pauses entries after hard streaks
+# - blocks chop/weak condition entries
+# - allows controlled size boost only after strong A+ performance
+# - writes a live risk state file for audit + dashboard use
+# =========================================================
+ENABLE_REALTIME_ADAPTIVE_RISK = os.getenv("ENABLE_REALTIME_ADAPTIVE_RISK", "true").lower() == "true"
+REALTIME_RISK_STATE_FILE = os.getenv("REALTIME_RISK_STATE_FILE", "realtime_adaptive_risk_state.json").strip()
+REALTIME_RISK_EVENT_LOG = os.getenv("REALTIME_RISK_EVENT_LOG", "realtime_adaptive_risk_events.jsonl").strip()
+REALTIME_RISK_LOOKBACK_TRADES = int(float(os.getenv("REALTIME_RISK_LOOKBACK_TRADES", "10")))
+REALTIME_RISK_SIZE_CUT_AFTER_LOSSES = int(float(os.getenv("REALTIME_RISK_SIZE_CUT_AFTER_LOSSES", "2")))
+REALTIME_RISK_PAUSE_AFTER_LOSSES = int(float(os.getenv("REALTIME_RISK_PAUSE_AFTER_LOSSES", "3")))
+REALTIME_RISK_SIZE_CUT_MULT = float(os.getenv("REALTIME_RISK_SIZE_CUT_MULT", "0.50"))
+REALTIME_RISK_DEFENSIVE_MULT = float(os.getenv("REALTIME_RISK_DEFENSIVE_MULT", "0.35"))
+REALTIME_RISK_WIN_STREAK_SIZE_UP = int(float(os.getenv("REALTIME_RISK_WIN_STREAK_SIZE_UP", "3")))
+REALTIME_RISK_SIZE_UP_MULT = float(os.getenv("REALTIME_RISK_SIZE_UP_MULT", "1.25"))
+REALTIME_RISK_MAX_SIZE_MULT = float(os.getenv("REALTIME_RISK_MAX_SIZE_MULT", "1.50"))
+REALTIME_RISK_BLOCK_CHOP = os.getenv("REALTIME_RISK_BLOCK_CHOP", "true").lower() == "true"
+REALTIME_RISK_MIN_EXECUTION_SCORE = float(os.getenv("REALTIME_RISK_MIN_EXECUTION_SCORE", "60"))
+REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_SOFT = float(os.getenv("REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_SOFT", "0.010"))
+REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_HARD = float(os.getenv("REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_HARD", "0.020"))
+REALTIME_RISK_ACCEL_LOSS_WINDOW_SECONDS = int(float(os.getenv("REALTIME_RISK_ACCEL_LOSS_WINDOW_SECONDS", "1800")))
+REALTIME_RISK_ACCEL_LOSS_COUNT = int(float(os.getenv("REALTIME_RISK_ACCEL_LOSS_COUNT", "2")))
+REALTIME_RISK_PAUSE_MINUTES = int(float(os.getenv("REALTIME_RISK_PAUSE_MINUTES", "30")))
+REALTIME_RISK_SEND_ALERTS = os.getenv("REALTIME_RISK_SEND_ALERTS", "true").lower() == "true"
+REALTIME_RISK_ONLY_SCALE_A_PLUS = os.getenv("REALTIME_RISK_ONLY_SCALE_A_PLUS", "true").lower() == "true"
+
+
+def realtime_risk_log_event(event: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = {"time": now_ts() if 'now_ts' in globals() else datetime.utcnow().isoformat(), "ts": int(time.time()), "event": event, **(payload or {})}
+        with open(REALTIME_RISK_EVENT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def realtime_risk_load_state() -> Dict[str, Any]:
+    data = load_json_file(REALTIME_RISK_STATE_FILE, {}) if 'load_json_file' in globals() else {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("mode", "NORMAL")
+    data.setdefault("size_multiplier", 1.0)
+    data.setdefault("entry_paused_until", 0)
+    data.setdefault("pause_reason", "")
+    data.setdefault("daily_loss_streak", 0)
+    data.setdefault("daily_win_streak", 0)
+    data.setdefault("last_update_ts", int(time.time()))
+    return data
+
+
+def realtime_risk_save_state(state: Dict[str, Any]) -> None:
+    try:
+        state["last_update_ts"] = int(time.time())
+        state["last_update_time"] = now_ts() if 'now_ts' in globals() else datetime.utcnow().isoformat()
+        atomic_write_json(REALTIME_RISK_STATE_FILE, state)
+    except Exception:
+        try:
+            with open(REALTIME_RISK_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, sort_keys=True, default=str)
+        except Exception:
+            pass
+
+
+def realtime_risk_today_key() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return datetime.now().date().isoformat()
+
+
+def realtime_risk_read_trade_memory(limit: int = 50) -> List[Dict[str, Any]]:
+    trades: List[Dict[str, Any]] = []
+    try:
+        if 'intel_load_trade_memory' in globals():
+            raw = intel_load_trade_memory()
+            if isinstance(raw, list):
+                trades = [t for t in raw if isinstance(t, dict)]
+        elif os.path.exists(globals().get('INTEL_TRADE_MEMORY_FILE', 'trade_memory.jsonl')):
+            with open(globals().get('INTEL_TRADE_MEMORY_FILE', 'trade_memory.jsonl'), 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            trades.append(obj)
+                    except Exception:
+                        pass
+    except Exception:
+        trades = []
+    trades = trades[-max(int(limit), 1):]
+    return trades
+
+
+def realtime_risk_trade_ts(trade: Dict[str, Any]) -> int:
+    for k in ("closed_ts", "exit_ts", "timestamp", "ts", "opened_ts"):
+        try:
+            v = trade.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+            if isinstance(v, str) and v.strip().isdigit():
+                return int(v.strip())
+        except Exception:
+            pass
+    return 0
+
+
+def realtime_risk_is_win(trade: Dict[str, Any]) -> bool:
+    try:
+        if 'phase3_infer_winner' in globals():
+            return bool(phase3_infer_winner(trade))
+    except Exception:
+        pass
+    pnl = safe_float(trade.get("realized_pnl_pct", trade.get("pnl_pct", trade.get("pnl", 0))), 0) if 'safe_float' in globals() else float(trade.get("pnl", 0) or 0)
+    return pnl > 0
+
+
+def realtime_risk_daily_pnl_pct(trades: List[Dict[str, Any]]) -> float:
+    today = realtime_risk_today_key()
+    total = 0.0
+    for t in trades:
+        try:
+            date_text = str(t.get("closed_date") or t.get("date") or t.get("report_date") or "")[:10]
+            if date_text and date_text != today:
+                continue
+            total += safe_float(t.get("realized_pnl_pct", t.get("pnl_pct", 0)), 0) if 'safe_float' in globals() else float(t.get("pnl_pct", 0) or 0)
+        except Exception:
+            pass
+    return total
+
+
+def realtime_risk_compute_from_memory() -> Dict[str, Any]:
+    trades = realtime_risk_read_trade_memory(REALTIME_RISK_LOOKBACK_TRADES)
+    recent = trades[-REALTIME_RISK_LOOKBACK_TRADES:]
+    loss_streak = 0
+    win_streak = 0
+    for t in reversed(recent):
+        if realtime_risk_is_win(t):
+            if loss_streak == 0:
+                win_streak += 1
+            else:
+                break
+        else:
+            if win_streak == 0:
+                loss_streak += 1
+            else:
+                break
+    now_i = int(time.time())
+    fast_losses = 0
+    for t in recent:
+        ts = realtime_risk_trade_ts(t)
+        if ts and now_i - ts <= REALTIME_RISK_ACCEL_LOSS_WINDOW_SECONDS and not realtime_risk_is_win(t):
+            fast_losses += 1
+    daily_pnl_pct = realtime_risk_daily_pnl_pct(trades)
+    return {
+        "trade_count_lookback": len(recent),
+        "loss_streak": loss_streak,
+        "win_streak": win_streak,
+        "fast_losses": fast_losses,
+        "daily_pnl_pct": daily_pnl_pct,
+        "last_trade_ts": realtime_risk_trade_ts(recent[-1]) if recent else 0,
+    }
+
+
+def realtime_risk_get_signal_quality(signal: Dict[str, Any]) -> Dict[str, Any]:
+    score = 0.0
+    for key in ("execution_score", "score", "confidence_score", "final_score"):
+        try:
+            if signal.get(key) is not None:
+                score = max(score, safe_float(signal.get(key), 0) if 'safe_float' in globals() else float(signal.get(key) or 0))
+        except Exception:
+            pass
+    regime = str(signal.get("regime") or signal.get("market_regime") or "").upper()
+    confidence = str(signal.get("confidence") or signal.get("grade") or "").upper()
+    return {"score": score, "regime": regime, "confidence": confidence}
+
+
+def realtime_risk_recalculate_state(reason: str = "tick") -> Dict[str, Any]:
+    state = realtime_risk_load_state()
+    stats = realtime_risk_compute_from_memory()
+    mode = "NORMAL"
+    mult = 1.0
+    paused_until = int(state.get("entry_paused_until", 0) or 0)
+    pause_reason = str(state.get("pause_reason", ""))
+    now_i = int(time.time())
+
+    if paused_until and now_i >= paused_until:
+        paused_until = 0
+        pause_reason = ""
+
+    if stats["daily_pnl_pct"] <= -abs(REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_HARD):
+        mode = "LOCKED"
+        mult = 0.0
+        paused_until = max(paused_until, now_i + REALTIME_RISK_PAUSE_MINUTES * 60)
+        pause_reason = "hard_daily_drawdown"
+    elif stats["loss_streak"] >= REALTIME_RISK_PAUSE_AFTER_LOSSES:
+        mode = "PAUSED"
+        mult = 0.0
+        paused_until = max(paused_until, now_i + REALTIME_RISK_PAUSE_MINUTES * 60)
+        pause_reason = "loss_streak_pause"
+    elif stats["fast_losses"] >= REALTIME_RISK_ACCEL_LOSS_COUNT:
+        mode = "DEFENSIVE"
+        mult = REALTIME_RISK_DEFENSIVE_MULT
+        pause_reason = "drawdown_acceleration_defensive"
+    elif stats["daily_pnl_pct"] <= -abs(REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_SOFT):
+        mode = "DEFENSIVE"
+        mult = REALTIME_RISK_DEFENSIVE_MULT
+        pause_reason = "soft_daily_drawdown"
+    elif stats["loss_streak"] >= REALTIME_RISK_SIZE_CUT_AFTER_LOSSES:
+        mode = "DEFENSIVE"
+        mult = REALTIME_RISK_SIZE_CUT_MULT
+        pause_reason = "loss_streak_size_cut"
+    elif stats["win_streak"] >= REALTIME_RISK_WIN_STREAK_SIZE_UP:
+        mode = "AGGRESSIVE"
+        mult = min(REALTIME_RISK_SIZE_UP_MULT, REALTIME_RISK_MAX_SIZE_MULT)
+        pause_reason = "win_streak_controlled_size_up"
+
+    state.update({
+        "mode": mode,
+        "size_multiplier": round(float(mult), 4),
+        "entry_paused_until": int(paused_until),
+        "pause_reason": pause_reason,
+        "daily_loss_streak": int(stats["loss_streak"]),
+        "daily_win_streak": int(stats["win_streak"]),
+        "fast_losses": int(stats["fast_losses"]),
+        "daily_pnl_pct_est": round(float(stats["daily_pnl_pct"]), 6),
+        "stats": stats,
+        "reason": reason,
+    })
+    realtime_risk_save_state(state)
+    return state
+
+
+def realtime_adaptive_risk_tick(force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_REALTIME_ADAPTIVE_RISK:
+        return {"enabled": False, "mode": "DISABLED", "size_multiplier": 1.0}
+    try:
+        previous = realtime_risk_load_state()
+        state = realtime_risk_recalculate_state(reason="force" if force else "loop")
+        changed = previous.get("mode") != state.get("mode") or previous.get("entry_paused_until") != state.get("entry_paused_until")
+        if changed:
+            realtime_risk_log_event("mode_changed", {"previous": previous, "state": state})
+            if REALTIME_RISK_SEND_ALERTS:
+                msg = (
+                    f"🛡️ REAL-TIME ADAPTIVE RISK UPDATE\n"
+                    f"Mode: {state.get('mode')}\n"
+                    f"Size Multiplier: {state.get('size_multiplier')}\n"
+                    f"Loss Streak: {state.get('daily_loss_streak')} | Win Streak: {state.get('daily_win_streak')}\n"
+                    f"Fast Losses: {state.get('fast_losses')} | Daily P/L % est: {round(float(state.get('daily_pnl_pct_est', 0))*100, 2)}%\n"
+                    f"Reason: {state.get('pause_reason') or state.get('reason')}\n"
+                    f"⏰ {now_ts() if 'now_ts' in globals() else datetime.utcnow().isoformat()}"
+                )
+                try: send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+                except Exception: pass
+                try: send_to_telegram(msg)
+                except Exception: pass
+        return state
+    except Exception as e:
+        try: debug(f"REALTIME ADAPTIVE RISK TICK ERROR | {e}")
+        except Exception: pass
+        return {"enabled": True, "mode": "ERROR", "size_multiplier": 1.0, "error": str(e)}
+
+
+def realtime_adaptive_risk_pretrade_gate(signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_REALTIME_ADAPTIVE_RISK:
+        return {"approved": True, "mode": "DISABLED", "reject_reasons": [], "size_multiplier": 1.0}
+    state = realtime_risk_recalculate_state(reason="pretrade")
+    reasons: List[str] = []
+    now_i = int(time.time())
+    paused_until = int(state.get("entry_paused_until", 0) or 0)
+    mode = str(state.get("mode", "NORMAL")).upper()
+    q = realtime_risk_get_signal_quality(signal)
+
+    if mode in {"LOCKED", "PAUSED"} or (paused_until and now_i < paused_until):
+        reasons.append(f"adaptive_risk_{mode.lower()}:{state.get('pause_reason')}")
+    if REALTIME_RISK_BLOCK_CHOP and q["regime"] in {"CHOP", "CHOPPY", "RANGE", "NO_TRADE"}:
+        reasons.append("adaptive_risk_blocks_chop_regime")
+    if q["score"] and q["score"] < REALTIME_RISK_MIN_EXECUTION_SCORE:
+        reasons.append(f"adaptive_risk_low_execution_score:{q['score']}")
+    if mode == "AGGRESSIVE" and REALTIME_RISK_ONLY_SCALE_A_PLUS and q["confidence"] not in {"A+", "A PLUS", "APLUS"}:
+        # Still allow the trade, but no size boost unless it is truly A+.
+        state["size_multiplier"] = 1.0
+
+    decision = {
+        "approved": len(reasons) == 0,
+        "mode": mode,
+        "reject_reasons": reasons,
+        "size_multiplier": float(state.get("size_multiplier", 1.0) or 1.0),
+        "state": state,
+        "quality": q,
+    }
+    if reasons:
+        realtime_risk_log_event("pretrade_block", {"decision": decision, "signal": {k: signal.get(k) for k in ("ticker", "direction", "confidence", "score", "execution_score", "regime")}})
+        msg = build_block_message("REAL-TIME ADAPTIVE RISK BLOCKED SIGNAL", signal, reasons, f"Mode: {mode} | Size Mult: {decision['size_multiplier']}") if 'build_block_message' in globals() else f"REAL-TIME ADAPTIVE RISK BLOCK: {reasons}"
+        try: send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        except Exception: pass
+        try: send_to_live_entry_discord(msg)
+        except Exception: pass
+        try: send_to_telegram(msg)
+        except Exception: pass
+    return decision
+
+
+def realtime_adaptive_risk_apply_size(size_decision: Dict[str, Any], risk_decision: Dict[str, Any], signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_REALTIME_ADAPTIVE_RISK or not isinstance(size_decision, dict):
+        return size_decision
+    x = deepcopy(size_decision)
+    mult = float((risk_decision or {}).get("size_multiplier", 1.0) or 1.0)
+    mode = str((risk_decision or {}).get("mode", "NORMAL")).upper()
+    try:
+        q = realtime_risk_get_signal_quality(signal)
+        if mode == "AGGRESSIVE" and REALTIME_RISK_ONLY_SCALE_A_PLUS and q.get("confidence") not in {"A+", "A PLUS", "APLUS"}:
+            mult = 1.0
+        original = safe_int(x.get("final_size", 0), 0) if 'safe_int' in globals() else int(x.get("final_size", 0) or 0)
+        if original <= 0:
+            return x
+        if mult <= 0:
+            adjusted = 0
+        elif mult < 1:
+            adjusted = max(1, int(math.floor(original * mult)))
+        else:
+            adjusted = int(math.ceil(original * min(mult, REALTIME_RISK_MAX_SIZE_MULT)))
+        adjusted = max(0, min(adjusted, MAX_POSITION_QTY if 'MAX_POSITION_QTY' in globals() else adjusted))
+        x["realtime_risk_original_final_size"] = original
+        x["realtime_risk_size_multiplier"] = round(mult, 4)
+        x["realtime_risk_mode"] = mode
+        x["final_size"] = adjusted
+        x.setdefault("adjustments", []).append(f"realtime_risk_{mode.lower()}_mult_{round(mult, 4)}")
+        x["approved"] = adjusted >= (MIN_POSITION_QTY if 'MIN_POSITION_QTY' in globals() else 1)
+        if not x["approved"]:
+            x.setdefault("reject_reasons", []).append("realtime_risk_adjusted_size_below_minimum")
+        realtime_risk_log_event("size_adjusted", {"mode": mode, "multiplier": mult, "original": original, "adjusted": adjusted})
+        try: debug(f"REALTIME RISK SIZE ADJUST | mode={mode} | base={original} -> adjusted={adjusted} | mult={mult}")
+        except Exception: pass
+        return x
+    except Exception as e:
+        try: debug(f"REALTIME RISK SIZE APPLY ERROR | {e}")
+        except Exception: pass
+        return size_decision
+
+
 # =========================================================
 # QQQ CLEAN SIGNAL GUARD
 # Final input cleanup layer. If any old script, old cache, or stale
@@ -17268,6 +17613,12 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     adaptive_signal = phase3_decision.get("adjusted_signal", regime_signal)
 
+    # REAL-TIME ADAPTIVE RISK: day-performance + live-condition gate before sizing.
+    realtime_risk_decision = realtime_adaptive_risk_pretrade_gate(adaptive_signal)
+    if not realtime_risk_decision.get("approved", True):
+        return
+    adaptive_signal["realtime_adaptive_risk"] = {k: v for k, v in realtime_risk_decision.items() if k != "state"}
+
     # PHASE 3.5: enforcement gate after adaptive intelligence, before sizing.
     phase35_pre_size_decision = phase35_enforcement_gate(
         adaptive_signal,
@@ -17282,6 +17633,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     size_decision = size_signal_by_stop(adaptive_signal)
     size_decision = phase3_apply_size_multiplier_to_decision(size_decision, phase3_decision)
     size_decision = apply_execution_score_to_size_decision(adaptive_signal, size_decision)
+    size_decision = realtime_adaptive_risk_apply_size(size_decision, realtime_risk_decision, adaptive_signal)
     if not size_decision["approved"]:
         msg = build_block_message("SIZING BLOCKED SIGNAL", regime_signal, size_decision["reject_reasons"], f"Raw Size: {size_decision.get('raw_size')} | Final Size: {size_decision.get('final_size')}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -20063,6 +20415,7 @@ def main_loop():
             process_telegram_updates()
             maybe_send_daily_alpaca_bot_report(force=False)
             maybe_send_premarket_elite_readiness_report(force=False)
+            realtime_adaptive_risk_tick(force=False)
             # PAPER TP/SL LOOP CHECK
             tpsl_loop_result = paper_tpsl_manage_positions()
             if tpsl_loop_result.get("events") or tpsl_loop_result.get("closed_count", 0) > 0:
