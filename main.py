@@ -34,6 +34,7 @@ print("[ALPACA EXECUTION RELIABILITY PATCH ACTIVE] reliable order routing + conf
 print("[IDEMPOTENCY EXECUTION BYPASS ACTIVE] approved trades bypass stale replay blocks", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
+print("[ORDER OWNERSHIP LOCK ACTIVE] only this bot client_order_id can submit/trust orders", flush=True)
 print("[TWELVE DATA WEBSOCKET PATCH ACTIVE] real-time-ready market feed enabled", flush=True)
 
 # =========================================================
@@ -233,6 +234,21 @@ ALPACA_EQUITY_ORDER_QTY = int(float(os.getenv("ALPACA_EQUITY_ORDER_QTY", "1")))
 ALPACA_EQUITY_ALLOW_SHORT = os.getenv("ALPACA_EQUITY_ALLOW_SHORT", "false").lower() == "true"
 ALPACA_SYNC_POSITIONS = os.getenv("ALPACA_SYNC_POSITIONS", "true").lower() == "true"
 ALPACA_ENABLE_OPTIONS = os.getenv("ALPACA_ENABLE_OPTIONS", "true").lower() == "true"
+
+# =========================================================
+# ORDER OWNERSHIP LOCK
+# Guarantees this engine only submits/trusts orders with this bot's
+# client_order_id prefix. This prevents older bots/manual Alpaca orders
+# from being counted as this engine's trades.
+# =========================================================
+ORDER_OWNERSHIP_LOCK = os.getenv("ORDER_OWNERSHIP_LOCK", "true").lower() == "true"
+ORDER_OWNERSHIP_CLIENT_PREFIX = os.getenv("ORDER_OWNERSHIP_CLIENT_PREFIX", "ubtmain").strip().replace(" ", "-")[:16] or "ubtmain"
+ORDER_OWNERSHIP_ADOPT_EXISTING_PREFIXES = os.getenv("ORDER_OWNERSHIP_ADOPT_EXISTING_PREFIXES", "false").lower() == "true"
+ORDER_OWNERSHIP_ALLOWED_OLD_PREFIXES = tuple(x.strip() for x in os.getenv("ORDER_OWNERSHIP_ALLOWED_OLD_PREFIXES", "ubt-,ub-,ubt-opt-,ubt-smart-,ubt-paper-,ub-close-").split(",") if x.strip())
+ORDER_OWNERSHIP_CANCEL_FOREIGN_OPEN_ORDERS = os.getenv("ORDER_OWNERSHIP_CANCEL_FOREIGN_OPEN_ORDERS", "true").lower() == "true"
+ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_OPEN_ORDERS = os.getenv("ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_OPEN_ORDERS", "true").lower() == "true"
+ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_POSITIONS = os.getenv("ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_POSITIONS", "true").lower() == "true"
+ORDER_OWNERSHIP_AUDIT_FILE = os.getenv("ORDER_OWNERSHIP_AUDIT_FILE", "order_ownership_audit.jsonl").strip()
 ALPACA_LIVE_OPTIONS_APPROVED = os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", "false").lower() == "true"
 USE_ALPACA_OPTIONS_BUYING_POWER = os.getenv("USE_ALPACA_OPTIONS_BUYING_POWER", "true").lower() == "true"
 
@@ -526,9 +542,14 @@ def alpaca_base_url() -> str:
 
 def alpaca_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
     try:
+        outbound_payload = dict(payload or {})
+        if method.upper() == "POST" and str(path).rstrip("/").endswith("/orders"):
+            ok, reason, outbound_payload = ensure_owned_order_payload(outbound_payload, context="alpaca_request")
+            if not ok:
+                return 403, {"error": reason, "payload": outbound_payload}
         url = f"{alpaca_base_url()}{path}"
         if method.upper() == "POST":
-            r = requests.post(url, headers=alpaca_headers(), json=payload or {}, timeout=20)
+            r = requests.post(url, headers=alpaca_headers(), json=outbound_payload, timeout=20)
         elif method.upper() == "GET":
             r = requests.get(url, headers=alpaca_headers(), timeout=20)
         else:
@@ -610,7 +631,7 @@ def alpaca_prepare_option_order_payload(payload: Dict[str, Any]) -> Tuple[bool, 
             payload.pop(k, None)
 
     if not payload.get("client_order_id"):
-        payload["client_order_id"] = f"ubt-opt-{symbol}-{int(time.time())}"[:48]
+        payload["client_order_id"] = make_owned_client_order_id("opt", symbol)
 
     return True, "payload_ok", payload
 
@@ -4698,9 +4719,9 @@ def idempotency_order_intent_id(signal: Dict[str, Any], side: str, qty: int, mod
 
 def idempotency_client_order_id(signal: Dict[str, Any], side: str, qty: int, mode: str, order_type: str = "market", limit_price: Optional[float] = None) -> str:
     key = idempotency_order_intent_id(signal, side, qty, mode, order_type, limit_price)
-    prefix = str(globals().get("IDEMPOTENCY_CLIENT_PREFIX", "ub")).strip()[:8] or "ub"
+    prefix = str(globals().get("ORDER_OWNERSHIP_CLIENT_PREFIX", globals().get("IDEMPOTENCY_CLIENT_PREFIX", "ubtmain"))).strip()[:16] or "ubtmain"
     # Alpaca client_order_id limit is 48 chars; keep stable + compact.
-    return f"{prefix}-{side[:1].lower()}-{idempotency_short(key, 36)}"[:48]
+    return f"{prefix}-idem-{side[:1].lower()}-{idempotency_short(key, 26)}"[:48]
 
 
 def idempotency_fill_event_id(order_or_fill: Dict[str, Any]) -> str:
@@ -5365,6 +5386,96 @@ def get_telegram_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 
 
 # =========================================================
+# ORDER OWNERSHIP LOCK HELPERS
+# =========================================================
+def ownership_audit(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        row = {"time": datetime.now().isoformat(), "ts": int(time.time()), "event": event, **(payload or {})}
+        with open(ORDER_OWNERSHIP_AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _ownership_clean_part(value: Any, max_len: int = 18) -> str:
+    try:
+        text = str(value or "").upper().strip()
+        text = re.sub(r"[^A-Z0-9_-]+", "-", text)
+        text = re.sub(r"-+", "-", text).strip("-")
+        return text[:max_len] or "X"
+    except Exception:
+        return "X"
+
+
+def make_owned_client_order_id(kind: str = "ord", *parts: Any) -> str:
+    prefix = str(globals().get("ORDER_OWNERSHIP_CLIENT_PREFIX", "ubtmain")).strip()[:16] or "ubtmain"
+    kind_clean = _ownership_clean_part(kind, 8).lower()
+    clean_parts = [_ownership_clean_part(x, 12) for x in parts if str(x or "").strip()]
+    raw = "-".join([prefix, kind_clean] + clean_parts + [str(int(time.time()))])
+    return raw[:48]
+
+
+def is_owned_client_order_id(client_order_id: Any) -> bool:
+    cid = str(client_order_id or "").strip()
+    if not cid:
+        return False
+    prefix = str(globals().get("ORDER_OWNERSHIP_CLIENT_PREFIX", "ubtmain")).strip()[:16] or "ubtmain"
+    if cid == prefix or cid.startswith(prefix + "-"):
+        return True
+    if globals().get("ORDER_OWNERSHIP_ADOPT_EXISTING_PREFIXES", False):
+        return any(cid.startswith(old) for old in globals().get("ORDER_OWNERSHIP_ALLOWED_OLD_PREFIXES", ()))
+    return False
+
+
+def ensure_owned_order_payload(payload: Dict[str, Any], context: str = "order") -> Tuple[bool, str, Dict[str, Any]]:
+    clean = dict(payload or {})
+    if not globals().get("ORDER_OWNERSHIP_LOCK", True):
+        return True, "ownership_lock_disabled", clean
+    cid = str(clean.get("client_order_id") or "").strip()
+    symbol = clean.get("symbol") or clean.get("contract_symbol") or "ORD"
+    side = clean.get("side") or "SIDE"
+    if not cid:
+        cid = make_owned_client_order_id(context, symbol, side)
+        clean["client_order_id"] = cid
+    if not is_owned_client_order_id(cid):
+        reason = f"foreign_client_order_id_blocked:{cid}"
+        ownership_audit("blocked_outbound_order", {"reason": reason, "payload": clean, "context": context})
+        try:
+            log(f"🚫 ORDER OWNERSHIP BLOCK | {reason} | symbol={symbol} side={side}")
+        except Exception:
+            print(f"[ORDER OWNERSHIP BLOCK] {reason}", flush=True)
+        return False, reason, clean
+    return True, "owned_order", clean
+
+
+def filter_owned_alpaca_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [o for o in (orders or []) if is_owned_client_order_id(o.get("client_order_id"))]
+
+
+def find_foreign_alpaca_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not globals().get("ORDER_OWNERSHIP_LOCK", True):
+        return []
+    return [o for o in (orders or []) if not is_owned_client_order_id(o.get("client_order_id"))]
+
+
+def cancel_foreign_alpaca_open_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cancelled = []
+    if not (globals().get("ORDER_OWNERSHIP_LOCK", True) and globals().get("ORDER_OWNERSHIP_CANCEL_FOREIGN_OPEN_ORDERS", True)):
+        return cancelled
+    for o in find_foreign_alpaca_orders(orders):
+        oid = str(o.get("id") or "").strip()
+        if not oid:
+            continue
+        try:
+            r = requests.delete(f"{ALPACA_BASE_URL}/v2/orders/{oid}", headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
+            cancelled.append({"id": oid, "status_code": getattr(r, "status_code", None), "client_order_id": o.get("client_order_id"), "symbol": o.get("symbol")})
+            ownership_audit("cancel_foreign_open_order", cancelled[-1])
+        except Exception as e:
+            ownership_audit("cancel_foreign_open_order_failed", {"id": oid, "error": str(e), "order": o})
+    return cancelled
+
+
+# =========================================================
 # ALPACA HELPERS
 # =========================================================
 def alpaca_ready() -> bool:
@@ -5384,7 +5495,17 @@ def alpaca_get(path: str, params: Optional[Dict[str, Any]] = None):
 
 
 def alpaca_post(path: str, payload: Dict[str, Any]):
-    return requests.post(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), json=payload, timeout=ALPACA_ORDER_TIMEOUT)
+    outbound_payload = dict(payload or {})
+    if str(path).rstrip("/").endswith("/orders"):
+        ok, reason, outbound_payload = ensure_owned_order_payload(outbound_payload, context="alpaca_post")
+        if not ok:
+            class OwnershipBlockedResponse:
+                status_code = 403
+                text = json.dumps({"error": reason, "payload": outbound_payload}, default=str)
+                def json(self):
+                    return {"error": reason, "payload": outbound_payload}
+            return OwnershipBlockedResponse()
+    return requests.post(f"{ALPACA_BASE_URL}{path}", headers=alpaca_headers(), json=outbound_payload, timeout=ALPACA_ORDER_TIMEOUT)
 
 def one_trade_today_key() -> str:
     return datetime.now().strftime("%Y-%m-%d")
@@ -5824,7 +5945,7 @@ def alpaca_submit_equity_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     if qty <= 0:
         qty = max(1, ALPACA_EQUITY_ORDER_QTY)
 
-    client_order_id = f"ubt-paper-{ticker}-{direction}-{int(time.time())}"
+    client_order_id = make_owned_client_order_id("paper", ticker, direction)
     payload = {
         "symbol": ticker,
         "qty": str(qty),
@@ -6850,7 +6971,7 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
         else:
             payload.pop("limit_price", None)
 
-        payload["client_order_id"] = f"ubt-smart-{smart_exec_signal_key(signal, selected).replace(':','-')[:36]}-{int(time.time())}-{attempt}"
+        payload["client_order_id"] = make_owned_client_order_id("smart", smart_exec_signal_key(signal, selected), attempt)
 
         debug(f"🚀 SMART EXEC SEND | attempt={attempt} type={payload.get('type')} limit={payload.get('limit_price')} reason={plan.get('reason')}")
 
@@ -6942,7 +7063,7 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "side": "buy",
         "type": order_type,
         "time_in_force": ALPACA_OPTION_TIME_IN_FORCE,
-        "client_order_id": f"ubt-opt-{symbol}-{int(time.time())}"[:48],
+        "client_order_id": make_owned_client_order_id("opt", symbol),
     }
     ask = safe_float(details.get("ask"), 0.0)
     if order_type == "limit":
@@ -7060,8 +7181,7 @@ def alpaca_submit_order(symbol: str, qty: int, side: str, order_type: str = "mar
         log("❌ Alpaca not configured")
         return None
     payload = {"symbol": symbol, "qty": str(int(qty)), "side": side, "type": order_type, "time_in_force": tif}
-    if client_order_id:
-        payload["client_order_id"] = client_order_id
+    payload["client_order_id"] = client_order_id or make_owned_client_order_id("direct", symbol, side)
     if order_type == "limit" and limit_price is not None:
         payload["limit_price"] = str(limit_price)
     try:
@@ -7086,7 +7206,7 @@ def alpaca_close_position_market(symbol: str, qty: Optional[int] = None) -> Opti
     if open_qty <= 0:
         return None
     sell_qty = open_qty if qty is None else min(open_qty, int(qty))
-    return alpaca_submit_order(symbol=symbol, qty=sell_qty, side="sell", order_type="market", tif="day", client_order_id=f"ub-close-{symbol}-{epoch()}")
+    return alpaca_submit_order(symbol=symbol, qty=sell_qty, side="sell", order_type="market", tif="day", client_order_id=make_owned_client_order_id("close", symbol))
 
 
 def get_account_equity() -> float:
@@ -8960,10 +9080,23 @@ def build_boot_reconciliation_report() -> Dict[str, Any]:
 
     broker_symbols = {str(p.get("symbol", "")).strip() for p in broker_positions if str(p.get("symbol", "")).strip()}
     local_live_symbols = {str(p.get("symbol", "")).strip() for p in local_open_positions if p.get("mode") == "LIVE"}
-    broker_order_ids = {str(o.get("id", "")).strip() for o in broker_orders if str(o.get("id", "")).strip()}
+    foreign_broker_orders = find_foreign_alpaca_orders(broker_orders)
+    cancelled_foreign_orders = cancel_foreign_alpaca_open_orders(foreign_broker_orders)
+    owned_broker_orders = filter_owned_alpaca_orders(broker_orders)
+
+    broker_order_ids = {str(o.get("id", "")).strip() for o in owned_broker_orders if str(o.get("id", "")).strip()}
     local_broker_order_ids = {str(o.get("broker_order_id", "")).strip() for o in local_pending_orders if str(o.get("broker_order_id", "")).strip()}
 
     mismatches = []
+    if ORDER_OWNERSHIP_LOCK and foreign_broker_orders and ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_OPEN_ORDERS:
+        for fo in foreign_broker_orders[:10]:
+            mismatches.append(f"foreign/old bot open order detected: {fo.get('symbol')} cid={fo.get('client_order_id') or 'NONE'} id={fo.get('id')}")
+
+    if ORDER_OWNERSHIP_LOCK and ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_POSITIONS:
+        for lp in local_open_positions:
+            cid = lp.get("client_order_id") or lp.get("order", {}).get("client_order_id") or lp.get("entry_client_order_id")
+            if cid and not is_owned_client_order_id(cid):
+                mismatches.append(f"local position not owned by this bot: {lp.get('symbol')} cid={cid}")
     for sym in sorted(broker_symbols - local_live_symbols):
         mismatches.append(f"broker position exists but local live position missing: {sym}")
     for sym in sorted(local_live_symbols - broker_symbols):
@@ -8979,6 +9112,10 @@ def build_boot_reconciliation_report() -> Dict[str, Any]:
         "safe_to_trade": safe_to_trade,
         "broker_position_count": len(broker_positions),
         "broker_open_order_count": len(broker_orders),
+        "owned_broker_open_order_count": len(owned_broker_orders),
+        "foreign_broker_open_order_count": len(foreign_broker_orders),
+        "cancelled_foreign_open_orders": cancelled_foreign_orders,
+        "order_ownership_prefix": ORDER_OWNERSHIP_CLIENT_PREFIX,
         "local_open_position_count": len(local_open_positions),
         "local_pending_order_count": len(local_pending_orders),
         "mismatches": mismatches,
@@ -18708,7 +18845,7 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
                 payload["limit_price"] = str(plan["limit_price"])
             else:
                 payload.pop("limit_price", None)
-            payload["client_order_id"] = f"ubt-smart-{smart_exec_signal_key(sig, sel).replace(':','-')[:30]}-{int(time.time())}-{attempt}"[:48]
+            payload["client_order_id"] = make_owned_client_order_id("smart", smart_exec_signal_key(sig, sel), attempt)
             return payload
 
         result = authorize_and_route_order("new_entry", signal, selected, qty, notional, smart_exec_alpaca_submit_order, _builder)
