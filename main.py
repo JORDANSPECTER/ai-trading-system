@@ -37,6 +37,7 @@ print("[TEMP ALLOCATOR TEST OVERRIDES ACTIVE] FORCE_REGIME_ALLOW=true symbols=QQ
 os.environ["REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION"] = "true"
 os.environ["BLOCK_DIRECT_AI_SIGNAL_EXECUTION"] = "true"
 print("[ALLOCATOR EXECUTION WIRING TEST ACTIVE] only allocator-selected candidates can reach execution", flush=True)
+print("[ALLOCATOR HARD BLOCK ACTIVE] ai_signal.json cannot execute unless source=multi_candidate_allocator", flush=True)
 
 try:
     import websocket  # pip package: websocket-client
@@ -2541,6 +2542,29 @@ def allocator_guard_before_execution(signal: Dict[str, Any], context: str = "sig
     except Exception:
         pass
     return ok
+
+
+def allocator_hard_block_response(signal: Dict[str, Any], context: str = "execution") -> Dict[str, Any]:
+    ok, reason = allocator_selected_signal_ok(signal if isinstance(signal, dict) else {})
+    try:
+        debug(f"🧱 ALLOCATOR HARD EXECUTION BLOCK | context={context} | reason={reason} | source={(signal or {}).get('source') if isinstance(signal, dict) else None} | ticker={(signal or {}).get('ticker') if isinstance(signal, dict) else None}")
+        if "portfolio_allocator_event" in globals():
+            portfolio_allocator_event("hard_execution_block", {"context": context, "reason": reason, "signal": signal if isinstance(signal, dict) else {}})
+    except Exception:
+        pass
+    return {"executed": False, "submitted": False, "approved": False, "reason": f"allocator_hard_block:{reason}", "context": context}
+
+def allocator_require_or_block(signal: Dict[str, Any], context: str = "execution") -> Tuple[bool, Dict[str, Any]]:
+    if not REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION:
+        return True, {"reason": "allocator_required_disabled"}
+    ok, reason = allocator_selected_signal_ok(signal if isinstance(signal, dict) else {})
+    if ok:
+        try:
+            debug(f"✅ ALLOCATOR EXECUTION GUARD PASS | context={context} | {reason} | ticker={(signal or {}).get('ticker') if isinstance(signal, dict) else None}")
+        except Exception:
+            pass
+        return True, {"reason": reason}
+    return False, allocator_hard_block_response(signal if isinstance(signal, dict) else {}, context=context)
 # Use for testing execution pipeline only. Keep false for live production.
 # =========================================================
 ALLOW_DUPLICATE_SIGNALS = os.getenv("ALLOW_DUPLICATE_SIGNALS", "true").lower() == "true"
@@ -5619,7 +5643,7 @@ def atomic_write_json(path: str, data: Any) -> bool:
         os.makedirs(directory, exist_ok=True)
         tmp_fd, tmp_path = tempfile.mkstemp(prefix=f".{base}.", suffix=".tmp", dir=directory)
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, default=str)
             f.flush()
             os.fsync(f.fileno())
         if file_exists(path):
@@ -6796,6 +6820,9 @@ def one_trade_dynamic_qty(details: Dict[str, Any], requested_qty: int, is_scale:
     return int(qty), reason
 
 def alpaca_submit_equity_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
+    _allocator_ok, _allocator_block = allocator_require_or_block(signal, context="alpaca_submit_equity_paper_order")
+    if not _allocator_ok:
+        return _allocator_block
     """Submit a real Alpaca PAPER equity order so it appears in the Alpaca dashboard."""
     if not ENABLE_ALPACA or not USE_ALPACA_PAPER or PAPER_BROKER_MODE != "alpaca":
         return {"submitted": False, "reason": "alpaca_paper_routing_disabled"}
@@ -7896,6 +7923,9 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
 
 def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Submit a real Alpaca PAPER option order with institutional contract selection."""
+    _allocator_ok, _allocator_block = allocator_require_or_block(signal, context="alpaca_submit_option_paper_order")
+    if not _allocator_ok:
+        return _allocator_block
     if not ENABLE_ALPACA or not USE_ALPACA_PAPER or PAPER_BROKER_MODE != "alpaca":
         return {"submitted": False, "reason": "alpaca_options_paper_routing_disabled"}
     if not ALPACA_ENABLE_OPTIONS:
@@ -18007,6 +18037,10 @@ def idem_bypass_result_if_approved(signal: Dict[str, Any], result: Dict[str, Any
 
 def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
+    _allocator_ok, _allocator_block = allocator_require_or_block(signal, context="paper_broker_bridge_execute")
+    if not _allocator_ok:
+        return _allocator_block
+
     # Unified decision pre-check. Option route runs a second pass with selected contract.
     if ENABLE_UNIFIED_DECISION_ENGINE:
         pre_decision = evaluate_trade_opportunity(signal, None)
@@ -18496,6 +18530,11 @@ def handle_new_signal(signal: Dict[str, Any]):
     if not signal:
         debug("handle_new_signal skipped: empty signal")
         return None
+
+    # FINAL ALLOCATOR HARD BLOCK: old/direct ai_signal.json routes stop here.
+    _allocator_ok, _allocator_block = allocator_require_or_block(signal, context="handle_new_signal_entry")
+    if not _allocator_ok:
+        return _allocator_block
 
     # =========================================================
     # PHASE 1 CANONICAL TRACE + STATE VISIBILITY
@@ -20870,6 +20909,9 @@ except Exception:
     _ORIG_paper_broker_bridge_execute = None
 
 def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
+    _allocator_ok, _allocator_block = allocator_require_or_block(signal, context="paper_broker_bridge_execute_wrapper")
+    if not _allocator_ok:
+        return _allocator_block
     if _ORIG_paper_broker_bridge_execute is None:
         return {"executed": False, "reason": "paper_bridge_missing"}
 
