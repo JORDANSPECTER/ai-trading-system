@@ -7,11 +7,20 @@ import hashlib
 import tempfile
 import traceback
 import re
+import threading
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
+
+try:
+    import websocket  # pip package: websocket-client
+    WEBSOCKET_CLIENT_AVAILABLE = True
+except Exception as _websocket_import_error:
+    websocket = None
+    WEBSOCKET_CLIENT_AVAILABLE = False
+    print(f"[WEBSOCKET IMPORT WARNING] websocket-client unavailable: {_websocket_import_error}", flush=True)
 
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
@@ -25,6 +34,7 @@ print("[ALPACA EXECUTION RELIABILITY PATCH ACTIVE] reliable order routing + conf
 print("[IDEMPOTENCY EXECUTION BYPASS ACTIVE] approved trades bypass stale replay blocks", flush=True)
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
+print("[TWELVE DATA WEBSOCKET PATCH ACTIVE] real-time-ready market feed enabled", flush=True)
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
@@ -359,6 +369,20 @@ TWELVE_DATA_PREPOST = os.getenv("TWELVE_DATA_PREPOST", "true").lower() == "true"
 MARKET_DATA_PREMARKET_FALLBACK_MODE = os.getenv("MARKET_DATA_PREMARKET_FALLBACK_MODE", "levels_or_range").strip().lower()
 MARKET_DATA_PREMARKET_FALLBACK_RANGE = float(os.getenv("MARKET_DATA_PREMARKET_FALLBACK_RANGE", "2.50"))
 MARKET_DATA_WRITE_LIVE_SNAPSHOT = os.getenv("MARKET_DATA_WRITE_LIVE_SNAPSHOT", "true").lower() == "true"
+
+# =========================================================
+# TWELVE DATA WEBSOCKET / REAL-TIME READY MARKET DATA
+# Safe defaults live inside main.py so Render ENV failures do not block deployment.
+# Only TWELVE_DATA_API_KEY must be present in Render.
+# =========================================================
+ENABLE_WEBSOCKET_MARKET_DATA = os.getenv("ENABLE_WEBSOCKET_MARKET_DATA", "true").lower() == "true"
+TWELVE_WS_SYMBOLS = os.getenv("TWELVE_WS_SYMBOLS", "QQQ,SPY,USO").strip()
+TWELVE_WS_URL = os.getenv("TWELVE_WS_URL", "wss://ws.twelvedata.com/v1/quotes/price").strip()
+TWELVE_WS_RECONNECT_SECONDS = int(float(os.getenv("TWELVE_WS_RECONNECT_SECONDS", "5")))
+TWELVE_WS_WRITE_EACH_TICK = os.getenv("TWELVE_WS_WRITE_EACH_TICK", "true").lower() == "true"
+TWELVE_WS_HEARTBEAT_SECONDS = int(float(os.getenv("TWELVE_WS_HEARTBEAT_SECONDS", "30")))
+TWELVE_WS_STATUS_FILE = os.getenv("TWELVE_WS_STATUS_FILE", "websocket_status.json").strip()
+
 AUTO_MANAGE_POSITIONS = os.getenv("AUTO_MANAGE_POSITIONS", "true").lower() == "true"
 AUTO_TP_ENABLED = os.getenv("AUTO_TP_ENABLED", "true").lower() == "true"
 AUTO_TRAILING_STOP_ENABLED = os.getenv("AUTO_TRAILING_STOP_ENABLED", "true").lower() == "true"
@@ -4405,6 +4429,12 @@ DIRTY_ORDERS = False
 DIRTY_RECON = False
 DIRTY_MACRO = False
 MARKET_PRICE_CACHE = {}
+TWELVE_WS_THREAD = None
+TWELVE_WS_STARTED = False
+TWELVE_WS_CONNECTED = False
+TWELVE_WS_LAST_MESSAGE_TS = 0
+TWELVE_WS_LAST_ERROR = ""
+TWELVE_WS_LOCK = threading.RLock()
 
 
 # =========================================================
@@ -8977,6 +9007,235 @@ def startup_reconcile_and_gate():
 # =========================================================
 # STEP 8 MARKET PRICE FEED / LIVE POSITION PRICE UPDATES
 # =========================================================
+
+# =========================================================
+# TWELVE DATA WEBSOCKET MARKET FEED
+# Real-time-ready layer. It starts a background WebSocket thread, keeps
+# MARKET_PRICE_CACHE hot, and writes market_prices.json so the rest of
+# your engine can keep using the same price router without a rebuild.
+# =========================================================
+def twelve_ws_symbol_list() -> List[str]:
+    symbols: List[str] = []
+    raw = TWELVE_WS_SYMBOLS or "QQQ,SPY,USO"
+    for part in str(raw).replace(";", ",").split(","):
+        sym = str(part or "").strip().upper()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+    return symbols
+
+
+def twelve_ws_status_payload(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    last_ts = safe_int(globals().get("TWELVE_WS_LAST_MESSAGE_TS", 0), 0)
+    payload = {
+        "enabled": bool(ENABLE_WEBSOCKET_MARKET_DATA),
+        "available": bool(WEBSOCKET_CLIENT_AVAILABLE),
+        "connected": bool(globals().get("TWELVE_WS_CONNECTED", False)),
+        "started": bool(globals().get("TWELVE_WS_STARTED", False)),
+        "last_message_ts": last_ts,
+        "last_message_age_seconds": max(0, epoch() - last_ts) if last_ts else None,
+        "last_error": str(globals().get("TWELVE_WS_LAST_ERROR", "")),
+        "symbols": twelve_ws_symbol_list(),
+        "updated_at": epoch(),
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+    return payload
+
+
+def twelve_ws_write_status(extra: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        if TWELVE_WS_STATUS_FILE:
+            atomic_write_json(TWELVE_WS_STATUS_FILE, twelve_ws_status_payload(extra))
+    except Exception as e:
+        try:
+            debug(f"TWELVE WS STATUS WRITE FAILED | {e}")
+        except Exception:
+            pass
+
+
+def twelve_ws_extract_tick(payload: Any) -> Tuple[str, float, int]:
+    if not isinstance(payload, dict):
+        return "", 0.0, 0
+    event = str(payload.get("event") or payload.get("type") or "").lower()
+    if event in {"heartbeat", "subscribe-status", "status", "connected"}:
+        return "", 0.0, 0
+    symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("s") or "").strip().upper()
+    price = safe_float(payload.get("price", payload.get("last", payload.get("close", payload.get("p", payload.get("value", 0))))), 0.0)
+    ts = safe_int(payload.get("timestamp", payload.get("ts", payload.get("time", 0))), 0)
+    if ts > 10000000000:
+        ts = int(ts / 1000)
+    if ts <= 0:
+        ts = epoch()
+    return symbol, price, ts
+
+
+def twelve_ws_merge_tick(symbol: str, price: float, ts: Optional[int] = None, raw: Optional[Dict[str, Any]] = None) -> None:
+    if not symbol or price <= 0:
+        return
+    sym = str(symbol).upper().strip()
+    tick_ts = safe_int(ts, 0) or epoch()
+    with TWELVE_WS_LOCK:
+        existing = MARKET_PRICE_CACHE.get(sym, {}) if isinstance(MARKET_PRICE_CACHE.get(sym, {}), dict) else {}
+        snapshot = deepcopy(existing)
+        snapshot.update({
+            "price": round(float(price), 6),
+            "last": round(float(price), 6),
+            "timestamp": tick_ts,
+            "price_updated_at": tick_ts,
+            "source": "twelvedata_websocket",
+            "websocket": True,
+        })
+        if isinstance(raw, dict):
+            snapshot["raw_event"] = str(raw.get("event") or raw.get("type") or "price")[:60]
+        MARKET_PRICE_CACHE[sym] = snapshot
+        globals()["TWELVE_WS_LAST_MESSAGE_TS"] = epoch()
+
+    if TWELVE_WS_WRITE_EACH_TICK and MARKET_DATA_FILE:
+        try:
+            current = load_json_file(MARKET_DATA_FILE, {})
+            if not isinstance(current, dict):
+                current = {}
+            current[sym] = snapshot
+            current["__updated_at"] = epoch()
+            current["__freshness_source"] = "twelvedata_websocket"
+            current["__max_age_seconds"] = MARKET_DATA_STALE_SECONDS
+            atomic_write_json(MARKET_DATA_FILE, current)
+        except Exception as e:
+            try:
+                debug(f"TWELVE WS MARKET FILE WRITE FAILED | {e}")
+            except Exception:
+                pass
+
+
+def twelve_ws_is_fresh(symbol: str) -> bool:
+    try:
+        sym = str(symbol or "").upper().strip()
+        item = MARKET_PRICE_CACHE.get(sym, {})
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("source", "")).lower() != "twelvedata_websocket":
+            return False
+        ts = safe_int(item.get("timestamp", item.get("price_updated_at", 0)), 0)
+        return safe_float(item.get("price", 0), 0) > 0 and ts > 0 and (epoch() - ts) <= MARKET_DATA_STALE_SECONDS
+    except Exception:
+        return False
+
+
+def twelve_ws_get_snapshot(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip()
+    if not sym or not twelve_ws_is_fresh(sym):
+        return {}
+    with TWELVE_WS_LOCK:
+        return deepcopy(MARKET_PRICE_CACHE.get(sym, {}))
+
+
+def twelve_ws_on_open(ws) -> None:
+    try:
+        globals()["TWELVE_WS_CONNECTED"] = True
+        globals()["TWELVE_WS_LAST_ERROR"] = ""
+        symbols = ",".join(twelve_ws_symbol_list())
+        subscribe_msg = {"action": "subscribe", "params": {"symbols": symbols}}
+        ws.send(json.dumps(subscribe_msg))
+        twelve_ws_write_status({"event": "open", "subscribed_symbols": symbols})
+        debug(f"✅ TWELVE WS CONNECTED | subscribed={symbols}")
+    except Exception as e:
+        globals()["TWELVE_WS_LAST_ERROR"] = str(e)
+        twelve_ws_write_status({"event": "open_error", "error": str(e)})
+
+
+def twelve_ws_on_message(ws, message: str) -> None:
+    try:
+        data = json.loads(message) if isinstance(message, str) else message
+        if isinstance(data, list):
+            for item in data:
+                symbol, price, ts = twelve_ws_extract_tick(item)
+                if symbol and price > 0:
+                    twelve_ws_merge_tick(symbol, price, ts, item if isinstance(item, dict) else {})
+            return
+        symbol, price, ts = twelve_ws_extract_tick(data)
+        if symbol and price > 0:
+            twelve_ws_merge_tick(symbol, price, ts, data if isinstance(data, dict) else {})
+    except Exception as e:
+        globals()["TWELVE_WS_LAST_ERROR"] = str(e)
+        try:
+            debug(f"TWELVE WS MESSAGE ERROR | {e} | raw={str(message)[:200]}")
+        except Exception:
+            pass
+
+
+def twelve_ws_on_error(ws, error) -> None:
+    globals()["TWELVE_WS_CONNECTED"] = False
+    globals()["TWELVE_WS_LAST_ERROR"] = str(error)
+    twelve_ws_write_status({"event": "error", "error": str(error)})
+    try:
+        debug(f"❌ TWELVE WS ERROR | {error}")
+    except Exception:
+        pass
+
+
+def twelve_ws_on_close(ws, close_status_code, close_msg) -> None:
+    globals()["TWELVE_WS_CONNECTED"] = False
+    twelve_ws_write_status({"event": "close", "code": close_status_code, "message": close_msg})
+    try:
+        debug(f"⚠️ TWELVE WS CLOSED | code={close_status_code} msg={close_msg}")
+    except Exception:
+        pass
+
+
+def twelve_ws_worker() -> None:
+    while True:
+        try:
+            if not ENABLE_WEBSOCKET_MARKET_DATA:
+                twelve_ws_write_status({"event": "disabled"})
+                return
+            if not WEBSOCKET_CLIENT_AVAILABLE or websocket is None:
+                globals()["TWELVE_WS_LAST_ERROR"] = "websocket-client package missing"
+                twelve_ws_write_status({"event": "missing_dependency"})
+                return
+            if not TWELVE_DATA_API_KEY:
+                globals()["TWELVE_WS_LAST_ERROR"] = "TWELVE_DATA_API_KEY missing"
+                twelve_ws_write_status({"event": "missing_api_key"})
+                time.sleep(max(10, TWELVE_WS_RECONNECT_SECONDS))
+                continue
+
+            url = f"{TWELVE_WS_URL}?apikey={TWELVE_DATA_API_KEY}"
+            app = websocket.WebSocketApp(url, on_open=twelve_ws_on_open, on_message=twelve_ws_on_message, on_error=twelve_ws_on_error, on_close=twelve_ws_on_close)
+            twelve_ws_write_status({"event": "connecting"})
+            app.run_forever(ping_interval=max(10, TWELVE_WS_HEARTBEAT_SECONDS), ping_timeout=5)
+        except Exception as e:
+            globals()["TWELVE_WS_CONNECTED"] = False
+            globals()["TWELVE_WS_LAST_ERROR"] = str(e)
+            twelve_ws_write_status({"event": "worker_exception", "error": str(e)})
+            try:
+                debug(f"TWELVE WS WORKER EXCEPTION | {e}")
+            except Exception:
+                pass
+        time.sleep(max(1, TWELVE_WS_RECONNECT_SECONDS))
+
+
+def start_twelve_websocket_feed() -> bool:
+    try:
+        if not ENABLE_WEBSOCKET_MARKET_DATA:
+            return False
+        if globals().get("TWELVE_WS_STARTED", False):
+            return True
+        if not WEBSOCKET_CLIENT_AVAILABLE:
+            log("⚠️ websocket-client missing. Add websocket-client to requirements.txt")
+            twelve_ws_write_status({"event": "missing_dependency"})
+            return False
+        globals()["TWELVE_WS_STARTED"] = True
+        thread = threading.Thread(target=twelve_ws_worker, name="twelve-data-websocket", daemon=True)
+        globals()["TWELVE_WS_THREAD"] = thread
+        thread.start()
+        debug(f"TWELVE WS THREAD STARTED | symbols={','.join(twelve_ws_symbol_list())}")
+        twelve_ws_write_status({"event": "thread_started"})
+        return True
+    except Exception as e:
+        globals()["TWELVE_WS_STARTED"] = False
+        globals()["TWELVE_WS_LAST_ERROR"] = str(e)
+        log(f"❌ TWELVE WS START FAILED: {e}")
+        return False
+
 def refresh_market_data_file_metadata() -> bool:
     """Stamp MARKET_DATA_FILE prices with explicit freshness timestamps.
 
@@ -9057,6 +9316,11 @@ def load_market_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     if not ENABLE_MARKET_DATA:
         return {}
+
+    try:
+        start_twelve_websocket_feed()
+    except Exception as e:
+        debug(f"TWELVE WS START CHECK FAILED | {e}")
 
     refresh_market_data_file_metadata()
 
@@ -9577,6 +9841,15 @@ def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
     if is_option_contract_symbol(symbol):
         debug(f"Skipping live stock quote lookup for option contract symbol: {symbol}")
         return {}
+
+    try:
+        start_twelve_websocket_feed()
+        ws_snapshot = twelve_ws_get_snapshot(symbol)
+        if ws_snapshot:
+            debug(f"Using Twelve Data WS snapshot for {symbol}: price={ws_snapshot.get('price')} age={epoch() - safe_int(ws_snapshot.get('timestamp', 0), 0)}s")
+            return ws_snapshot
+    except Exception as e:
+        debug(f"TWELVE WS SNAPSHOT CHECK FAILED | {symbol} | {e}")
 
     cached = cache_get_market_snapshot(symbol)
     if cached:
@@ -18600,6 +18873,14 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main_loop():
+    try:
+        start_twelve_websocket_feed()
+    except Exception as e:
+        try:
+            debug(f"TWELVE WS STARTUP ERROR | {e}")
+        except Exception:
+            pass
+
     try:
         debug_alpaca_urls_once()
     except Exception:
