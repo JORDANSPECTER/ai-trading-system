@@ -19436,6 +19436,258 @@ def maybe_send_daily_alpaca_bot_report(force: bool = False) -> Optional[Dict[str
     return report
 
 
+# =========================================================
+# 9:25 AM ET PRE-MARKET ELITE READINESS CHECK
+# Blocks trading before market open unless the full live stack is clean.
+# =========================================================
+ENABLE_PREMARKET_ELITE_READINESS_CHECK = os.getenv("ENABLE_PREMARKET_ELITE_READINESS_CHECK", "true").lower() == "true"
+PREMARKET_READINESS_TIME_HHMM = os.getenv("PREMARKET_READINESS_TIME_HHMM", "09:25").strip()
+PREMARKET_READINESS_TIMEZONE = os.getenv("PREMARKET_READINESS_TIMEZONE", "America/New_York").strip()
+PREMARKET_READINESS_BLOCK_TRADING_ON_FAIL = os.getenv("PREMARKET_READINESS_BLOCK_TRADING_ON_FAIL", "true").lower() == "true"
+PREMARKET_READINESS_SEND_TO_TELEGRAM = os.getenv("PREMARKET_READINESS_SEND_TO_TELEGRAM", "true").lower() == "true"
+PREMARKET_READINESS_SEND_TO_DISCORD = os.getenv("PREMARKET_READINESS_SEND_TO_DISCORD", "true").lower() == "true"
+PREMARKET_READINESS_FILE = os.getenv("PREMARKET_READINESS_FILE", "premarket_elite_readiness.json").strip()
+PREMARKET_READINESS_REQUIRED_SYMBOLS = [x.strip().upper() for x in os.getenv("PREMARKET_READINESS_REQUIRED_SYMBOLS", "QQQ,SPY,USO").split(",") if x.strip()]
+PREMARKET_READINESS_MAX_MARKET_AGE_SECONDS = int(float(os.getenv("PREMARKET_READINESS_MAX_MARKET_AGE_SECONDS", str(MARKET_DATA_STALE_SECONDS))))
+PREMARKET_READINESS_MACRO_MAX_AGE_SECONDS = int(float(os.getenv("PREMARKET_READINESS_MACRO_MAX_AGE_SECONDS", "86400")))
+
+
+def _premarket_now_et():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(PREMARKET_READINESS_TIMEZONE))
+    except Exception:
+        return datetime.now()
+
+
+def premarket_elite_readiness_due() -> bool:
+    if not ENABLE_PREMARKET_ELITE_READINESS_CHECK:
+        return False
+    now_et = _premarket_now_et()
+    today = now_et.date().isoformat()
+    try:
+        hh, mm = PREMARKET_READINESS_TIME_HHMM.split(":", 1)
+        target = now_et.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except Exception:
+        target = now_et.replace(hour=9, minute=25, second=0, microsecond=0)
+    try:
+        ensure_globals_initialized()
+        if str(GLOBAL_STATE.get("last_premarket_elite_readiness_date", "")) == today:
+            return False
+    except Exception:
+        pass
+    return now_et >= target
+
+
+def _readiness_pass(name: str, ok: bool, detail: str = "") -> Dict[str, Any]:
+    return {"name": name, "ok": bool(ok), "detail": str(detail or "")}
+
+
+def _readiness_fetch_alpaca_open_orders() -> List[Dict[str, Any]]:
+    try:
+        url = alpaca_endpoint("/orders") + "?status=open&limit=100&nested=false"
+        r = requests.get(url, headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
+        body = r.json() if getattr(r, "text", "") else []
+        return body if isinstance(body, list) else []
+    except Exception:
+        return []
+
+
+def _readiness_fetch_alpaca_positions() -> List[Dict[str, Any]]:
+    try:
+        url = alpaca_endpoint("/positions")
+        r = requests.get(url, headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
+        body = r.json() if getattr(r, "text", "") else []
+        return body if isinstance(body, list) else []
+    except Exception:
+        return []
+
+
+def _readiness_market_data_status() -> Tuple[bool, str]:
+    try:
+        if not os.path.exists(MARKET_DATA_FILE):
+            return False, f"missing {MARKET_DATA_FILE}"
+        file_age = max(0, int(time.time() - os.path.getmtime(MARKET_DATA_FILE)))
+        data = load_json_file(MARKET_DATA_FILE, {}) if 'load_json_file' in globals() else {}
+        missing = []
+        stale = []
+        for sym in PREMARKET_READINESS_REQUIRED_SYMBOLS:
+            item = None
+            if isinstance(data, dict):
+                item = data.get(sym) or data.get(sym.lower())
+                if item is None and isinstance(data.get("prices"), dict):
+                    item = data.get("prices", {}).get(sym) or data.get("prices", {}).get(sym.lower())
+            if not item:
+                missing.append(sym)
+                continue
+            ts = None
+            if isinstance(item, dict):
+                ts = item.get("ts") or item.get("timestamp") or item.get("updated_at_ts") or item.get("price_updated_at_ts")
+            age = file_age
+            try:
+                if ts:
+                    age = max(0, int(time.time() - float(ts)))
+            except Exception:
+                age = file_age
+            if age > PREMARKET_READINESS_MAX_MARKET_AGE_SECONDS:
+                stale.append(f"{sym}:{age}s")
+        ok = file_age <= PREMARKET_READINESS_MAX_MARKET_AGE_SECONDS and not missing and not stale
+        detail = f"file_age={file_age}s required={','.join(PREMARKET_READINESS_REQUIRED_SYMBOLS)}"
+        if missing:
+            detail += f" missing={','.join(missing)}"
+        if stale:
+            detail += f" stale={','.join(stale)}"
+        return ok, detail
+    except Exception as e:
+        return False, f"market_check_error:{e}"
+
+
+def _readiness_macro_status() -> Tuple[bool, str]:
+    try:
+        if not ENABLE_MACRO_BRIDGE:
+            return True, "macro bridge disabled"
+        if not os.path.exists(MACRO_FILE):
+            return False, f"missing {MACRO_FILE}"
+        age = max(0, int(time.time() - os.path.getmtime(MACRO_FILE)))
+        return age <= PREMARKET_READINESS_MACRO_MAX_AGE_SECONDS, f"macro_age={age}s file={MACRO_FILE}"
+    except Exception as e:
+        return False, f"macro_check_error:{e}"
+
+
+def build_premarket_elite_readiness_report(force: bool = False) -> Dict[str, Any]:
+    ensure_globals_initialized()
+    checks: List[Dict[str, Any]] = []
+    account_ok = False
+    account_detail = "not checked"
+    try:
+        if not alpaca_ready():
+            account_detail = "missing Alpaca API env keys/base url"
+        else:
+            r = requests.get(alpaca_endpoint("/account"), headers=alpaca_headers(), timeout=ALPACA_ORDER_TIMEOUT)
+            account_ok = r.status_code < 300
+            account_detail = f"status={r.status_code}"
+    except Exception as e:
+        account_detail = f"account_error:{e}"
+    checks.append(_readiness_pass("Alpaca connected", account_ok, account_detail))
+
+    open_orders = _readiness_fetch_alpaca_open_orders() if account_ok else []
+    foreign_orders = find_foreign_alpaca_orders(open_orders) if 'find_foreign_alpaca_orders' in globals() else []
+    cancelled_foreign = cancel_foreign_alpaca_open_orders(foreign_orders) if foreign_orders and 'cancel_foreign_alpaca_open_orders' in globals() else []
+    checks.append(_readiness_pass("No foreign open orders", len(foreign_orders) == 0, f"foreign={len(foreign_orders)} cancelled={len(cancelled_foreign)}"))
+
+    broker_positions = _readiness_fetch_alpaca_positions() if account_ok else []
+    try:
+        local_open = (GLOBAL_POSITIONS or {}).get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+    except Exception:
+        local_open = []
+    foreign_positions = find_foreign_alpaca_positions(broker_positions, local_open) if 'find_foreign_alpaca_positions' in globals() else []
+    auto_closed = auto_close_foreign_alpaca_positions(broker_positions, local_open, reason="premarket_readiness") if foreign_positions and 'auto_close_foreign_alpaca_positions' in globals() else []
+    checks.append(_readiness_pass("No foreign positions", len(foreign_positions) == 0, f"foreign={len(foreign_positions)} auto_close_submitted={len(auto_closed)}"))
+
+    market_ok, market_detail = _readiness_market_data_status()
+    checks.append(_readiness_pass("Live market data fresh", market_ok, market_detail))
+    macro_ok, macro_detail = _readiness_macro_status()
+    checks.append(_readiness_pass("Macro/oil snapshot loaded", macro_ok, macro_detail))
+
+    kill_active = bool(GLOBAL_STATE.get("kill_switch", False)) or bool(globals().get("KILL_SWITCH", False))
+    paused = bool(GLOBAL_STATE.get("bot_paused", False)) or bool(globals().get("BOT_PAUSED", False))
+    checks.append(_readiness_pass("Kill switch off", not kill_active, f"kill_switch={kill_active}"))
+    checks.append(_readiness_pass("Bot not paused", not paused, f"bot_paused={paused}"))
+    checks.append(_readiness_pass("Ownership prefix active", bool(ORDER_OWNERSHIP_LOCK and ORDER_OWNERSHIP_CLIENT_PREFIX), f"prefix={ORDER_OWNERSHIP_CLIENT_PREFIX}"))
+    checks.append(_readiness_pass("Telegram/Discord configured", bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) or bool(DISCORD_AI_WEBHOOK), f"telegram={bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)} discord_ai={bool(DISCORD_AI_WEBHOOK)}"))
+
+    passed = all(c.get("ok") for c in checks)
+    report = {
+        "generated_at": now_ts() if 'now_ts' in globals() else datetime.now().isoformat(),
+        "generated_ts": int(time.time()),
+        "report_date": _premarket_now_et().date().isoformat(),
+        "time_hhmm": PREMARKET_READINESS_TIME_HHMM,
+        "timezone": PREMARKET_READINESS_TIMEZONE,
+        "passed": passed,
+        "checks": checks,
+        "foreign_orders": foreign_orders[:20],
+        "cancelled_foreign_orders": cancelled_foreign,
+        "foreign_positions": foreign_positions[:20],
+        "auto_closed_foreign_positions": auto_closed,
+        "block_trading_on_fail": PREMARKET_READINESS_BLOCK_TRADING_ON_FAIL,
+    }
+    try:
+        atomic_write_json(PREMARKET_READINESS_FILE, report)
+    except Exception:
+        pass
+    try:
+        GLOBAL_STATE["premarket_elite_ready"] = bool(passed)
+        GLOBAL_STATE["last_premarket_elite_readiness_status"] = "PASS" if passed else "FAIL"
+        GLOBAL_STATE["last_premarket_elite_readiness_ts"] = int(time.time())
+        if passed:
+            if not kill_active and not paused:
+                GLOBAL_STATE["allow_entries"] = True
+                GLOBAL_STATE["engine_enabled"] = True
+        else:
+            if PREMARKET_READINESS_BLOCK_TRADING_ON_FAIL:
+                GLOBAL_STATE["allow_entries"] = False
+                GLOBAL_STATE["premarket_block_reason"] = "9:25 elite readiness check failed"
+        save_state(GLOBAL_STATE)
+    except Exception:
+        pass
+    return report
+
+
+def format_premarket_elite_readiness_report(report: Dict[str, Any]) -> str:
+    status = "✅ PASS — ENGINE READY" if report.get("passed") else "🚫 FAIL — TRADING BLOCKED"
+    lines = [
+        "🧠 9:25 PRE-MARKET ELITE READINESS CHECK",
+        status,
+        f"Date: {report.get('report_date')} | Time: {report.get('time_hhmm')} {report.get('timezone')}",
+        f"Bot Prefix: {ORDER_OWNERSHIP_CLIENT_PREFIX}",
+        "",
+    ]
+    for c in report.get("checks", []):
+        icon = "✅" if c.get("ok") else "❌"
+        lines.append(f"{icon} {c.get('name')}: {c.get('detail')}")
+    if not report.get("passed") and report.get("block_trading_on_fail"):
+        lines.extend(["", "Action: New entries are blocked until the failed checks are fixed and readiness passes."])
+    lines.append(f"Generated: {report.get('generated_at')}")
+    return "\n".join(lines)
+
+
+def send_premarket_elite_readiness_report(force: bool = False) -> Dict[str, Any]:
+    report = build_premarket_elite_readiness_report(force=force)
+    msg = format_premarket_elite_readiness_report(report)
+    if PREMARKET_READINESS_SEND_TO_DISCORD:
+        try:
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+        except Exception as e:
+            try: debug(f"PREMARKET READINESS discord error: {e}")
+            except Exception: pass
+    if PREMARKET_READINESS_SEND_TO_TELEGRAM:
+        try:
+            send_to_telegram(msg)
+        except Exception as e:
+            try: debug(f"PREMARKET READINESS telegram error: {e}")
+            except Exception: pass
+    try:
+        log(f"✅ PREMARKET ELITE READINESS SENT | passed={report.get('passed')}")
+    except Exception:
+        pass
+    return report
+
+
+def maybe_send_premarket_elite_readiness_report(force: bool = False) -> Optional[Dict[str, Any]]:
+    if not ENABLE_PREMARKET_ELITE_READINESS_CHECK and not force:
+        return None
+    if not force and not premarket_elite_readiness_due():
+        return None
+    report = send_premarket_elite_readiness_report(force=force)
+    try:
+        ensure_globals_initialized()
+        GLOBAL_STATE["last_premarket_elite_readiness_date"] = report.get("report_date") or _premarket_now_et().date().isoformat()
+        GLOBAL_STATE["last_premarket_elite_readiness_ts"] = int(time.time())
+        save_state(GLOBAL_STATE)
+    except Exception:
+        pass
+    return report
+
 def main_loop():
     try:
         start_twelve_websocket_feed()
@@ -19509,6 +19761,7 @@ def main_loop():
             intel_periodic_snapshot()
             process_telegram_updates()
             maybe_send_daily_alpaca_bot_report(force=False)
+            maybe_send_premarket_elite_readiness_report(force=False)
             # PAPER TP/SL LOOP CHECK
             tpsl_loop_result = paper_tpsl_manage_positions()
             if tpsl_loop_result.get("events") or tpsl_loop_result.get("closed_count", 0) > 0:
@@ -20232,6 +20485,10 @@ def execution_score_breakdown(signal: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 if __name__ == "__main__":
+    if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
+        ensure_globals_initialized()
+        send_premarket_elite_readiness_report(force=True)
+        sys.exit(0)
     if "--macro-test" in sys.argv:
         cli_macro_test()
         sys.exit(0)
