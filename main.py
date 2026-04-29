@@ -763,7 +763,7 @@ UNIFIED_DECISION_WEAK_SCORE = int(float(os.getenv("UNIFIED_DECISION_WEAK_SCORE",
 UNIFIED_DECISION_MAX_SPREAD_PCT = float(os.getenv("UNIFIED_DECISION_MAX_SPREAD_PCT", os.getenv("ALPACA_OPTION_MAX_SPREAD_PCT", "0.18")))
 UNIFIED_DECISION_MAX_CONTRACT_MID = float(os.getenv("UNIFIED_DECISION_MAX_CONTRACT_MID", os.getenv("ALPACA_OPTION_MAX_CONTRACT_MID", "8")))
 UNIFIED_DECISION_MAX_NOTIONAL = float(os.getenv("UNIFIED_DECISION_MAX_NOTIONAL", os.getenv("ALPACA_OPTION_MAX_NOTIONAL", "800")))
-UNIFIED_DECISION_REQUIRE_QQQ_ONLY = os.getenv("UNIFIED_DECISION_REQUIRE_QQQ_ONLY", "true").lower() == "true"
+UNIFIED_DECISION_REQUIRE_QQQ_ONLY = os.getenv("UNIFIED_DECISION_REQUIRE_QQQ_ONLY", "false").lower() == "true"
 
 # =========================================================
 # INTELLIGENCE PHASE 3: ADAPTIVE INTELLIGENCE
@@ -1377,10 +1377,10 @@ def auto_debug_routing(signal=None) -> None:
 # QQQ-ONLY ENFORCEMENT + CLEAN LEARNING FILTER
 # Added to prevent SPY/fallback trades and garbage learning.
 # =========================================================
-ENABLE_QQQ_ONLY_ENFORCEMENT = os.getenv("ENABLE_QQQ_ONLY_ENFORCEMENT", "true").lower() == "true"
+ENABLE_QQQ_ONLY_ENFORCEMENT = os.getenv("ENABLE_QQQ_ONLY_ENFORCEMENT", "false").lower() == "true"
 QQQ_ONLY_ALLOWED_TICKERS = {
     t.strip().upper()
-    for t in os.getenv("QQQ_ONLY_ALLOWED_TICKERS", "QQQ").split(",")
+    for t in os.getenv("QQQ_ONLY_ALLOWED_TICKERS", "QQQ,SPY,NVDA,TSLA,AAPL,AMD,META,MSFT").split(",")
     if t.strip()
 }
 REQUIRE_VALID_TRIGGER_FOR_LEARNING = os.getenv("REQUIRE_VALID_TRIGGER_FOR_LEARNING", "true").lower() == "true"
@@ -21019,6 +21019,8 @@ def main_loop():
             maybe_send_daily_alpaca_bot_report(force=False)
             maybe_send_premarket_elite_readiness_report(force=False)
             realtime_adaptive_risk_tick(force=False)
+            portfolio_hedging_engine_tick(force=False)
+            multi_ticker_scanner_tick(force=False)
             # PAPER TP/SL LOOP CHECK
             tpsl_loop_result = paper_tpsl_manage_positions()
             if tpsl_loop_result.get("events") or tpsl_loop_result.get("closed_count", 0) > 0:
@@ -21741,6 +21743,225 @@ def execution_score_breakdown(signal: Dict[str, Any]) -> Dict[str, Any]:
             "verdict": "UNKNOWN",
         }
 
+
+# =========================================================
+# PORTFOLIO HEDGING ENGINE + MULTI-TICKER SCANNER
+# =========================================================
+ENABLE_PORTFOLIO_HEDGING_ENGINE = os.getenv("ENABLE_PORTFOLIO_HEDGING_ENGINE", "true").lower() == "true"
+PORTFOLIO_HEDGE_MODE = os.getenv("PORTFOLIO_HEDGE_MODE", "alert").lower().strip()
+PORTFOLIO_HEDGE_TICKER = os.getenv("PORTFOLIO_HEDGE_TICKER", "QQQ").upper().strip()
+PORTFOLIO_HEDGE_DRAWDOWN_PCT = float(os.getenv("PORTFOLIO_HEDGE_DRAWDOWN_PCT", "0.18"))
+PORTFOLIO_HEDGE_COOLDOWN_SECONDS = int(float(os.getenv("PORTFOLIO_HEDGE_COOLDOWN_SECONDS", "900")))
+PORTFOLIO_HEDGE_FILE = os.getenv("PORTFOLIO_HEDGE_FILE", "portfolio_hedge_state.json").strip()
+PORTFOLIO_HEDGE_LOG_FILE = os.getenv("PORTFOLIO_HEDGE_LOG_FILE", "portfolio_hedge_events.jsonl").strip()
+
+ENABLE_MULTI_TICKER_SCANNER = os.getenv("ENABLE_MULTI_TICKER_SCANNER", "true").lower() == "true"
+MULTI_TICKER_SCAN_SYMBOLS = [x.strip().upper() for x in os.getenv("MULTI_TICKER_SCAN_SYMBOLS", "QQQ,SPY,NVDA,TSLA,AAPL,AMD,META,MSFT").split(",") if x.strip()]
+MULTI_TICKER_SCAN_INTERVAL_SECONDS = int(float(os.getenv("MULTI_TICKER_SCAN_INTERVAL_SECONDS", "30")))
+MULTI_TICKER_SCAN_MIN_SCORE = float(os.getenv("MULTI_TICKER_SCAN_MIN_SCORE", "72"))
+MULTI_TICKER_SCAN_REQUIRE_NO_OPEN_POSITION = os.getenv("MULTI_TICKER_SCAN_REQUIRE_NO_OPEN_POSITION", "true").lower() == "true"
+MULTI_TICKER_SCAN_WRITE_SIGNAL = os.getenv("MULTI_TICKER_SCAN_WRITE_SIGNAL", "true").lower() == "true"
+MULTI_TICKER_SCAN_FILE = os.getenv("MULTI_TICKER_SCAN_FILE", "multi_ticker_scanner_state.json").strip()
+MULTI_TICKER_SCAN_LOG_FILE = os.getenv("MULTI_TICKER_SCAN_LOG_FILE", "multi_ticker_scanner_events.jsonl").strip()
+
+
+def _elite_write_json(path: str, data: Any) -> None:
+    try:
+        atomic_write_json(path, data)
+    except Exception:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+
+def _elite_load_json(path: str, default: Any) -> Any:
+    try:
+        return load_json_file(path, default)
+    except Exception:
+        return deepcopy(default)
+
+
+def _elite_event(path: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = {"ts": int(time.time()), "time": now_ts(), **(payload or {})}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _elite_alert(title: str, body: str) -> None:
+    msg = f"{title}\n{body}\n⏰ {now_ts()}"
+    try: send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+    except Exception: pass
+    try: send_to_telegram(msg)
+    except Exception: pass
+
+
+def scanner_snapshot(symbol: str) -> Dict[str, Any]:
+    symbol = str(symbol or "").upper().strip()
+    price = 0.0
+    try: price = safe_float(get_live_market_price(symbol), 0)
+    except Exception: price = 0.0
+    data = _elite_load_json(MARKET_DATA_FILE, {})
+    vwap = high = low = 0.0
+    try:
+        nodes = []
+        if isinstance(data, dict):
+            if isinstance(data.get(symbol), dict): nodes.append(data.get(symbol))
+            for k in ["prices", "symbols", "quotes", "data"]:
+                b = data.get(k)
+                if isinstance(b, dict) and isinstance(b.get(symbol), dict): nodes.append(b.get(symbol))
+            if str(data.get("symbol", "")).upper() == symbol: nodes.append(data)
+        for n in nodes:
+            p = safe_float(n.get("price", n.get("last", n.get("close", 0))), 0)
+            if price <= 0 and p > 0: price = p
+            vwap = safe_float(n.get("vwap", n.get("session_vwap", vwap)), vwap)
+            high = safe_float(n.get("high", n.get("day_high", high)), high)
+            low = safe_float(n.get("low", n.get("day_low", low)), low)
+    except Exception:
+        pass
+    if price > 0:
+        if vwap <= 0: vwap = price
+        if high <= 0: high = price
+        if low <= 0: low = price
+    return {"symbol": symbol, "price": price, "vwap": vwap, "high": high, "low": low}
+
+
+def multi_ticker_score_symbol(symbol: str) -> Dict[str, Any]:
+    snap = scanner_snapshot(symbol)
+    price = safe_float(snap.get("price"), 0)
+    vwap = safe_float(snap.get("vwap"), price)
+    high = safe_float(snap.get("high"), price)
+    low = safe_float(snap.get("low"), price)
+    if price <= 0:
+        return {"symbol": symbol, "score": 0, "direction": "NO_TRADE", "reasons": ["missing_price"], "snapshot": snap}
+    rng = max(high - low, price * 0.004, 0.01)
+    score = 20.0
+    reasons = []
+    if price >= vwap:
+        score += 25; reasons.append("above_vwap")
+    else:
+        score += 15; reasons.append("below_vwap")
+    if price >= high - rng * 0.25 and price >= vwap:
+        score += 35; direction = "CALL"; reasons.append("breakout_near_high")
+    elif price <= low + rng * 0.25 and price < vwap:
+        score += 35; direction = "PUT"; reasons.append("breakdown_near_low")
+    elif price >= vwap:
+        score += 15; direction = "CALL"; reasons.append("vwap_control_call")
+    else:
+        score += 15; direction = "PUT"; reasons.append("vwap_control_put")
+    try:
+        regime = str(detect_market_regime_v2(symbol).get("regime", "NORMAL")).upper()
+        snap["market_regime"] = regime
+        if regime == "TREND": score += 15; reasons.append("trend_regime")
+        elif regime == "EXPANSION": score += 10; reasons.append("expansion_regime")
+        elif regime == "CHOP": score -= 25; reasons.append("chop_penalty")
+        elif regime == "EVENT": score -= 35; reasons.append("event_penalty")
+    except Exception: pass
+    return {"symbol": symbol, "score": round(max(0, min(100, score)), 2), "direction": direction, "reasons": reasons, "snapshot": snap}
+
+
+def multi_ticker_scanner_build_signal(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    ticker = str(candidate.get("symbol") or "QQQ").upper()
+    direction = str(candidate.get("direction") or "CALL").upper()
+    snap = candidate.get("snapshot", {}) if isinstance(candidate.get("snapshot"), dict) else {}
+    price = safe_float(snap.get("price"), 0)
+    vwap = safe_float(snap.get("vwap"), price)
+    rng = max(abs(safe_float(snap.get("high"), price) - safe_float(snap.get("low"), price)), price * 0.006, 0.25)
+    stop = price + rng * 0.35 if direction == "PUT" else max(price - rng * 0.35, 0.01)
+    target = max(price - rng * 0.65, 0.01) if direction == "PUT" else price + rng * 0.65
+    sig = build_unbiased_signal(ticker=ticker, direction=direction, entry=round(price, 2), stop=round(stop, 2), target=round(target, 2), setup="multi_ticker_scanner_vwap_regime", confidence="A" if safe_float(candidate.get("score"), 0) >= 82 else "B+", key_level=round(vwap, 2), vwap=round(vwap, 2), underlying_price=round(price, 2), qty=1, notes=f"Multi-ticker scanner selected {ticker}. Score={candidate.get('score')} Reasons={', '.join(candidate.get('reasons', []))}", confirmation="scanner_vwap_regime", regime=str(snap.get("market_regime", "NORMAL")))
+    sig["source"] = "multi_ticker_scanner"
+    sig["scanner_score"] = candidate.get("score")
+    sig["scanner_reasons"] = candidate.get("reasons", [])
+    return sig
+
+
+def multi_ticker_scanner_tick(force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_MULTI_TICKER_SCANNER:
+        return {"ran": False, "reason": "disabled"}
+    state = _elite_load_json(MULTI_TICKER_SCAN_FILE, {"last_scan_ts": 0})
+    now = int(time.time())
+    if not force and now - safe_int(state.get("last_scan_ts", 0), 0) < MULTI_TICKER_SCAN_INTERVAL_SECONDS:
+        return {"ran": False, "reason": "cooldown"}
+    try:
+        ensure_globals_initialized()
+        opens = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+        if MULTI_TICKER_SCAN_REQUIRE_NO_OPEN_POSITION and opens:
+            return {"ran": False, "reason": "open_position_exists", "open_count": len(opens)}
+    except Exception: pass
+    candidates = sorted([multi_ticker_score_symbol(sym) for sym in MULTI_TICKER_SCAN_SYMBOLS], key=lambda x: safe_float(x.get("score"), 0), reverse=True)
+    best = candidates[0] if candidates else {}
+    state.update({"last_scan_ts": now, "best": best, "candidates": candidates[:10]})
+    _elite_write_json(MULTI_TICKER_SCAN_FILE, state)
+    _elite_event(MULTI_TICKER_SCAN_LOG_FILE, {"event": "scan", "best": best})
+    if best and safe_float(best.get("score"), 0) >= MULTI_TICKER_SCAN_MIN_SCORE and str(best.get("direction")) in {"CALL", "PUT"}:
+        sig = multi_ticker_scanner_build_signal(best)
+        if MULTI_TICKER_SCAN_WRITE_SIGNAL:
+            write_auto_signal(sig)
+            state["last_signal_ts"] = now
+            state["last_signal"] = sig
+            _elite_write_json(MULTI_TICKER_SCAN_FILE, state)
+            _elite_event(MULTI_TICKER_SCAN_LOG_FILE, {"event": "signal_written", "signal": sig})
+            try: debug(f"MULTI-TICKER SCANNER SIGNAL | {sig.get('ticker')} {sig.get('direction')} score={best.get('score')}")
+            except Exception: pass
+        return {"ran": True, "signal": sig, "best": best}
+    return {"ran": True, "signal": None, "best": best}
+
+
+def portfolio_hedge_exposure(open_positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    calls = puts = 0; worst_dd = 0.0
+    for pos in open_positions or []:
+        direction = str(pos.get("direction") or "").upper(); sym = str(pos.get("symbol") or "").upper(); qty = max(1, safe_int(pos.get("qty_open", pos.get("qty", 1)), 1))
+        if direction == "PUT" or sym.endswith("P"): puts += qty
+        else: calls += qty
+        entry = safe_float(pos.get("entry_price", pos.get("entry_contract", 0)), 0); last = safe_float(pos.get("last_price", pos.get("mark", entry)), entry)
+        if entry > 0 and last > 0: worst_dd = max(worst_dd, max(0.0, (entry - last) / entry))
+    return {"calls": calls, "puts": puts, "net_delta_count": calls - puts, "worst_drawdown_pct": round(worst_dd, 4)}
+
+
+def portfolio_hedge_build_signal(reason: str, exposure: Dict[str, Any]) -> Dict[str, Any]:
+    ticker = PORTFOLIO_HEDGE_TICKER or "QQQ"; snap = scanner_snapshot(ticker); price = safe_float(snap.get("price"), 0) or 1.0
+    direction = "PUT" if safe_int(exposure.get("net_delta_count", 0), 0) > 0 else "CALL"; rng = max(price * 0.006, 0.25)
+    stop = price + rng if direction == "PUT" else max(price - rng, 0.01); target = max(price - rng * 1.5, 0.01) if direction == "PUT" else price + rng * 1.5
+    sig = build_unbiased_signal(ticker=ticker, direction=direction, entry=round(price, 2), stop=round(stop, 2), target=round(target, 2), setup="portfolio_hedge_protection", confidence="B+", key_level=round(safe_float(snap.get("vwap"), price), 2), vwap=round(safe_float(snap.get("vwap"), price), 2), underlying_price=round(price, 2), qty=1, notes=f"Portfolio hedge generated. Reason={reason} Exposure={exposure}", confirmation="hedge_risk_control", regime="defensive")
+    sig["source"] = "portfolio_hedging_engine"; sig["is_hedge"] = True; sig["hedge_reason"] = reason
+    return sig
+
+
+def portfolio_hedging_engine_tick(force: bool = False) -> Dict[str, Any]:
+    if not ENABLE_PORTFOLIO_HEDGING_ENGINE: return {"ran": False, "reason": "disabled"}
+    state = _elite_load_json(PORTFOLIO_HEDGE_FILE, {"last_action_ts": 0}); now = int(time.time())
+    try:
+        ensure_globals_initialized(); opens = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+    except Exception: opens = []
+    if not opens:
+        state.update({"last_check_ts": now, "status": "no_open_positions"}); _elite_write_json(PORTFOLIO_HEDGE_FILE, state); return {"ran": True, "reason": "no_open_positions"}
+    exposure = portfolio_hedge_exposure(opens); reasons = []
+    if abs(safe_int(exposure.get("net_delta_count", 0), 0)) >= 1 and safe_float(exposure.get("worst_drawdown_pct", 0), 0) >= PORTFOLIO_HEDGE_DRAWDOWN_PCT: reasons.append("drawdown_protection_needed")
+    try:
+        regime = str(detect_market_regime_v2(PORTFOLIO_HEDGE_TICKER).get("regime", "NORMAL")).upper(); exposure["regime"] = regime
+        if regime in {"CHOP", "EVENT"} and abs(safe_int(exposure.get("net_delta_count", 0), 0)) >= 1: reasons.append(f"defensive_regime_{regime}")
+    except Exception: pass
+    if not reasons:
+        state.update({"last_check_ts": now, "status": "clean", "exposure": exposure}); _elite_write_json(PORTFOLIO_HEDGE_FILE, state); return {"ran": True, "reason": "clean", "exposure": exposure}
+    if not force and now - safe_int(state.get("last_action_ts", 0), 0) < PORTFOLIO_HEDGE_COOLDOWN_SECONDS: return {"ran": True, "reason": "cooldown", "exposure": exposure, "hedge_reasons": reasons}
+    action = "alert_only"; sig = None; reason_text = ", ".join(reasons)
+    if PORTFOLIO_HEDGE_MODE == "signal":
+        sig = portfolio_hedge_build_signal(reason_text, exposure); write_auto_signal(sig); action = "hedge_signal_written"
+    elif PORTFOLIO_HEDGE_MODE == "close_risk":
+        closed = 0
+        for pos in list(opens):
+            try:
+                live_price = safe_float(pos.get("last_price", pos.get("entry_price", 0)), 0)
+                if close_position_with_exit_protection(pos, live_price, f"PORTFOLIO HEDGE RISK CLOSE - {reason_text}"): closed += 1
+            except Exception as e:
+                try: debug(f"PORTFOLIO HEDGE CLOSE ERROR | {e}")
+                except Exception: pass
+        action = f"risk_close_attempted_{closed}"
+    _elite_alert("🛡️ PORTFOLIO HEDGING ENGINE", f"Reason: {reason_text}\nMode: {PORTFOLIO_HEDGE_MODE}\nAction: {action}\nExposure: {json.dumps(exposure, default=str)}")
+    state.update({"last_check_ts": now, "last_action_ts": now, "status": action, "exposure": exposure, "reasons": reasons, "last_signal": sig}); _elite_write_json(PORTFOLIO_HEDGE_FILE, state); _elite_event(PORTFOLIO_HEDGE_LOG_FILE, {"event": "hedge_action", "action": action, "reasons": reasons, "exposure": exposure, "signal": sig})
+    return {"ran": True, "action": action, "reasons": reasons, "exposure": exposure, "signal": sig}
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
