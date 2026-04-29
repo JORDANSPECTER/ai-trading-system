@@ -35,6 +35,7 @@ print("[IDEMPOTENCY EXECUTION BYPASS ACTIVE] approved trades bypass stale replay
 print("[TELEGRAM COMMAND DASHBOARD ACTIVE] /start /status buttons enabled", flush=True)
 print("[ONE TRADE SETUP LOCK PATCH ACTIVE] one_trade_setup_not_used fixed", flush=True)
 print("[ORDER OWNERSHIP LOCK ACTIVE] only this bot client_order_id can submit/trust orders", flush=True)
+print("[FOREIGN POSITION AUTO-CLOSE ACTIVE] bot will close broker positions it does not own", flush=True)
 print("[TWELVE DATA WEBSOCKET PATCH ACTIVE] real-time-ready market feed enabled", flush=True)
 
 # =========================================================
@@ -248,6 +249,11 @@ ORDER_OWNERSHIP_ALLOWED_OLD_PREFIXES = tuple(x.strip() for x in os.getenv("ORDER
 ORDER_OWNERSHIP_CANCEL_FOREIGN_OPEN_ORDERS = os.getenv("ORDER_OWNERSHIP_CANCEL_FOREIGN_OPEN_ORDERS", "true").lower() == "true"
 ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_OPEN_ORDERS = os.getenv("ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_OPEN_ORDERS", "true").lower() == "true"
 ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_POSITIONS = os.getenv("ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_POSITIONS", "true").lower() == "true"
+# Auto-clean broker positions that were not created/tracked by this bot.
+# Defaults TRUE because the user wants this bot to be the only source of truth.
+ORDER_OWNERSHIP_AUTO_CLOSE_FOREIGN_POSITIONS = os.getenv("ORDER_OWNERSHIP_AUTO_CLOSE_FOREIGN_POSITIONS", "true").lower() == "true"
+ORDER_OWNERSHIP_CLOSE_FOREIGN_ON_STARTUP = os.getenv("ORDER_OWNERSHIP_CLOSE_FOREIGN_ON_STARTUP", "true").lower() == "true"
+ORDER_OWNERSHIP_CLOSE_FOREIGN_MODE = os.getenv("ORDER_OWNERSHIP_CLOSE_FOREIGN_MODE", "market").strip().lower()
 ORDER_OWNERSHIP_AUDIT_FILE = os.getenv("ORDER_OWNERSHIP_AUDIT_FILE", "order_ownership_audit.jsonl").strip()
 ALPACA_LIVE_OPTIONS_APPROVED = os.getenv("ALPACA_LIVE_OPTIONS_APPROVED", "false").lower() == "true"
 USE_ALPACA_OPTIONS_BUYING_POWER = os.getenv("USE_ALPACA_OPTIONS_BUYING_POWER", "true").lower() == "true"
@@ -5475,6 +5481,102 @@ def cancel_foreign_alpaca_open_orders(orders: List[Dict[str, Any]]) -> List[Dict
     return cancelled
 
 
+def _broker_position_qty(position: Dict[str, Any]) -> int:
+    try:
+        return int(float(position.get("qty", 0) or 0))
+    except Exception:
+        return 0
+
+
+def _close_side_for_broker_position(position: Dict[str, Any]) -> str:
+    qty = _broker_position_qty(position)
+    return "sell" if qty > 0 else "buy"
+
+
+def _local_position_client_id(position: Dict[str, Any]) -> str:
+    try:
+        return str(
+            position.get("client_order_id")
+            or position.get("entry_client_order_id")
+            or position.get("entry_order", {}).get("client_order_id")
+            or position.get("order", {}).get("client_order_id")
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def find_foreign_alpaca_positions(broker_positions: List[Dict[str, Any]], local_positions: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """
+    Alpaca positions do not reliably carry client_order_id, so ownership is inferred from local state.
+    A broker position is foreign when:
+      1) there is no matching LIVE local position, or
+      2) the matching local position exists but does not have this bot's owned client_order_id.
+    """
+    if not globals().get("ORDER_OWNERSHIP_LOCK", True):
+        return []
+    local_positions = local_positions or []
+    local_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for lp in local_positions:
+        sym = str(lp.get("symbol", "")).strip()
+        if not sym:
+            continue
+        if str(lp.get("mode", "")).upper() == "LIVE":
+            local_by_symbol[sym] = lp
+
+    foreign: List[Dict[str, Any]] = []
+    for bp in broker_positions or []:
+        sym = str(bp.get("symbol", "")).strip()
+        if not sym:
+            continue
+        lp = local_by_symbol.get(sym)
+        if not lp:
+            item = dict(bp)
+            item["ownership_reason"] = "broker_position_missing_from_local_live_state"
+            foreign.append(item)
+            continue
+        cid = _local_position_client_id(lp)
+        if cid and is_owned_client_order_id(cid):
+            continue
+        item = dict(bp)
+        item["ownership_reason"] = f"local_position_unowned_or_missing_client_id:{cid or 'NONE'}"
+        foreign.append(item)
+    return foreign
+
+
+def auto_close_foreign_alpaca_positions(broker_positions: List[Dict[str, Any]], local_positions: Optional[List[Dict[str, Any]]] = None, reason: str = "startup") -> List[Dict[str, Any]]:
+    closed: List[Dict[str, Any]] = []
+    if not (globals().get("ORDER_OWNERSHIP_LOCK", True) and globals().get("ORDER_OWNERSHIP_AUTO_CLOSE_FOREIGN_POSITIONS", True)):
+        return closed
+    if reason == "startup" and not globals().get("ORDER_OWNERSHIP_CLOSE_FOREIGN_ON_STARTUP", True):
+        return closed
+
+    for pos in find_foreign_alpaca_positions(broker_positions, local_positions):
+        sym = str(pos.get("symbol", "")).strip()
+        qty_abs = abs(_broker_position_qty(pos))
+        if not sym or qty_abs <= 0:
+            continue
+        side = _close_side_for_broker_position(pos)
+        cid = make_owned_client_order_id("xforeign", sym, side)
+        record = {"symbol": sym, "qty": qty_abs, "side": side, "client_order_id": cid, "reason": pos.get("ownership_reason", reason)}
+        try:
+            # Use our normal submit path so the close order itself is owned/audited by this bot.
+            resp = alpaca_submit_order(symbol=sym, qty=qty_abs, side=side, order_type="market", tif="day", client_order_id=cid)
+            record["response"] = resp
+            record["submitted"] = bool(resp)
+            closed.append(record)
+            ownership_audit("auto_close_foreign_position", record)
+            try:
+                log(f"🧹 AUTO-CLOSE FOREIGN POSITION | symbol={sym} qty={qty_abs} side={side} cid={cid} reason={record['reason']}")
+            except Exception:
+                print(f"[AUTO-CLOSE FOREIGN POSITION] {record}", flush=True)
+        except Exception as e:
+            record["error"] = str(e)
+            closed.append(record)
+            ownership_audit("auto_close_foreign_position_failed", record)
+    return closed
+
+
 # =========================================================
 # ALPACA HELPERS
 # =========================================================
@@ -9082,6 +9184,8 @@ def build_boot_reconciliation_report() -> Dict[str, Any]:
     local_live_symbols = {str(p.get("symbol", "")).strip() for p in local_open_positions if p.get("mode") == "LIVE"}
     foreign_broker_orders = find_foreign_alpaca_orders(broker_orders)
     cancelled_foreign_orders = cancel_foreign_alpaca_open_orders(foreign_broker_orders)
+    foreign_broker_positions = find_foreign_alpaca_positions(broker_positions, local_open_positions)
+    auto_closed_foreign_positions = auto_close_foreign_alpaca_positions(broker_positions, local_open_positions, reason="startup")
     owned_broker_orders = filter_owned_alpaca_orders(broker_orders)
 
     broker_order_ids = {str(o.get("id", "")).strip() for o in owned_broker_orders if str(o.get("id", "")).strip()}
@@ -9093,6 +9197,8 @@ def build_boot_reconciliation_report() -> Dict[str, Any]:
             mismatches.append(f"foreign/old bot open order detected: {fo.get('symbol')} cid={fo.get('client_order_id') or 'NONE'} id={fo.get('id')}")
 
     if ORDER_OWNERSHIP_LOCK and ORDER_OWNERSHIP_BLOCK_ON_FOREIGN_POSITIONS:
+        for fp in foreign_broker_positions:
+            mismatches.append(f"foreign/old bot broker position auto-close submitted or required: {fp.get('symbol')} reason={fp.get('ownership_reason', 'unknown')}")
         for lp in local_open_positions:
             cid = lp.get("client_order_id") or lp.get("order", {}).get("client_order_id") or lp.get("entry_client_order_id")
             if cid and not is_owned_client_order_id(cid):
@@ -9115,6 +9221,8 @@ def build_boot_reconciliation_report() -> Dict[str, Any]:
         "owned_broker_open_order_count": len(owned_broker_orders),
         "foreign_broker_open_order_count": len(foreign_broker_orders),
         "cancelled_foreign_open_orders": cancelled_foreign_orders,
+        "foreign_broker_position_count": len(foreign_broker_positions),
+        "auto_closed_foreign_positions": auto_closed_foreign_positions,
         "order_ownership_prefix": ORDER_OWNERSHIP_CLIENT_PREFIX,
         "local_open_position_count": len(local_open_positions),
         "local_pending_order_count": len(local_pending_orders),
