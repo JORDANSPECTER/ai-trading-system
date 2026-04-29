@@ -68,6 +68,20 @@ print("[PHASE 1 ARCHITECTURE VISIBILITY ACTIVE] trace-only decision/state snapsh
 # =========================================================
 ENABLE_PHASE2_STATE_ENFORCEMENT = os.getenv("ENABLE_PHASE2_STATE_ENFORCEMENT", "true").lower() == "true"
 PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN = os.getenv("PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN", "true").lower() == "true"
+
+# =========================================================
+# PHASE 2B UNCERTAIN ORDER RECOVERY + BROKER TIMEOUT PROTECTION
+# Additive fail-closed layer: if broker submit/confirm becomes unknown,
+# new entries are blocked until reconciliation clears the uncertainty.
+# =========================================================
+ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY = os.getenv("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", "true").lower() == "true"
+PHASE2B_UNCERTAIN_ORDERS_FILE = os.getenv("PHASE2B_UNCERTAIN_ORDERS_FILE", "uncertain_orders.json").strip()
+PHASE2B_UNCERTAIN_EVENTS_FILE = os.getenv("PHASE2B_UNCERTAIN_EVENTS_FILE", "uncertain_order_events.jsonl").strip()
+PHASE2B_BLOCK_NEW_ENTRIES_ON_UNCERTAIN = os.getenv("PHASE2B_BLOCK_NEW_ENTRIES_ON_UNCERTAIN", "true").lower() == "true"
+PHASE2B_MARK_CONFIRM_FAILURE_UNCERTAIN = os.getenv("PHASE2B_MARK_CONFIRM_FAILURE_UNCERTAIN", "true").lower() == "true"
+PHASE2B_UNCERTAIN_HTTP_CODES = {int(x.strip()) for x in os.getenv("PHASE2B_UNCERTAIN_HTTP_CODES", "408,429,500,502,503,504,598,599").split(",") if x.strip().isdigit()}
+PHASE2B_RECON_REQUIRED_FILE = os.getenv("PHASE2B_RECON_REQUIRED_FILE", "review_required.json").strip()
+PHASE2B_TIMEOUT_SECONDS = float(os.getenv("PHASE2B_TIMEOUT_SECONDS", "20"))
 PHASE2_ATTACH_TRACE_ID_TO_ORDERS = os.getenv("PHASE2_ATTACH_TRACE_ID_TO_ORDERS", "true").lower() == "true"
 PHASE2_TRACE_ID_CLIENT_ORDER_LEN = int(float(os.getenv("PHASE2_TRACE_ID_CLIENT_ORDER_LEN", "8")))
 PHASE2_ENFORCEMENT_LOG_FILE = os.getenv("PHASE2_ENFORCEMENT_LOG_FILE", "phase2_enforcement_events.jsonl").strip()
@@ -485,6 +499,11 @@ def phase2_engine_allows_order(payload: dict = None, context: str = "new_entry")
         return True, "phase2_disabled", None
     payload = payload or {}
     protective = phase2_is_protective_order(payload, context)
+    if globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True):
+        p2b_allowed, p2b_reason = phase2b_recovery_gate_for_new_entries(payload, context)
+        if not p2b_allowed:
+            phase2b_event("new_entry_blocked_by_uncertain_order", {"reason": p2b_reason, "context": context, "symbol": payload.get("symbol") or payload.get("contract_symbol"), "side": payload.get("side")})
+            return False, p2b_reason, None
     snapshot = phase2_get_engine_snapshot_for_enforcement()
     if snapshot is None:
         if globals().get("PHASE2_FAIL_CLOSED_ON_STATE_UNKNOWN", True) and not protective:
@@ -957,6 +976,172 @@ SMART_EXECUTION_LOG_FILE = os.getenv("SMART_EXECUTION_LOG_FILE", "execution_log.
 
 
 
+
+# =========================================================
+# PHASE 2B UNCERTAIN ORDER RECOVERY HELPERS
+# =========================================================
+def phase2b_now() -> str:
+    try:
+        return datetime.now().isoformat()
+    except Exception:
+        return str(time.time())
+
+
+def phase2b_event(event: str, payload: dict = None) -> None:
+    try:
+        row = {"timestamp": phase2b_now(), "event": event, **(payload or {})}
+        with open(globals().get("PHASE2B_UNCERTAIN_EVENTS_FILE", "uncertain_order_events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception as e:
+        try:
+            phase1_log(f"PHASE2B EVENT LOG ERROR | {e}")
+        except Exception:
+            print(f"PHASE2B EVENT LOG ERROR | {e}", flush=True)
+
+
+def phase2b_load_uncertain_orders() -> dict:
+    path = globals().get("PHASE2B_UNCERTAIN_ORDERS_FILE", "uncertain_orders.json")
+    try:
+        if not os.path.exists(path):
+            return {"active": False, "orders": [], "updated_at": phase2b_now()}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"active": False, "orders": [], "updated_at": phase2b_now(), "repair_reason": "non_dict_file"}
+        data.setdefault("orders", [])
+        data["active"] = any(str(o.get("status", "ACTIVE")).upper() not in {"CLEARED", "RESOLVED"} for o in data.get("orders", []) if isinstance(o, dict))
+        return data
+    except Exception as e:
+        phase2b_event("uncertain_orders_load_failed", {"error": str(e), "file": path})
+        return {"active": True, "orders": [{"status": "ACTIVE", "reason": "uncertain_orders_file_unreadable", "error": str(e)}], "updated_at": phase2b_now()}
+
+
+def phase2b_save_uncertain_orders(data: dict) -> bool:
+    path = globals().get("PHASE2B_UNCERTAIN_ORDERS_FILE", "uncertain_orders.json")
+    try:
+        data = dict(data or {})
+        data.setdefault("orders", [])
+        data["active"] = any(str(o.get("status", "ACTIVE")).upper() not in {"CLEARED", "RESOLVED"} for o in data.get("orders", []) if isinstance(o, dict))
+        data["updated_at"] = phase2b_now()
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        phase2b_event("uncertain_orders_save_failed", {"error": str(e), "file": path})
+        return False
+
+
+def phase2b_has_active_uncertain_orders() -> bool:
+    if not globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True):
+        return False
+    data = phase2b_load_uncertain_orders()
+    return bool(data.get("active"))
+
+
+def phase2b_mark_review_required(reason: str, metadata: dict = None) -> None:
+    try:
+        path = globals().get("PHASE2B_RECON_REQUIRED_FILE", globals().get("REVIEW_REQUIRED_FILE", "review_required.json"))
+        payload = {
+            "active": True,
+            "reason": reason,
+            "source": "phase2b_uncertain_order_recovery",
+            "manual_unlock_required": True,
+            "timestamp": phase2b_now(),
+            "metadata": metadata or {},
+        }
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp, path)
+        phase2b_event("review_required_marked", payload)
+    except Exception as e:
+        phase2b_event("review_required_mark_failed", {"error": str(e), "reason": reason})
+
+
+def phase2b_mark_uncertain_order(reason: str, payload: dict = None, response_code: int = 0, response_body=None, exception: str = "") -> dict:
+    payload = dict(payload or {})
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    trace_id = str(payload.get("trace_id") or payload.get("_phase2_trace_id") or phase2_get_trace_id_from_payload(payload) or "").strip()
+    symbol = str(payload.get("symbol") or payload.get("contract_symbol") or "").strip()
+    side = str(payload.get("side") or "").strip()
+    record = {
+        "status": "ACTIVE",
+        "reason": reason,
+        "created_at": phase2b_now(),
+        "client_order_id": client_order_id,
+        "trace_id": trace_id,
+        "symbol": symbol,
+        "side": side,
+        "response_code": response_code,
+        "response_body": response_body,
+        "exception": exception,
+        "payload_preview": {k: payload.get(k) for k in ("symbol", "side", "qty", "type", "limit_price", "client_order_id", "time_in_force")},
+    }
+    data = phase2b_load_uncertain_orders()
+    orders = [o for o in data.get("orders", []) if isinstance(o, dict)]
+    if client_order_id:
+        orders = [o for o in orders if str(o.get("client_order_id") or "") != client_order_id]
+    orders.append(record)
+    data["orders"] = orders[-100:]
+    phase2b_save_uncertain_orders(data)
+    phase2b_mark_review_required("uncertain_order_requires_reconciliation", record)
+    phase2b_event("uncertain_order_detected", record)
+    try:
+        msg = f"⚠️ UNCERTAIN ORDER DETECTED | reason={reason} | symbol={symbol} | cid={client_order_id} | trace={trace_id}"
+        debug(msg)
+        send_to_discord(globals().get("DISCORD_AI_WEBHOOK", ""), msg, "AI")
+        send_to_telegram(msg)
+    except Exception:
+        pass
+    return record
+
+
+def phase2b_clear_uncertain_order(client_order_id: str = "", trace_id: str = "", reason: str = "reconciled") -> dict:
+    data = phase2b_load_uncertain_orders()
+    changed = False
+    for order in data.get("orders", []):
+        if not isinstance(order, dict):
+            continue
+        cid_match = client_order_id and str(order.get("client_order_id") or "") == str(client_order_id)
+        trace_match = trace_id and str(order.get("trace_id") or "") == str(trace_id)
+        if cid_match or trace_match:
+            order["status"] = "CLEARED"
+            order["cleared_at"] = phase2b_now()
+            order["clear_reason"] = reason
+            changed = True
+    if changed:
+        phase2b_save_uncertain_orders(data)
+        phase2b_event("uncertain_order_cleared", {"client_order_id": client_order_id, "trace_id": trace_id, "reason": reason})
+    return data
+
+
+def phase2b_is_uncertain_http_result(code: int, body=None) -> bool:
+    try:
+        if int(code) in globals().get("PHASE2B_UNCERTAIN_HTTP_CODES", {408, 429, 500, 502, 503, 504, 598, 599}):
+            return True
+    except Exception:
+        pass
+    try:
+        text = json.dumps(body, default=str).lower() if not isinstance(body, str) else body.lower()
+        uncertain_words = ("timeout", "timed out", "connection aborted", "connection reset", "remote host", "temporarily unavailable", "gateway", "unknown")
+        return any(w in text for w in uncertain_words)
+    except Exception:
+        return False
+
+
+def phase2b_recovery_gate_for_new_entries(payload: dict = None, context: str = "new_entry") -> tuple:
+    if not globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True):
+        return True, "phase2b_disabled"
+    if not globals().get("PHASE2B_BLOCK_NEW_ENTRIES_ON_UNCERTAIN", True):
+        return True, "phase2b_block_disabled"
+    if phase2_is_protective_order(payload or {}, context):
+        return True, "phase2b_protective_allowed"
+    if phase2b_has_active_uncertain_orders():
+        return False, "phase2b_uncertain_order_active_recon_required"
+    return True, "phase2b_no_uncertain_orders"
+
 # =========================================================
 # ALPACA EXECUTION RELIABILITY PATCH
 # =========================================================
@@ -986,15 +1171,17 @@ def alpaca_base_url() -> str:
 
 
 def alpaca_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+    outbound_payload = dict(payload or {})
+    is_order_submit = method.upper() == "POST" and str(path).rstrip("/").endswith("/orders")
     try:
-        outbound_payload = dict(payload or {})
-        if method.upper() == "POST" and str(path).rstrip("/").endswith("/orders"):
+        if is_order_submit:
             ok, reason, outbound_payload = ensure_owned_order_payload(outbound_payload, context="alpaca_request")
             if not ok:
                 return 403, {"error": reason, "payload": outbound_payload}
         url = f"{alpaca_base_url()}{path}"
+        timeout_seconds = globals().get("PHASE2B_TIMEOUT_SECONDS", 20) if is_order_submit else 20
         if method.upper() == "POST":
-            r = requests.post(url, headers=alpaca_headers(), json=outbound_payload, timeout=20)
+            r = requests.post(url, headers=alpaca_headers(), json=outbound_payload, timeout=timeout_seconds)
         elif method.upper() == "GET":
             r = requests.get(url, headers=alpaca_headers(), timeout=20)
         else:
@@ -1003,10 +1190,25 @@ def alpaca_request(method: str, path: str, payload: Optional[Dict[str, Any]] = N
             body = r.json()
         except Exception:
             body = r.text
+        if is_order_submit and globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True) and phase2b_is_uncertain_http_result(r.status_code, body):
+            phase2b_mark_uncertain_order(
+                reason="broker_order_submit_uncertain_http_result",
+                payload=outbound_payload,
+                response_code=r.status_code,
+                response_body=body,
+            )
         return r.status_code, body
     except Exception as e:
+        if is_order_submit and globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True):
+            phase2b_mark_uncertain_order(
+                reason="broker_order_submit_exception_or_timeout",
+                payload=outbound_payload,
+                response_code=599,
+                response_body={"error": str(e), "path": path, "method": method},
+                exception=str(e),
+            )
+            return 599, {"error": "uncertain_order_submit_exception", "exception": str(e), "path": path, "method": method}
         return 599, {"error": str(e), "path": path, "method": method}
-
 
 def alpaca_confirm_order(order_id: str) -> Dict[str, Any]:
     if not order_id:
@@ -1103,11 +1305,29 @@ def alpaca_submit_order_reliable(payload: Dict[str, Any]) -> Tuple[int, Any]:
     alpaca_audit("submit_attempt", {"payload": clean_payload})
     code, body = alpaca_request("POST", "/v2/orders", clean_payload)
     alpaca_audit("submit_response", {"code": code, "body": body, "payload": clean_payload})
+    if globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True) and phase2b_is_uncertain_http_result(code, body):
+        phase2b_mark_uncertain_order(
+            reason="broker_order_submit_uncertain_response",
+            payload=clean_payload,
+            response_code=code,
+            response_body=body,
+        )
 
     if code < 300 and ALPACA_OPTION_CONFIRM_AFTER_SUBMIT:
         order_id = body.get("id") if isinstance(body, dict) else None
         confirm = alpaca_confirm_order(order_id)
         alpaca_audit("submit_confirm", {"order_id": order_id, "confirm": confirm})
+        if globals().get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", True) and globals().get("PHASE2B_MARK_CONFIRM_FAILURE_UNCERTAIN", True):
+            try:
+                if not bool(confirm.get("confirmed")):
+                    phase2b_mark_uncertain_order(
+                        reason="broker_order_confirm_failed_after_submit",
+                        payload=clean_payload,
+                        response_code=int(confirm.get("code", 0) or 0),
+                        response_body=confirm,
+                    )
+            except Exception:
+                pass
         try:
             debug(f"✅ ALPACA ORDER CONFIRM | order_id={order_id} confirm={confirm}")
         except Exception:
