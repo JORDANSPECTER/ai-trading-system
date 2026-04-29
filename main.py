@@ -1175,6 +1175,21 @@ INTEL_REBUILD_ANALYTICS_ON_CLOSE = os.getenv("INTEL_REBUILD_ANALYTICS_ON_CLOSE",
 INTEL_ANALYTICS_REFRESH_SECONDS = int(os.getenv("INTEL_ANALYTICS_REFRESH_SECONDS", "60"))
 
 # =========================================================
+# POST-TRADE INTELLIGENCE + MISTAKE DETECTION ENGINE
+# Auto-score every closed trade, detect rule/execution mistakes,
+# and feed clean scorecards into trade memory + daily accountability.
+# =========================================================
+ENABLE_POST_TRADE_INTELLIGENCE = os.getenv("ENABLE_POST_TRADE_INTELLIGENCE", "true").lower() == "true"
+POST_TRADE_SCORECARD_FILE = os.getenv("POST_TRADE_SCORECARD_FILE", "post_trade_scorecards.jsonl").strip()
+POST_TRADE_SUMMARY_FILE = os.getenv("POST_TRADE_SUMMARY_FILE", "post_trade_intelligence_summary.json").strip()
+POST_TRADE_ALERTS = os.getenv("POST_TRADE_ALERTS", "true").lower() == "true"
+POST_TRADE_CHASE_SLIPPAGE_PCT = float(os.getenv("POST_TRADE_CHASE_SLIPPAGE_PCT", "0.08"))
+POST_TRADE_FAST_LOSS_SECONDS = int(float(os.getenv("POST_TRADE_FAST_LOSS_SECONDS", "180")))
+POST_TRADE_MIN_A_SCORE = int(float(os.getenv("POST_TRADE_MIN_A_SCORE", "80")))
+POST_TRADE_MIN_B_SCORE = int(float(os.getenv("POST_TRADE_MIN_B_SCORE", "65")))
+POST_TRADE_REQUIRE_BOT_PREFIX = os.getenv("POST_TRADE_REQUIRE_BOT_PREFIX", "true").lower() == "true"
+
+# =========================================================
 # INTELLIGENCE PHASE 3: ADAPTIVE INTELLIGENCE
 # Uses closed-trade memory to score setup performance,
 # suggest confidence corrections, dynamically adjust size,
@@ -8513,6 +8528,15 @@ def intel_record_closed_trade(position: Dict[str, Any], close_reason: str = ""):
         return
     try:
         story = intel_trade_story_from_position(position, close_reason)
+        try:
+            scorecard = post_trade_record_scorecard(position, story, close_reason)
+            if scorecard:
+                story["post_trade_scorecard"] = scorecard
+                story["post_trade_grade"] = scorecard.get("grade")
+                story["post_trade_score"] = scorecard.get("score")
+                story["post_trade_mistakes"] = scorecard.get("mistakes", [])
+        except Exception as post_trade_error:
+            log(f"❌ POST-TRADE hook failed inside trade memory: {post_trade_error}")
         intel_append_jsonl(INTEL_TRADE_MEMORY_FILE, story)
         intel_event("trade_closed", story, position=position, stage="trade_memory", decision="closed")
         if INTEL_REBUILD_ANALYTICS_ON_CLOSE:
@@ -8532,6 +8556,283 @@ def intel_record_closed_trade(position: Dict[str, Any], close_reason: str = ""):
             send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
     except Exception as e:
         log(f"❌ INTEL closed-trade record failed: {e}")
+
+
+# =========================================================
+# POST-TRADE INTELLIGENCE + MISTAKE DETECTION ENGINE
+# =========================================================
+def post_trade_session_from_ts(ts_value: int) -> str:
+    try:
+        dt = datetime.fromtimestamp(safe_int(ts_value, epoch()))
+        hhmm = dt.strftime("%H:%M")
+        if "09:30" <= hhmm <= "10:30":
+            return "open"
+        if "15:00" <= hhmm <= "16:15":
+            return "power_hour"
+        if "10:31" <= hhmm < "15:00":
+            return "midday"
+        return "outside_regular_hours"
+    except Exception:
+        return "unknown"
+
+
+def post_trade_letter(score: int) -> str:
+    score = int(max(0, min(100, score)))
+    if score >= 90:
+        return "A+"
+    if score >= POST_TRADE_MIN_A_SCORE:
+        return "A"
+    if score >= POST_TRADE_MIN_B_SCORE:
+        return "B"
+    if score >= 50:
+        return "C"
+    return "D"
+
+
+def post_trade_setup_name(position: Dict[str, Any], story: Dict[str, Any]) -> str:
+    for key in ("setup", "setup_type", "strategy", "trigger", "entry_type", "trade_reason"):
+        value = position.get(key) or story.get(key)
+        if value:
+            return str(value).strip()[:80]
+    notes = " ".join([str(x) for x in position.get("notes", [])])[:120].lower()
+    if "retest" in notes:
+        return "retest_hold"
+    if "break" in notes:
+        return "break_and_hold"
+    if "reject" in notes:
+        return "rejection"
+    if "stop" in notes:
+        return "risk_exit"
+    return "unknown_setup"
+
+
+def post_trade_safe_prefix_ok(position: Dict[str, Any]) -> bool:
+    if not POST_TRADE_REQUIRE_BOT_PREFIX:
+        return True
+    try:
+        prefix = str(globals().get("ORDER_OWNERSHIP_PREFIX", os.getenv("ORDER_OWNERSHIP_PREFIX", "ubtmain-"))).strip()
+        ids = [
+            position.get("client_order_id"),
+            position.get("entry_client_order_id"),
+            position.get("alpaca_client_order_id"),
+            position.get("close_client_order_id"),
+        ]
+        ids += [o.get("client_order_id") for o in position.get("orders", []) if isinstance(o, dict)]
+        ids = [str(x) for x in ids if x]
+        if not ids:
+            return False
+        return any(x.startswith(prefix) for x in ids)
+    except Exception:
+        return False
+
+
+def post_trade_build_scorecard(position: Dict[str, Any], story: Dict[str, Any], close_reason: str = "") -> Dict[str, Any]:
+    score = 75
+    mistakes: List[str] = []
+    strengths: List[str] = []
+    action_items: List[str] = []
+
+    entry = safe_float(story.get("entry_price", position.get("entry_price", 0)), 0)
+    exit_price = safe_float(story.get("exit_price", position.get("exit_price", 0)), 0)
+    realized_pct = safe_float(story.get("realized_pnl_pct", position.get("realized_pnl_pct", 0)), 0)
+    r_mult = safe_float(story.get("r_multiple", position.get("r_multiple", 0)), 0)
+    time_in_trade = safe_int(story.get("time_in_trade_seconds", 0), 0)
+    winner = bool(story.get("winner", realized_pct > 0))
+    notes_text = " ".join([str(x) for x in position.get("notes", [])]).lower()
+    reason_text = str(close_reason or story.get("close_reason", "")).lower()
+    setup = post_trade_setup_name(position, story)
+    session = post_trade_session_from_ts(safe_int(story.get("closed_ts", epoch()), epoch()))
+
+    if winner:
+        score += 8
+        strengths.append("trade_closed_green")
+    else:
+        score -= 12
+        mistakes.append("trade_closed_red")
+        action_items.append("Review whether entry confirmation was real or forced.")
+
+    if r_mult >= 2:
+        score += 12
+        strengths.append("excellent_r_multiple")
+    elif r_mult >= 1:
+        score += 6
+        strengths.append("positive_r_multiple")
+    elif r_mult < 0:
+        score -= 15
+        mistakes.append("negative_r_multiple")
+
+    if position.get("tp1_hit"):
+        score += 6
+        strengths.append("tp1_hit")
+    elif not winner and ("stop" in reason_text or "trailing" in reason_text):
+        score -= 5
+        mistakes.append("stopped_before_tp1")
+
+    if position.get("tp2_hit"):
+        score += 5
+        strengths.append("tp2_hit")
+
+    intended_entry = safe_float(position.get("intended_entry", position.get("planned_entry", position.get("signal_entry", 0))), 0)
+    if intended_entry > 0 and entry > 0:
+        entry_slip_pct = abs(entry - intended_entry) / intended_entry
+        if entry_slip_pct >= POST_TRADE_CHASE_SLIPPAGE_PCT:
+            score -= 12
+            mistakes.append("late_or_chased_entry_vs_plan")
+            action_items.append("Require pullback/retest instead of chasing extended candle.")
+        else:
+            strengths.append("entry_close_to_plan")
+    else:
+        entry_slip_pct = 0.0
+
+    if any(x in notes_text for x in ["chase", "extended", "late entry"]):
+        score -= 15
+        mistakes.append("chasing_flag_present")
+        action_items.append("Block entries after extended candles unless retest confirms.")
+
+    if time_in_trade > 0 and time_in_trade <= POST_TRADE_FAST_LOSS_SECONDS and realized_pct < 0:
+        score -= 8
+        mistakes.append("fast_loss")
+        action_items.append("Fast losses usually mean entry timing or level confirmation failed.")
+
+    if "time exit" in reason_text or "stagnant" in reason_text:
+        score -= 4
+        mistakes.append("dead_trade_time_exit")
+        action_items.append("Avoid low momentum/chop entries unless expansion confirms.")
+
+    regime = str(position.get("regime", position.get("market_regime", story.get("regime", "")))).upper()
+    if "CHOP" in regime:
+        score -= 12
+        mistakes.append("entered_chop_regime")
+        action_items.append("Block or reduce size in chop unless A+ level reclaim/rejection appears.")
+
+    vwap_state = str(position.get("vwap_state", position.get("vwap", ""))).lower()
+    direction = str(story.get("direction", position.get("direction", ""))).upper()
+    if direction == "CALL" and any(x in vwap_state for x in ["below", "reject"]):
+        score -= 10
+        mistakes.append("call_against_vwap")
+        action_items.append("Calls need VWAP reclaim/hold or clear exception tag.")
+    if direction == "PUT" and any(x in vwap_state for x in ["above", "reclaim"]):
+        score -= 10
+        mistakes.append("put_against_vwap")
+        action_items.append("Puts need VWAP reject/loss or clear exception tag.")
+
+    oil_state = str(position.get("oil_state", position.get("macro_oil_state", ""))).lower()
+    if direction == "CALL" and any(x in oil_state for x in ["rising_sharp", "oil_up_strong", "rising strong"]):
+        score -= 8
+        mistakes.append("call_against_oil_macro")
+    if direction == "PUT" and any(x in oil_state for x in ["falling_sharp", "oil_down_strong", "falling strong"]):
+        score -= 8
+        mistakes.append("put_against_oil_macro")
+
+    bot_owned = post_trade_safe_prefix_ok(position)
+    if not bot_owned:
+        score -= 25
+        mistakes.append("missing_this_bot_order_prefix")
+        action_items.append("Treat this as untrusted/foreign unless reconciliation confirms ownership.")
+
+    if not mistakes:
+        strengths.append("no_major_rule_violations_detected")
+
+    score = int(max(0, min(100, round(score))))
+    return {
+        "ts": epoch(),
+        "time": now_ts(),
+        "position_id": story.get("position_id", position.get("id")),
+        "signal_id": story.get("signal_id", position.get("signal_id", "")),
+        "ticker": story.get("ticker", position.get("ticker", "")),
+        "symbol": story.get("symbol", position.get("symbol", "")),
+        "direction": direction,
+        "setup": setup,
+        "session": session,
+        "bot_owned": bot_owned,
+        "entry_price": round(entry, 4),
+        "exit_price": round(exit_price, 4),
+        "realized_pnl_pct": round(realized_pct, 4),
+        "r_multiple": round(r_mult, 4),
+        "time_in_trade_seconds": time_in_trade,
+        "close_reason": close_reason or story.get("close_reason", ""),
+        "execution_slippage_pct_vs_plan": round(entry_slip_pct * 100, 4),
+        "score": score,
+        "grade": post_trade_letter(score),
+        "mistakes": sorted(set(mistakes)),
+        "strengths": sorted(set(strengths)),
+        "action_items": list(dict.fromkeys(action_items))[:6],
+    }
+
+
+def post_trade_update_summary(scorecard: Dict[str, Any]) -> Dict[str, Any]:
+    summary = load_json_file(POST_TRADE_SUMMARY_FILE, {})
+    if not isinstance(summary, dict):
+        summary = {}
+    summary.setdefault("generated_at", now_ts())
+    summary.setdefault("total_trades_scored", 0)
+    summary.setdefault("grade_counts", {})
+    summary.setdefault("by_setup", {})
+    summary.setdefault("by_session", {})
+    summary.setdefault("mistake_counts", {})
+    summary.setdefault("recent_scorecards", [])
+
+    summary["generated_at"] = now_ts()
+    summary["total_trades_scored"] = safe_int(summary.get("total_trades_scored", 0), 0) + 1
+    grade = str(scorecard.get("grade", "NA"))
+    summary["grade_counts"][grade] = safe_int(summary["grade_counts"].get(grade, 0), 0) + 1
+
+    for bucket_name, key in (("by_setup", scorecard.get("setup", "unknown")), ("by_session", scorecard.get("session", "unknown"))):
+        bucket = summary[bucket_name].setdefault(str(key), {"trades": 0, "score_total": 0, "wins": 0, "losses": 0, "pnl_pct_total": 0.0})
+        bucket["trades"] += 1
+        bucket["score_total"] += safe_int(scorecard.get("score", 0), 0)
+        bucket["wins"] += 1 if safe_float(scorecard.get("realized_pnl_pct", 0), 0) > 0 else 0
+        bucket["losses"] += 1 if safe_float(scorecard.get("realized_pnl_pct", 0), 0) <= 0 else 0
+        bucket["pnl_pct_total"] = round(safe_float(bucket.get("pnl_pct_total", 0), 0) + safe_float(scorecard.get("realized_pnl_pct", 0), 0), 4)
+        bucket["avg_score"] = round(bucket["score_total"] / max(1, bucket["trades"]), 2)
+        bucket["win_rate"] = round(bucket["wins"] / max(1, bucket["trades"]), 4)
+
+    for mistake in scorecard.get("mistakes", []):
+        summary["mistake_counts"][mistake] = safe_int(summary["mistake_counts"].get(mistake, 0), 0) + 1
+
+    recent = summary.get("recent_scorecards", [])
+    recent.append({k: scorecard.get(k) for k in ["time", "ticker", "symbol", "direction", "setup", "grade", "score", "realized_pnl_pct", "r_multiple", "mistakes"]})
+    summary["recent_scorecards"] = recent[-25:]
+    atomic_write_json(POST_TRADE_SUMMARY_FILE, summary)
+    return summary
+
+
+def post_trade_scorecard_message(scorecard: Dict[str, Any]) -> str:
+    mistakes = scorecard.get("mistakes", []) or ["none"]
+    strengths = scorecard.get("strengths", []) or ["none"]
+    actions = scorecard.get("action_items", []) or ["Keep collecting clean sample size."]
+    return (
+        f"🧠 POST-TRADE SCORECARD\n"
+        f"{scorecard.get('ticker')} {scorecard.get('direction')} | {scorecard.get('grade')} ({scorecard.get('score')}/100)\n"
+        f"Symbol: {scorecard.get('symbol')}\n"
+        f"Setup: {scorecard.get('setup')} | Session: {scorecard.get('session')}\n"
+        f"Entry: {scorecard.get('entry_price')} → Exit: {scorecard.get('exit_price')}\n"
+        f"PnL %: {scorecard.get('realized_pnl_pct')} | R: {scorecard.get('r_multiple')}\n"
+        f"Bot Owned: {scorecard.get('bot_owned')}\n"
+        f"Mistakes: {', '.join(mistakes[:6])}\n"
+        f"Strengths: {', '.join(strengths[:6])}\n"
+        f"Next Fix: {actions[0]}\n"
+        f"⏰ {now_ts()}"
+    )
+
+
+def post_trade_record_scorecard(position: Dict[str, Any], story: Dict[str, Any], close_reason: str = "") -> Dict[str, Any]:
+    if not ENABLE_POST_TRADE_INTELLIGENCE:
+        return {}
+    try:
+        scorecard = post_trade_build_scorecard(position, story, close_reason)
+        intel_append_jsonl(POST_TRADE_SCORECARD_FILE, scorecard)
+        post_trade_update_summary(scorecard)
+        intel_event("post_trade_scorecard", scorecard, position=position, stage="post_trade_intelligence", decision=scorecard.get("grade", "scored"))
+        if POST_TRADE_ALERTS:
+            msg = post_trade_scorecard_message(scorecard)
+            send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
+            send_to_live_entry_discord(msg)
+            send_to_telegram(msg)
+        return scorecard
+    except Exception as e:
+        log(f"❌ POST-TRADE INTELLIGENCE failed: {e}")
+        return {"error": str(e)}
 
 
 def intel_load_trade_memory() -> List[Dict[str, Any]]:
