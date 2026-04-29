@@ -21962,6 +21962,318 @@ def portfolio_hedging_engine_tick(force: bool = False) -> Dict[str, Any]:
     _elite_alert("🛡️ PORTFOLIO HEDGING ENGINE", f"Reason: {reason_text}\nMode: {PORTFOLIO_HEDGE_MODE}\nAction: {action}\nExposure: {json.dumps(exposure, default=str)}")
     state.update({"last_check_ts": now, "last_action_ts": now, "status": action, "exposure": exposure, "reasons": reasons, "last_signal": sig}); _elite_write_json(PORTFOLIO_HEDGE_FILE, state); _elite_event(PORTFOLIO_HEDGE_LOG_FILE, {"event": "hedge_action", "action": action, "reasons": reasons, "exposure": exposure, "signal": sig})
     return {"ran": True, "action": action, "reasons": reasons, "exposure": exposure, "signal": sig}
+
+
+# =========================================================
+# SAFE MULTI-TICKER EXECUTION + PER-SYMBOL RULES
+# =========================================================
+# This layer lets the scanner find opportunities across multiple names, but it
+# only allows execution when that specific ticker passes its own risk, score,
+# liquidity, sizing, and direction rules.
+ENABLE_SAFE_MULTI_TICKER_EXECUTION = os.getenv("ENABLE_SAFE_MULTI_TICKER_EXECUTION", "true").lower() == "true"
+SAFE_MULTI_TICKER_RULES_FILE = os.getenv("SAFE_MULTI_TICKER_RULES_FILE", "safe_multi_ticker_rules.json").strip()
+SAFE_MULTI_TICKER_RULES_LOG_FILE = os.getenv("SAFE_MULTI_TICKER_RULES_LOG_FILE", "safe_multi_ticker_rules_events.jsonl").strip()
+SAFE_MULTI_TICKER_DEFAULT_ALLOWED = os.getenv("SAFE_MULTI_TICKER_DEFAULT_ALLOWED", "false").lower() == "true"
+SAFE_MULTI_TICKER_BLOCK_CHOP = os.getenv("SAFE_MULTI_TICKER_BLOCK_CHOP", "true").lower() == "true"
+SAFE_MULTI_TICKER_BLOCK_EVENT = os.getenv("SAFE_MULTI_TICKER_BLOCK_EVENT", "true").lower() == "true"
+SAFE_MULTI_TICKER_REQUIRE_SCANNER_SOURCE = os.getenv("SAFE_MULTI_TICKER_REQUIRE_SCANNER_SOURCE", "false").lower() == "true"
+SAFE_MULTI_TICKER_ALLOWED_SYMBOLS = [x.strip().upper() for x in os.getenv("SAFE_MULTI_TICKER_ALLOWED_SYMBOLS", "QQQ,SPY,NVDA,TSLA,AAPL,AMD,META,MSFT").split(",") if x.strip()]
+SAFE_MULTI_TICKER_EXECUTION_SYMBOLS = [x.strip().upper() for x in os.getenv("SAFE_MULTI_TICKER_EXECUTION_SYMBOLS", "QQQ,SPY,NVDA").split(",") if x.strip()]
+SAFE_MULTI_TICKER_MIN_SCORE_DEFAULT = float(os.getenv("SAFE_MULTI_TICKER_MIN_SCORE_DEFAULT", "78"))
+SAFE_MULTI_TICKER_MAX_QTY_DEFAULT = int(float(os.getenv("SAFE_MULTI_TICKER_MAX_QTY_DEFAULT", "1")))
+SAFE_MULTI_TICKER_MAX_OPEN_SYMBOLS = int(float(os.getenv("SAFE_MULTI_TICKER_MAX_OPEN_SYMBOLS", "1")))
+SAFE_MULTI_TICKER_MAX_CORRELATED_TECH_POSITIONS = int(float(os.getenv("SAFE_MULTI_TICKER_MAX_CORRELATED_TECH_POSITIONS", "2")))
+SAFE_MULTI_TICKER_ENV_RULES_JSON = os.getenv("SAFE_MULTI_TICKER_RULES_JSON", "").strip()
+
+DEFAULT_SAFE_MULTI_TICKER_RULES = {
+    "QQQ":  {"enabled": True,  "can_execute": True,  "allow_calls": True, "allow_puts": True, "min_score": 72, "max_qty": 2, "max_contract_mid": 8.00,  "max_spread_pct": 0.18, "max_notional": 800,  "size_multiplier": 1.00, "allow_chop": False, "notes": "primary instrument"},
+    "SPY":  {"enabled": True,  "can_execute": True,  "allow_calls": True, "allow_puts": True, "min_score": 76, "max_qty": 1, "max_contract_mid": 6.00,  "max_spread_pct": 0.16, "max_notional": 600,  "size_multiplier": 0.80, "allow_chop": False, "notes": "secondary index"},
+    "NVDA": {"enabled": True,  "can_execute": True,  "allow_calls": True, "allow_puts": True, "min_score": 80, "max_qty": 1, "max_contract_mid": 12.00, "max_spread_pct": 0.22, "max_notional": 1200, "size_multiplier": 0.60, "allow_chop": False, "notes": "high beta tech; smaller size"},
+    "TSLA": {"enabled": True,  "can_execute": False, "allow_calls": True, "allow_puts": True, "min_score": 84, "max_qty": 1, "max_contract_mid": 12.00, "max_spread_pct": 0.25, "max_notional": 1200, "size_multiplier": 0.50, "allow_chop": False, "notes": "scan first, manually enable when ready"},
+    "AAPL": {"enabled": True,  "can_execute": False, "allow_calls": True, "allow_puts": True, "min_score": 78, "max_qty": 1, "max_contract_mid": 5.00,  "max_spread_pct": 0.18, "max_notional": 500,  "size_multiplier": 0.50, "allow_chop": False, "notes": "scan first"},
+    "AMD":  {"enabled": True,  "can_execute": False, "allow_calls": True, "allow_puts": True, "min_score": 82, "max_qty": 1, "max_contract_mid": 6.00,  "max_spread_pct": 0.25, "max_notional": 600,  "size_multiplier": 0.50, "allow_chop": False, "notes": "scan first; spreads can widen"},
+    "META": {"enabled": True,  "can_execute": False, "allow_calls": True, "allow_puts": True, "min_score": 80, "max_qty": 1, "max_contract_mid": 8.00,  "max_spread_pct": 0.20, "max_notional": 800,  "size_multiplier": 0.50, "allow_chop": False, "notes": "scan first"},
+    "MSFT": {"enabled": True,  "can_execute": False, "allow_calls": True, "allow_puts": True, "min_score": 78, "max_qty": 1, "max_contract_mid": 6.00,  "max_spread_pct": 0.18, "max_notional": 600,  "size_multiplier": 0.50, "allow_chop": False, "notes": "scan first"},
+}
+
+SAFE_MULTI_TICKER_TECH_BASKET = {"QQQ", "NVDA", "TSLA", "AAPL", "AMD", "META", "MSFT"}
+
+
+def safe_multi_ticker_event(event: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = {"event": event, "ts": int(time.time()), "time": now_ts(), **(payload or {})}
+        with open(SAFE_MULTI_TICKER_RULES_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def safe_multi_ticker_load_rules() -> Dict[str, Dict[str, Any]]:
+    rules = deepcopy(DEFAULT_SAFE_MULTI_TICKER_RULES)
+
+    # Optional JSON env override. Example:
+    # SAFE_MULTI_TICKER_RULES_JSON={"TSLA":{"can_execute":true,"min_score":88}}
+    if SAFE_MULTI_TICKER_ENV_RULES_JSON:
+        try:
+            env_rules = json.loads(SAFE_MULTI_TICKER_ENV_RULES_JSON)
+            if isinstance(env_rules, dict):
+                for sym, patch in env_rules.items():
+                    s = str(sym).upper().strip()
+                    if isinstance(patch, dict):
+                        base = rules.get(s, {"enabled": SAFE_MULTI_TICKER_DEFAULT_ALLOWED, "can_execute": False})
+                        base.update(patch)
+                        rules[s] = base
+        except Exception as e:
+            safe_multi_ticker_event("rules_env_json_error", {"error": str(e)})
+
+    # Optional file override. The engine also writes defaults here so you can edit it later.
+    try:
+        existing = _elite_load_json(SAFE_MULTI_TICKER_RULES_FILE, {}) if "_elite_load_json" in globals() else {}
+        if isinstance(existing, dict) and existing:
+            for sym, patch in existing.items():
+                s = str(sym).upper().strip()
+                if isinstance(patch, dict):
+                    base = rules.get(s, {"enabled": SAFE_MULTI_TICKER_DEFAULT_ALLOWED, "can_execute": False})
+                    base.update(patch)
+                    rules[s] = base
+        else:
+            if "_elite_write_json" in globals():
+                _elite_write_json(SAFE_MULTI_TICKER_RULES_FILE, rules)
+    except Exception as e:
+        safe_multi_ticker_event("rules_file_error", {"error": str(e)})
+
+    return rules
+
+
+def safe_multi_ticker_get_rule(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip()
+    rules = safe_multi_ticker_load_rules()
+    rule = deepcopy(rules.get(sym, {}))
+    if not rule:
+        rule = {
+            "enabled": SAFE_MULTI_TICKER_DEFAULT_ALLOWED,
+            "can_execute": SAFE_MULTI_TICKER_DEFAULT_ALLOWED,
+            "allow_calls": True,
+            "allow_puts": True,
+            "min_score": SAFE_MULTI_TICKER_MIN_SCORE_DEFAULT,
+            "max_qty": SAFE_MULTI_TICKER_MAX_QTY_DEFAULT,
+            "max_contract_mid": UNIFIED_DECISION_MAX_CONTRACT_MID if "UNIFIED_DECISION_MAX_CONTRACT_MID" in globals() else 8.0,
+            "max_spread_pct": UNIFIED_DECISION_MAX_SPREAD_PCT if "UNIFIED_DECISION_MAX_SPREAD_PCT" in globals() else 0.20,
+            "max_notional": UNIFIED_DECISION_MAX_NOTIONAL if "UNIFIED_DECISION_MAX_NOTIONAL" in globals() else 800.0,
+            "size_multiplier": 0.50,
+            "allow_chop": False,
+            "notes": "default fallback rule",
+        }
+    rule["symbol"] = sym
+    return rule
+
+
+def safe_multi_ticker_open_exposure() -> Dict[str, Any]:
+    try:
+        ensure_globals_initialized()
+        opens = GLOBAL_POSITIONS.get("open_positions", []) if isinstance(GLOBAL_POSITIONS, dict) else []
+    except Exception:
+        opens = []
+    symbols = []
+    tech = 0
+    for pos in opens or []:
+        raw = str(pos.get("ticker") or pos.get("underlying") or pos.get("asset") or pos.get("symbol") or "").upper()
+        sym = raw[:4]
+        # Try cleaner extraction for option OCC symbols like NVDA260501C...
+        m = re.match(r"^([A-Z]{1,6})\d{6}[CP]", raw)
+        if m:
+            sym = m.group(1)
+        if sym:
+            symbols.append(sym)
+            if sym in SAFE_MULTI_TICKER_TECH_BASKET:
+                tech += 1
+    return {"open_count": len(opens or []), "symbols": symbols, "tech_count": tech}
+
+
+def safe_multi_ticker_gate(signal: Dict[str, Any], selected_contract: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Hard gate for multi-ticker trading. Does not replace risk engine; it sits in front of it."""
+    if not ENABLE_SAFE_MULTI_TICKER_EXECUTION:
+        return {"approved": True, "reason": "safe_multi_ticker_disabled", "adjusted_signal": deepcopy(signal), "rule": {}}
+
+    x = deepcopy(signal or {})
+    ticker = str(x.get("ticker") or x.get("underlying") or x.get("asset") or "QQQ").upper().strip()
+    direction = str(x.get("direction") or x.get("side") or "CALL").upper().strip()
+    if direction in {"BUY_CALL", "LONG_CALL"}: direction = "CALL"
+    if direction in {"BUY_PUT", "LONG_PUT"}: direction = "PUT"
+
+    rule = safe_multi_ticker_get_rule(ticker)
+    reasons = []
+
+    if ticker not in SAFE_MULTI_TICKER_ALLOWED_SYMBOLS:
+        reasons.append(f"ticker_not_in_safe_allowed_symbols:{ticker}")
+    if ticker not in SAFE_MULTI_TICKER_EXECUTION_SYMBOLS:
+        reasons.append(f"ticker_not_enabled_for_execution:{ticker}")
+    if not bool(rule.get("enabled", False)):
+        reasons.append(f"symbol_rule_disabled:{ticker}")
+    if not bool(rule.get("can_execute", False)):
+        reasons.append(f"symbol_rule_can_execute_false:{ticker}")
+    if direction == "CALL" and not bool(rule.get("allow_calls", True)):
+        reasons.append(f"calls_disabled_for:{ticker}")
+    if direction == "PUT" and not bool(rule.get("allow_puts", True)):
+        reasons.append(f"puts_disabled_for:{ticker}")
+    if SAFE_MULTI_TICKER_REQUIRE_SCANNER_SOURCE and str(x.get("source", "")).lower() != "multi_ticker_scanner":
+        reasons.append("non_scanner_signal_blocked_by_safe_multi_ticker")
+
+    scanner_score = safe_float(x.get("scanner_score", x.get("score", x.get("execution_score", 0))), 0)
+    min_score = safe_float(rule.get("min_score", SAFE_MULTI_TICKER_MIN_SCORE_DEFAULT), SAFE_MULTI_TICKER_MIN_SCORE_DEFAULT)
+    if scanner_score > 0 and scanner_score < min_score:
+        reasons.append(f"scanner_score_below_{ticker}_min:{scanner_score}<{min_score}")
+
+    # Regime control per symbol.
+    regime = str(x.get("regime") or x.get("market_regime") or "").upper().strip()
+    if not regime:
+        try:
+            regime = str(detect_market_regime_v2(ticker).get("regime", "NORMAL")).upper()
+        except Exception:
+            regime = "UNKNOWN"
+    if regime == "CHOP" and SAFE_MULTI_TICKER_BLOCK_CHOP and not bool(rule.get("allow_chop", False)):
+        reasons.append(f"chop_blocked_for:{ticker}")
+    if regime == "EVENT" and SAFE_MULTI_TICKER_BLOCK_EVENT and not bool(rule.get("allow_event", False)):
+        reasons.append(f"event_regime_blocked_for:{ticker}")
+
+    exposure = safe_multi_ticker_open_exposure()
+    open_symbols = exposure.get("symbols", []) if isinstance(exposure, dict) else []
+    if open_symbols.count(ticker) >= SAFE_MULTI_TICKER_MAX_OPEN_SYMBOLS:
+        reasons.append(f"max_open_positions_for_symbol:{ticker}")
+    if ticker in SAFE_MULTI_TICKER_TECH_BASKET and safe_int(exposure.get("tech_count", 0), 0) >= SAFE_MULTI_TICKER_MAX_CORRELATED_TECH_POSITIONS:
+        # Allow QQQ primary to be evaluated by existing risk engine, but be strict for adds.
+        if ticker != "QQQ" or ticker in open_symbols:
+            reasons.append("max_correlated_tech_positions_reached")
+
+    # Liquidity/risk checks when a selected contract or quote exists.
+    c = selected_contract or x.get("auto_contract") or {}
+    if isinstance(c, dict):
+        details = c.get("details", {}) if isinstance(c.get("details"), dict) else c
+        mid = safe_float(details.get("contract_mid", details.get("mid", details.get("mark", details.get("price", 0)))), 0)
+        spread_pct = safe_float(details.get("spread_pct", details.get("contract_spread_pct", 0)), 0)
+        max_mid = safe_float(rule.get("max_contract_mid", 0), 0)
+        max_spread = safe_float(rule.get("max_spread_pct", 0), 0)
+        max_notional = safe_float(rule.get("max_notional", 0), 0)
+        qty_probe = max(1, safe_int(x.get("qty", x.get("quantity", 1)), 1))
+        if mid > 0 and max_mid > 0 and mid > max_mid:
+            reasons.append(f"contract_mid_too_high_for_{ticker}:{mid}>{max_mid}")
+        if spread_pct > 0 and max_spread > 0 and spread_pct > max_spread:
+            reasons.append(f"spread_too_wide_for_{ticker}:{spread_pct}>{max_spread}")
+        if mid > 0 and max_notional > 0 and (mid * qty_probe * 100) > max_notional:
+            reasons.append(f"notional_too_high_for_{ticker}:{round(mid * qty_probe * 100, 2)}>{max_notional}")
+
+    # Apply per-symbol size cap to the signal so downstream sizing starts conservative.
+    max_qty = max(1, safe_int(rule.get("max_qty", SAFE_MULTI_TICKER_MAX_QTY_DEFAULT), SAFE_MULTI_TICKER_MAX_QTY_DEFAULT))
+    requested_qty = max(1, safe_int(x.get("qty", x.get("quantity", 1)), 1))
+    adjusted_qty = min(requested_qty, max_qty)
+    size_mult = safe_float(rule.get("size_multiplier", 1.0), 1.0)
+    if size_mult < 1.0 and adjusted_qty > 1:
+        adjusted_qty = max(1, int(math.floor(adjusted_qty * size_mult)))
+    x["qty"] = adjusted_qty
+    x["quantity"] = adjusted_qty
+    x["safe_multi_ticker_rule"] = rule
+    x["safe_multi_ticker_regime"] = regime
+    x["safe_multi_ticker_adjusted_qty"] = adjusted_qty
+
+    approved = len(reasons) == 0
+    result = {"approved": approved, "reject_reasons": reasons, "adjusted_signal": x, "rule": rule, "regime": regime, "exposure": exposure}
+    safe_multi_ticker_event("gate", {"ticker": ticker, "direction": direction, "approved": approved, "reasons": reasons, "rule": rule, "regime": regime, "scanner_score": scanner_score, "exposure": exposure})
+    return result
+
+
+# Wrap scanner scoring so disabled symbols can still be observed but cannot win execution accidentally.
+_base_multi_ticker_score_symbol = multi_ticker_score_symbol if "multi_ticker_score_symbol" in globals() else None
+if _base_multi_ticker_score_symbol:
+    def multi_ticker_score_symbol(symbol: str) -> Dict[str, Any]:
+        result = _base_multi_ticker_score_symbol(symbol)
+        sym = str(symbol or result.get("symbol") or "").upper().strip()
+        rule = safe_multi_ticker_get_rule(sym)
+        result["symbol_rule"] = rule
+        if not bool(rule.get("enabled", False)):
+            result["score"] = 0
+            result.setdefault("reasons", []).append("symbol_rule_disabled")
+            result["direction"] = "NO_TRADE"
+        elif not bool(rule.get("can_execute", False)):
+            # Keep it visible in scanner state, but reduce score so it does not auto-write a live signal.
+            result["score"] = min(safe_float(result.get("score", 0), 0), safe_float(rule.get("min_score", 99), 99) - 1)
+            result.setdefault("reasons", []).append("scan_only_not_execution_enabled")
+        return result
+
+
+# Wrap scanner signal building so every auto-generated multi-ticker signal carries its rules.
+_base_multi_ticker_scanner_build_signal = multi_ticker_scanner_build_signal if "multi_ticker_scanner_build_signal" in globals() else None
+if _base_multi_ticker_scanner_build_signal:
+    def multi_ticker_scanner_build_signal(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        sig = _base_multi_ticker_scanner_build_signal(candidate)
+        gate = safe_multi_ticker_gate(sig, None)
+        adjusted = gate.get("adjusted_signal", sig)
+        adjusted["safe_multi_ticker_gate_preview"] = {
+            "approved": gate.get("approved"),
+            "reject_reasons": gate.get("reject_reasons", []),
+            "regime": gate.get("regime"),
+            "rule": gate.get("rule", {}),
+        }
+        # If a symbol is not execution-approved, keep the idea for review but mark it observe-only.
+        if not gate.get("approved"):
+            adjusted["observe_only"] = True
+            adjusted["execution_blocked_by_safe_multi_ticker"] = True
+            adjusted["safe_multi_ticker_reject_reasons"] = gate.get("reject_reasons", [])
+        return adjusted
+
+
+# Wrap auto contract selection to apply per-symbol size/risk tags before option symbol creation.
+_base_auto_select_option_contract = auto_select_option_contract if "auto_select_option_contract" in globals() else None
+if _base_auto_select_option_contract:
+    def auto_select_option_contract(signal: Dict[str, Any]) -> Dict[str, Any]:
+        gate = safe_multi_ticker_gate(signal, None)
+        x = gate.get("adjusted_signal", deepcopy(signal))
+        x["safe_multi_ticker_pre_contract_gate"] = {"approved": gate.get("approved"), "reject_reasons": gate.get("reject_reasons", []), "rule": gate.get("rule", {})}
+        return _base_auto_select_option_contract(x)
+
+
+# Final wrapper around the unified decision engine. This is the actual trade blocker.
+_base_evaluate_trade_opportunity = evaluate_trade_opportunity if "evaluate_trade_opportunity" in globals() else None
+if _base_evaluate_trade_opportunity:
+    def evaluate_trade_opportunity(signal: Dict[str, Any], selected_contract: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        gate = safe_multi_ticker_gate(signal, selected_contract)
+        adjusted_signal = gate.get("adjusted_signal", deepcopy(signal))
+        if not gate.get("approved", False):
+            decision = {
+                "approved": False,
+                "stage": "safe_multi_ticker_per_symbol_rules",
+                "ticker": str(adjusted_signal.get("ticker", "")).upper(),
+                "direction": str(adjusted_signal.get("direction", "")).upper(),
+                "score": 0,
+                "size_multiplier": 0,
+                "reject_reasons": gate.get("reject_reasons", []),
+                "rule": gate.get("rule", {}),
+                "regime": gate.get("regime"),
+                "exposure": gate.get("exposure", {}),
+                "selected_contract": selected_contract,
+            }
+            try:
+                safety_write_decision_event("safe_multi_ticker_block", signal=signal, decision=decision, selected=selected_contract, result={"approved": False})
+            except Exception:
+                pass
+            return decision
+
+        base = _base_evaluate_trade_opportunity(adjusted_signal, selected_contract)
+        if isinstance(base, dict):
+            base["safe_multi_ticker"] = {
+                "approved": True,
+                "rule": gate.get("rule", {}),
+                "regime": gate.get("regime"),
+                "adjusted_qty": adjusted_signal.get("qty"),
+                "exposure": gate.get("exposure", {}),
+            }
+        return base
+
+
+try:
+    print("[SAFE MULTI-TICKER EXECUTION RULES ACTIVE] per-symbol controls enabled", flush=True)
+except Exception:
+    pass
+
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
