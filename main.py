@@ -22,6 +22,45 @@ except Exception as _websocket_import_error:
     WEBSOCKET_CLIENT_AVAILABLE = False
     print(f"[WEBSOCKET IMPORT WARNING] websocket-client unavailable: {_websocket_import_error}", flush=True)
 
+
+# =========================================================
+# PHASE 1 ARCHITECTURE VISIBILITY LAYER
+# Additive only. No behavior changes yet.
+# Requires companion files:
+# - engine_state.py
+# - decision_trace.py
+# - reason_codes.py
+# - state_evaluator.py
+# - trace_writer.py
+# =========================================================
+try:
+    from decision_trace import create_decision_trace, section_result
+    from trace_writer import (
+        write_trace_event,
+        write_trace_section,
+        write_engine_state_snapshot,
+        write_operator_dashboard_snapshot,
+    )
+    from state_evaluator import evaluate_engine_state_visibility
+    PHASE1_ARCH_AVAILABLE = True
+except Exception as _phase1_arch_error:
+    PHASE1_ARCH_AVAILABLE = False
+    create_decision_trace = None
+    section_result = None
+    write_trace_event = None
+    write_trace_section = None
+    write_engine_state_snapshot = None
+    write_operator_dashboard_snapshot = None
+    evaluate_engine_state_visibility = None
+    print(f"[PHASE1 ARCH WARNING] unavailable: {_phase1_arch_error}", flush=True)
+
+PHASE1_TRACE_ONLY = os.getenv("PHASE1_TRACE_ONLY", "true").lower() == "true"
+ENABLE_PHASE1_DECISION_TRACE = os.getenv("ENABLE_PHASE1_DECISION_TRACE", "true").lower() == "true"
+ENABLE_PHASE1_STATE_VISIBILITY = os.getenv("ENABLE_PHASE1_STATE_VISIBILITY", "true").lower() == "true"
+ENABLE_PHASE1_OPERATOR_SNAPSHOT = os.getenv("ENABLE_PHASE1_OPERATOR_SNAPSHOT", "true").lower() == "true"
+PHASE1_DASHBOARD_EVERY_SECONDS = int(float(os.getenv("PHASE1_DASHBOARD_EVERY_SECONDS", "30")))
+print("[PHASE 1 ARCHITECTURE VISIBILITY ACTIVE] trace-only decision/state snapshots enabled", flush=True)
+
 print("[ONE TRADE LOCK PATCH ACTIVE] KILL_SWITCH/BOT_PAUSED NameError fixed", flush=True)
 print("[UNIFIED DECISION ENGINE ACTIVE] score/risk/liquidity/learning policy enabled", flush=True)
 print("[SMART EXECUTION SYSTEM ACTIVE] idempotency retry + order planning enabled", flush=True)
@@ -162,6 +201,214 @@ def debug_alpaca_urls_once() -> None:
         log(f"DEBUG: ALPACA URLS | base={normalize_alpaca_base_url(globals().get('ALPACA_BASE_URL', os.getenv('ALPACA_BASE_URL', '')))} account={alpaca_endpoint('/account')} orders={alpaca_endpoint('/orders')} positions={alpaca_endpoint('/positions')}")
     except Exception:
         pass
+
+
+# =========================================================
+# PHASE 1 ARCHITECTURE VISIBILITY HELPERS
+# These helpers are deliberately additive/trace-only.
+# They must never change routing, sizing, risk, or execution behavior while
+# PHASE1_TRACE_ONLY=true.
+# =========================================================
+def phase1_now_string() -> str:
+    try:
+        if "now_ts" in globals():
+            return now_ts()
+    except Exception:
+        pass
+    try:
+        return datetime.utcnow().isoformat() + "Z"
+    except Exception:
+        return ""
+
+
+def phase1_log(message: str) -> None:
+    try:
+        if "debug" in globals():
+            debug(message)
+        elif "log" in globals():
+            log(message)
+        else:
+            print(message, flush=True)
+    except Exception:
+        try:
+            print(message, flush=True)
+        except Exception:
+            pass
+
+
+def phase1_safe_write_engine_state_visibility():
+    """
+    Phase 1 visibility only.
+    Does NOT enforce state yet.
+
+    TODO PHASE 2 ENFORCEMENT:
+    Enforce engine_state_snapshot.allow_new_entries before any new order intent is created.
+    """
+    if not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_STATE_VISIBILITY:
+        return None
+    try:
+        snapshot = evaluate_engine_state_visibility(
+            market_data_file=globals().get("MARKET_DATA_FILE", globals().get("MARKET_PRICES_FILE", "market_prices.json")),
+            market_data_max_age_seconds=int(globals().get("MARKET_DATA_STALE_SECONDS", globals().get("MARKET_DATA_MAX_AGE_SECONDS", 30))),
+            recon_file=globals().get("RECON_FILE", "reconciliation.json"),
+            degraded_file=globals().get("DEGRADED_MODE_FILE", "degraded_mode.json"),
+            review_file=globals().get("REVIEW_REQUIRED_FILE", "review_required.json"),
+            hard_lock_file=globals().get("GLOBAL_HARD_LOCK_FILE", "global_hard_lock.json"),
+        )
+        write_engine_state_snapshot(snapshot)
+        return snapshot
+    except Exception as e:
+        phase1_log(f"PHASE1 STATE VISIBILITY ERROR | {e}")
+        return None
+
+
+def phase1_create_trace_for_signal(signal: dict, source: str = "main_loop"):
+    """Create canonical decision trace for the signal. Phase 1 only logs."""
+    if not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_DECISION_TRACE:
+        return None
+    try:
+        trace = create_decision_trace(
+            raw_signal=signal or {},
+            normalized_signal=signal or {},
+            source=source,
+        )
+        try:
+            if isinstance(signal, dict):
+                signal["_phase1_trace_id"] = trace.trace_id
+        except Exception:
+            pass
+        write_trace_event(trace, event_type="trace_created")
+        return trace
+    except Exception as e:
+        phase1_log(f"PHASE1 TRACE CREATE ERROR | {e}")
+        return None
+
+
+def phase1_trace_section(trace, section: str, payload: dict, event_type: str = "trace_section") -> None:
+    """Write one section to the trace stream without changing behavior."""
+    if not trace or not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_DECISION_TRACE:
+        return
+    try:
+        safe_payload = payload or {}
+        if hasattr(trace, "set_section"):
+            trace.set_section(section, safe_payload)
+        write_trace_section(trace.trace_id, section, safe_payload, event_type=event_type)
+    except Exception as e:
+        phase1_log(f"PHASE1 TRACE SECTION ERROR | section={section} error={e}")
+
+
+def phase1_trace_by_id(trace_id: str, section: str, payload: dict, event_type: str = "trace_section") -> None:
+    """Write a trace section when only trace_id is available, such as deep execution paths."""
+    if not trace_id or not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_DECISION_TRACE:
+        return
+    try:
+        write_trace_section(trace_id, section, payload or {}, event_type=event_type)
+    except Exception as e:
+        phase1_log(f"PHASE1 TRACE_BY_ID ERROR | trace_id={trace_id} section={section} error={e}")
+
+
+def phase1_trace_signal_section(signal: dict, section: str, payload: dict, event_type: str = "trace_section") -> None:
+    try:
+        trace_id = str((signal or {}).get("_phase1_trace_id") or "")
+        if trace_id:
+            phase1_trace_by_id(trace_id, section, payload or {}, event_type=event_type)
+    except Exception as e:
+        phase1_log(f"PHASE1 TRACE SIGNAL SECTION ERROR | {e}")
+
+
+def phase1_trace_broker_event(trace, event: dict) -> None:
+    if not trace or not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_DECISION_TRACE:
+        return
+    try:
+        payload = event or {}
+        if hasattr(trace, "append_broker_event"):
+            trace.append_broker_event(payload)
+        write_trace_section(trace.trace_id, "broker_order_events", payload, event_type="broker_event")
+    except Exception as e:
+        phase1_log(f"PHASE1 BROKER TRACE ERROR | {e}")
+
+
+def phase1_close_trace(trace, status: str = "CLOSED") -> None:
+    if not trace or not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_DECISION_TRACE:
+        return
+    try:
+        if hasattr(trace, "close"):
+            trace.close(status)
+        write_trace_event(trace, event_type="trace_closed")
+    except Exception as e:
+        phase1_log(f"PHASE1 TRACE CLOSE ERROR | {e}")
+
+
+def phase1_trace_decision_result(trace, section: str, result: dict, default_approved=None) -> None:
+    try:
+        approved = result.get("approved", default_approved) if isinstance(result, dict) else default_approved
+        phase1_trace_section(
+            trace,
+            section,
+            {
+                "approved": approved,
+                "result": result if isinstance(result, dict) else {"value": result},
+                "timestamp": phase1_now_string(),
+            },
+        )
+    except Exception as e:
+        phase1_log(f"PHASE1 TRACE DECISION RESULT ERROR | section={section} error={e}")
+
+
+def phase1_write_operator_snapshot(extra: dict = None) -> None:
+    if not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_OPERATOR_SNAPSHOT:
+        return
+    try:
+        now_epoch = int(time.time())
+        last_write = int(globals().get("_PHASE1_LAST_DASHBOARD_WRITE", 0) or 0)
+        if extra is None and last_write and (now_epoch - last_write) < PHASE1_DASHBOARD_EVERY_SECONDS:
+            return
+        globals()["_PHASE1_LAST_DASHBOARD_WRITE"] = now_epoch
+        state_snapshot = phase1_safe_write_engine_state_visibility()
+        payload = {
+            "timestamp": phase1_now_string(),
+            "phase": "PHASE_1_VISIBILITY_ONLY",
+            "trace_only": PHASE1_TRACE_ONLY,
+            "engine_state": state_snapshot.to_dict() if hasattr(state_snapshot, "to_dict") else (state_snapshot or {}),
+            "runtime": {
+                "live_mode": globals().get("LIVE_MODE", False),
+                "enable_alpaca": globals().get("ENABLE_ALPACA", False),
+                "enable_paper_execution": globals().get("ENABLE_PAPER_EXECUTION", False),
+                "run_loop": globals().get("RUN_LOOP", False),
+                "paper_broker_mode": globals().get("PAPER_BROKER_MODE", ""),
+            },
+            "risk": {
+                "max_open_positions": globals().get("MAX_OPEN_POSITIONS", None),
+                "max_daily_loss_pct": globals().get("MAX_DAILY_LOSS_PCT", None),
+                "max_portfolio_heat_pct": globals().get("MAX_PORTFOLIO_HEAT_PCT", None),
+            },
+            "files": {
+                "market_data_file": globals().get("MARKET_DATA_FILE", ""),
+                "state_file": globals().get("STATE_FILE", ""),
+                "positions_file": globals().get("POSITIONS_FILE", ""),
+                "orders_file": globals().get("ORDERS_FILE", ""),
+                "recon_file": globals().get("RECON_FILE", ""),
+            },
+            "extra": extra or {},
+        }
+        write_operator_dashboard_snapshot(payload)
+    except Exception as e:
+        phase1_log(f"PHASE1 OPERATOR SNAPSHOT ERROR | {e}")
+
+
+# TODO PHASE 2 ENFORCEMENT:
+# If current_state is EXIT_ONLY, allow only close/flatten/protective orders.
+# TODO PHASE 2 ENFORCEMENT:
+# If trace_writer fails before order intent persistence, fail closed and do not submit broker order.
+# TODO PHASE 2 ENFORCEMENT:
+# Attach trace_id to every client_order_id and local order record.
+# TODO PHASE 2 ENFORCEMENT:
+# Require broker order lifecycle events to reconcile back to a trace_id.
+# TODO PHASE 2 ENFORCEMENT:
+# Convert state_evaluator result into hard gate before execution.
+# TODO PHASE 2 ENFORCEMENT:
+# Feed execution quality degradation into CAUTIOUS/DEGRADED state requests.
+
 
 # =========================================================
 # ENV VARS
@@ -6099,7 +6346,18 @@ def alpaca_submit_equity_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     try:
+        phase1_trace_signal_section(signal, "broker_order_events", {
+            "event": "submit_attempt",
+            "client_order_id": payload.get("client_order_id"),
+            "payload": payload,
+        }, event_type="broker_event")
         r = alpaca_post("/v2/orders", payload)
+        phase1_trace_signal_section(signal, "broker_order_events", {
+            "event": "submit_response",
+            "status_code": getattr(r, "status_code", None),
+            "body": getattr(r, "text", ""),
+            "client_order_id": payload.get("client_order_id"),
+        }, event_type="broker_event")
         if r.status_code in (200, 201):
             data = r.json()
             debug(f"✅ ALPACA ORDER SUBMITTED | {ticker} {side.upper()} qty={qty} id={data.get('id')} client={payload['client_order_id']}")
@@ -7208,6 +7466,14 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
         "time_in_force": ALPACA_OPTION_TIME_IN_FORCE,
         "client_order_id": make_owned_client_order_id("opt", symbol),
     }
+    phase1_trace_signal_section(signal, "broker_order_events", {
+        "event": "option_payload_built",
+        "client_order_id": payload.get("client_order_id"),
+        "symbol": symbol,
+        "qty": qty,
+        "order_type": order_type,
+        "selector": selector,
+    }, event_type="broker_event")
     ask = safe_float(details.get("ask"), 0.0)
     if order_type == "limit":
         if ask <= 0:
@@ -7228,6 +7494,11 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 qty_for_exec = 1
             smart_result = smart_exec_submit_with_retry(signal, selected_for_exec, qty_for_exec, payload)
+            phase1_trace_signal_section(signal, "broker_order_events", {
+                "event": "smart_execution_result",
+                "result": smart_result,
+                "client_order_id": payload.get("client_order_id"),
+            }, event_type="broker_event")
             return smart_result
 
         r = alpaca_post("/v2/orders", payload)
@@ -7243,11 +7514,30 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
                 send_to_telegram(f"✅ ALPACA PAPER OPTION ORDER SUBMITTED\n{symbol} BUY qty={qty}\nOrder ID: {data.get('id')}")
             except Exception:
                 pass
+            phase1_trace_signal_section(signal, "broker_order_events", {
+                "event": "order_accepted",
+                "broker_order": data,
+                "client_order_id": payload.get("client_order_id"),
+            }, event_type="broker_event")
             return {"submitted": True, "reason": "alpaca_option_order_submitted", "order": data, "payload": payload, "selector": selector, "one_trade_gate": "scale" if is_scale else "new", "qty_reason": qty_reason}
         debug(f"❌ ALPACA OPTION ORDER FAILED | status={r.status_code} body={r.text} payload={payload} selector={selector}")
+        phase1_trace_signal_section(signal, "broker_order_events", {
+            "event": "order_failed",
+            "status_code": r.status_code,
+            "body": r.text,
+            "client_order_id": payload.get("client_order_id"),
+        }, event_type="broker_event")
         return {"submitted": False, "reason": f"alpaca_option_order_failed_{r.status_code}", "body": r.text, "payload": payload, "selector": selector}
     except Exception as e:
         debug(f"❌ ALPACA OPTION ORDER EXCEPTION | {e}")
+        try:
+            phase1_trace_signal_section(signal, "broker_order_events", {
+                "event": "order_exception",
+                "error": str(e),
+                "payload": payload if "payload" in locals() else {},
+            }, event_type="broker_event")
+        except Exception:
+            pass
         return {"submitted": False, "reason": f"alpaca_option_order_exception:{e}", "payload": payload, "selector": selector}
 
 def alpaca_delete(path: str):
@@ -11113,6 +11403,7 @@ def open_position_if_missing(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]
     symbol = str(signal.get("symbol", "")).strip()
 
     duplicate_gate = hard_duplicate_entry_gate(signal)
+    phase1_trace_decision_result(trace, "duplicate_entry_gate_initial", duplicate_gate)
     if not duplicate_gate["approved"]:
         msg = build_block_message("HARD DUPLICATE CAP SKIPPED OPEN", signal, duplicate_gate["reject_reasons"], "open_position_if_missing refused to create a stacked position.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17719,10 +18010,39 @@ def handle_new_signal(signal: Dict[str, Any]):
         debug("handle_new_signal skipped: empty signal")
         return None
 
+    # =========================================================
+    # PHASE 1 CANONICAL TRACE + STATE VISIBILITY
+    # Additive/visibility-only. Does not change trading behavior.
+    # =========================================================
+    phase1_state_snapshot = phase1_safe_write_engine_state_visibility()
+    trace = phase1_create_trace_for_signal(signal, source=str(signal.get("source", "handle_new_signal")) if isinstance(signal, dict) else "handle_new_signal")
+    if phase1_state_snapshot:
+        phase1_trace_section(
+            trace,
+            "engine_state",
+            phase1_state_snapshot.to_dict() if hasattr(phase1_state_snapshot, "to_dict") else {},
+            event_type="engine_state_snapshot",
+        )
+    phase1_trace_section(
+        trace,
+        "signal_intake",
+        {
+            "raw_signal": deepcopy(signal) if isinstance(signal, dict) else {},
+            "source": signal.get("source", "unknown") if isinstance(signal, dict) else "unknown",
+            "timestamp": phase1_now_string(),
+        },
+    )
+    phase1_write_operator_snapshot({"event": "signal_received", "ticker": signal.get("ticker") if isinstance(signal, dict) else None})
+
+    # TODO PHASE 2 ENFORCEMENT:
+    # if not PHASE1_TRACE_ONLY and phase1_state_snapshot and not phase1_state_snapshot.allow_new_entries:
+    #     return None
+
     # MARKET REGIME ENGINE: classify current conditions and block chop/event/stale-data before any entry path.
     try:
         mr_gate = market_regime_pretrade_gate(signal)
         signal = mr_gate.get("signal", signal)
+        phase1_trace_decision_result(trace, "market_regime_pretrade_gate", mr_gate)
         if not mr_gate.get("approved", True):
             debug(f"🚫 MARKET REGIME BLOCK | regime={mr_gate.get('regime')} | reasons={mr_gate.get('reasons')}")
             return None
@@ -17730,6 +18050,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         debug(f"MARKET REGIME PRETRADE ERROR | {mr_error}")
 
     clean_ok, clean_reason = qqq_clean_signal_guard(signal, stage="handle_new_signal")
+    phase1_trace_section(trace, "clean_signal_guard", {"approved": clean_ok, "reason": clean_reason})
     if not clean_ok:
         debug(f"🚫 QQQ CLEAN GUARD BLOCK | reason={clean_reason}")
         try:
@@ -17739,6 +18060,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         return None
 
     qqq_ok, qqq_reason = qqq_only_signal_allowed(signal, stage="handle_new_signal")
+    phase1_trace_section(trace, "symbol_scope_guard", {"approved": qqq_ok, "reason": qqq_reason})
     if not qqq_ok:
         qqq_only_debug_block(signal, qqq_reason, stage="handle_new_signal")
         return None
@@ -17778,6 +18100,11 @@ def handle_new_signal(signal: Dict[str, Any]):
         )
     except Exception:
         pass
+    phase1_trace_section(trace, "manual_engine_controls", {
+        "engine_enabled": GLOBAL_STATE.get("engine_enabled", True),
+        "kill_switch": GLOBAL_STATE.get("kill_switch", False),
+        "bot_paused": GLOBAL_STATE.get("bot_paused", False),
+    })
     if not GLOBAL_STATE.get("engine_enabled", True) or GLOBAL_STATE.get("kill_switch", False) or GLOBAL_STATE.get("bot_paused", False):
         try:
             intel_event("signal_ignored", {"engine_enabled": GLOBAL_STATE.get("engine_enabled", True), "kill_switch": GLOBAL_STATE.get("kill_switch", False), "bot_paused": GLOBAL_STATE.get("bot_paused", False)}, signal=signal, stage="engine_state", decision="ignored")
@@ -17811,6 +18138,7 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     # PHASE 0: catastrophic-loss safety gate before normal validation/risk.
     phase0_decision = phase0_pretrade_safety_gate(signal)
+    phase1_trace_decision_result(trace, "phase0_pretrade_safety", phase0_decision)
     if not phase0_decision["approved"]:
         msg = build_block_message("PHASE 0 BLOCKED SIGNAL", signal, phase0_decision["reject_reasons"], "Fresh price / state / hard risk gate failed.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17819,6 +18147,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         return
 
     validation_decision = validate_signal(signal)
+    phase1_trace_decision_result(trace, "pre_trade_validation", validation_decision)
     if not validation_decision["approved"]:
         msg = build_block_message("VALIDATION BLOCKED SIGNAL", signal, validation_decision["reject_reasons"], f"Reward/Risk: {validation_decision.get('reward_to_risk', 0.0)}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17826,6 +18155,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         return
 
     entry_lock_decision = evaluate_entry_lock(signal)
+    phase1_trace_decision_result(trace, "entry_lock", entry_lock_decision)
     if not entry_lock_decision["approved"]:
         extras = (
             f"Live Price: {entry_lock_decision.get('live_price')} | "
@@ -17841,6 +18171,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     entry_locked_signal = apply_entry_lock_to_signal(signal, entry_lock_decision)
 
     regime_decision = evaluate_regime(entry_locked_signal)
+    phase1_trace_decision_result(trace, "regime_evaluation", regime_decision)
     if not regime_decision["approved"]:
         msg = build_block_message("REGIME BLOCKED SIGNAL", signal, regime_decision["reject_reasons"], f"Regime: {regime_decision.get('regime')} | Score: {regime_decision.get('regime_score')}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17853,10 +18184,12 @@ def handle_new_signal(signal: Dict[str, Any]):
     # Manual + closed-trade memory adjusts grade/confidence BEFORE Phase 3 and BEFORE execution.
     # Risk, Phase 3.5, portfolio, and kill-switch gates still remain in full control.
     regime_signal = adaptive_apply_learning_to_signal(regime_signal)
+    phase1_trace_section(trace, "journal_learning_adjustment", {"signal_after_learning": deepcopy(regime_signal)})
 
     # UNUSUAL WHALES DARK POOL:
     # Institutional resource levels become confluence before Phase 3 sizing/execution.
     regime_signal = apply_unusual_whales_darkpool_to_signal(regime_signal, stage="pre_phase3")
+    phase1_trace_section(trace, "darkpool_context", {"signal_after_darkpool": deepcopy(regime_signal)})
     send_unusual_whales_darkpool_alert(regime_signal)
     maybe_send_live_entry_oil_style_alert(regime_signal, stage="pre_phase3")
     if unusual_whales_darkpool_blocks_signal(regime_signal):
@@ -17866,6 +18199,7 @@ def handle_new_signal(signal: Dict[str, Any]):
     # downgrade confidence, and adjust size before risk sizing/execution.
     debug(f"PHASE 3 PRE-ENTRY HOOK REACHED | ticker={regime_signal.get('ticker')} | direction={regime_signal.get('direction')} | confidence={regime_signal.get('confidence')}")
     phase3_decision = phase3_evaluate_adaptive_intelligence(regime_signal)
+    phase1_trace_decision_result(trace, "adaptive_learning", {k: v for k, v in phase3_decision.items() if k != "adjusted_signal"})
     if not phase3_decision["approved"]:
         msg = build_block_message("PHASE 3 ADAPTIVE BLOCKED SIGNAL", regime_signal, phase3_decision.get("reject_reasons", []), f"Setup: {phase3_decision.get('setup_key')} | Stats: {phase3_decision.get('stats', {})}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17877,6 +18211,7 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     # REAL-TIME ADAPTIVE RISK: day-performance + live-condition gate before sizing.
     realtime_risk_decision = realtime_adaptive_risk_pretrade_gate(adaptive_signal)
+    phase1_trace_decision_result(trace, "realtime_adaptive_risk", {k: v for k, v in realtime_risk_decision.items() if k != "state"} if isinstance(realtime_risk_decision, dict) else realtime_risk_decision)
     if not realtime_risk_decision.get("approved", True):
         return
     adaptive_signal["realtime_adaptive_risk"] = {k: v for k, v in realtime_risk_decision.items() if k != "state"}
@@ -17888,14 +18223,19 @@ def handle_new_signal(signal: Dict[str, Any]):
         size_decision=None,
         stage="pre_size",
     )
+    phase1_trace_decision_result(trace, "phase35_pre_size", phase35_pre_size_decision)
     if not phase35_pre_size_decision["approved"]:
         return
 
     adaptive_signal = enrich_signal_with_execution_risk_fields(adaptive_signal)
     size_decision = size_signal_by_stop(adaptive_signal)
+    phase1_trace_decision_result(trace, "position_sizing_initial", size_decision)
     size_decision = phase3_apply_size_multiplier_to_decision(size_decision, phase3_decision)
+    phase1_trace_decision_result(trace, "position_sizing_after_phase3", size_decision)
     size_decision = apply_execution_score_to_size_decision(adaptive_signal, size_decision)
+    phase1_trace_decision_result(trace, "execution_scoring", {"approved": size_decision.get("approved"), "size_decision": size_decision, "execution_score": adaptive_signal.get("execution_score", adaptive_signal.get("score"))})
     size_decision = realtime_adaptive_risk_apply_size(size_decision, realtime_risk_decision, adaptive_signal)
+    phase1_trace_decision_result(trace, "position_sizing_after_realtime_risk", size_decision)
     if not size_decision["approved"]:
         msg = build_block_message("SIZING BLOCKED SIGNAL", regime_signal, size_decision["reject_reasons"], f"Raw Size: {size_decision.get('raw_size')} | Final Size: {size_decision.get('final_size')}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17912,11 +18252,13 @@ def handle_new_signal(signal: Dict[str, Any]):
         size_decision=size_decision,
         stage="final_pre_risk",
     )
+    phase1_trace_decision_result(trace, "phase35_final_pre_risk", phase35_final_decision)
     if not phase35_final_decision["approved"]:
         return
     sized_signal["phase35_decision"] = phase35_final_decision
 
     risk_decision = evaluate_risk_policy(sized_signal)
+    phase1_trace_decision_result(trace, "risk_policy", risk_decision)
     if not risk_decision["approved"]:
         msg = build_block_message("RISK BLOCKED SIGNAL", sized_signal, risk_decision["reject_reasons"], f"Risk %: {round(risk_decision.get('risk_per_trade_pct', 0.0)*100, 3)} | Heat %: {round(risk_decision.get('portfolio_heat_pct', 0.0)*100, 3)}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17924,6 +18266,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         return
 
     portfolio_decision = evaluate_portfolio_risk(sized_signal)
+    phase1_trace_decision_result(trace, "portfolio_risk", portfolio_decision)
     if not portfolio_decision["approved"]:
         msg = build_block_message("PORTFOLIO BLOCKED SIGNAL", sized_signal, portfolio_decision["reject_reasons"], f"Projected Heat %: {round(portfolio_decision.get('projected_heat_pct', 0.0)*100, 3)}")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17932,10 +18275,12 @@ def handle_new_signal(signal: Dict[str, Any]):
 
     # STEP 14: final account-level portfolio guard before routing/execution.
     step14_decision = step14_can_open_new_trade(sized_signal)
+    phase1_trace_decision_result(trace, "step14_portfolio_guard", step14_decision)
     if not step14_decision["approved"]:
         return
 
     duplicate_gate_final = hard_duplicate_entry_gate(sized_signal)
+    phase1_trace_decision_result(trace, "duplicate_entry_gate_final", duplicate_gate_final)
     if not duplicate_gate_final["approved"]:
         msg = build_block_message("HARD DUPLICATE CAP BLOCKED ENTRY", sized_signal, duplicate_gate_final["reject_reasons"], "Blocked at final pre-order gate.")
         send_to_discord(DISCORD_AI_WEBHOOK, msg, "AI")
@@ -17955,6 +18300,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         planned_price=safe_float(sized_signal.get("entry_contract", 0), 0),
         mode="LIVE" if (GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True)) else "PAPER",
     )
+    phase1_trace_decision_result(trace, "phase1_execution_safety", phase1_entry_decision)
     if not phase1_entry_decision["approved"]:
         return
 
@@ -17965,6 +18311,7 @@ def handle_new_signal(signal: Dict[str, Any]):
         qty=safe_int(sized_signal.get("qty", 0), 0),
         mode="LIVE" if (GLOBAL_STATE.get("alpaca_enabled", False) and ENABLE_ALPACA and not GLOBAL_STATE.get("paper_enabled", True)) else "PAPER",
     )
+    phase1_trace_decision_result(trace, "phase2_execution_reliability", phase2_entry_decision)
     if not phase2_entry_decision["approved"]:
         return
 
@@ -17983,7 +18330,17 @@ def handle_new_signal(signal: Dict[str, Any]):
         stage="approval_pipeline",
         decision="approved",
     )
+    phase1_trace_section(trace, "final_decision", {
+        "approved": True,
+        "decision": "APPROVE_ENTRY",
+        "final_qty": sized_signal.get("qty"),
+        "ticker": sized_signal.get("ticker"),
+        "symbol": sized_signal.get("symbol"),
+        "execution_score": sized_signal.get("execution_score", sized_signal.get("score")),
+        "size_decision": sized_signal.get("size_decision", {}),
+    })
     route_signal(sized_signal, GLOBAL_STATE)
+    phase1_trace_section(trace, "route_signal", {"routed": True, "state_signal_count_before": GLOBAL_STATE.get("signal_count")})
     sig_hash = signal_hash(signal)
     GLOBAL_STATE["last_signal_hash"] = sig_hash
     GLOBAL_STATE["last_signal_time"] = epoch()
@@ -17994,7 +18351,18 @@ def handle_new_signal(signal: Dict[str, Any]):
     # PHASE 3.5 EXECUTION ROUTER FIX:
     # After all validation/risk/portfolio/phase gates approve, this explicitly
     # creates the paper/live order and local position.
+    phase1_trace_section(trace, "execution_plan", {
+        "ticker": sized_signal.get("ticker"),
+        "symbol": sized_signal.get("symbol"),
+        "qty": sized_signal.get("qty"),
+        "entry_contract": sized_signal.get("entry_contract"),
+        "stop_contract": sized_signal.get("stop_contract"),
+        "tp1_contract": sized_signal.get("tp1_contract"),
+        "paper_broker_mode": globals().get("PAPER_BROKER_MODE", ""),
+        "alpaca_enabled": globals().get("ENABLE_ALPACA", False),
+    })
     opened_position = execute_approved_signal(sized_signal)
+    phase1_trace_section(trace, "execution_result", {"opened_position": deepcopy(opened_position) if opened_position else None})
     if opened_position:
         debug(
             f"ENTRY EXECUTION CONFIRMED | symbol={opened_position.get('symbol')} | "
@@ -18005,6 +18373,9 @@ def handle_new_signal(signal: Dict[str, Any]):
         debug("ENTRY EXECUTION NOT CREATED | approved signal did not produce an order/position")
 
     manage_open_positions(sized_signal)
+    phase1_trace_section(trace, "position_management_tick", {"managed_after_entry": True})
+    phase1_write_operator_snapshot({"event": "signal_processed", "ticker": sized_signal.get("ticker"), "approved": True})
+    phase1_close_trace(trace, status="ENTRY_PIPELINE_COMPLETE")
 
 
 
@@ -21158,6 +21529,7 @@ def run_once():
     sig = load_live_signal() or fallback_signal()
     handle_new_signal(sig)
     runtime_housekeeping()
+    phase1_write_operator_snapshot({"event": "run_once"})
     process_telegram_updates()
     maybe_send_daily_alpaca_bot_report(force="--daily-report-now" in sys.argv)
     send_heartbeat(force=False)
