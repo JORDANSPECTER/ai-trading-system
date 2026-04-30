@@ -24178,6 +24178,405 @@ try:
     print("[MULTI-CANDIDATE SCANNER GENERATOR ACTIVE] pool -> allocator -> selected signal enabled", flush=True)
 except Exception:
     pass
+
+# =========================================================
+# PHASE 3: INTELLIGENT ENGINE RECOVERY + EXPLICIT DEGRADE REASONS
+# Additive safety layer. It does NOT override true hard-risk locks.
+# It makes DEGRADED state explain itself and auto-recovers only when
+# conditions are clean enough to safely allow allocator/unified-decision flow.
+# =========================================================
+ENABLE_PHASE3_INTELLIGENT_RECOVERY = os.getenv("ENABLE_PHASE3_INTELLIGENT_RECOVERY", "true").lower() == "true"
+PHASE3_RECOVERY_STATE_FILE = os.getenv("PHASE3_RECOVERY_STATE_FILE", "phase3_intelligent_recovery_state.json").strip()
+PHASE3_RECOVERY_EVENTS_FILE = os.getenv("PHASE3_RECOVERY_EVENTS_FILE", "phase3_intelligent_recovery_events.jsonl").strip()
+PHASE3_DEGRADE_REASONS_FILE = os.getenv("PHASE3_DEGRADE_REASONS_FILE", "phase3_degrade_reasons.json").strip()
+PHASE3_RECOVERY_ALERTS = os.getenv("PHASE3_RECOVERY_ALERTS", "true").lower() == "true"
+PHASE3_RECOVERY_CHECK_SECONDS = int(float(os.getenv("PHASE3_RECOVERY_CHECK_SECONDS", "10")))
+PHASE3_RECOVERY_MIN_CLEAN_CHECKS = int(float(os.getenv("PHASE3_RECOVERY_MIN_CLEAN_CHECKS", "2")))
+PHASE3_RECOVERY_MARKET_MAX_AGE_SECONDS = int(float(os.getenv("PHASE3_RECOVERY_MARKET_MAX_AGE_SECONDS", os.getenv("MARKET_DATA_MAX_AGE_SECONDS", "300"))))
+PHASE3_RECOVERY_CLEAR_STALE_DEGRADED_FILES = os.getenv("PHASE3_RECOVERY_CLEAR_STALE_DEGRADED_FILES", "true").lower() == "true"
+PHASE3_RECOVERY_ALLOW_NORMAL_OVERRIDE = os.getenv("PHASE3_RECOVERY_ALLOW_NORMAL_OVERRIDE", "true").lower() == "true"
+PHASE3_RECOVERY_FORCE_ACTIVE_FOR_TEST = os.getenv("FORCE_ENGINE_ACTIVE", "false").lower() == "true"
+PHASE3_RECOVERY_BLOCK_AFTER_HOURS = os.getenv("PHASE3_RECOVERY_BLOCK_AFTER_HOURS", "false").lower() == "true"
+
+
+def phase3_recovery_now() -> str:
+    try:
+        return now_ts() if "now_ts" in globals() else datetime.now().isoformat()
+    except Exception:
+        return datetime.now().isoformat()
+
+
+def phase3_recovery_event(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        row = {"time": phase3_recovery_now(), "event": event, **(payload or {})}
+        with open(PHASE3_RECOVERY_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def phase3_recovery_read_json(path: str, default: Any) -> Any:
+    try:
+        if not path or not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def phase3_recovery_write_json(path: str, payload: Dict[str, Any]) -> bool:
+    try:
+        if "atomic_write_json" in globals():
+            return bool(atomic_write_json(path, payload))
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload or {}, f, indent=2, default=str)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        phase3_recovery_event("write_failed", {"path": path, "error": str(e)})
+        return False
+
+
+def phase3_file_age_seconds(path: str) -> Optional[float]:
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def phase3_truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "active", "locked"}
+
+
+def phase3_recovery_market_status() -> Dict[str, Any]:
+    path = str(globals().get("MARKET_DATA_FILE", globals().get("MARKET_PRICES_FILE", "market_prices.json")))
+    max_age = max(
+        PHASE3_RECOVERY_MARKET_MAX_AGE_SECONDS,
+        int(float(globals().get("MARKET_DATA_MAX_AGE_SECONDS", 0) or 0)),
+        int(float(globals().get("MARKET_DATA_STALE_SECONDS", 0) or 0)),
+        60,
+    )
+    age = phase3_file_age_seconds(path)
+    if age is None:
+        return {"ok": False, "reason": "market_data_file_missing", "file": path}
+    data = phase3_recovery_read_json(path, {})
+    symbols_with_price = []
+    if isinstance(data, dict):
+        for sym, row in data.items():
+            if not isinstance(row, dict):
+                continue
+            try:
+                px = safe_float(row.get("price") or row.get("last") or row.get("close"), 0) if "safe_float" in globals() else float(row.get("price") or row.get("last") or row.get("close") or 0)
+            except Exception:
+                px = 0
+            if px > 0:
+                symbols_with_price.append(str(sym).upper())
+    if age > max_age:
+        return {"ok": False, "reason": "market_data_stale", "age_seconds": round(age, 2), "max_age_seconds": max_age, "file": path, "symbols_with_price": symbols_with_price}
+    if not symbols_with_price:
+        return {"ok": False, "reason": "market_data_has_no_prices", "age_seconds": round(age, 2), "file": path}
+    return {"ok": True, "reason": "market_data_fresh", "age_seconds": round(age, 2), "max_age_seconds": max_age, "file": path, "symbols_with_price": symbols_with_price[:12]}
+
+
+def phase3_recovery_recon_status() -> Dict[str, Any]:
+    path = str(globals().get("RECON_FILE", "reconciliation.json"))
+    data = phase3_recovery_read_json(path, {})
+    bad = []
+    if isinstance(data, dict):
+        for key in ("mismatch", "has_mismatch", "broker_local_mismatch", "foreign_positions", "foreign_orders", "reconciliation_required"):
+            if data.get(key):
+                bad.append(key)
+        for section_name in ("last_boot_report", "last_runtime_report", "report"):
+            report = data.get(section_name)
+            if isinstance(report, dict):
+                for key in ("mismatches", "foreign_positions", "foreign_orders", "missing_local_positions", "missing_broker_positions", "uncertain_orders"):
+                    if report.get(key):
+                        bad.append(f"{section_name}.{key}")
+    if bad:
+        return {"ok": False, "reason": "reconciliation_not_clean", "bad_keys": sorted(set(bad)), "file": path}
+    return {"ok": True, "reason": "reconciliation_clean", "file": path}
+
+
+def phase3_recovery_open_risk_status() -> Dict[str, Any]:
+    open_positions = []
+    active_orders = []
+    try:
+        positions = load_positions() if "load_positions" in globals() else phase3_recovery_read_json(globals().get("POSITIONS_FILE", "positions.json"), {})
+        if isinstance(positions, dict):
+            open_positions = [p for p in positions.get("open_positions", []) if isinstance(p, dict) and str(p.get("status", "OPEN")).upper() in {"OPEN", "ACTIVE"}]
+    except Exception as e:
+        return {"ok": False, "reason": "positions_check_error", "error": str(e)}
+    try:
+        orders = load_orders() if "load_orders" in globals() else phase3_recovery_read_json(globals().get("ORDERS_FILE", "orders.json"), {})
+        if isinstance(orders, dict):
+            active_statuses = {"new", "accepted", "pending_new", "partially_filled", "pending_cancel", "open", "submitted"}
+            active_orders = [o for o in orders.get("orders", []) if isinstance(o, dict) and str(o.get("status", "")).lower() in active_statuses]
+    except Exception as e:
+        return {"ok": False, "reason": "orders_check_error", "error": str(e)}
+    if open_positions:
+        return {"ok": False, "reason": "open_positions_exist", "open_positions": len(open_positions)}
+    if active_orders:
+        return {"ok": False, "reason": "active_orders_exist", "active_orders": len(active_orders)}
+    return {"ok": True, "reason": "no_open_positions_or_active_orders", "open_positions": 0, "active_orders": 0}
+
+
+def phase3_recovery_loss_status() -> Dict[str, Any]:
+    try:
+        daily_pnl = step14_daily_pnl_dollars() if "step14_daily_pnl_dollars" in globals() else safe_float(globals().get("GLOBAL_STATE", {}).get("daily_realized_pnl_dollars", 0), 0)
+    except Exception:
+        daily_pnl = 0.0
+    try:
+        loss_limit = step14_daily_loss_limit_dollars() if "step14_daily_loss_limit_dollars" in globals() else 0.0
+    except Exception:
+        loss_limit = 0.0
+    if loss_limit and daily_pnl <= -abs(loss_limit):
+        return {"ok": False, "reason": "daily_loss_limit_hit", "daily_pnl": daily_pnl, "loss_limit": -abs(loss_limit)}
+    return {"ok": True, "reason": "daily_loss_safe", "daily_pnl": daily_pnl, "loss_limit": -abs(loss_limit) if loss_limit else None}
+
+
+def phase3_recovery_manual_status() -> Dict[str, Any]:
+    if os.getenv("KILL_SWITCH", "false").lower() == "true":
+        return {"ok": False, "reason": "env_kill_switch_true"}
+    if os.getenv("BOT_PAUSED", "false").lower() == "true":
+        return {"ok": False, "reason": "env_bot_paused_true"}
+    return {"ok": True, "reason": "manual_env_clear"}
+
+
+def phase3_recovery_safety_file_status() -> Dict[str, Any]:
+    files = {
+        "degraded": str(globals().get("DEGRADED_MODE_FILE", "degraded_mode.json")),
+        "review_required": str(globals().get("REVIEW_REQUIRED_FILE", "review_required.json")),
+        "hard_lock": str(globals().get("GLOBAL_HARD_LOCK_FILE", "global_hard_lock.json")),
+    }
+    active = []
+    details = {}
+    for label, path in files.items():
+        data = phase3_recovery_read_json(path, {})
+        details[label] = data if isinstance(data, dict) else {}
+        if isinstance(data, dict) and any(phase3_truthy(data.get(k)) for k in ("active", "enabled", "locked", "hard_lock")):
+            active.append(label)
+    # Hard lock/review required are not auto-cleared. Degraded may be auto-cleared when all truth checks pass.
+    blocking = [x for x in active if x in {"review_required", "hard_lock"}]
+    if blocking:
+        return {"ok": False, "reason": "hard_safety_file_active", "active": active, "details": details}
+    return {"ok": True, "reason": "no_hard_safety_file_active", "active": active, "details": details}
+
+
+def phase3_collect_degrade_reasons(trigger: str = "loop") -> Dict[str, Any]:
+    checks = {
+        "manual": phase3_recovery_manual_status(),
+        "market_data": phase3_recovery_market_status(),
+        "reconciliation": phase3_recovery_recon_status(),
+        "open_risk": phase3_recovery_open_risk_status(),
+        "daily_loss": phase3_recovery_loss_status(),
+        "safety_files": phase3_recovery_safety_file_status(),
+    }
+    engine_snapshot = phase3_recovery_read_json("engine_state_machine.json", {})
+    controlled_snapshot = phase3_recovery_read_json(globals().get("ENGINE_RECOVERY_STATE_FILE", "controlled_engine_recovery_state.json"), {})
+    current_state = str(engine_snapshot.get("current_state") or engine_snapshot.get("state") or "UNKNOWN").upper() if isinstance(engine_snapshot, dict) else "UNKNOWN"
+    blockers = []
+    for name, status in checks.items():
+        if not status.get("ok"):
+            blockers.append({"subsystem": name, "reason": status.get("reason", "unknown"), "details": status})
+    if isinstance(engine_snapshot, dict):
+        for r in engine_snapshot.get("reasons", []) or []:
+            if isinstance(r, dict) and str(r.get("severity", "")).upper() in {"BLOCK", "CRITICAL", "WARN"}:
+                blockers.append({"subsystem": r.get("subsystem", "engine_state"), "reason": r.get("reason_code") or r.get("code") or r.get("message", "engine_state_reason"), "details": r})
+    payload = {
+        "time": phase3_recovery_now(),
+        "trigger": trigger,
+        "current_state": current_state,
+        "blockers": blockers,
+        "checks": checks,
+        "engine_state_snapshot": engine_snapshot if isinstance(engine_snapshot, dict) else {},
+        "controlled_recovery_snapshot": controlled_snapshot if isinstance(controlled_snapshot, dict) else {},
+    }
+    phase3_recovery_write_json(PHASE3_DEGRADE_REASONS_FILE, payload)
+    return payload
+
+
+def phase3_recovery_conditions_clean(report: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    blockers = []
+    for b in report.get("blockers", []) or []:
+        reason = str(b.get("reason", ""))
+        # These stale visibility reasons can be overwritten if truth checks are now clean.
+        soft_visibility_reasons = ("MARKET_DATA_STALE", "market_data_stale", "DEGRADED_FILE_ACTIVE", "degraded")
+        if any(x in reason for x in soft_visibility_reasons):
+            continue
+        blockers.append(reason)
+    truth_checks = report.get("checks", {}) if isinstance(report.get("checks"), dict) else {}
+    for name, status in truth_checks.items():
+        if not isinstance(status, dict):
+            continue
+        if not status.get("ok"):
+            reason = str(status.get("reason", "unknown"))
+            # active degraded file alone is allowed to be cleared; hard/review is not.
+            if name == "safety_files" and reason == "no_hard_safety_file_active":
+                continue
+            blockers.append(f"{name}:{reason}")
+    return len(blockers) == 0, sorted(set(blockers))
+
+
+def phase3_clear_recoverable_locks(clean_reasons: List[str]) -> List[str]:
+    cleared = []
+    timestamp = phase3_recovery_now()
+    # Clear degraded file only. Never clear hard lock/review-required automatically.
+    if PHASE3_RECOVERY_CLEAR_STALE_DEGRADED_FILES:
+        degraded_file = str(globals().get("DEGRADED_MODE_FILE", "degraded_mode.json"))
+        data = phase3_recovery_read_json(degraded_file, {})
+        if isinstance(data, dict) and any(phase3_truthy(data.get(k)) for k in ("active", "enabled", "locked")):
+            data.update({"active": False, "enabled": False, "locked": False, "phase3_recovered_at": timestamp, "phase3_recovery_reasons": clean_reasons})
+            if phase3_recovery_write_json(degraded_file, data):
+                cleared.append(degraded_file)
+    # Clear local soft pause/kill only if the reason is not a hard risk reason.
+    try:
+        state = globals().get("GLOBAL_STATE") if isinstance(globals().get("GLOBAL_STATE"), dict) else (load_state() if "load_state" in globals() else {})
+        if isinstance(state, dict):
+            hard_reason = str(state.get("hard_kill_reason") or state.get("step15_last_reason") or "").lower()
+            forbidden = ("daily loss", "loss limit", "max loss", "drawdown", "foreign", "recon", "mismatch", "uncertain")
+            if not any(x in hard_reason for x in forbidden):
+                changed = False
+                for key in ("kill_switch", "bot_paused", "step15_kill_active", "step15_locked"):
+                    if state.get(key):
+                        state[key] = False
+                        changed = True
+                if state.get("engine_enabled") is False:
+                    state["engine_enabled"] = True
+                    changed = True
+                if state.get("allow_entries") is False:
+                    state["allow_entries"] = True
+                    changed = True
+                if changed:
+                    state["hard_kill_reason"] = ""
+                    state["step15_last_reason"] = ""
+                    state["phase3_recovered_at"] = timestamp
+                    state["phase3_recovery_reasons"] = clean_reasons
+                    if "save_state" in globals():
+                        save_state(state)
+                    cleared.append("local_soft_lock_state")
+    except Exception as e:
+        phase3_recovery_event("clear_local_lock_error", {"error": str(e)})
+    return cleared
+
+
+def phase3_intelligent_engine_recovery(trigger: str = "loop") -> Dict[str, Any]:
+    if not ENABLE_PHASE3_INTELLIGENT_RECOVERY:
+        return {"enabled": False, "recovered": False, "reason": "phase3_recovery_disabled"}
+    now_i = int(time.time())
+    last = int(globals().get("_PHASE3_LAST_RECOVERY_TS", 0) or 0)
+    if trigger not in {"manual", "startup", "state_gate"} and now_i - last < PHASE3_RECOVERY_CHECK_SECONDS:
+        return phase3_recovery_read_json(PHASE3_RECOVERY_STATE_FILE, {"enabled": True, "skipped": "cooldown"})
+    globals()["_PHASE3_LAST_RECOVERY_TS"] = now_i
+
+    report = phase3_collect_degrade_reasons(trigger=trigger)
+    clean, blockers = phase3_recovery_conditions_clean(report)
+    prior = phase3_recovery_read_json(PHASE3_RECOVERY_STATE_FILE, {})
+    clean_count = int(prior.get("clean_count", 0) or 0) + 1 if clean else 0
+    clean_reasons = []
+    if clean:
+        for name, status in report.get("checks", {}).items():
+            if isinstance(status, dict):
+                clean_reasons.append(f"{name}:{status.get('reason')}")
+    cleared = []
+    recovered = False
+    if PHASE3_RECOVERY_FORCE_ACTIVE_FOR_TEST:
+        clean = True
+        clean_count = max(clean_count, PHASE3_RECOVERY_MIN_CLEAN_CHECKS)
+        clean_reasons.append("force_engine_active_for_test")
+    if clean and clean_count >= PHASE3_RECOVERY_MIN_CLEAN_CHECKS:
+        cleared = phase3_clear_recoverable_locks(clean_reasons)
+        recovered = bool(cleared) or PHASE3_RECOVERY_ALLOW_NORMAL_OVERRIDE or PHASE3_RECOVERY_FORCE_ACTIVE_FOR_TEST
+
+    payload = {
+        "time": phase3_recovery_now(),
+        "trigger": trigger,
+        "clean": clean,
+        "clean_count": clean_count,
+        "required_clean_count": PHASE3_RECOVERY_MIN_CLEAN_CHECKS,
+        "recovered": recovered,
+        "normal_override_allowed": bool(recovered and PHASE3_RECOVERY_ALLOW_NORMAL_OVERRIDE),
+        "cleared": cleared,
+        "blockers": blockers,
+        "degrade_report_file": PHASE3_DEGRADE_REASONS_FILE,
+        "checks": report.get("checks", {}),
+    }
+    phase3_recovery_write_json(PHASE3_RECOVERY_STATE_FILE, payload)
+    phase3_recovery_event("phase3_recovery_checked", payload)
+    try:
+        if blockers:
+            debug(f"PHASE 3 RECOVERY BLOCKED | reasons={blockers[:5]}")
+        elif recovered:
+            debug(f"✅ PHASE 3 ENGINE RECOVERY | clean_count={clean_count} cleared={cleared} normal_override={payload['normal_override_allowed']}")
+        else:
+            debug(f"PHASE 3 RECOVERY CLEAN WAIT | clean_count={clean_count}/{PHASE3_RECOVERY_MIN_CLEAN_CHECKS}")
+    except Exception:
+        pass
+    return payload
+
+
+# Wrap allocator state lookup so stale DEGRADED visibility does not freeze the system forever
+# when truth checks are clean. This does not override hard/review/daily-loss/foreign/recon locks.
+_base_portfolio_allocator_current_state_phase3 = portfolio_allocator_current_state if "portfolio_allocator_current_state" in globals() else None
+if _base_portfolio_allocator_current_state_phase3:
+    def portfolio_allocator_current_state() -> Dict[str, Any]:
+        state = _base_portfolio_allocator_current_state_phase3()
+        try:
+            recovery = phase3_intelligent_engine_recovery(trigger="state_gate")
+            blockers = recovery.get("blockers", []) if isinstance(recovery, dict) else []
+            if (recovery.get("recovered") or recovery.get("normal_override_allowed")) and not blockers:
+                old_state = str(state.get("current_state", "UNKNOWN")) if isinstance(state, dict) else "UNKNOWN"
+                state = dict(state or {})
+                state["previous_state_before_phase3_recovery"] = old_state
+                state["current_state"] = "NORMAL"
+                state["allowed_to_trade"] = True
+                state["allow_new_entries"] = True
+                state["phase3_recovery_override"] = True
+                state["phase3_recovery_state"] = recovery
+        except Exception as e:
+            try:
+                debug(f"PHASE 3 RECOVERY STATE WRAP ERROR | {e}")
+            except Exception:
+                pass
+        return state
+
+
+# Wrap Phase 2 state enforcement if present so it logs explicit degrade reasons before blocking.
+_base_phase2_enforce_engine_state_phase3 = phase2_enforce_engine_state if "phase2_enforce_engine_state" in globals() else None
+if _base_phase2_enforce_engine_state_phase3:
+    def phase2_enforce_engine_state(stage: str = "unknown", signal: Optional[Dict[str, Any]] = None, allow_exit: bool = False) -> Tuple[bool, str, Dict[str, Any]]:
+        try:
+            recovery = phase3_intelligent_engine_recovery(trigger=f"phase2:{stage}")
+            if recovery.get("recovered") and not recovery.get("blockers") and not allow_exit:
+                return True, "phase3_recovered_state_allows_entry", {"phase3_recovery": recovery}
+        except Exception as e:
+            try:
+                debug(f"PHASE 3 PRE-ENFORCEMENT RECOVERY ERROR | {e}")
+            except Exception:
+                pass
+        ok, reason, meta = _base_phase2_enforce_engine_state_phase3(stage=stage, signal=signal, allow_exit=allow_exit)
+        if not ok:
+            try:
+                report = phase3_collect_degrade_reasons(trigger=f"blocked:{stage}")
+                meta = dict(meta or {})
+                meta["phase3_degrade_reasons_file"] = PHASE3_DEGRADE_REASONS_FILE
+                meta["phase3_degrade_reasons"] = report.get("blockers", [])[:10]
+                debug(f"PHASE 3 EXPLICIT DEGRADE REASONS | stage={stage} | reasons={[b.get('reason') for b in report.get('blockers', [])[:8]]}")
+            except Exception:
+                pass
+        return ok, reason, meta
+
+try:
+    print("[PHASE 3 INTELLIGENT RECOVERY ACTIVE] explicit degrade reasons + auto-unlock enabled", flush=True)
+except Exception:
+    pass
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
