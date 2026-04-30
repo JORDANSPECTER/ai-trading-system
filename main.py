@@ -2565,6 +2565,109 @@ def allocator_require_or_block(signal: Dict[str, Any], context: str = "execution
             pass
         return True, {"reason": reason}
     return False, allocator_hard_block_response(signal if isinstance(signal, dict) else {}, context=context)
+# =========================================================
+# DUAL APPROVAL EXECUTION ENFORCEMENT
+# Final execution authority requires BOTH:
+# 1) portfolio allocator selected the candidate
+# 2) unified decision engine approved the trade
+# This prevents allocator selection from bypassing risk/score rejection.
+# =========================================================
+REQUIRE_DUAL_APPROVAL_BEFORE_EXECUTION = os.getenv("REQUIRE_DUAL_APPROVAL_BEFORE_EXECUTION", "true").lower() == "true"
+DUAL_APPROVAL_BLOCK_FORCE_MIN_QTY = os.getenv("DUAL_APPROVAL_BLOCK_FORCE_MIN_QTY", "true").lower() == "true"
+DUAL_APPROVAL_EVENT_FILE = os.getenv("DUAL_APPROVAL_EVENT_FILE", "dual_approval_events.jsonl").strip()
+
+
+def dual_approval_event(event: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = {"time": now_ts() if "now_ts" in globals() else datetime.now().isoformat(), "event": event, **(payload or {})}
+        with open(DUAL_APPROVAL_EVENT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def signal_has_unified_approval(signal: Dict[str, Any]) -> bool:
+    if not isinstance(signal, dict):
+        return False
+    for key in ("unified_decision", "unified_pre_decision", "final_unified_decision"):
+        d = signal.get(key)
+        if isinstance(d, dict) and d.get("approved") is True:
+            return True
+    return False
+
+
+def dual_approval_block_response(signal: Dict[str, Any], context: str, decision: Dict[str, Any] = None, reason: str = "") -> Dict[str, Any]:
+    decision = decision or {}
+    msg = reason or "unified_decision_not_approved"
+    try:
+        debug(
+            f"DUAL APPROVAL EXECUTION BLOCK | context={context} | reason={msg} | "
+            f"allocator_ok=True | unified_approved={decision.get('approved')} | "
+            f"score={decision.get('score')} | ticker={(signal or {}).get('ticker') if isinstance(signal, dict) else None}"
+        )
+        dual_approval_event("execution_block", {
+            "context": context,
+            "reason": msg,
+            "ticker": (signal or {}).get("ticker") if isinstance(signal, dict) else None,
+            "direction": (signal or {}).get("direction") if isinstance(signal, dict) else None,
+            "decision": decision,
+        })
+    except Exception:
+        pass
+    return {
+        "executed": False,
+        "submitted": False,
+        "approved": False,
+        "reason": f"dual_approval_block:{msg}",
+        "decision": decision,
+        "context": context,
+    }
+
+
+def dual_approval_require_or_block(signal: Dict[str, Any], selected: Dict[str, Any] = None, context: str = "execution") -> Tuple[bool, Dict[str, Any], Dict[str, Any]]:
+    """Final pre-execution gate. Returns (ok, possibly_enriched_signal, result_or_decision)."""
+    if not REQUIRE_DUAL_APPROVAL_BEFORE_EXECUTION:
+        return True, signal, {"reason": "dual_approval_disabled"}
+
+    allocator_ok, allocator_result = allocator_require_or_block(signal, context=f"dual_approval:{context}")
+    if not allocator_ok:
+        return False, signal, allocator_result
+
+    if not ENABLE_UNIFIED_DECISION_ENGINE:
+        return True, signal, {"reason": "unified_decision_engine_disabled"}
+
+    try:
+        decision = evaluate_trade_opportunity(signal, selected if isinstance(selected, dict) else None)
+    except Exception as e:
+        return False, signal, dual_approval_block_response(signal, context, {}, f"unified_decision_error:{e}")
+
+    try:
+        signal["unified_decision"] = decision
+        signal["final_unified_decision"] = decision
+    except Exception:
+        pass
+
+    if not isinstance(decision, dict) or decision.get("approved") is not True:
+        return False, signal, dual_approval_block_response(signal, context, decision if isinstance(decision, dict) else {}, "unified_decision_rejected")
+
+    try:
+        signal = unified_decision_apply_size(signal, decision)
+    except Exception:
+        pass
+
+    try:
+        debug(f"DUAL APPROVAL PASS | context={context} | ticker={signal.get('ticker')} | score={decision.get('score')} | allocator_ok=True | unified_ok=True")
+        dual_approval_event("execution_pass", {"context": context, "ticker": signal.get("ticker"), "direction": signal.get("direction"), "decision": decision})
+    except Exception:
+        pass
+    return True, signal, decision
+
+
+def dual_approval_can_force_min_qty(signal: Dict[str, Any]) -> bool:
+    if not DUAL_APPROVAL_BLOCK_FORCE_MIN_QTY:
+        return True
+    return signal_has_unified_approval(signal)
+
 # Use for testing execution pipeline only. Keep false for live production.
 # =========================================================
 ALLOW_DUPLICATE_SIGNALS = os.getenv("ALLOW_DUPLICATE_SIGNALS", "true").lower() == "true"
@@ -7942,17 +8045,18 @@ def alpaca_submit_option_paper_order(signal: Dict[str, Any]) -> Dict[str, Any]:
     details = selector.get("details", {}) or {}
 
     
-    # Unified institutional decision layer before Alpaca option order submission
-    if ENABLE_UNIFIED_DECISION_ENGINE:
-        try:
-            selected_for_decision = selected if isinstance(selected, dict) else {}
-        except Exception:
-            selected_for_decision = {}
-        unified_decision = evaluate_trade_opportunity(signal, selected_for_decision)
+    # Dual approval final check before Alpaca option order submission.
+    # Allocator selection + unified approval are both mandatory.
+    if REQUIRE_DUAL_APPROVAL_BEFORE_EXECUTION:
+        _dual_ok, signal, _dual_result = dual_approval_require_or_block(signal, details, context="alpaca_submit_option_paper_order_final")
+        if not _dual_ok:
+            return {"submitted": False, "executed": False, "reason": _dual_result.get("reason", "dual_approval_block"), "decision": _dual_result.get("decision"), "selector": selector}
+    elif ENABLE_UNIFIED_DECISION_ENGINE:
+        unified_decision = evaluate_trade_opportunity(signal, details)
         signal["unified_decision"] = unified_decision
         if not unified_decision.get("approved"):
             debug(f"🧠 UNIFIED DECISION BLOCKED ORDER | score={unified_decision.get('score')} reasons={unified_decision.get('block_reasons')}")
-            return {"executed": False, "reason": "unified_decision_block", "decision": unified_decision}
+            return {"executed": False, "submitted": False, "reason": "unified_decision_block", "decision": unified_decision}
         signal = unified_decision_apply_size(signal, unified_decision)
 
     gate_ok, gate_reason, is_scale = one_trade_entry_gate(signal)
@@ -18041,8 +18145,13 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not _allocator_ok:
         return _allocator_block
 
-    # Unified decision pre-check. Option route runs a second pass with selected contract.
-    if ENABLE_UNIFIED_DECISION_ENGINE:
+    # Dual approval pre-check: allocator selection alone is not enough.
+    # No route can proceed unless unified decision approves too.
+    if REQUIRE_DUAL_APPROVAL_BEFORE_EXECUTION:
+        _dual_ok, signal, _dual_result = dual_approval_require_or_block(signal, None, context="paper_broker_bridge_execute_precheck")
+        if not _dual_ok:
+            return _dual_result
+    elif ENABLE_UNIFIED_DECISION_ENGINE:
         pre_decision = evaluate_trade_opportunity(signal, None)
         signal["unified_pre_decision"] = pre_decision
         if not pre_decision.get("approved") and pre_decision.get("risk_score", 100) <= 0:
@@ -18065,9 +18174,11 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
         signal = enrich_signal_with_execution_risk_fields(signal)
         start_qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_OPTION_QTY)), ALPACA_OPTION_QTY)
         exec_qty, exec_reason = safe_apply_execution_score_sizing(signal, start_qty)
-        if exec_qty <= 0 and os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true":
+        if exec_qty <= 0 and os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true" and dual_approval_can_force_min_qty(signal):
             exec_qty = 1
             exec_reason = f"alpaca_option_force_min_qty_after_score:{signal.get('execution_score')}"
+        elif exec_qty <= 0:
+            return {"executed": False, "reason": f"dual_approval_no_force_min_qty_after_score:{signal.get('execution_score')}", "unified_decision": signal.get("unified_decision") or signal.get("final_unified_decision")}
         signal["qty"] = max(1, safe_int(exec_qty, 1))
         debug(f"ALPACA PAPER OPTIONS ROUTE | ticker={signal.get('ticker')} direction={signal.get('direction')} qty={signal.get('qty')} score={signal.get('execution_score')} reason={exec_reason}")
         alpaca_result = alpaca_submit_option_paper_order(signal)
@@ -18088,9 +18199,11 @@ def paper_broker_bridge_execute(signal: Dict[str, Any]) -> Dict[str, Any]:
         signal = enrich_signal_with_execution_risk_fields(signal)
         start_qty = safe_int(signal.get("qty", signal.get("qty_hint", ALPACA_EQUITY_ORDER_QTY)), ALPACA_EQUITY_ORDER_QTY)
         exec_qty, exec_reason = safe_apply_execution_score_sizing(signal, start_qty)
-        if exec_qty <= 0 and os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true":
+        if exec_qty <= 0 and os.getenv("EXEC_SCORE_FORCE_MIN_QTY_ON_APPROVED", "true").lower() == "true" and dual_approval_can_force_min_qty(signal):
             exec_qty = 1
             exec_reason = f"alpaca_equity_force_min_qty_after_score:{signal.get('execution_score')}"
+        elif exec_qty <= 0:
+            return {"executed": False, "reason": f"dual_approval_no_force_min_qty_after_score:{signal.get('execution_score')}", "unified_decision": signal.get("unified_decision") or signal.get("final_unified_decision")}
         signal["qty"] = max(1, safe_int(exec_qty, 1))
         debug(f"ALPACA PAPER EQUITY ROUTE | ticker={signal.get('ticker')} direction={signal.get('direction')} qty={signal.get('qty')} score={signal.get('execution_score')} reason={exec_reason}")
         alpaca_result = alpaca_submit_equity_paper_order(signal)
@@ -20734,6 +20847,11 @@ def smart_exec_submit_with_retry(signal: Dict[str, Any], selected: Dict[str, Any
     qty = int(float(qty or 0))
     if qty <= 0:
         return {"executed": False, "reason": "qty_zero"}
+
+    if REQUIRE_DUAL_APPROVAL_BEFORE_EXECUTION:
+        _dual_ok, signal, _dual_result = dual_approval_require_or_block(signal, selected, context="smart_exec_submit_with_retry")
+        if not _dual_ok:
+            return _dual_result
 
     gate_ok, gate_reason, key = smart_exec_gate(signal, selected)
     if not gate_ok:
