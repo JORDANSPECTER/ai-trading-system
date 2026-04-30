@@ -298,6 +298,8 @@ def phase1_safe_write_engine_state_visibility():
     if not PHASE1_ARCH_AVAILABLE or not ENABLE_PHASE1_STATE_VISIBILITY:
         return None
     try:
+        if globals().get("ENABLE_CONTROLLED_ENGINE_RECOVERY", True) and "controlled_engine_recovery_check" in globals():
+            controlled_engine_recovery_check(trigger="state_visibility")
         snapshot = evaluate_engine_state_visibility(
             market_data_file=globals().get("MARKET_DATA_FILE", globals().get("MARKET_PRICES_FILE", "market_prices.json")),
             market_data_max_age_seconds=int(globals().get("MARKET_DATA_STALE_SECONDS", globals().get("MARKET_DATA_MAX_AGE_SECONDS", 30))),
@@ -844,7 +846,7 @@ TWELVE_DATA_PREMARKET_START = os.getenv("TWELVE_DATA_PREMARKET_START", "04:00").
 TWELVE_DATA_PREMARKET_END = os.getenv("TWELVE_DATA_PREMARKET_END", "09:29").strip()
 MARKET_DATA_WRITE_PREMARKET_LEVELS = os.getenv("MARKET_DATA_WRITE_PREMARKET_LEVELS", "true").lower() == "true"
 TWELVE_DATA_TIMEZONE = os.getenv("TWELVE_DATA_TIMEZONE", "America/New_York").strip()
-TWELVE_DATA_PREPOST = os.getenv("TWELVE_DATA_PREPOST", "true").lower() == "true"
+TWELVE_DATA_PREPOST = os.getenv("TWELVE_DATA_PREPOST", "false").lower() == "true"
 MARKET_DATA_PREMARKET_FALLBACK_MODE = os.getenv("MARKET_DATA_PREMARKET_FALLBACK_MODE", "levels_or_range").strip().lower()
 MARKET_DATA_PREMARKET_FALLBACK_RANGE = float(os.getenv("MARKET_DATA_PREMARKET_FALLBACK_RANGE", "2.50"))
 MARKET_DATA_WRITE_LIVE_SNAPSHOT = os.getenv("MARKET_DATA_WRITE_LIVE_SNAPSHOT", "true").lower() == "true"
@@ -5931,6 +5933,213 @@ def save_recon(recon: Dict[str, Any]):
     global GLOBAL_RECON
     GLOBAL_RECON = recon
     mark_recon_dirty()
+
+
+
+def controlled_recovery_event(event: str, payload: Dict[str, Any] = None) -> None:
+    try:
+        row = {"time": now_ts() if "now_ts" in globals() else datetime.now().isoformat(), "event": event, **(payload or {})}
+        with open(globals().get("ENGINE_RECOVERY_EVENTS_FILE", "controlled_engine_recovery_events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def controlled_recovery_read_json(path: str, default: Any):
+    try:
+        if not path or not os.path.exists(path):
+            return deepcopy(default)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return deepcopy(default)
+
+
+def controlled_recovery_write_json(path: str, payload: Any) -> bool:
+    try:
+        if "atomic_write_json" in globals():
+            return atomic_write_json(path, payload)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        return True
+    except Exception as e:
+        controlled_recovery_event("write_failed", {"path": path, "error": str(e)})
+        return False
+
+
+def controlled_recovery_market_fresh() -> Tuple[bool, str, Dict[str, Any]]:
+    path = str(globals().get("MARKET_DATA_FILE", globals().get("MARKET_PRICES_FILE", "market_prices.json")))
+    max_age = int(float(globals().get("ENGINE_RECOVERY_MARKET_MAX_AGE_SECONDS", globals().get("MARKET_DATA_STALE_SECONDS", 300))))
+    try:
+        if not os.path.exists(path):
+            return False, "market_data_missing", {"file": path}
+        age = max(0.0, time.time() - os.path.getmtime(path))
+        if age > max_age:
+            return False, "market_data_file_stale", {"file": path, "age_seconds": age, "max_age_seconds": max_age}
+        data = controlled_recovery_read_json(path, {})
+        good_symbols = []
+        if isinstance(data, dict):
+            for sym in ("QQQ", "SPY", "NVDA", "TSLA", "AAPL", "AMD", "META", "MSFT"):
+                row = data.get(sym)
+                if isinstance(row, dict) and safe_float(row.get("price") or row.get("last") or row.get("close"), 0) > 0:
+                    good_symbols.append(sym)
+        if not good_symbols:
+            return False, "market_data_no_valid_prices", {"file": path, "age_seconds": age}
+        return True, "market_data_fresh", {"file": path, "age_seconds": age, "symbols": good_symbols[:8]}
+    except Exception as e:
+        return False, f"market_data_check_error:{e}", {"file": path}
+
+
+def controlled_recovery_recon_clean() -> Tuple[bool, str, Dict[str, Any]]:
+    try:
+        recon = load_recon() if "load_recon" in globals() else controlled_recovery_read_json(globals().get("RECON_FILE", "reconciliation.json"), {})
+        if not isinstance(recon, dict):
+            return True, "recon_unknown_but_not_blocking", {}
+        bad_keys = []
+        for key in ("mismatch", "has_mismatch", "broker_local_mismatch", "foreign_positions", "foreign_orders", "reconciliation_required"):
+            if recon.get(key):
+                bad_keys.append(key)
+        report = recon.get("last_boot_report") or recon.get("last_runtime_report") or {}
+        if isinstance(report, dict):
+            for key in ("mismatches", "foreign_positions", "foreign_orders", "missing_local_positions", "missing_broker_positions"):
+                if report.get(key):
+                    bad_keys.append(f"report.{key}")
+        if bad_keys:
+            return False, "recon_mismatch_active", {"bad_keys": bad_keys}
+        return True, "recon_clean", {}
+    except Exception as e:
+        return False, f"recon_check_error:{e}", {}
+
+
+def controlled_recovery_no_risk_open() -> Tuple[bool, str, Dict[str, Any]]:
+    try:
+        positions = load_positions() if "load_positions" in globals() else controlled_recovery_read_json(globals().get("POSITIONS_FILE", "positions.json"), {})
+        orders = load_orders() if "load_orders" in globals() else controlled_recovery_read_json(globals().get("ORDERS_FILE", "orders.json"), {})
+        open_positions = []
+        if isinstance(positions, dict):
+            open_positions = [p for p in positions.get("open_positions", []) if str(p.get("status", "OPEN")).upper() == "OPEN"]
+        active_orders = []
+        if isinstance(orders, dict):
+            for o in orders.get("orders", []):
+                if str(o.get("status", "")).lower() in {"new", "accepted", "pending_new", "partially_filled", "pending_cancel", "open", "submitted"}:
+                    active_orders.append(o)
+        if globals().get("ENGINE_RECOVERY_REQUIRE_NO_OPEN_POSITIONS", True) and open_positions:
+            return False, "open_positions_exist", {"open_positions": len(open_positions)}
+        if globals().get("ENGINE_RECOVERY_REQUIRE_NO_ACTIVE_ORDERS", True) and active_orders:
+            return False, "active_orders_exist", {"active_orders": len(active_orders)}
+        return True, "no_open_risk", {"open_positions": len(open_positions), "active_orders": len(active_orders)}
+    except Exception as e:
+        return False, f"open_risk_check_error:{e}", {}
+
+
+def controlled_recovery_daily_loss_safe() -> Tuple[bool, str, Dict[str, Any]]:
+    try:
+        daily_pnl = step14_daily_pnl_dollars() if "step14_daily_pnl_dollars" in globals() else safe_float(GLOBAL_STATE.get("daily_realized_pnl_dollars", 0), 0)
+        loss_limit = step14_daily_loss_limit_dollars() if "step14_daily_loss_limit_dollars" in globals() else 0
+        if loss_limit and daily_pnl <= -abs(loss_limit):
+            return False, "daily_loss_limit_still_hit", {"daily_pnl": daily_pnl, "loss_limit": -abs(loss_limit)}
+        return True, "daily_loss_safe", {"daily_pnl": daily_pnl, "loss_limit": -abs(loss_limit) if loss_limit else None}
+    except Exception as e:
+        return False, f"daily_loss_check_error:{e}", {}
+
+
+def controlled_recovery_manual_env_safe() -> Tuple[bool, str, Dict[str, Any]]:
+    if str(os.getenv("KILL_SWITCH", "false")).lower() == "true":
+        return False, "manual_env_kill_switch_true", {}
+    if str(os.getenv("BOT_PAUSED", "false")).lower() == "true":
+        return False, "manual_env_bot_paused_true", {}
+    return True, "manual_env_clear", {}
+
+
+def controlled_recovery_clear_degraded_files(reasons: List[str]) -> List[str]:
+    cleared = []
+    if not globals().get("ENGINE_RECOVERY_CLEAR_DEGRADED_FILE", True):
+        return cleared
+    path = globals().get("DEGRADED_MODE_FILE", "degraded_mode.json")
+    data = controlled_recovery_read_json(path, {})
+    if isinstance(data, dict) and (data.get("active") or data.get("enabled") or data.get("locked")):
+        data.update({"active": False, "enabled": False, "locked": False, "recovered_at": now_ts() if "now_ts" in globals() else datetime.now().isoformat(), "recovered_by": "controlled_engine_recovery", "recovery_reasons": reasons})
+        if controlled_recovery_write_json(path, data):
+            cleared.append(path)
+    return cleared
+
+
+def controlled_recovery_clear_local_kill(reasons: List[str]) -> bool:
+    if not globals().get("ENGINE_RECOVERY_CLEAR_LOCAL_KILL", True):
+        return False
+    try:
+        ensure_globals_initialized()
+    except Exception:
+        pass
+    try:
+        state = GLOBAL_STATE if isinstance(globals().get("GLOBAL_STATE"), dict) else load_state()
+        hard_reason = str(state.get("hard_kill_reason") or state.get("step15_last_reason") or "").lower()
+        forbidden = ("daily loss", "loss limit", "max loss", "hard loss", "drawdown", "foreign position", "reconciliation")
+        if any(x in hard_reason for x in forbidden):
+            controlled_recovery_event("local_kill_not_cleared_forbidden_reason", {"hard_reason": hard_reason})
+            return False
+        changed = False
+        for key in ("kill_switch", "bot_paused", "step15_kill_active", "step15_locked"):
+            if state.get(key):
+                state[key] = False
+                changed = True
+        if not state.get("engine_enabled", True):
+            state["engine_enabled"] = True
+            changed = True
+        if not state.get("allow_entries", True):
+            state["allow_entries"] = True
+            changed = True
+        if changed:
+            state["hard_kill_reason"] = ""
+            state["step15_last_reason"] = ""
+            state["controlled_recovery_last_unlock"] = now_ts() if "now_ts" in globals() else datetime.now().isoformat()
+            state["controlled_recovery_reasons"] = reasons
+            save_state(state)
+            try:
+                flush_dirty_stores(force=True)
+            except Exception:
+                pass
+            return True
+        return False
+    except Exception as e:
+        controlled_recovery_event("clear_local_kill_error", {"error": str(e)})
+        return False
+
+
+def controlled_engine_recovery_check(trigger: str = "loop") -> Dict[str, Any]:
+    result = {"trigger": trigger, "attempted": False, "recovered": False, "blocked": [], "cleared": [], "time": now_ts() if "now_ts" in globals() else datetime.now().isoformat()}
+    if not globals().get("ENABLE_CONTROLLED_ENGINE_RECOVERY", True):
+        result["blocked"].append("recovery_disabled")
+        return result
+    checks = [controlled_recovery_manual_env_safe(), controlled_recovery_market_fresh(), controlled_recovery_recon_clean(), controlled_recovery_no_risk_open(), controlled_recovery_daily_loss_safe()]
+    result["checks"] = [{"ok": ok, "reason": reason, "meta": meta} for ok, reason, meta in checks]
+    failed = [reason for ok, reason, meta in checks if not ok]
+    if failed:
+        result["blocked"].extend(failed)
+        controlled_recovery_write_json(globals().get("ENGINE_RECOVERY_STATE_FILE", "controlled_engine_recovery_state.json"), result)
+        controlled_recovery_event("recovery_blocked", result)
+        return result
+    result["attempted"] = True
+    ok_reasons = [reason for ok, reason, meta in checks if ok]
+    cleared_files = controlled_recovery_clear_degraded_files(ok_reasons)
+    local_kill_cleared = controlled_recovery_clear_local_kill(ok_reasons)
+    result["cleared"] = cleared_files + (["local_kill_state"] if local_kill_cleared else [])
+    result["recovered"] = bool(result["cleared"])
+    controlled_recovery_write_json(globals().get("ENGINE_RECOVERY_STATE_FILE", "controlled_engine_recovery_state.json"), result)
+    controlled_recovery_event("recovery_checked", result)
+    if result["recovered"]:
+        msg = f"✅ CONTROLLED ENGINE RECOVERY | cleared={result['cleared']} | trigger={trigger}"
+        try:
+            debug(msg)
+        except Exception:
+            print(msg, flush=True)
+        if globals().get("ENGINE_RECOVERY_ALERTS", True):
+            try:
+                send_to_discord(globals().get("DISCORD_AI_WEBHOOK", ""), msg, "AI")
+                send_to_telegram(msg)
+            except Exception:
+                pass
+    return result
 
 
 def load_macro_store() -> Dict[str, Any]:
@@ -12365,6 +12574,14 @@ def step15_reset_lock():
 def step15_global_guard() -> bool:
     """Return True if engine can continue. Return False when Step 15 lock is active."""
     ensure_globals_initialized()
+    try:
+        if globals().get("ENABLE_CONTROLLED_ENGINE_RECOVERY", True) and "controlled_engine_recovery_check" in globals():
+            controlled_engine_recovery_check(trigger="step15_guard")
+    except Exception as _recovery_error:
+        try:
+            debug(f"CONTROLLED RECOVERY CHECK ERROR | {_recovery_error}")
+        except Exception:
+            pass
     if not ENABLE_STEP15_GLOBAL_KILL_SWITCH:
         return True
 
@@ -23752,6 +23969,7 @@ if _base_evaluate_trade_opportunity_for_allocator:
 try:
     print("[PORTFOLIO ALLOCATOR ACTIVE] rank + capital allocation layer enabled", flush=True)
     print("[ALLOCATOR QUALITY FILTER ACTIVE] candidates must pass execution threshold before selection", flush=True)
+    print("[CONTROLLED ENGINE RECOVERY ACTIVE] degraded/locked states can recover only when safe", flush=True)
 except Exception:
     pass
 
