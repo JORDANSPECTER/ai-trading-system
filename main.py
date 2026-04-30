@@ -23339,6 +23339,11 @@ ENABLE_PORTFOLIO_ALLOCATOR = os.getenv("ENABLE_PORTFOLIO_ALLOCATOR", "true").low
 PORTFOLIO_ALLOCATOR_FILE = os.getenv("PORTFOLIO_ALLOCATOR_FILE", "portfolio_allocator_state.json").strip()
 PORTFOLIO_ALLOCATOR_LOG_FILE = os.getenv("PORTFOLIO_ALLOCATOR_LOG_FILE", "portfolio_allocator_decisions.jsonl").strip()
 PORTFOLIO_ALLOCATOR_MIN_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_MIN_SCORE", "72"))
+# Allocator quality filter: do not select weak candidates just because they are the best available.
+PORTFOLIO_ALLOCATOR_REQUIRE_EXECUTION_THRESHOLD = os.getenv("PORTFOLIO_ALLOCATOR_REQUIRE_EXECUTION_THRESHOLD", "true").lower() == "true"
+PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE", "65"))
+PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION = float(os.getenv("PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION", "65"))
+PORTFOLIO_ALLOCATOR_BLOCK_AFTER_HOURS_PLAN_ONLY = os.getenv("PORTFOLIO_ALLOCATOR_BLOCK_AFTER_HOURS_PLAN_ONLY", "true").lower() == "true"
 PORTFOLIO_ALLOCATOR_FULL_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_FULL_SCORE", "86"))
 PORTFOLIO_ALLOCATOR_STARTER_SCORE = float(os.getenv("PORTFOLIO_ALLOCATOR_STARTER_SCORE", "76"))
 PORTFOLIO_ALLOCATOR_MAX_CANDIDATES = int(float(os.getenv("PORTFOLIO_ALLOCATOR_MAX_CANDIDATES", "10")))
@@ -23523,6 +23528,64 @@ def portfolio_allocator_candidate_features(candidate: Dict[str, Any], exposure: 
     }
 
 
+def portfolio_allocator_candidate_execution_precheck(candidate: Dict[str, Any], features: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Allocator quality gate: prevents selecting the best bad trade."""
+    features = features or {}
+    reasons: List[str] = []
+    warnings: List[str] = []
+    execution_score = 0.0
+    scanner_score = safe_float(candidate.get("score", candidate.get("scanner_score", features.get("scanner_score", 0))), 0)
+    symbol = str(candidate.get("symbol") or candidate.get("ticker") or features.get("symbol") or "").upper().strip()
+    direction = str(candidate.get("direction") or features.get("direction") or "").upper().strip()
+
+    if scanner_score < PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION:
+        reasons.append(f"scanner_score_below_selection_min:{round(scanner_score,2)}<{PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION}")
+
+    temp_signal: Dict[str, Any] = {}
+    try:
+        if "multi_ticker_scanner_build_signal" in globals():
+            temp_signal = multi_ticker_scanner_build_signal(candidate)
+        else:
+            temp_signal = deepcopy(candidate)
+        if isinstance(temp_signal, dict):
+            temp_signal["source"] = "allocator_precheck"
+            temp_signal["ticker"] = str(temp_signal.get("ticker") or symbol).upper().strip()
+            temp_signal["direction"] = str(temp_signal.get("direction") or direction).upper().strip()
+            temp_signal["scanner_score"] = scanner_score
+            temp_signal["allocator_precheck"] = True
+            try:
+                if "enrich_signal_with_execution_risk_fields" in globals():
+                    temp_signal = enrich_signal_with_execution_risk_fields(temp_signal)
+            except Exception as _enrich_error:
+                warnings.append(f"enrich_failed:{_enrich_error}")
+            try:
+                if "premium_execution_score" in globals():
+                    execution_score = float(premium_execution_score(temp_signal))
+                else:
+                    execution_score = safe_float(temp_signal.get("execution_score", temp_signal.get("score", 0)), 0)
+            except Exception as _score_error:
+                warnings.append(f"execution_score_failed:{_score_error}")
+                execution_score = safe_float(temp_signal.get("execution_score", temp_signal.get("score", 0)), 0)
+    except Exception as e:
+        reasons.append(f"allocator_precheck_signal_build_failed:{e}")
+
+    if execution_score < PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE:
+        reasons.append(f"execution_score_below_allocator_min:{round(execution_score,2)}<{PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE}")
+
+    try:
+        breakdown = execution_score_breakdown(temp_signal) if "execution_score_breakdown" in globals() and isinstance(temp_signal, dict) else {}
+        neutral = " ".join(str(x).lower() for x in breakdown.get("neutral", [])) if isinstance(breakdown, dict) else ""
+        negative = " ".join(str(x).lower() for x in breakdown.get("negative", [])) if isinstance(breakdown, dict) else ""
+        summary = str(breakdown.get("summary", "")).lower() if isinstance(breakdown, dict) else ""
+        joined = " ".join([neutral, negative, summary])
+        if PORTFOLIO_ALLOCATOR_BLOCK_AFTER_HOURS_PLAN_ONLY and ("after hours" in joined or "plan only" in joined or "premarket levels not loaded" in joined):
+            reasons.append("after_hours_or_plan_only_candidate")
+    except Exception as _breakdown_error:
+        warnings.append(f"breakdown_check_failed:{_breakdown_error}")
+
+    return {"passed": len(reasons) == 0, "symbol": symbol, "direction": direction, "scanner_score": round(scanner_score, 2), "execution_score": round(execution_score, 2), "min_execution_score": PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE, "min_scanner_score": PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION, "reasons": reasons, "warnings": warnings}
+
+
 def portfolio_allocator_rank_candidates(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     exposure = portfolio_allocator_open_exposure_snapshot()
     budget = portfolio_allocator_remaining_budget(exposure)
@@ -23535,6 +23598,11 @@ def portfolio_allocator_rank_candidates(candidates: List[Dict[str, Any]]) -> Dic
         if not isinstance(c, dict):
             continue
         f = portfolio_allocator_candidate_features(c, exposure)
+        q = portfolio_allocator_candidate_execution_precheck(c, f) if PORTFOLIO_ALLOCATOR_REQUIRE_EXECUTION_THRESHOLD else {"passed": True, "reasons": [], "execution_score": None}
+        f["quality_precheck"] = q
+        if PORTFOLIO_ALLOCATOR_REQUIRE_EXECUTION_THRESHOLD and not q.get("passed", False):
+            f["allocator_score_before_quality_filter"] = f.get("allocator_score", 0)
+            f["allocator_score"] = min(safe_float(f.get("allocator_score", 0), 0), safe_float(q.get("execution_score", 0), 0))
         c2 = deepcopy(c)
         c2["portfolio_allocator_features"] = f
         c2["allocator_score"] = f.get("allocator_score", 0)
@@ -23556,6 +23624,9 @@ def portfolio_allocator_rank_candidates(candidates: List[Dict[str, Any]]) -> Dic
             reasons.append("candidate_direction_not_tradeable")
         if score < PORTFOLIO_ALLOCATOR_MIN_SCORE:
             reasons.append(f"allocator_score_below_min:{score}<{PORTFOLIO_ALLOCATOR_MIN_SCORE}")
+        quality_precheck = f.get("quality_precheck", {}) if isinstance(f.get("quality_precheck"), dict) else {}
+        if PORTFOLIO_ALLOCATOR_REQUIRE_EXECUTION_THRESHOLD and not bool(quality_precheck.get("passed", False)):
+            reasons.extend(quality_precheck.get("reasons", ["allocator_quality_precheck_failed"]))
         if remaining_risk <= 0:
             reasons.append("no_remaining_risk_budget")
         if allocations_used >= PORTFOLIO_ALLOCATOR_MAX_NEW_TRADES_PER_SCAN:
@@ -23680,6 +23751,7 @@ if _base_evaluate_trade_opportunity_for_allocator:
 
 try:
     print("[PORTFOLIO ALLOCATOR ACTIVE] rank + capital allocation layer enabled", flush=True)
+    print("[ALLOCATOR QUALITY FILTER ACTIVE] candidates must pass execution threshold before selection", flush=True)
 except Exception:
     pass
 
