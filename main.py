@@ -24179,6 +24179,275 @@ try:
 except Exception:
     pass
 
+
+# =========================================================
+# PHASE 4: EXECUTION-GRADE SIGNAL SYSTEM (A+ SETUPS ONLY)
+# Purpose:
+# - Improve signal quality without loosening risk.
+# - Generate candidates only when structure + timing + VWAP/level context are strong.
+# - Keep allocator/unified decision/engine-state gates as final authority.
+# =========================================================
+ENABLE_PHASE4_EXECUTION_GRADE_SIGNALS = os.getenv("ENABLE_PHASE4_EXECUTION_GRADE_SIGNALS", "true").lower() == "true"
+PHASE4_A_PLUS_ONLY = os.getenv("PHASE4_A_PLUS_ONLY", "true").lower() == "true"
+PHASE4_MIN_EXECUTION_GRADE_SCORE = float(os.getenv("PHASE4_MIN_EXECUTION_GRADE_SCORE", "72"))
+PHASE4_MIN_SCANNER_SCORE = float(os.getenv("PHASE4_MIN_SCANNER_SCORE", "72"))
+PHASE4_ALLOW_AFTER_HOURS = os.getenv("PHASE4_ALLOW_AFTER_HOURS", "false").lower() == "true"
+PHASE4_ALLOW_MIDDAY = os.getenv("PHASE4_ALLOW_MIDDAY", "false").lower() == "true"
+PHASE4_REQUIRE_VWAP_ALIGNMENT = os.getenv("PHASE4_REQUIRE_VWAP_ALIGNMENT", "true").lower() == "true"
+PHASE4_REQUIRE_LEVEL_INTERACTION = os.getenv("PHASE4_REQUIRE_LEVEL_INTERACTION", "true").lower() == "true"
+PHASE4_REQUIRE_VOLUME_CONFIRMATION = os.getenv("PHASE4_REQUIRE_VOLUME_CONFIRMATION", "false").lower() == "true"
+PHASE4_PREMARKET_BREAK_BUFFER_PCT = float(os.getenv("PHASE4_PREMARKET_BREAK_BUFFER_PCT", "0.0015"))
+PHASE4_RETEST_DISTANCE_PCT = float(os.getenv("PHASE4_RETEST_DISTANCE_PCT", "0.0035"))
+PHASE4_VWAP_DISTANCE_MIN_PCT = float(os.getenv("PHASE4_VWAP_DISTANCE_MIN_PCT", "0.0005"))
+PHASE4_MAX_EXTENDED_FROM_VWAP_PCT = float(os.getenv("PHASE4_MAX_EXTENDED_FROM_VWAP_PCT", "0.012"))
+PHASE4_EVENTS_FILE = os.getenv("PHASE4_EVENTS_FILE", "phase4_signal_quality_events.jsonl").strip()
+PHASE4_STATE_FILE = os.getenv("PHASE4_STATE_FILE", "phase4_signal_quality_state.json").strip()
+
+
+def phase4_now_et() -> Any:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now()
+
+
+def phase4_event(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        row = {"event": event, "time": phase4_now_et().isoformat(), **(payload or {})}
+        if "_elite_event" in globals():
+            _elite_event(PHASE4_EVENTS_FILE, row)
+        else:
+            with open(PHASE4_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def phase4_write_state(payload: Dict[str, Any]) -> None:
+    try:
+        if "atomic_write_json" in globals():
+            atomic_write_json(PHASE4_STATE_FILE, payload)
+        elif "_elite_write_json" in globals():
+            _elite_write_json(PHASE4_STATE_FILE, payload)
+        else:
+            with open(PHASE4_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+    except Exception:
+        pass
+
+
+def phase4_session_state() -> Dict[str, Any]:
+    now = phase4_now_et()
+    hhmm = now.strftime("%H:%M")
+    weekday = now.weekday()
+    regular = weekday < 5 and "09:30" <= hhmm <= "16:00"
+    open_window = weekday < 5 and "09:30" <= hhmm <= "10:45"
+    power_hour = weekday < 5 and "15:00" <= hhmm <= "16:05"
+    midday = weekday < 5 and "11:00" <= hhmm <= "14:30"
+    premarket = weekday < 5 and "04:00" <= hhmm < "09:30"
+    after_hours = not regular
+    if open_window:
+        label = "OPEN_WINDOW"
+    elif power_hour:
+        label = "POWER_HOUR"
+    elif midday:
+        label = "MIDDAY"
+    elif premarket:
+        label = "PREMARKET_PLAN_ONLY"
+    elif regular:
+        label = "REGULAR"
+    else:
+        label = "AFTER_HOURS_PLAN_ONLY"
+    return {"now_et": now.isoformat(), "hhmm": hhmm, "weekday": weekday, "regular": regular, "open_window": open_window, "power_hour": power_hour, "midday": midday, "premarket": premarket, "after_hours": after_hours, "label": label, "tradable": bool(regular or PHASE4_ALLOW_AFTER_HOURS), "prime_window": bool(open_window or power_hour)}
+
+
+def phase4_snapshot(symbol: str) -> Dict[str, Any]:
+    symbol = str(symbol or "QQQ").upper().strip()
+    snap = scanner_snapshot(symbol) if "scanner_snapshot" in globals() else {"symbol": symbol}
+    if not isinstance(snap, dict):
+        snap = {"symbol": symbol}
+    try:
+        market_data = load_json_file(globals().get("MARKET_DATA_FILE", "market_prices.json"), {}) if "load_json_file" in globals() else {}
+        node = market_data.get(symbol, {}) if isinstance(market_data, dict) and isinstance(market_data.get(symbol), dict) else {}
+        for key in ("premarket_high", "premarket_low", "pm_high", "pm_low", "last_candle_volume", "volume", "vwap", "session_vwap", "price", "last", "close"):
+            if key not in snap and isinstance(node, dict) and key in node:
+                snap[key] = node.get(key)
+    except Exception:
+        pass
+    return snap
+
+
+def phase4_infer_regime(symbol: str, snap: Dict[str, Any]) -> str:
+    try:
+        if "detect_market_regime_v2" in globals():
+            return str(detect_market_regime_v2(symbol).get("regime", snap.get("market_regime", "NORMAL"))).upper()
+    except Exception:
+        pass
+    return str(snap.get("market_regime") or snap.get("regime") or "NORMAL").upper()
+
+
+def phase4_level_values(snap: Dict[str, Any], price: float) -> Dict[str, float]:
+    sf = globals().get("safe_float", lambda v, d=0.0: float(v) if v not in (None, "") else d)
+    pm_high = sf(snap.get("premarket_high", snap.get("pm_high", 0)), 0)
+    pm_low = sf(snap.get("premarket_low", snap.get("pm_low", 0)), 0)
+    high = sf(snap.get("high", snap.get("day_high", price)), price)
+    low = sf(snap.get("low", snap.get("day_low", price)), price)
+    return {"pm_high": pm_high, "pm_low": pm_low, "high": high, "low": low}
+
+
+def phase4_build_execution_grade_candidate(symbol: str) -> Dict[str, Any]:
+    symbol = str(symbol or "QQQ").upper().strip()
+    snap = phase4_snapshot(symbol)
+    sf = globals().get("safe_float", lambda v, d=0.0: float(v) if v not in (None, "") else d)
+    price = sf(snap.get("price", snap.get("last", snap.get("close", 0))), 0)
+    vwap = sf(snap.get("vwap", snap.get("session_vwap", 0)), 0)
+    if price <= 0:
+        return {"symbol": symbol, "score": 0, "execution_score": 0, "direction": "NO_TRADE", "reasons": [], "reject_reasons": ["missing_price"], "snapshot": snap, "phase4": True}
+    if vwap <= 0:
+        vwap = price
+    levels = phase4_level_values(snap, price)
+    session = phase4_session_state()
+    regime = phase4_infer_regime(symbol, snap)
+    snap["market_regime"] = regime
+    snap["phase4_session"] = session
+    candidates: List[Dict[str, Any]] = []
+    for direction in ("CALL", "PUT"):
+        score = 0.0
+        reasons: List[str] = []
+        rejects: List[str] = []
+        setup_type = "WAIT"
+        key_level = vwap
+        if not session.get("tradable"):
+            rejects.append("after_hours_or_plan_only_candidate")
+        elif session.get("prime_window"):
+            score += 12; reasons.append(f"prime_session:{session.get('label')}")
+        elif session.get("midday"):
+            if PHASE4_ALLOW_MIDDAY:
+                score += 2; reasons.append("midday_allowed_with_extra_confirmation")
+            else:
+                rejects.append("midday_requires_extra_confirmation")
+        else:
+            score += 6; reasons.append(f"regular_session:{session.get('label')}")
+        if direction == "CALL":
+            if price > vwap * (1 + PHASE4_VWAP_DISTANCE_MIN_PCT):
+                score += 18; reasons.append("call_vwap_control")
+            else:
+                rejects.append("call_not_above_vwap")
+            if price > vwap * (1 + PHASE4_MAX_EXTENDED_FROM_VWAP_PCT):
+                rejects.append("call_too_extended_from_vwap")
+            pm_high = levels["pm_high"]
+            if pm_high > 0:
+                key_level = pm_high
+                if price >= pm_high * (1 + PHASE4_PREMARKET_BREAK_BUFFER_PCT):
+                    score += 24; reasons.append("premarket_high_break"); setup_type = "break_and_hold"
+                elif abs(price - pm_high) / max(price, 0.01) <= PHASE4_RETEST_DISTANCE_PCT and price >= vwap:
+                    score += 18; reasons.append("premarket_high_retest_area"); setup_type = "retest_hold"
+                else:
+                    rejects.append("no_call_key_level_interaction")
+            elif PHASE4_REQUIRE_LEVEL_INTERACTION:
+                rejects.append("premarket_high_missing")
+        else:
+            if price < vwap * (1 - PHASE4_VWAP_DISTANCE_MIN_PCT):
+                score += 18; reasons.append("put_vwap_control")
+            else:
+                rejects.append("put_not_below_vwap")
+            if price < vwap * (1 - PHASE4_MAX_EXTENDED_FROM_VWAP_PCT):
+                rejects.append("put_too_extended_from_vwap")
+            pm_low = levels["pm_low"]
+            if pm_low > 0:
+                key_level = pm_low
+                if price <= pm_low * (1 - PHASE4_PREMARKET_BREAK_BUFFER_PCT):
+                    score += 24; reasons.append("premarket_low_break"); setup_type = "breakdown_and_hold"
+                elif abs(price - pm_low) / max(price, 0.01) <= PHASE4_RETEST_DISTANCE_PCT and price <= vwap:
+                    score += 18; reasons.append("premarket_low_retest_area"); setup_type = "retest_reject"
+                else:
+                    rejects.append("no_put_key_level_interaction")
+            elif PHASE4_REQUIRE_LEVEL_INTERACTION:
+                rejects.append("premarket_low_missing")
+        if regime in {"TREND", "EXPANSION"}:
+            score += 12; reasons.append(f"regime_confirmed:{regime}")
+        elif regime == "NORMAL":
+            score += 6; reasons.append("normal_regime")
+        elif regime == "CHOP":
+            rejects.append("chop_regime")
+        elif regime == "EVENT":
+            rejects.append("event_regime")
+        vol = sf(snap.get("last_candle_volume", snap.get("volume", 0)), 0)
+        if vol > 0:
+            score += 6; reasons.append("volume_present")
+        elif PHASE4_REQUIRE_VOLUME_CONFIRMATION:
+            rejects.append("volume_confirmation_missing")
+        rng = max(abs(levels.get("high", price) - levels.get("low", price)), price * 0.006, 0.25)
+        if direction == "CALL":
+            stop = max(min(vwap, price - rng * 0.35), 0.01); target = price + rng * 0.75
+        else:
+            stop = price + rng * 0.35; target = max(price - rng * 0.75, 0.01)
+        risk = abs(price - stop); reward = abs(target - price); rr = reward / risk if risk > 0 else 0
+        if rr >= 1.5:
+            score += 8; reasons.append(f"rr_ok:{round(rr,2)}")
+        else:
+            rejects.append(f"rr_too_low:{round(rr,2)}")
+        if PHASE4_A_PLUS_ONLY and score < PHASE4_MIN_EXECUTION_GRADE_SCORE:
+            rejects.append(f"phase4_score_below_a_plus:{round(score,2)}<{PHASE4_MIN_EXECUTION_GRADE_SCORE}")
+        passed = len(rejects) == 0 and score >= PHASE4_MIN_EXECUTION_GRADE_SCORE
+        final_score = round(max(0, min(100, score)), 2) if passed else round(max(0, min(score, 59)), 2)
+        candidates.append({"symbol": symbol, "score": final_score, "execution_score": final_score, "direction": direction if passed else "NO_TRADE", "candidate_direction": direction, "confidence": "A+" if score >= 84 and passed else ("A" if passed else "C"), "setup_type": setup_type, "phase4_a_plus": bool(score >= 84 and passed), "phase4_tradeable": bool(passed), "phase4_reasons": reasons, "reasons": reasons, "reject_reasons": rejects, "key_level": round(key_level, 2) if key_level else round(vwap, 2), "entry": round(price, 2), "stop": round(stop, 2), "target": round(target, 2), "rr": round(rr, 2), "snapshot": snap, "phase4": True, "session": session.get("label"), "regime": regime})
+    best = sorted(candidates, key=lambda x: safe_float(x.get("score", 0), 0), reverse=True)[0]
+    if not best.get("phase4_tradeable"):
+        best["direction"] = "NO_TRADE"
+    phase4_event("candidate_scored", {"symbol": symbol, "best": best})
+    phase4_write_state({"last_scored_at": phase4_now_et().isoformat(), "last_symbol": symbol, "last_candidate": best, "session": session})
+    return best
+
+
+_base_phase4_multi_ticker_score_symbol = multi_ticker_score_symbol if "multi_ticker_score_symbol" in globals() else None
+def multi_ticker_score_symbol(symbol: str) -> Dict[str, Any]:
+    if not ENABLE_PHASE4_EXECUTION_GRADE_SIGNALS:
+        if _base_phase4_multi_ticker_score_symbol:
+            return _base_phase4_multi_ticker_score_symbol(symbol)
+        return {"symbol": symbol, "score": 0, "direction": "NO_TRADE", "reasons": ["phase4_disabled_no_base"], "snapshot": {}}
+    c = phase4_build_execution_grade_candidate(symbol)
+    try:
+        if c.get("phase4_tradeable"):
+            debug(f"PHASE 4 A+ CANDIDATE | {c.get('symbol')} {c.get('direction')} score={c.get('score')} setup={c.get('setup_type')} reasons={c.get('reasons')}")
+        else:
+            debug(f"PHASE 4 NO TRADE | {c.get('symbol')} score={c.get('score')} rejects={c.get('reject_reasons')[:4]}")
+    except Exception:
+        pass
+    return c
+
+
+_base_phase4_multi_ticker_scanner_build_signal = multi_ticker_scanner_build_signal if "multi_ticker_scanner_build_signal" in globals() else None
+def multi_ticker_scanner_build_signal(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_PHASE4_EXECUTION_GRADE_SIGNALS or not isinstance(candidate, dict) or not candidate.get("phase4"):
+        if _base_phase4_multi_ticker_scanner_build_signal:
+            return _base_phase4_multi_ticker_scanner_build_signal(candidate)
+        return deepcopy(candidate or {})
+    ticker = str(candidate.get("symbol") or "QQQ").upper(); direction = str(candidate.get("direction") or candidate.get("candidate_direction") or "NO_TRADE").upper()
+    snap = candidate.get("snapshot", {}) if isinstance(candidate.get("snapshot"), dict) else {}
+    price = safe_float(candidate.get("entry", snap.get("price", 0)), 0); stop = safe_float(candidate.get("stop", 0), 0); target = safe_float(candidate.get("target", 0), 0)
+    vwap = safe_float(snap.get("vwap", snap.get("session_vwap", price)), price)
+    sig = build_unbiased_signal(ticker=ticker, direction=direction if direction in {"CALL", "PUT"} else "NO_TRADE", entry=round(price, 2), stop=round(stop, 2), target=round(target, 2), setup=str(candidate.get("setup_type") or "phase4_execution_grade_setup"), confidence=str(candidate.get("confidence") or "A"), key_level=safe_float(candidate.get("key_level", vwap), vwap), vwap=round(vwap, 2), underlying_price=round(price, 2), qty=1, notes="Phase 4 execution-grade setup. " + "; ".join(candidate.get("reasons", [])[:8]), confirmation="phase4_execution_grade_confirmation", regime=str(candidate.get("regime") or snap.get("market_regime", "NORMAL")))
+    sig.update({"source": "multi_candidate_allocator", "signal_quality_source": "phase4_execution_grade_signal_system", "phase4_execution_grade": True, "phase4_a_plus": bool(candidate.get("phase4_a_plus")), "phase4_tradeable": bool(candidate.get("phase4_tradeable")), "execution_score": safe_int(candidate.get("execution_score", candidate.get("score", 0)), 0), "score": safe_float(candidate.get("score", 0), 0), "scanner_score": safe_float(candidate.get("score", 0), 0), "grade": str(candidate.get("confidence") or "A"), "setup_type": str(candidate.get("setup_type") or "phase4_execution_grade_setup"), "strategy_reasons": candidate.get("reasons", []), "reject_reasons": candidate.get("reject_reasons", []), "session": candidate.get("session"), "time_window": candidate.get("session"), "vwap_position": "above" if direction == "CALL" else "below", "volume": "strong confirmation" if "volume_present" in candidate.get("reasons", []) else "normal", "oil_bias": "neutral", "level_context": {"state": "at_key_level", "key_level": candidate.get("key_level"), "rr": candidate.get("rr")}, "trade_reason": "Phase 4 A+ setup: " + "; ".join(candidate.get("reasons", [])[:6])})
+    return sig
+
+
+_base_phase4_premium_execution_score = premium_execution_score if "premium_execution_score" in globals() else None
+def premium_execution_score(signal: Dict[str, Any]) -> int:
+    try:
+        if ENABLE_PHASE4_EXECUTION_GRADE_SIGNALS and isinstance(signal, dict) and signal.get("phase4_execution_grade"):
+            return max(0, min(100, safe_int(signal.get("execution_score", signal.get("score", 0)), 0)))
+    except Exception:
+        pass
+    if _base_phase4_premium_execution_score:
+        return _base_phase4_premium_execution_score(signal)
+    return 0
+
+try:
+    print("[PHASE 4 EXECUTION-GRADE SIGNAL SYSTEM ACTIVE] A+ setup quality filter + score enhancement enabled", flush=True)
+except Exception:
+    pass
 # =========================================================
 # PHASE 3: INTELLIGENT ENGINE RECOVERY + EXPLICIT DEGRADE REASONS
 # Additive safety layer. It does NOT override true hard-risk locks.
