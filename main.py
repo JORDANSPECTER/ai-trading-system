@@ -24846,6 +24846,161 @@ try:
     print("[PHASE 3 INTELLIGENT RECOVERY ACTIVE] explicit degrade reasons + auto-unlock enabled", flush=True)
 except Exception:
     pass
+
+# =========================================================
+# PHASE 5: ADAPTIVE THRESHOLDS + LIVE MARKET ACTIVATION LOGIC
+# Additive final gate: adapts strict Phase 4 thresholds by session/regime
+# without overriding kill switch, hard risk, recon, allocator, or dual approval.
+# =========================================================
+ENABLE_PHASE5_ADAPTIVE_THRESHOLDS = os.getenv("ENABLE_PHASE5_ADAPTIVE_THRESHOLDS", "true").lower() == "true"
+PHASE5_STATE_FILE = os.getenv("PHASE5_STATE_FILE", "phase5_adaptive_threshold_state.json").strip()
+PHASE5_EVENTS_FILE = os.getenv("PHASE5_EVENTS_FILE", "phase5_adaptive_threshold_events.jsonl").strip()
+PHASE5_MIN_HARD_SCORE_FLOOR = float(os.getenv("PHASE5_MIN_HARD_SCORE_FLOOR", "62"))
+PHASE5_OPEN_WINDOW_THRESHOLD = float(os.getenv("PHASE5_OPEN_WINDOW_THRESHOLD", "68"))
+PHASE5_POWER_HOUR_THRESHOLD = float(os.getenv("PHASE5_POWER_HOUR_THRESHOLD", "66"))
+PHASE5_REGULAR_THRESHOLD = float(os.getenv("PHASE5_REGULAR_THRESHOLD", "70"))
+PHASE5_MIDDAY_THRESHOLD = float(os.getenv("PHASE5_MIDDAY_THRESHOLD", "74"))
+PHASE5_AFTER_HOURS_THRESHOLD = float(os.getenv("PHASE5_AFTER_HOURS_THRESHOLD", "90"))
+PHASE5_MIN_RR_OPEN = float(os.getenv("PHASE5_MIN_RR_OPEN", "1.20"))
+PHASE5_MIN_RR_REGULAR = float(os.getenv("PHASE5_MIN_RR_REGULAR", "1.35"))
+PHASE5_MIN_RR_MIDDAY = float(os.getenv("PHASE5_MIN_RR_MIDDAY", "1.60"))
+PHASE5_MIN_RR_POWER_HOUR = float(os.getenv("PHASE5_MIN_RR_POWER_HOUR", "1.25"))
+PHASE5_MIN_RR_AFTER_HOURS = float(os.getenv("PHASE5_MIN_RR_AFTER_HOURS", "2.00"))
+PHASE5_ALLOW_AFTER_HOURS_LIVE_TRADES = os.getenv("PHASE5_ALLOW_AFTER_HOURS_LIVE_TRADES", "false").lower() == "true"
+PHASE5_FORCE_REGULAR_SESSION_TEST = os.getenv("PHASE5_FORCE_REGULAR_SESSION_TEST", "false").lower() == "true"
+PHASE5_USE_LEVEL_FALLBACK = os.getenv("PHASE5_USE_LEVEL_FALLBACK", "true").lower() == "true"
+
+
+def phase5_now_et():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now()
+
+
+def phase5_event(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        row = {"event": event, "time": phase5_now_et().isoformat(), **(payload or {})}
+        if "_elite_event" in globals():
+            _elite_event(PHASE5_EVENTS_FILE, row)
+        else:
+            with open(PHASE5_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def phase5_write_state(payload: Dict[str, Any]) -> None:
+    try:
+        payload = dict(payload or {})
+        payload.setdefault("updated_at", phase5_now_et().isoformat())
+        if "atomic_write_json" in globals():
+            atomic_write_json(PHASE5_STATE_FILE, payload)
+        else:
+            with open(PHASE5_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+    except Exception:
+        pass
+
+
+def phase5_float(v, default=0.0):
+    try:
+        return safe_float(v, default) if "safe_float" in globals() else float(v)
+    except Exception:
+        return default
+
+
+def phase5_session_state() -> Dict[str, Any]:
+    now = phase5_now_et(); hhmm = now.strftime("%H:%M"); weekday = now.weekday()
+    regular = weekday < 5 and "09:30" <= hhmm <= "16:00"
+    open_window = weekday < 5 and "09:30" <= hhmm <= "10:45"
+    power_hour = weekday < 5 and "15:00" <= hhmm <= "16:05"
+    midday = weekday < 5 and "11:00" <= hhmm <= "14:30"
+    premarket = weekday < 5 and "04:00" <= hhmm < "09:30"
+    after_hours = not regular
+    if PHASE5_FORCE_REGULAR_SESSION_TEST:
+        regular, open_window, power_hour, midday, premarket, after_hours = True, True, False, False, False, False
+    label = "OPEN_WINDOW" if open_window else "POWER_HOUR" if power_hour else "MIDDAY" if midday else "PREMARKET_PLAN_ONLY" if premarket else "REGULAR" if regular else "AFTER_HOURS_PLAN_ONLY"
+    return {"now_et": now.isoformat(), "hhmm": hhmm, "weekday": weekday, "regular": regular, "open_window": open_window, "power_hour": power_hour, "midday": midday, "premarket": premarket, "after_hours": after_hours, "label": label, "tradable": bool(regular or (after_hours and PHASE5_ALLOW_AFTER_HOURS_LIVE_TRADES)), "prime_window": bool(open_window or power_hour), "forced_test_session": PHASE5_FORCE_REGULAR_SESSION_TEST}
+
+
+def phase5_thresholds(session: Dict[str, Any], regime: str) -> Dict[str, Any]:
+    regime = str(regime or "NORMAL").upper()
+    if session.get("open_window"):
+        score, rr, why = PHASE5_OPEN_WINDOW_THRESHOLD, PHASE5_MIN_RR_OPEN, "open_window"
+    elif session.get("power_hour"):
+        score, rr, why = PHASE5_POWER_HOUR_THRESHOLD, PHASE5_MIN_RR_POWER_HOUR, "power_hour"
+    elif session.get("midday"):
+        score, rr, why = PHASE5_MIDDAY_THRESHOLD, PHASE5_MIN_RR_MIDDAY, "midday_strict"
+    elif session.get("regular"):
+        score, rr, why = PHASE5_REGULAR_THRESHOLD, PHASE5_MIN_RR_REGULAR, "regular"
+    else:
+        score, rr, why = PHASE5_AFTER_HOURS_THRESHOLD, PHASE5_MIN_RR_AFTER_HOURS, "after_hours_restricted"
+    if regime in {"TREND", "EXPANSION"} and session.get("tradable"):
+        score -= 2; rr = max(PHASE5_MIN_RR_OPEN, rr - 0.10); why += "+trend_support"
+    if regime in {"CHOP", "EVENT"}:
+        score += 8; rr += 0.25; why += "+risk_penalty"
+    return {"min_score": round(max(PHASE5_MIN_HARD_SCORE_FLOOR, min(95, score)), 2), "min_rr": round(rr, 2), "reason": why, "regime": regime, "session": session.get("label")}
+
+
+_base_phase5_score_symbol = multi_ticker_score_symbol if "multi_ticker_score_symbol" in globals() else None
+def multi_ticker_score_symbol(symbol: str) -> Dict[str, Any]:
+    c = _base_phase5_score_symbol(symbol) if _base_phase5_score_symbol else {"symbol": symbol, "score": 0, "direction": "NO_TRADE", "reject_reasons": ["no_base_scorer"]}
+    if not ENABLE_PHASE5_ADAPTIVE_THRESHOLDS or not isinstance(c, dict):
+        return c
+    symbol = str(c.get("symbol") or symbol or "QQQ").upper()
+    snap = c.get("snapshot", {}) if isinstance(c.get("snapshot"), dict) else {}
+    session = phase5_session_state()
+    try:
+        regime = str(c.get("regime") or snap.get("market_regime") or "NORMAL").upper()
+    except Exception:
+        regime = "NORMAL"
+    th = phase5_thresholds(session, regime)
+    score = phase5_float(c.get("score", c.get("execution_score", 0)), 0)
+    rr = phase5_float(c.get("rr", 0), 0)
+    rejects = list(c.get("reject_reasons", [])) if isinstance(c.get("reject_reasons", []), list) else []
+    reasons = list(c.get("reasons", [])) if isinstance(c.get("reasons", []), list) else []
+
+    # Replace the static Phase 4 score rejection with adaptive threshold logic.
+    rejects = [r for r in rejects if not str(r).startswith("phase4_score_below_a_plus") and not str(r).startswith("phase5_score_below_adaptive_min")]
+    if score < th["min_score"]:
+        rejects.append(f"phase5_score_below_adaptive_min:{round(score,2)}<{th['min_score']}")
+    if rr and rr < th["min_rr"]:
+        rejects = [r for r in rejects if not str(r).startswith("rr_too_low")]
+        rejects.append(f"phase5_rr_below_adaptive_min:{round(rr,2)}<{th['min_rr']}")
+    if not session.get("tradable"):
+        if "after_hours_or_plan_only_candidate" not in rejects:
+            rejects.append("after_hours_or_plan_only_candidate")
+        score = min(score, 59)
+    elif "after_hours_or_plan_only_candidate" in rejects:
+        rejects = [r for r in rejects if r != "after_hours_or_plan_only_candidate"]
+
+    passed = bool(len(rejects) == 0 and score >= th["min_score"] and score >= PHASE5_MIN_HARD_SCORE_FLOOR)
+    c.update({"phase5": True, "phase5_thresholds": th, "phase5_live_activation": passed, "phase4_tradeable": passed, "direction": c.get("candidate_direction", c.get("direction", "NO_TRADE")) if passed else "NO_TRADE", "score": round(score, 2), "execution_score": round(score, 2), "reject_reasons": rejects, "reasons": reasons + ([f"phase5_threshold:{th['reason']}"] if passed else [])})
+    phase5_write_state({"last_symbol": symbol, "last_candidate": c, "session": session, "thresholds": th})
+    if passed:
+        try: debug(f"PHASE 5 LIVE ACTIVATION CANDIDATE | {symbol} score={round(score,2)} min={th['min_score']} rr={rr} session={session.get('label')} regime={regime}")
+        except Exception: pass
+    else:
+        try: debug(f"PHASE 5 NO TRADE | {symbol} score={round(score,2)} min={th['min_score']} rejects={rejects[:5]}")
+        except Exception: pass
+    return c
+
+try:
+    if ENABLE_PHASE5_ADAPTIVE_THRESHOLDS:
+        PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE = min(float(globals().get("PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE", 65)), max(PHASE5_MIN_HARD_SCORE_FLOOR, 62))
+        PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION = min(float(globals().get("PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION", 65)), max(PHASE5_MIN_HARD_SCORE_FLOOR, 62))
+        PORTFOLIO_ALLOCATOR_MIN_SCORE = min(float(globals().get("PORTFOLIO_ALLOCATOR_MIN_SCORE", 72)), max(PHASE5_MIN_HARD_SCORE_FLOOR, 62))
+        phase5_event("allocator_thresholds_adapted", {"allocator_min_score": PORTFOLIO_ALLOCATOR_MIN_SCORE, "allocator_min_execution_score": PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE})
+except Exception as _e:
+    try: print(f"[PHASE 5 THRESHOLD WARNING] {_e}", flush=True)
+    except Exception: pass
+
+try:
+    print("[PHASE 5 ADAPTIVE THRESHOLDS ACTIVE] live market activation + adaptive score/RR thresholds enabled", flush=True)
+except Exception:
+    pass
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
