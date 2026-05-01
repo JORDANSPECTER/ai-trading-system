@@ -128,6 +128,7 @@ print("[MARKET REGIME ENGINE ACTIVE] realtime trend/chop/expansion/event classif
 print("[ORDER OWNERSHIP LOCK ACTIVE] only this bot client_order_id can submit/trust orders", flush=True)
 print("[FOREIGN POSITION AUTO-CLOSE ACTIVE] bot will close broker positions it does not own", flush=True)
 print("[TWELVE DATA WEBSOCKET PATCH ACTIVE] real-time-ready market feed enabled", flush=True)
+print("[ALPACA MARKET DATA INTEGRATION ACTIVE] Alpaca stock data is primary/fallback feed", flush=True)
 
 # =========================================================
 # MACRO BRIDGE IMPORTS
@@ -828,7 +829,13 @@ MAX_ORDER_STALE_SECONDS = int(os.getenv("MAX_ORDER_STALE_SECONDS", "120"))
 # MARKET DATA / STEP 8 LIVE PRICE MANAGEMENT
 ENABLE_MARKET_DATA = os.getenv("ENABLE_MARKET_DATA", "true").lower() == "true"
 MARKET_DATA_FILE = os.getenv("MARKET_DATA_FILE", "market_prices.json").strip()
-MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "auto").strip().lower()
+# Alpaca-first market data router. Default provider is now alpaca so the engine
+# does not depend on Twelve Data pre/post-market permissions for basic prices.
+MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "alpaca").strip().lower()
+ALPACA_MARKET_DATA_PRIMARY = os.getenv("ALPACA_MARKET_DATA_PRIMARY", "true").lower() == "true"
+ALPACA_MARKET_DATA_FEED = os.getenv("ALPACA_MARKET_DATA_FEED", "iex").strip().lower()
+ALPACA_MARKET_DATA_ALLOW_TWELVE_FALLBACK = os.getenv("ALPACA_MARKET_DATA_ALLOW_TWELVE_FALLBACK", "true").lower() == "true"
+ALPACA_MARKET_DATA_WRITE_FILE = os.getenv("ALPACA_MARKET_DATA_WRITE_FILE", "true").lower() == "true"
 MARKET_DATA_REFRESH_SECONDS = int(os.getenv("MARKET_DATA_REFRESH_SECONDS", "5"))
 MARKET_DATA_STALE_SECONDS = int(os.getenv("MARKET_DATA_STALE_SECONDS", "20"))
 # Market data freshness fix: lets Render/file-based testing keep prices fresh without GitHub redeploys.
@@ -856,7 +863,8 @@ MARKET_DATA_WRITE_LIVE_SNAPSHOT = os.getenv("MARKET_DATA_WRITE_LIVE_SNAPSHOT", "
 # Safe defaults live inside main.py so Render ENV failures do not block deployment.
 # Only TWELVE_DATA_API_KEY must be present in Render.
 # =========================================================
-ENABLE_WEBSOCKET_MARKET_DATA = os.getenv("ENABLE_WEBSOCKET_MARKET_DATA", "true").lower() == "true"
+# Twelve WebSocket is optional now. Keep it off by default when Alpaca is primary.
+ENABLE_WEBSOCKET_MARKET_DATA = os.getenv("ENABLE_WEBSOCKET_MARKET_DATA", "false").lower() == "true"
 TWELVE_WS_SYMBOLS = os.getenv("TWELVE_WS_SYMBOLS", "QQQ,SPY,USO").strip()
 TWELVE_WS_URL = os.getenv("TWELVE_WS_URL", "wss://ws.twelvedata.com/v1/quotes/price").strip()
 TWELVE_WS_RECONNECT_SECONDS = int(float(os.getenv("TWELVE_WS_RECONNECT_SECONDS", "5")))
@@ -11524,6 +11532,123 @@ def fetch_alpaca_data_price(symbol: str) -> float:
     return 0.0
 
 
+def _alpaca_extract_quote_fields(payload: Any) -> Dict[str, Any]:
+    """Extract bid/ask/mid/last from Alpaca stock/options quote/trade payloads."""
+    out: Dict[str, Any] = {}
+    try:
+        if not isinstance(payload, dict):
+            return out
+        for container_key in ("quotes", "trades", "bars", "snapshots", "data"):
+            container = payload.get(container_key)
+            if isinstance(container, dict) and container:
+                for _, inner in container.items():
+                    fields = _alpaca_extract_quote_fields(inner)
+                    if fields:
+                        return fields
+        for nested_key in ("latestQuote", "latest_quote", "quote", "latestTrade", "latest_trade", "trade", "minuteBar", "dailyBar", "bar"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                fields = _alpaca_extract_quote_fields(nested)
+                if fields:
+                    return fields
+        bid = safe_float(payload.get("bp", payload.get("bid_price", payload.get("bid", 0))), 0)
+        ask = safe_float(payload.get("ap", payload.get("ask_price", payload.get("ask", 0))), 0)
+        last = safe_float(payload.get("p", payload.get("price", payload.get("last", payload.get("last_price", payload.get("c", payload.get("close", 0)))))), 0)
+        mid = safe_float(payload.get("mid", 0), 0)
+        if mid <= 0 and bid > 0 and ask > 0:
+            mid = round((bid + ask) / 2.0, 6)
+        price = mid if mid > 0 else last
+        if price <= 0:
+            price = ask if ask > 0 else bid
+        if price > 0:
+            out["price"] = round(float(price), 6)
+            out["last"] = round(float(last if last > 0 else price), 6)
+        if bid > 0:
+            out["bid"] = round(float(bid), 6)
+        if ask > 0:
+            out["ask"] = round(float(ask), 6)
+        if mid > 0:
+            out["mid"] = round(float(mid), 6)
+        if bid > 0 and ask > 0:
+            out["spread"] = round(float(ask - bid), 6)
+            out["spread_pct"] = round(float((ask - bid) / max(mid or price, 0.01)), 6)
+        return out
+    except Exception:
+        return out
+
+
+def fetch_alpaca_data_snapshot(symbol: str) -> Dict[str, Any]:
+    """Alpaca-first stock market data snapshot for underlying symbols."""
+    symbol = str(symbol or "").upper().strip()
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY or not ALPACA_DATA_BASE_URL or not symbol:
+        return {}
+    if is_option_contract_symbol(symbol):
+        return {}
+
+    feed = str(globals().get("ALPACA_MARKET_DATA_FEED", os.getenv("ALPACA_MARKET_DATA_FEED", "iex")) or "iex").lower().strip()
+    feeds = []
+    if feed:
+        feeds.append(feed)
+    if "iex" not in feeds:
+        feeds.append("iex")
+    if "sip" not in feeds:
+        feeds.append("sip")
+
+    endpoint_templates = [
+        ("/v2/stocks/quotes/latest", {"symbols": symbol}),
+        ("/v2/stocks/trades/latest", {"symbols": symbol}),
+        ("/v2/stocks/bars/latest", {"symbols": symbol}),
+        (f"/v2/stocks/{symbol}/quotes/latest", {}),
+        (f"/v2/stocks/{symbol}/trades/latest", {}),
+        (f"/v2/stocks/{symbol}/bars/latest", {}),
+    ]
+
+    errors: List[str] = []
+    for f in feeds:
+        for path, base_params in endpoint_templates:
+            params = dict(base_params)
+            if f:
+                params["feed"] = f
+            try:
+                r = requests.get(f"{ALPACA_DATA_BASE_URL}{path}", headers=alpaca_data_headers(), params=params, timeout=8)
+                if r.status_code != 200:
+                    errors.append(f"{path}:{f}:{r.status_code}")
+                    continue
+                fields = _alpaca_extract_quote_fields(r.json())
+                price = safe_float(fields.get("price", 0), 0)
+                if price > 0:
+                    snapshot: Dict[str, Any] = {
+                        "price": round(price, 6),
+                        "last": round(safe_float(fields.get("last", price), price), 6),
+                        "timestamp": epoch(),
+                        "price_updated_at": epoch(),
+                        "source": "alpaca_market_data",
+                        "provider": "alpaca",
+                        "feed": f,
+                        "symbol": symbol,
+                    }
+                    for k in ("bid", "ask", "mid", "spread", "spread_pct"):
+                        if k in fields:
+                            snapshot[k] = fields[k]
+                    try:
+                        existing = load_json_file(MARKET_DATA_FILE, {}) if MARKET_DATA_FILE else {}
+                        existing_symbol = existing.get(symbol, {}) if isinstance(existing, dict) else {}
+                        if isinstance(existing_symbol, dict):
+                            for k in ("vwap", "session_vwap", "premarket_high", "premarket_low", "pm_high", "pm_low", "pre_market_high", "pre_market_low"):
+                                v = safe_float(existing_symbol.get(k, 0), 0)
+                                if v > 0 and k not in snapshot:
+                                    snapshot[k] = v
+                    except Exception:
+                        pass
+                    debug(f"ALPACA MARKET DATA SNAPSHOT | symbol={symbol} price={snapshot.get('price')} feed={f} source={path}")
+                    return snapshot
+            except Exception as e:
+                errors.append(f"{path}:{f}:{str(e)[:60]}")
+    if errors:
+        debug(f"ALPACA MARKET DATA UNAVAILABLE | symbol={symbol} errors={errors[:4]}")
+    return {}
+
+
 def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
     """Live market snapshot router. Returns price + VWAP when available."""
     symbol = str(symbol or "").strip().upper()
@@ -11534,12 +11659,24 @@ def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
         debug(f"Skipping live stock quote lookup for option contract symbol: {symbol}")
         return {}
 
+    # Alpaca is now the first live source. This prevents missing_price errors when
+    # Twelve Data blocks pre/post-market endpoints and keeps execution aligned with broker data.
+    if ALPACA_MARKET_DATA_PRIMARY:
+        try:
+            alpaca_snapshot = fetch_alpaca_data_snapshot(symbol)
+            if alpaca_snapshot and safe_float(alpaca_snapshot.get("price", 0), 0) > 0:
+                cache_set_market_snapshot(symbol, alpaca_snapshot, "alpaca_market_data")
+                return alpaca_snapshot
+        except Exception as e:
+            debug(f"ALPACA MARKET DATA SNAPSHOT CHECK FAILED | {symbol} | {e}")
+
     try:
-        start_twelve_websocket_feed()
-        ws_snapshot = twelve_ws_get_snapshot(symbol)
-        if ws_snapshot:
-            debug(f"Using Twelve Data WS snapshot for {symbol}: price={ws_snapshot.get('price')} age={epoch() - safe_int(ws_snapshot.get('timestamp', 0), 0)}s")
-            return ws_snapshot
+        if ENABLE_WEBSOCKET_MARKET_DATA:
+            start_twelve_websocket_feed()
+            ws_snapshot = twelve_ws_get_snapshot(symbol)
+            if ws_snapshot:
+                debug(f"Using Twelve Data WS snapshot for {symbol}: price={ws_snapshot.get('price')} age={epoch() - safe_int(ws_snapshot.get('timestamp', 0), 0)}s")
+                return ws_snapshot
     except Exception as e:
         debug(f"TWELVE WS SNAPSHOT CHECK FAILED | {symbol} | {e}")
 
@@ -11552,9 +11689,9 @@ def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
         return cached
 
     if MARKET_DATA_PROVIDER == "auto":
-        providers = ["twelvedata", "alpaca"]
-    elif MARKET_DATA_PROVIDER in {"alpaca", "twelvedata"}:
-        providers = [MARKET_DATA_PROVIDER]
+        providers = ["alpaca", "twelvedata"] if ALPACA_MARKET_DATA_PRIMARY else ["twelvedata", "alpaca"]
+    elif MARKET_DATA_PROVIDER in {"alpaca", "alpaca_market_data", "twelvedata"}:
+        providers = ["alpaca" if MARKET_DATA_PROVIDER == "alpaca_market_data" else MARKET_DATA_PROVIDER]
     else:
         return {}
 
@@ -11568,6 +11705,10 @@ def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
                 return snapshot
 
         elif provider == "alpaca":
+            snapshot = fetch_alpaca_data_snapshot(symbol)
+            if snapshot and safe_float(snapshot.get("price", 0), 0) > 0:
+                cache_set_market_snapshot(symbol, snapshot, "alpaca_market_data")
+                return snapshot
             price = fetch_alpaca_data_price(symbol)
             if price > 0:
                 snapshot = {
@@ -11576,6 +11717,8 @@ def get_live_market_snapshot(symbol: str) -> Dict[str, Any]:
                     "timestamp": epoch(),
                     "price_updated_at": epoch(),
                     "source": "alpaca",
+                    "provider": "alpaca",
+                    "feed": ALPACA_MARKET_DATA_FEED,
                 }
                 cache_set_market_snapshot(symbol, snapshot, "alpaca")
                 return snapshot
