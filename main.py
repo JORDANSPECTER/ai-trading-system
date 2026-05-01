@@ -25001,6 +25001,306 @@ try:
     print("[PHASE 5 ADAPTIVE THRESHOLDS ACTIVE] live market activation + adaptive score/RR thresholds enabled", flush=True)
 except Exception:
     pass
+
+# =========================================================
+# PHASE 6 EXECUTION QUALITY + SLIPPAGE ATTRIBUTION MODULE
+# Observability-only: records latency, spread, expected-vs-realized price,
+# submit status, and symbol/session quality without changing execution behavior.
+# =========================================================
+ENABLE_PHASE6_EXECUTION_QUALITY = os.getenv("ENABLE_PHASE6_EXECUTION_QUALITY", "true").lower() == "true"
+PHASE6_EXEC_QUALITY_FILE = os.getenv("PHASE6_EXEC_QUALITY_FILE", "phase6_execution_quality_metrics.json").strip()
+PHASE6_EXEC_EVENTS_FILE = os.getenv("PHASE6_EXEC_EVENTS_FILE", "phase6_execution_quality_events.jsonl").strip()
+PHASE6_SLIPPAGE_MAX_WARN_PCT = float(os.getenv("PHASE6_SLIPPAGE_MAX_WARN_PCT", "0.04"))
+PHASE6_SLIPPAGE_DEGRADE_PCT = float(os.getenv("PHASE6_SLIPPAGE_DEGRADE_PCT", "0.08"))
+PHASE6_LATENCY_WARN_MS = int(float(os.getenv("PHASE6_LATENCY_WARN_MS", "1500")))
+PHASE6_LATENCY_DEGRADE_MS = int(float(os.getenv("PHASE6_LATENCY_DEGRADE_MS", "3500")))
+PHASE6_MAX_EVENT_HISTORY = int(float(os.getenv("PHASE6_MAX_EVENT_HISTORY", "250")))
+
+
+def phase6_now_iso() -> str:
+    try:
+        return datetime.now().isoformat()
+    except Exception:
+        return ""
+
+
+def phase6_epoch_ms() -> int:
+    try:
+        return int(time.time() * 1000)
+    except Exception:
+        return 0
+
+
+def phase6_float(v, default: float = 0.0) -> float:
+    try:
+        return safe_float(v, default) if "safe_float" in globals() else float(v)
+    except Exception:
+        return default
+
+
+def phase6_int(v, default: int = 0) -> int:
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def phase6_jsonable(obj):
+    try:
+        json.dumps(obj, default=str)
+        return obj
+    except Exception:
+        try:
+            if hasattr(obj, "json"):
+                return obj.json()
+        except Exception:
+            pass
+        return str(obj)
+
+
+def phase6_event(event: str, payload: Dict[str, Any]) -> None:
+    if not ENABLE_PHASE6_EXECUTION_QUALITY:
+        return
+    try:
+        row = {"event": event, "time": phase6_now_iso(), **(payload or {})}
+        if "_elite_event" in globals():
+            _elite_event(PHASE6_EXEC_EVENTS_FILE, row)
+        else:
+            with open(PHASE6_EXEC_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def phase6_load_metrics() -> Dict[str, Any]:
+    try:
+        if "load_json_file" in globals():
+            data = load_json_file(PHASE6_EXEC_QUALITY_FILE, {})
+        elif os.path.exists(PHASE6_EXEC_QUALITY_FILE):
+            with open(PHASE6_EXEC_QUALITY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def phase6_write_metrics(data: Dict[str, Any]) -> None:
+    if not ENABLE_PHASE6_EXECUTION_QUALITY:
+        return
+    try:
+        data = dict(data or {})
+        data["updated_at"] = phase6_now_iso()
+        if "atomic_write_json" in globals():
+            atomic_write_json(PHASE6_EXEC_QUALITY_FILE, data)
+        else:
+            with open(PHASE6_EXEC_QUALITY_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        phase6_event("metrics_write_failed", {"error": str(e)})
+
+
+def phase6_extract_symbol(payload: Dict[str, Any], body: Any = None) -> str:
+    try:
+        symbol = str((payload or {}).get("symbol") or "").upper()
+        if symbol:
+            return symbol
+        if isinstance(body, dict):
+            return str(body.get("symbol") or body.get("asset_symbol") or "UNKNOWN").upper()
+    except Exception:
+        pass
+    return "UNKNOWN"
+
+
+def phase6_extract_client_order_id(payload: Dict[str, Any], body: Any = None) -> str:
+    try:
+        cid = str((payload or {}).get("client_order_id") or "")
+        if cid:
+            return cid
+        if isinstance(body, dict):
+            return str(body.get("client_order_id") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def phase6_spread_bucket(spread_pct: float) -> str:
+    if spread_pct <= 0:
+        return "unknown"
+    if spread_pct <= 0.05:
+        return "tight"
+    if spread_pct <= 0.12:
+        return "normal"
+    if spread_pct <= 0.20:
+        return "wide"
+    return "very_wide"
+
+
+def phase6_price_snapshot_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    p = payload or {}
+    bid = phase6_float(p.get("bid"), 0.0)
+    ask = phase6_float(p.get("ask"), 0.0)
+    mid = phase6_float(p.get("mid"), 0.0)
+    if mid <= 0 and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2
+    limit_price = phase6_float(p.get("limit_price"), 0.0)
+    expected = mid or limit_price or ask or bid
+    spread = max(0.0, ask - bid) if ask > 0 and bid > 0 else 0.0
+    spread_pct = (spread / mid) if mid > 0 else 0.0
+    return {"bid": bid, "ask": ask, "mid": mid, "limit_price": limit_price, "expected_price": expected, "spread": spread, "spread_pct": spread_pct, "spread_bucket": phase6_spread_bucket(spread_pct)}
+
+
+def phase6_extract_fill_price(body: Any) -> float:
+    if not isinstance(body, dict):
+        return 0.0
+    for key in ("filled_avg_price", "avg_fill_price", "average_fill_price", "limit_price", "price"):
+        price = phase6_float(body.get(key), 0.0)
+        if price > 0:
+            return price
+    return 0.0
+
+
+def phase6_order_status(code: int, body: Any) -> str:
+    if code >= 500 or code == 599:
+        return "timeout_or_server_error"
+    if code >= 400:
+        return "rejected_or_failed"
+    if isinstance(body, dict):
+        status = str(body.get("status") or "").lower()
+        if status:
+            return status
+    return "accepted" if code < 300 else "unknown"
+
+
+def phase6_session_label() -> str:
+    try:
+        if "phase5_session_state" in globals():
+            return str(phase5_session_state().get("label") or "UNKNOWN")
+    except Exception:
+        pass
+    return "UNKNOWN"
+
+
+def phase6_record_order_event(source: str, payload: Dict[str, Any], code: int, body: Any, submit_started_ms: int, submit_finished_ms: int) -> Dict[str, Any]:
+    if not ENABLE_PHASE6_EXECUTION_QUALITY:
+        return {}
+    try:
+        payload = dict(payload or {})
+        safe_body = phase6_jsonable(body)
+        price = phase6_price_snapshot_from_payload(payload)
+        fill_price = phase6_extract_fill_price(safe_body)
+        expected = price.get("expected_price", 0.0)
+        submitted_price = price.get("limit_price", 0.0) or expected
+        realized_price = fill_price or submitted_price
+        side = str(payload.get("side") or "buy").lower()
+        slippage = 0.0
+        slippage_pct = 0.0
+        if expected > 0 and realized_price > 0:
+            raw = realized_price - expected
+            if side == "sell":
+                raw = -raw
+            slippage = raw
+            slippage_pct = raw / expected
+        latency_ms = max(0, int(submit_finished_ms - submit_started_ms))
+        symbol = phase6_extract_symbol(payload, safe_body)
+        client_order_id = phase6_extract_client_order_id(payload, safe_body)
+        status = phase6_order_status(code, safe_body)
+        quality_state = "OK"
+        warnings = []
+        if latency_ms >= PHASE6_LATENCY_DEGRADE_MS:
+            quality_state = "DEGRADED"; warnings.append(f"latency_degraded:{latency_ms}ms")
+        elif latency_ms >= PHASE6_LATENCY_WARN_MS:
+            quality_state = "WARN"; warnings.append(f"latency_warn:{latency_ms}ms")
+        if slippage_pct >= PHASE6_SLIPPAGE_DEGRADE_PCT:
+            quality_state = "DEGRADED"; warnings.append(f"slippage_degraded:{round(slippage_pct,4)}")
+        elif slippage_pct >= PHASE6_SLIPPAGE_MAX_WARN_PCT:
+            if quality_state == "OK": quality_state = "WARN"
+            warnings.append(f"slippage_warn:{round(slippage_pct,4)}")
+        if price.get("spread_bucket") in {"wide", "very_wide"}:
+            warnings.append(f"spread_{price.get('spread_bucket')}:{round(price.get('spread_pct',0),4)}")
+        event = {"source": source, "symbol": symbol, "client_order_id": client_order_id, "status_code": code, "status": status, "order_type": payload.get("type"), "side": side, "qty": payload.get("qty"), "session": phase6_session_label(), "latency_ms": latency_ms, "expected_price": expected, "submitted_price": submitted_price, "fill_price": fill_price, "realized_price_for_slippage": realized_price, "slippage": round(slippage, 4), "slippage_pct": round(slippage_pct, 6), "spread_pct": round(price.get("spread_pct", 0.0), 6), "spread_bucket": price.get("spread_bucket"), "quality_state": quality_state, "warnings": warnings, "response": safe_body, "timestamp": phase6_now_iso()}
+        phase6_event("order_execution_quality", event)
+        metrics = phase6_load_metrics()
+        summary = metrics.setdefault("summary", {"events": 0, "accepted": 0, "failed": 0, "warn": 0, "degraded": 0})
+        by_symbol = metrics.setdefault("by_symbol", {})
+        hist = metrics.setdefault("recent_events", [])
+        summary["events"] = phase6_int(summary.get("events"), 0) + 1
+        summary["accepted"] = phase6_int(summary.get("accepted"), 0) + (1 if code < 300 else 0)
+        summary["failed"] = phase6_int(summary.get("failed"), 0) + (0 if code < 300 else 1)
+        summary["warn"] = phase6_int(summary.get("warn"), 0) + (1 if quality_state == "WARN" else 0)
+        summary["degraded"] = phase6_int(summary.get("degraded"), 0) + (1 if quality_state == "DEGRADED" else 0)
+        sym = by_symbol.setdefault(symbol, {"events": 0, "accepted": 0, "failed": 0, "avg_latency_ms": 0.0, "avg_slippage_pct": 0.0})
+        n = phase6_int(sym.get("events"), 0)
+        sym["events"] = n + 1
+        sym["accepted"] = phase6_int(sym.get("accepted"), 0) + (1 if code < 300 else 0)
+        sym["failed"] = phase6_int(sym.get("failed"), 0) + (0 if code < 300 else 1)
+        sym["avg_latency_ms"] = round(((phase6_float(sym.get("avg_latency_ms"), 0.0) * n) + latency_ms) / max(1, n + 1), 2)
+        sym["avg_slippage_pct"] = round(((phase6_float(sym.get("avg_slippage_pct"), 0.0) * n) + slippage_pct) / max(1, n + 1), 6)
+        sym["last_quality_state"] = quality_state
+        sym["last_warnings"] = warnings
+        sym["last_status"] = status
+        sym["last_event_at"] = phase6_now_iso()
+        hist.append({k: v for k, v in event.items() if k != "response"})
+        metrics["recent_events"] = hist[-PHASE6_MAX_EVENT_HISTORY:]
+        metrics["last_event"] = {k: v for k, v in event.items() if k != "response"}
+        metrics["execution_quality_state"] = "DEGRADED" if summary.get("degraded", 0) else ("WARN" if summary.get("warn", 0) else "OK")
+        phase6_write_metrics(metrics)
+        try:
+            debug(f"PHASE 6 EXEC QUALITY | source={source} symbol={symbol} code={code} status={status} latency_ms={latency_ms} slippage_pct={round(slippage_pct,4)} spread={price.get('spread_bucket')} state={quality_state}")
+        except Exception:
+            pass
+        return event
+    except Exception as e:
+        phase6_event("order_execution_quality_failed", {"error": str(e), "source": source, "payload": phase6_jsonable(payload)})
+        return {}
+
+
+try:
+    _phase6_base_smart_exec_alpaca_submit_order = smart_exec_alpaca_submit_order
+    def smart_exec_alpaca_submit_order(payload: Dict[str, Any]) -> Tuple[int, Any]:
+        start = phase6_epoch_ms()
+        code, body = _phase6_base_smart_exec_alpaca_submit_order(payload)
+        finish = phase6_epoch_ms()
+        phase6_record_order_event("smart_exec_alpaca_submit_order", payload or {}, code, body, start, finish)
+        return code, body
+except Exception as _phase6_wrap_smart_error:
+    try: print(f"[PHASE 6 WRAP WARNING] smart_exec wrapper unavailable: {_phase6_wrap_smart_error}", flush=True)
+    except Exception: pass
+
+try:
+    _phase6_base_alpaca_submit_order_reliable = alpaca_submit_order_reliable
+    def alpaca_submit_order_reliable(payload: Dict[str, Any]) -> Tuple[int, Any]:
+        start = phase6_epoch_ms()
+        code, body = _phase6_base_alpaca_submit_order_reliable(payload)
+        finish = phase6_epoch_ms()
+        phase6_record_order_event("alpaca_submit_order_reliable", payload or {}, code, body, start, finish)
+        return code, body
+except Exception as _phase6_wrap_reliable_error:
+    try: print(f"[PHASE 6 WRAP WARNING] reliable wrapper unavailable: {_phase6_wrap_reliable_error}", flush=True)
+    except Exception: pass
+
+try:
+    _phase6_base_alpaca_request = alpaca_request
+    def alpaca_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+        start = phase6_epoch_ms()
+        code, body = _phase6_base_alpaca_request(method, path, payload)
+        finish = phase6_epoch_ms()
+        try:
+            is_order_submit = str(method or "").upper() == "POST" and str(path or "").rstrip("/").endswith("/orders")
+            if is_order_submit:
+                phase6_record_order_event("alpaca_request_post_orders", payload or {}, code, body, start, finish)
+        except Exception:
+            pass
+        return code, body
+except Exception as _phase6_wrap_request_error:
+    try: print(f"[PHASE 6 WRAP WARNING] alpaca_request wrapper unavailable: {_phase6_wrap_request_error}", flush=True)
+    except Exception: pass
+
+try:
+    print("[PHASE 6 EXECUTION QUALITY ACTIVE] slippage + latency attribution enabled", flush=True)
+except Exception:
+    pass
 if __name__ == "__main__":
     if "--premarket-readiness-now" in sys.argv or "--readiness-now" in sys.argv:
         ensure_globals_initialized()
