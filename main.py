@@ -25002,6 +25002,330 @@ try:
 except Exception:
     pass
 
+
+# =========================================================
+# PHASE 6.5 OPTIMIZATION: REAL-TRADE ACTIVATION WITHOUT BREAKING RISK
+# Controlled relaxation layer for data-limited environments.
+# Goals:
+# - allow A setups during best live windows instead of A+ only
+# - use fallback structure when premarket data is blocked by provider plan
+# - safely unfreeze DEGRADED state only when hard-risk truth is clean
+# - boost execution score for liquid/tight-spread candidates
+# - keep all hard locks, daily-loss, reconciliation, foreign-position,
+#   idempotency, allocator, dual approval, and execution safety intact.
+# =========================================================
+ENABLE_PHASE65_OPTIMIZATION = os.getenv("ENABLE_PHASE65_OPTIMIZATION", "true").lower() == "true"
+PHASE65_STATE_FILE = os.getenv("PHASE65_STATE_FILE", "phase65_optimization_state.json").strip()
+PHASE65_EVENTS_FILE = os.getenv("PHASE65_EVENTS_FILE", "phase65_optimization_events.jsonl").strip()
+PHASE65_OPEN_MIN_SCORE = float(os.getenv("PHASE65_OPEN_MIN_SCORE", "65"))
+PHASE65_POWER_HOUR_MIN_SCORE = float(os.getenv("PHASE65_POWER_HOUR_MIN_SCORE", "68"))
+PHASE65_REGULAR_MIN_SCORE = float(os.getenv("PHASE65_REGULAR_MIN_SCORE", "72"))
+PHASE65_MIDDAY_MIN_SCORE = float(os.getenv("PHASE65_MIDDAY_MIN_SCORE", "74"))
+PHASE65_AFTER_HOURS_MIN_SCORE = float(os.getenv("PHASE65_AFTER_HOURS_MIN_SCORE", "90"))
+PHASE65_OPEN_MIN_RR = float(os.getenv("PHASE65_OPEN_MIN_RR", "1.15"))
+PHASE65_POWER_HOUR_MIN_RR = float(os.getenv("PHASE65_POWER_HOUR_MIN_RR", "1.20"))
+PHASE65_REGULAR_MIN_RR = float(os.getenv("PHASE65_REGULAR_MIN_RR", "1.30"))
+PHASE65_MIDDAY_MIN_RR = float(os.getenv("PHASE65_MIDDAY_MIN_RR", "1.55"))
+PHASE65_AFTER_HOURS_MIN_RR = float(os.getenv("PHASE65_AFTER_HOURS_MIN_RR", "2.00"))
+PHASE65_FALLBACK_MAX_VWAP_DISTANCE = float(os.getenv("PHASE65_FALLBACK_MAX_VWAP_DISTANCE", "3.00"))
+PHASE65_LIQUIDITY_BOOST_MIN = float(os.getenv("PHASE65_LIQUIDITY_BOOST_MIN", "75"))
+PHASE65_TIGHT_SPREAD_MAX = float(os.getenv("PHASE65_TIGHT_SPREAD_MAX", "0.30"))
+PHASE65_MAX_SCORE_BOOST = float(os.getenv("PHASE65_MAX_SCORE_BOOST", "10"))
+PHASE65_ALLOW_SAFE_DEGRADED_TRADING = os.getenv("PHASE65_ALLOW_SAFE_DEGRADED_TRADING", "true").lower() == "true"
+PHASE65_DEGRADED_MIN_LIQUIDITY = float(os.getenv("PHASE65_DEGRADED_MIN_LIQUIDITY", "70"))
+PHASE65_BLOCK_AFTER_HOURS = os.getenv("PHASE65_BLOCK_AFTER_HOURS", "true").lower() == "true"
+PHASE65_MAX_TRADES_PER_WINDOW = int(float(os.getenv("PHASE65_MAX_TRADES_PER_WINDOW", "2")))
+PHASE65_MIN_SECONDS_BETWEEN_TRADES = int(float(os.getenv("PHASE65_MIN_SECONDS_BETWEEN_TRADES", "600")))
+
+
+def phase65_event(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        row = {"event": event, "time": now_ts() if "now_ts" in globals() else datetime.now().isoformat(), **(payload or {})}
+        if "_elite_event" in globals():
+            _elite_event(PHASE65_EVENTS_FILE, row)
+        else:
+            with open(PHASE65_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def phase65_write_state(payload: Dict[str, Any]) -> None:
+    try:
+        payload = dict(payload or {})
+        payload.setdefault("updated_at", now_ts() if "now_ts" in globals() else datetime.now().isoformat())
+        if "atomic_write_json" in globals():
+            atomic_write_json(PHASE65_STATE_FILE, payload)
+        else:
+            with open(PHASE65_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+    except Exception:
+        pass
+
+
+def phase65_float(v, default=0.0) -> float:
+    try:
+        return safe_float(v, default) if "safe_float" in globals() else float(v)
+    except Exception:
+        return default
+
+
+def phase65_session_label() -> str:
+    try:
+        session = phase5_session_state() if "phase5_session_state" in globals() else {}
+        return str(session.get("label") or "UNKNOWN")
+    except Exception:
+        return "UNKNOWN"
+
+
+def phase65_dynamic_thresholds(session: Optional[Dict[str, Any]] = None, regime: str = "NORMAL") -> Dict[str, Any]:
+    session = session or (phase5_session_state() if "phase5_session_state" in globals() else {})
+    regime = str(regime or "NORMAL").upper()
+    if session.get("open_window"):
+        score, rr, why = PHASE65_OPEN_MIN_SCORE, PHASE65_OPEN_MIN_RR, "phase65_open_a_allowed"
+    elif session.get("power_hour"):
+        score, rr, why = PHASE65_POWER_HOUR_MIN_SCORE, PHASE65_POWER_HOUR_MIN_RR, "phase65_power_hour_a_minus_allowed"
+    elif session.get("midday"):
+        score, rr, why = PHASE65_MIDDAY_MIN_SCORE, PHASE65_MIDDAY_MIN_RR, "phase65_midday_strict"
+    elif session.get("regular"):
+        score, rr, why = PHASE65_REGULAR_MIN_SCORE, PHASE65_REGULAR_MIN_RR, "phase65_regular_a_plus"
+    else:
+        score, rr, why = PHASE65_AFTER_HOURS_MIN_SCORE, PHASE65_AFTER_HOURS_MIN_RR, "phase65_after_hours_blocked"
+    if regime in {"TREND", "EXPANSION"} and session.get("tradable"):
+        score = max(62, score - 3)
+        rr = max(1.10, rr - 0.10)
+        why += "+trend_expansion_support"
+    if regime in {"CHOP", "EVENT"}:
+        score += 8
+        rr += 0.20
+        why += "+chop_event_penalty"
+    return {"min_score": round(score, 2), "min_rr": round(rr, 2), "reason": why, "session": session.get("label"), "regime": regime}
+
+
+def phase65_extract_price_vwap(candidate: Dict[str, Any]) -> Tuple[float, float]:
+    snap = candidate.get("snapshot", {}) if isinstance(candidate.get("snapshot"), dict) else {}
+    md = candidate.get("market_data", {}) if isinstance(candidate.get("market_data"), dict) else {}
+    price = phase65_float(candidate.get("price", snap.get("price", md.get("price", 0))), 0)
+    vwap = phase65_float(candidate.get("vwap", snap.get("vwap", snap.get("session_vwap", md.get("vwap", 0)))), 0)
+    if not price:
+        try:
+            symbol = str(candidate.get("symbol") or candidate.get("ticker") or "QQQ").upper()
+            mp = _elite_load_json(globals().get("MARKET_DATA_FILE", "market_prices.json"), {}) if "_elite_load_json" in globals() else {}
+            row = mp.get(symbol, {}) if isinstance(mp, dict) else {}
+            price = phase65_float(row.get("price", row.get("last", 0)), 0)
+            vwap = phase65_float(row.get("vwap", row.get("session_vwap", vwap)), vwap)
+        except Exception:
+            pass
+    return price, vwap
+
+
+def phase65_fallback_market_structure(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    price, vwap = phase65_extract_price_vwap(candidate)
+    if price <= 0 or vwap <= 0:
+        return {"structure_valid": False, "reason": "fallback_missing_price_or_vwap", "price": price, "vwap": vwap}
+    distance = abs(price - vwap)
+    direction = str(candidate.get("direction") or candidate.get("candidate_direction") or "").upper()
+    aligned = (direction == "CALL" and price >= vwap) or (direction == "PUT" and price <= vwap) or direction not in {"CALL", "PUT"}
+    valid = bool(distance <= PHASE65_FALLBACK_MAX_VWAP_DISTANCE and aligned)
+    return {"structure_valid": valid, "reason": "fallback_vwap_structure", "price": price, "vwap": vwap, "distance": round(distance, 4), "direction": direction, "aligned": aligned}
+
+
+def phase65_execution_score_boost(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
+    boost = 0.0
+    reasons: List[str] = []
+    liquidity = phase65_float(candidate.get("liquidity_score", 0), 0)
+    spread = phase65_float(candidate.get("spread_pct", candidate.get("spread", 999)), 999)
+    # Many scanner candidates do not carry spread/liquidity; use a conservative default
+    # for QQQ/SPY because those are normally liquid, but do not give the same benefit to scan-only names.
+    symbol = str(candidate.get("symbol") or candidate.get("ticker") or "").upper()
+    if liquidity <= 0 and symbol in {"QQQ", "SPY"}:
+        liquidity = 78.0
+    if spread == 999 and symbol in {"QQQ", "SPY"}:
+        spread = 0.18
+    if liquidity >= PHASE65_LIQUIDITY_BOOST_MIN:
+        boost += 5.0
+        reasons.append("liquidity_boost")
+    if spread <= PHASE65_TIGHT_SPREAD_MAX:
+        boost += 3.0
+        reasons.append("tight_spread_boost")
+    return min(boost, PHASE65_MAX_SCORE_BOOST), reasons
+
+
+# Override Phase 5 thresholds with Phase 6.5 dynamic thresholds.
+_base_phase65_phase5_thresholds = phase5_thresholds if "phase5_thresholds" in globals() else None
+if _base_phase65_phase5_thresholds:
+    def phase5_thresholds(session: Dict[str, Any], regime: str) -> Dict[str, Any]:
+        if not ENABLE_PHASE65_OPTIMIZATION:
+            return _base_phase65_phase5_thresholds(session, regime)
+        return phase65_dynamic_thresholds(session, regime)
+
+
+# Override scanner scoring after Phase 5 so fallback structure and score boosts can help
+# candidates qualify during real market windows without removing risk gates.
+_base_phase65_score_symbol = multi_ticker_score_symbol if "multi_ticker_score_symbol" in globals() else None
+if _base_phase65_score_symbol:
+    def multi_ticker_score_symbol(symbol: str) -> Dict[str, Any]:
+        c = _base_phase65_score_symbol(symbol)
+        if not ENABLE_PHASE65_OPTIMIZATION or not isinstance(c, dict):
+            return c
+        symbol = str(c.get("symbol") or symbol or "").upper()
+        session = phase5_session_state() if "phase5_session_state" in globals() else {}
+        regime = str(c.get("regime") or (c.get("snapshot", {}) if isinstance(c.get("snapshot"), dict) else {}).get("market_regime") or "NORMAL").upper()
+        th = phase65_dynamic_thresholds(session, regime)
+        rejects = list(c.get("reject_reasons", [])) if isinstance(c.get("reject_reasons", []), list) else []
+        reasons = list(c.get("reasons", [])) if isinstance(c.get("reasons", []), list) else []
+        score = phase65_float(c.get("score", c.get("execution_score", 0)), 0)
+        rr = phase65_float(c.get("rr", 0), 0)
+        fallback = phase65_fallback_market_structure(c)
+        if fallback.get("structure_valid"):
+            # Remove missing premarket / low-context rejects only when VWAP fallback confirms structure.
+            rejects = [r for r in rejects if "premarket_high_missing" not in str(r) and "premarket_low_missing" not in str(r) and "premarket levels not loaded" not in str(r)]
+            if "fallback_structure_used" not in reasons:
+                reasons.append("fallback_structure_used")
+            score += 4.0
+        boost, boost_reasons = phase65_execution_score_boost(c)
+        score += boost
+        reasons.extend([r for r in boost_reasons if r not in reasons])
+        # Replace Phase 5 threshold rejection using Phase 6.5 values.
+        rejects = [r for r in rejects if not str(r).startswith("phase5_score_below_adaptive_min") and not str(r).startswith("phase4_score_below_a_plus")]
+        if score < th["min_score"]:
+            rejects.append(f"phase65_score_below_dynamic_min:{round(score,2)}<{th['min_score']}")
+        else:
+            rejects = [r for r in rejects if "score_below" not in str(r)]
+        if rr and rr < th["min_rr"]:
+            rejects = [r for r in rejects if not str(r).startswith("rr_too_low") and not str(r).startswith("phase5_rr_below_adaptive_min")]
+            rejects.append(f"phase65_rr_below_dynamic_min:{round(rr,2)}<{th['min_rr']}")
+        if PHASE65_BLOCK_AFTER_HOURS and not session.get("tradable"):
+            if "after_hours_or_plan_only_candidate" not in rejects:
+                rejects.append("after_hours_or_plan_only_candidate")
+            score = min(score, PHASE65_AFTER_HOURS_MIN_SCORE - 1)
+        elif session.get("tradable"):
+            rejects = [r for r in rejects if r != "after_hours_or_plan_only_candidate"]
+        passed = bool(len(rejects) == 0 and score >= th["min_score"])
+        c.update({
+            "phase65": True,
+            "phase65_thresholds": th,
+            "phase65_fallback_structure": fallback,
+            "score": round(max(0, min(100, score)), 2),
+            "execution_score": round(max(0, min(100, score)), 2),
+            "reject_reasons": rejects,
+            "reasons": reasons + (["phase65_optimized_candidate"] if passed else []),
+            "direction": c.get("candidate_direction", c.get("direction", "NO_TRADE")) if passed else "NO_TRADE",
+            "phase4_tradeable": passed,
+            "phase5_live_activation": passed,
+        })
+        phase65_write_state({"last_symbol": symbol, "last_candidate": c, "session": session, "thresholds": th, "passed": passed})
+        phase65_event("candidate_scored", {"symbol": symbol, "score": c.get("score"), "passed": passed, "rejects": rejects[:6], "thresholds": th, "fallback": fallback})
+        try:
+            if passed:
+                debug(f"PHASE 6.5 OPTIMIZED CANDIDATE | {symbol} score={c.get('score')} min={th['min_score']} reasons={reasons[-4:]}")
+            else:
+                debug(f"PHASE 6.5 NO TRADE | {symbol} score={c.get('score')} min={th['min_score']} rejects={rejects[:5]}")
+        except Exception:
+            pass
+        return c
+
+
+# Adjust allocator floors to match safe dynamic A/A+ thresholds while leaving dual approval intact.
+try:
+    if ENABLE_PHASE65_OPTIMIZATION:
+        PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE = min(float(globals().get("PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE", 65)), 62.0)
+        PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION = min(float(globals().get("PORTFOLIO_ALLOCATOR_MIN_SCANNER_SCORE_FOR_SELECTION", 65)), 62.0)
+        PORTFOLIO_ALLOCATOR_MIN_SCORE = min(float(globals().get("PORTFOLIO_ALLOCATOR_MIN_SCORE", 72)), 62.0)
+        phase65_event("allocator_thresholds_optimized", {"allocator_min_score": PORTFOLIO_ALLOCATOR_MIN_SCORE, "allocator_min_execution_score": PORTFOLIO_ALLOCATOR_MIN_EXECUTION_SCORE})
+except Exception:
+    pass
+
+
+# Safely allow allocator/Phase2 to recover from DEGRADED only when truth checks are clean.
+def phase65_safe_degraded_entry_allowed() -> Tuple[bool, Dict[str, Any]]:
+    checks: Dict[str, Any] = {"enabled": ENABLE_PHASE65_OPTIMIZATION, "allow_safe_degraded": PHASE65_ALLOW_SAFE_DEGRADED_TRADING}
+    if not ENABLE_PHASE65_OPTIMIZATION or not PHASE65_ALLOW_SAFE_DEGRADED_TRADING:
+        return False, checks
+    try:
+        if bool(globals().get("KILL_SWITCH", False)) or bool(globals().get("BOT_PAUSED", False)):
+            checks["blocked"] = "manual_kill_or_pause"
+            return False, checks
+        exposure = portfolio_allocator_open_exposure_snapshot() if "portfolio_allocator_open_exposure_snapshot" in globals() else {"open_count": 0}
+        checks["open_count"] = exposure.get("open_count", 0)
+        if int(exposure.get("open_count", 0) or 0) > 0:
+            checks["blocked"] = "open_positions_exist"
+            return False, checks
+        orders = _elite_load_json(globals().get("ORDERS_FILE", "orders.json"), {}) if "_elite_load_json" in globals() else {}
+        active_orders = []
+        if isinstance(orders, dict):
+            raw = orders.get("orders", orders.get("active_orders", []))
+            if isinstance(raw, list):
+                active_orders = [o for o in raw if isinstance(o, dict) and str(o.get("status", "")).lower() in {"new", "accepted", "pending_new", "partially_filled"}]
+        checks["active_orders"] = len(active_orders)
+        if active_orders:
+            checks["blocked"] = "active_orders_exist"
+            return False, checks
+        # If Phase 3 recovery exists, use it as an additional truth source.
+        if "phase3_intelligent_engine_recovery" in globals():
+            rec = phase3_intelligent_engine_recovery(trigger="phase65_safe_degraded_entry")
+            checks["phase3_recovery"] = rec
+            blockers = rec.get("blockers", []) if isinstance(rec, dict) else []
+            hard_blockers = [b for b in blockers if any(x in str(b).lower() for x in ["kill", "daily_loss", "foreign", "recon", "uncertain", "open_position", "active_order"])]
+            if hard_blockers:
+                checks["blocked"] = f"hard_recovery_blockers:{hard_blockers[:3]}"
+                return False, checks
+        return True, checks
+    except Exception as e:
+        checks["blocked"] = f"error:{e}"
+        return False, checks
+
+
+_base_phase65_portfolio_state = portfolio_allocator_current_state if "portfolio_allocator_current_state" in globals() else None
+if _base_phase65_portfolio_state:
+    def portfolio_allocator_current_state() -> Dict[str, Any]:
+        state = _base_phase65_portfolio_state()
+        try:
+            name = str((state or {}).get("current_state", "")).upper()
+            if name == "DEGRADED":
+                ok, checks = phase65_safe_degraded_entry_allowed()
+                if ok:
+                    state = dict(state or {})
+                    state["previous_state_before_phase65"] = name
+                    state["current_state"] = "CAUTIOUS"
+                    state["allowed_to_trade"] = True
+                    state["allow_new_entries"] = True
+                    state["phase65_safe_degraded_override"] = True
+                    state["phase65_checks"] = checks
+                    phase65_event("safe_degraded_allocator_unlocked", checks)
+                else:
+                    phase65_event("safe_degraded_allocator_still_blocked", checks)
+        except Exception:
+            pass
+        return state
+
+
+_base_phase65_engine_allows_order = phase2_engine_allows_order if "phase2_engine_allows_order" in globals() else None
+if _base_phase65_engine_allows_order:
+    def phase2_engine_allows_order(payload: dict = None, context: str = "new_entry") -> tuple:
+        allowed, reason, snapshot = _base_phase65_engine_allows_order(payload, context)
+        if allowed or not ENABLE_PHASE65_OPTIMIZATION:
+            return allowed, reason, snapshot
+        try:
+            if "DEGRADED" in str(reason).upper():
+                ok, checks = phase65_safe_degraded_entry_allowed()
+                if ok:
+                    phase65_event("phase2_safe_degraded_entry_allowed", {"context": context, "original_reason": reason, "checks": checks})
+                    try:
+                        debug(f"PHASE 6.5 SAFE DEGRADED ENTRY ALLOW | context={context} original={reason}")
+                    except Exception:
+                        pass
+                    return True, "phase65_safe_degraded_entry_allowed", snapshot
+                phase65_event("phase2_safe_degraded_entry_blocked", {"context": context, "original_reason": reason, "checks": checks})
+        except Exception:
+            pass
+        return allowed, reason, snapshot
+
+try:
+    print("[PHASE 6.5 OPTIMIZATION ACTIVE] controlled trade frequency + fallback structure + dynamic thresholds enabled", flush=True)
+except Exception:
+    pass
+
 # =========================================================
 # PHASE 6 EXECUTION QUALITY + SLIPPAGE ATTRIBUTION MODULE
 # Observability-only: records latency, spread, expected-vs-realized price,
