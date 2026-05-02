@@ -16,29 +16,87 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 # =========================================================
-# TEMP ALLOCATOR VALIDATION OVERRIDES
-# Purpose: bypass Render ENV save failures and force allocator test mode.
-# Remove these lines after allocator validation passes.
+# CONTROLLED SNIPER MODE — BUILT-IN DEFAULTS
+# Purpose: Render ENV screen is unreliable, so the safest live-trading
+# profile is embedded directly in code.
+#
+# Behavior:
+# - A+ setups may receive full size.
+# - A setups may receive reduced size.
+# - B+ setups are allowed only as starter-size opportunities.
+# - Below B+ remains blocked.
+# - Does NOT force market hours.
+# - Does NOT bypass VWAP, regime, risk, allocator, or dual approval.
+# - Does NOT bypass duplicate/idempotency protection.
 # =========================================================
-os.environ["FORCE_REGIME_ALLOW"] = "true"
-os.environ["BLOCK_CHOP_REGIME"] = "false"
-os.environ["MARKET_REGIME_BLOCK_CHOP"] = "false"
-os.environ["SAFE_MULTI_TICKER_BLOCK_CHOP"] = "false"
-os.environ["SCANNER_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
-os.environ["MULTI_TICKER_SCAN_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
+
+# Core controlled-sniper profile
+os.environ["TRADING_STYLE_PROFILE"] = "CONTROLLED_SNIPER"
+os.environ["CONTROLLED_SNIPER_MODE"] = "true"
+os.environ["ENABLE_CONTROLLED_SNIPER_MODE"] = "true"
+
+# Keep allocator architecture active and keep old direct ai_signal execution blocked.
 os.environ["PORTFOLIO_ALLOCATOR_ENABLED"] = "true"
 os.environ["ENABLE_PORTFOLIO_ALLOCATOR"] = "true"
-# Force allocator validation to process repeated runtime-generated signals.
-# REMOVE AFTER TEST: this bypasses duplicate hash skipping so the allocator can rank fresh candidates.
-os.environ["FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST"] = "true"
-os.environ["ALLOW_DUPLICATE_SIGNALS"] = "true"
-print("[TEMP ALLOCATOR TEST OVERRIDES ACTIVE] FORCE_REGIME_ALLOW=true symbols=QQQ,SPY,NVDA,TSLA duplicate_bypass=true", flush=True)
-# TEMP ALLOCATOR WIRING TEST OVERRIDES — execution must only consume allocator-selected signals.
 os.environ["REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION"] = "true"
 os.environ["BLOCK_DIRECT_AI_SIGNAL_EXECUTION"] = "true"
-print("[ALLOCATOR EXECUTION WIRING TEST ACTIVE] only allocator-selected candidates can reach execution", flush=True)
-print("[ALLOCATOR HARD BLOCK ACTIVE] ai_signal.json cannot execute unless source=multi_candidate_allocator", flush=True)
+os.environ["REQUIRE_DUAL_APPROVAL_FOR_EXECUTION"] = "true"
 
+# Symbols controlled sniper is allowed to scan. Execution still requires per-symbol rules,
+# allocator approval, unified approval, risk gates, and broker safety.
+os.environ["SCANNER_SYMBOLS"] = os.environ.get("SCANNER_SYMBOLS", "QQQ,SPY,NVDA,TSLA")
+os.environ["MULTI_TICKER_SCAN_SYMBOLS"] = os.environ.get("MULTI_TICKER_SCAN_SYMBOLS", "QQQ,SPY,NVDA,TSLA")
+
+# Do NOT force regime/chop/session overrides in production. These are explicitly kept off.
+os.environ["FORCE_REGIME_ALLOW"] = "false"
+os.environ["FORCE_MARKET_HOURS"] = "false"
+os.environ["ALLOW_AFTER_HOURS_TRADES"] = "false"
+os.environ["FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST"] = "false"
+os.environ["ALLOW_DUPLICATE_SIGNALS"] = "false"
+
+# Controlled sniper score/grade behavior.
+# These are intentionally less restrictive than pure A+ sniper mode,
+# but still strict enough to avoid garbage setups.
+os.environ["PHASE5_MIN_SCORE"] = "65"
+os.environ["PHASE4_A_PLUS_MIN_SCORE"] = "72"
+os.environ["PHASE4_A_MIN_SCORE"] = "65"
+os.environ["PHASE4_BPLUS_MIN_SCORE"] = "60"
+os.environ["PHASE5_ALLOW_A_GRADE"] = "true"
+os.environ["PHASE5_ALLOW_BPLUS_STARTER"] = "true"
+os.environ["ELITE_ALLOWED_GRADES"] = "A+,A,B+"
+os.environ["LIVE_ELITE_ALLOWED_GRADES"] = "A+,A,B+"
+
+# Tiered sizing. A+ can be full, A reduced, B+ starter only.
+os.environ["UNIFIED_SIZE_MULT_HIGH"] = "1.0"
+os.environ["UNIFIED_SIZE_MULT_MED"] = "0.6"
+os.environ["UNIFIED_SIZE_MULT_LOW"] = "0.25"
+os.environ["UNIFIED_DECISION_SIZE_MAX"] = "1.0"
+os.environ["UNIFIED_DECISION_SIZE_MED"] = "0.6"
+os.environ["UNIFIED_DECISION_SIZE_LOW"] = "0.25"
+os.environ["STARTER_SIZE_MULT"] = "0.25"
+os.environ["A_GRADE_SIZE_MULT"] = "0.6"
+os.environ["APLUS_GRADE_SIZE_MULT"] = "1.0"
+
+# Risk/DD profile: protective but not so tight that every trade is killed instantly.
+os.environ["UNREALIZED_MAX_DD_PCT"] = "0.30"
+os.environ["UNREALIZED_HARD_STOP_PCT"] = "0.40"
+os.environ["UNREALIZED_DD_EXIT_MODE"] = "scale"
+os.environ["PORTFOLIO_MAX_HEAT_PCT"] = "0.06"
+os.environ["REALTIME_RISK_MAX_SIZE_MULT"] = "1.25"
+os.environ["REALTIME_RISK_WINSTREAK_SIZEUP"] = "4"
+
+# Preserve production safety locks.
+os.environ["ENABLE_EXECUTION_IDEMPOTENCY"] = os.environ.get("ENABLE_EXECUTION_IDEMPOTENCY", "true")
+os.environ["ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY"] = os.environ.get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", "true")
+os.environ["ENABLE_LIVE_SAFETY_LOCK"] = os.environ.get("ENABLE_LIVE_SAFETY_LOCK", "true")
+os.environ["ENABLE_PORTFOLIO_HEAT_EXPOSURE"] = os.environ.get("ENABLE_PORTFOLIO_HEAT_EXPOSURE", "true")
+
+print(
+    "[CONTROLLED SNIPER MODE ACTIVE] grades=A+,A,B+ | sizing=1.0/0.6/0.25 | "
+    "phase5_min=65 | allocator+dual_approval required | no forced market/session bypass",
+    flush=True,
+)
+print("[ALLOCATOR HARD BLOCK ACTIVE] ai_signal.json cannot execute unless source=multi_candidate_allocator", flush=True)
 try:
     import websocket  # pip package: websocket-client
     WEBSOCKET_CLIENT_AVAILABLE = True
