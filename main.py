@@ -24439,6 +24439,141 @@ def phase4_level_values(snap: Dict[str, Any], price: float) -> Dict[str, float]:
     return {"pm_high": pm_high, "pm_low": pm_low, "high": high, "low": low}
 
 
+# =========================================================
+# UPGRADED PREMARKET + STRUCTURE DATA LAYER
+# =========================================================
+try:
+    print("[PREMARKET STRUCTURE LAYER ACTIVE] Alpaca/current-data fallback for PM high/low + structure enabled", flush=True)
+except Exception:
+    pass
+
+PREMARKET_STRUCTURE_LAYER_ENABLED = os.getenv("PREMARKET_STRUCTURE_LAYER_ENABLED", "true").lower() == "true"
+PREMARKET_FALLBACK_ALLOW_SYNTHETIC = os.getenv("PREMARKET_FALLBACK_ALLOW_SYNTHETIC", "true").lower() == "true"
+PREMARKET_FALLBACK_MIN_RANGE_PCT = float(os.getenv("PREMARKET_FALLBACK_MIN_RANGE_PCT", "0.006"))
+PREMARKET_FALLBACK_MAX_RANGE_PCT = float(os.getenv("PREMARKET_FALLBACK_MAX_RANGE_PCT", "0.018"))
+PREMARKET_STRUCTURE_EVENTS_FILE = os.getenv("PREMARKET_STRUCTURE_EVENTS_FILE", "premarket_structure_events.jsonl")
+PREMARKET_STRUCTURE_STATE_FILE = os.getenv("PREMARKET_STRUCTURE_STATE_FILE", "premarket_structure_state.json")
+
+def _pm_structure_float(value, default=0.0):
+    try:
+        if value in (None, "", "None", "nan"):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+def _pm_structure_event(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        row = {"event": event, "time": datetime.now().isoformat(), **(payload or {})}
+        if "_elite_event" in globals():
+            _elite_event(PREMARKET_STRUCTURE_EVENTS_FILE, row)
+        else:
+            with open(PREMARKET_STRUCTURE_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+def _pm_structure_write_state(payload: Dict[str, Any]) -> None:
+    try:
+        if "atomic_write_json" in globals():
+            atomic_write_json(PREMARKET_STRUCTURE_STATE_FILE, payload)
+        elif "_elite_write_json" in globals():
+            _elite_write_json(PREMARKET_STRUCTURE_STATE_FILE, payload)
+        else:
+            with open(PREMARKET_STRUCTURE_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+    except Exception:
+        pass
+
+def _load_market_node_for_structure(symbol: str) -> Dict[str, Any]:
+    try:
+        data = load_json_file(globals().get("MARKET_DATA_FILE", "market_prices.json"), {}) if "load_json_file" in globals() else {}
+        node = data.get(symbol, {}) if isinstance(data, dict) else {}
+        return node if isinstance(node, dict) else {}
+    except Exception:
+        return {}
+
+def build_premarket_structure_snapshot(symbol: str, base_snap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    symbol = str(symbol or "QQQ").upper().strip()
+    snap = dict(base_snap or {})
+    node = _load_market_node_for_structure(symbol)
+    for key in (
+        "price", "last", "close", "vwap", "session_vwap", "volume", "last_candle_volume",
+        "premarket_high", "premarket_low", "pm_high", "pm_low",
+        "previous_day_high", "previous_day_low", "prev_day_high", "prev_day_low",
+        "prior_high", "prior_low", "yesterday_high", "yesterday_low",
+        "day_high", "day_low", "high", "low", "range_high_30m", "range_low_30m",
+        "thirty_min_high", "thirty_min_low", "last_30m_high", "last_30m_low"
+    ):
+        if key not in snap and key in node:
+            snap[key] = node.get(key)
+    price = _pm_structure_float(snap.get("price", snap.get("last", snap.get("close", 0))), 0)
+    vwap = _pm_structure_float(snap.get("vwap", snap.get("session_vwap", price)), price)
+    if price <= 0:
+        snap["premarket_structure_source"] = "missing_price"
+        snap["premarket_structure_valid"] = False
+        return snap
+    high = _pm_structure_float(snap.get("premarket_high", snap.get("pm_high", 0)), 0)
+    low = _pm_structure_float(snap.get("premarket_low", snap.get("pm_low", 0)), 0)
+    source = "true_premarket" if high > 0 and low > 0 else ""
+    if high <= 0 or low <= 0:
+        prev_high = _pm_structure_float(snap.get("previous_day_high", snap.get("prev_day_high", snap.get("prior_high", snap.get("yesterday_high", 0)))), 0)
+        prev_low = _pm_structure_float(snap.get("previous_day_low", snap.get("prev_day_low", snap.get("prior_low", snap.get("yesterday_low", 0)))), 0)
+        if prev_high > 0 and prev_low > 0 and prev_high > prev_low:
+            high, low, source = prev_high, prev_low, "previous_day_fallback"
+    if high <= 0 or low <= 0:
+        range_high = _pm_structure_float(snap.get("range_high_30m", snap.get("thirty_min_high", snap.get("last_30m_high", snap.get("day_high", snap.get("high", 0))))), 0)
+        range_low = _pm_structure_float(snap.get("range_low_30m", snap.get("thirty_min_low", snap.get("last_30m_low", snap.get("day_low", snap.get("low", 0))))), 0)
+        if range_high > 0 and range_low > 0 and range_high > range_low:
+            high, low, source = range_high, range_low, "recent_range_fallback"
+    if (high <= 0 or low <= 0) and PREMARKET_FALLBACK_ALLOW_SYNTHETIC:
+        center = vwap if vwap > 0 else price
+        raw_pct = abs(price - center) / max(price, 0.01)
+        band_pct = min(max(raw_pct * 1.75, PREMARKET_FALLBACK_MIN_RANGE_PCT), PREMARKET_FALLBACK_MAX_RANGE_PCT)
+        high = max(price, center) * (1 + band_pct / 2)
+        low = min(price, center) * (1 - band_pct / 2)
+        source = "synthetic_vwap_range_fallback"
+    if high > 0 and low > 0 and high > low:
+        snap["premarket_high"] = high
+        snap["premarket_low"] = low
+        snap["pm_high"] = high
+        snap["pm_low"] = low
+        snap["structure_high"] = high
+        snap["structure_low"] = low
+        snap["premarket_structure_source"] = source or "unknown_fallback"
+        snap["premarket_structure_valid"] = True
+        snap["premarket_structure_is_fallback"] = source != "true_premarket"
+        snap["premarket_structure_range_pct"] = round((high - low) / max(price, 0.01), 5)
+    else:
+        snap["premarket_structure_source"] = "unavailable"
+        snap["premarket_structure_valid"] = False
+        snap["premarket_structure_is_fallback"] = True
+    _pm_structure_event("structure_snapshot", {"symbol": symbol, "price": price, "vwap": vwap, "pm_high": snap.get("pm_high"), "pm_low": snap.get("pm_low"), "source": snap.get("premarket_structure_source"), "valid": snap.get("premarket_structure_valid")})
+    _pm_structure_write_state({"last_symbol": symbol, "last_snapshot": {"symbol": symbol, "price": price, "vwap": vwap, "pm_high": snap.get("pm_high"), "pm_low": snap.get("pm_low"), "source": snap.get("premarket_structure_source"), "valid": snap.get("premarket_structure_valid"), "fallback": snap.get("premarket_structure_is_fallback")}, "updated_at": datetime.now().isoformat()})
+    return snap
+
+_base_phase4_snapshot_for_structure = phase4_snapshot
+def phase4_snapshot(symbol: str) -> Dict[str, Any]:
+    snap = _base_phase4_snapshot_for_structure(symbol)
+    if PREMARKET_STRUCTURE_LAYER_ENABLED:
+        snap = build_premarket_structure_snapshot(symbol, snap)
+    return snap
+
+_base_phase4_level_values_for_structure = phase4_level_values
+def phase4_level_values(snap: Dict[str, Any], price: float) -> Dict[str, float]:
+    if PREMARKET_STRUCTURE_LAYER_ENABLED:
+        try:
+            symbol = str(snap.get("symbol") or snap.get("ticker") or "QQQ").upper()
+            snap = build_premarket_structure_snapshot(symbol, snap)
+        except Exception:
+            pass
+    levels = _base_phase4_level_values_for_structure(snap, price)
+    if levels.get("pm_high", 0) <= 0:
+        levels["pm_high"] = _pm_structure_float(snap.get("structure_high"), 0)
+    if levels.get("pm_low", 0) <= 0:
+        levels["pm_low"] = _pm_structure_float(snap.get("structure_low"), 0)
+    return levels
+
 def phase4_build_execution_grade_candidate(symbol: str) -> Dict[str, Any]:
     symbol = str(symbol or "QQQ").upper().strip()
     snap = phase4_snapshot(symbol)
