@@ -91,6 +91,120 @@ os.environ["ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY"] = os.environ.get("ENABLE_P
 os.environ["ENABLE_LIVE_SAFETY_LOCK"] = os.environ.get("ENABLE_LIVE_SAFETY_LOCK", "true")
 os.environ["ENABLE_PORTFOLIO_HEAT_EXPOSURE"] = os.environ.get("ENABLE_PORTFOLIO_HEAT_EXPOSURE", "true")
 
+
+# =========================================================
+# BUILT-IN STARTER LIVE RISK CONFIG — $1,000 ACCOUNT PROFILE
+# Purpose: Render ENV screen is unreliable, so these non-secret live-risk
+# controls are embedded directly in code. Secrets still stay in Render:
+# ALPACA_API_KEY, ALPACA_SECRET_KEY, Discord/Telegram tokens, data keys.
+#
+# This profile is intentionally conservative:
+# - max 1 contract
+# - max 1 open position
+# - stop after 2 consecutive losses
+# - $60 max daily loss target on a $1,000 starter account
+# - controlled sniper grades A+/A/B+ with tiered sizing
+# =========================================================
+
+# Live routing/profile. This intentionally sets live mode behavior in code.
+# Make sure your Alpaca keys are LIVE keys before deploying this file.
+os.environ["LIVE_MODE"] = "true"
+os.environ["MODE"] = "live"
+os.environ["ENABLE_PAPER_EXECUTION"] = "false"
+os.environ["USE_ALPACA_PAPER"] = "false"
+os.environ["PAPER_BROKER_MODE"] = "alpaca"
+os.environ["ENABLE_ALPACA"] = "true"
+os.environ["ENABLE_EXECUTION"] = "true"
+# Do not set API keys here. Keep keys in Render secrets.
+# If your code reads ALPACA_BASE_URL, this points to live Alpaca.
+os.environ["ALPACA_BASE_URL"] = "https://api.alpaca.markets"
+os.environ["ALPACA_ORDERS_URL"] = "https://api.alpaca.markets/v2/orders"
+os.environ["ALPACA_ACCOUNT_URL"] = "https://api.alpaca.markets/v2/account"
+os.environ["ALPACA_POSITIONS_URL"] = "https://api.alpaca.markets/v2/positions"
+
+# Starter live account sizing/risk.
+os.environ["MAX_RISK_PER_TRADE_PCT"] = "0.03"
+os.environ["MAXRISKPERTRADEPCT"] = "0.03"
+os.environ["MAX_DAILY_LOSS_PCT"] = "0.06"
+os.environ["MAXDAILYLOSSPCT"] = "0.06"
+os.environ["MAX_OPEN_POSITIONS"] = "1"
+os.environ["MAXOPENPOSITIONS"] = "1"
+os.environ["MAX_CONSECUTIVE_LOSSES"] = "2"
+os.environ["MAXCONSECUTIVELOSSES"] = "2"
+os.environ["MAX_DAILY_TRADES"] = "2"
+os.environ["MAXDAILYTRADES"] = "2"
+os.environ["MAX_TOTAL_CONTRACTS_PER_TRADE"] = "1"
+os.environ["ALPACA_OPTION_QTY"] = "1"
+os.environ["BASE_OPTION_QTY"] = "1"
+os.environ["SCALE_OPTION_QTY"] = "0"
+os.environ["ALLOW_SCALING"] = "false"
+
+# Live safety lock. Max one contract, one open position, $60 daily loss.
+os.environ["LIVESAFETYMAXQTY"] = "1"
+os.environ["LIVE_SAFETY_MAX_QTY"] = "1"
+os.environ["LIVESAFETYMAXOPENPOSITIONS"] = "1"
+os.environ["LIVE_SAFETY_MAX_OPEN_POSITIONS"] = "1"
+os.environ["LIVESAFETYMAXDAILYLOSSDOLLARS"] = "60"
+os.environ["LIVE_SAFETY_MAX_DAILY_LOSS_DOLLARS"] = "60"
+os.environ["LIVESAFETYREQUIREMANUALUNLOCK"] = "true"
+os.environ["LIVE_SAFETY_REQUIRE_MANUAL_UNLOCK"] = "true"
+os.environ["LIVESAFETYREQUIREFORCEOFF"] = "true"
+os.environ["LIVE_SAFETY_REQUIRE_FORCE_OFF"] = "true"
+
+# Unrealized drawdown controls.
+os.environ["UNREALIZED_MAX_DD_PCT"] = "0.30"
+os.environ["UNREALIZEDMAXDDPCT"] = "0.30"
+os.environ["UNREALIZED_HARD_STOP_PCT"] = "0.40"
+os.environ["UNREALIZEDHARDSTOPPCT"] = "0.40"
+os.environ["UNREALIZED_DD_EXIT_MODE"] = "scale"
+os.environ["UNREALIZEDDDEXITMODE"] = "scale"
+os.environ["PORTFOLIO_MAX_HEAT_PCT"] = "0.06"
+os.environ["PORTFOLIOMAXHEATPCT"] = "0.06"
+
+# Controlled Sniper thresholds.
+os.environ["PHASE5_MIN_SCORE"] = "65"
+os.environ["ELITE_ALLOWED_GRADES"] = "A+,A,B+"
+os.environ["LIVE_ELITE_ALLOWED_GRADES"] = "A+,A,B+"
+os.environ["UNIFIED_SIZE_MULT_HIGH"] = "1.0"
+os.environ["UNIFIED_SIZE_MULT_MED"] = "0.6"
+os.environ["UNIFIED_SIZE_MULT_LOW"] = "0.25"
+os.environ["UNIFIED_DECISION_MIN_SCORE"] = "65"
+os.environ["UNIFIEDDECISIONMINSCORE"] = "65"
+os.environ["UNIFIED_DECISION_MIN_RISK_SCORE"] = "60"
+os.environ["UNIFIEDDECISIONMINRISKSCORE"] = "60"
+
+# Adaptive risk controls.
+os.environ["REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_SOFT"] = "0.03"
+os.environ["REALTIMERISKMAXDAILYDRAWDOWNPCTSOFT"] = "0.03"
+os.environ["REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_HARD"] = "0.06"
+os.environ["REALTIMERISKMAXDAILYDRAWDOWNPCTHARD"] = "0.06"
+os.environ["REALTIME_RISK_MAX_SIZE_MULT"] = "1.25"
+os.environ["REALTIMERISKMAXSIZEMULT"] = "1.25"
+os.environ["REALTIME_RISK_WINSTREAK_SIZEUP"] = "4"
+os.environ["REALTIMERISKWINSTREAKSIZEUP"] = "4"
+
+# Anti-chase / execution drift control.
+os.environ["NOCHASEMAXENTRYDRIFTPCT"] = "0.05"
+os.environ["NO_CHASE_MAX_ENTRY_DRIFT_PCT"] = "0.05"
+
+# Safety modules must remain on.
+os.environ["ENABLE_LIVE_SAFETY_LOCK"] = "true"
+os.environ["ENABLELIVESAFETYLOCK"] = "true"
+os.environ["ENABLE_EXECUTION_IDEMPOTENCY"] = "true"
+os.environ["ENABLEEXECUTIONIDEMPOTENCY"] = "true"
+os.environ["ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY"] = "true"
+os.environ["ENABLEPHASE2BUNCERTAINORDERRECOVERY"] = "true"
+os.environ["ENABLE_PORTFOLIO_HEAT_EXPOSURE"] = "true"
+os.environ["ENABLEPORTFOLIOHEATEXPOSURE"] = "true"
+os.environ["ENABLE_REALTIME_ADAPTIVE_RISK"] = "true"
+os.environ["ENABLEREALTIMEADAPTIVERISK"] = "true"
+
+print(
+    "[STARTER LIVE RISK CONFIG ACTIVE] live=true | max_qty=1 | max_positions=1 | "
+    "max_daily_loss=$60/6% | risk_per_trade=3% | grades=A+,A,B+ | sizing=1.0/0.6/0.25",
+    flush=True,
+)
+
 print(
     "[CONTROLLED SNIPER MODE ACTIVE] grades=A+,A,B+ | sizing=1.0/0.6/0.25 | "
     "phase5_min=65 | allocator+dual_approval required | no forced market/session bypass",
