@@ -16,201 +16,78 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 # =========================================================
-# CONTROLLED SNIPER MODE — BUILT-IN DEFAULTS
-# Purpose: Render ENV screen is unreliable, so the safest live-trading
-# profile is embedded directly in code.
-#
-# Behavior:
-# - A+ setups may receive full size.
-# - A setups may receive reduced size.
-# - B+ setups are allowed only as starter-size opportunities.
-# - Below B+ remains blocked.
-# - Does NOT force market hours.
-# - Does NOT bypass VWAP, regime, risk, allocator, or dual approval.
-# - Does NOT bypass duplicate/idempotency protection.
+# BUILT-IN PAPER MODE VALIDATION CONFIG
+# Purpose: bypass Render ENV save failures and force SAFE PAPER execution.
+# This is NOT live trading. It uses Alpaca PAPER order/account endpoints.
+# Keep only secrets (API keys/webhooks) in Render ENV.
 # =========================================================
-
-# Core controlled-sniper profile
-os.environ["TRADING_STYLE_PROFILE"] = "CONTROLLED_SNIPER"
-os.environ["CONTROLLED_SNIPER_MODE"] = "true"
-os.environ["ENABLE_CONTROLLED_SNIPER_MODE"] = "true"
-
-# Keep allocator architecture active and keep old direct ai_signal execution blocked.
-os.environ["PORTFOLIO_ALLOCATOR_ENABLED"] = "true"
-os.environ["ENABLE_PORTFOLIO_ALLOCATOR"] = "true"
-os.environ["REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION"] = "true"
-os.environ["BLOCK_DIRECT_AI_SIGNAL_EXECUTION"] = "true"
-os.environ["REQUIRE_DUAL_APPROVAL_FOR_EXECUTION"] = "true"
-
-# Symbols controlled sniper is allowed to scan. Execution still requires per-symbol rules,
-# allocator approval, unified approval, risk gates, and broker safety.
-os.environ["SCANNER_SYMBOLS"] = os.environ.get("SCANNER_SYMBOLS", "QQQ,SPY,NVDA,TSLA")
-os.environ["MULTI_TICKER_SCAN_SYMBOLS"] = os.environ.get("MULTI_TICKER_SCAN_SYMBOLS", "QQQ,SPY,NVDA,TSLA")
-
-# Do NOT force regime/chop/session overrides in production. These are explicitly kept off.
-os.environ["FORCE_REGIME_ALLOW"] = "false"
-os.environ["FORCE_MARKET_HOURS"] = "false"
-os.environ["ALLOW_AFTER_HOURS_TRADES"] = "false"
-os.environ["FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST"] = "false"
-os.environ["ALLOW_DUPLICATE_SIGNALS"] = "false"
-
-# Controlled sniper score/grade behavior.
-# These are intentionally less restrictive than pure A+ sniper mode,
-# but still strict enough to avoid garbage setups.
-os.environ["PHASE5_MIN_SCORE"] = "65"
-os.environ["PHASE4_A_PLUS_MIN_SCORE"] = "72"
-os.environ["PHASE4_A_MIN_SCORE"] = "65"
-os.environ["PHASE4_BPLUS_MIN_SCORE"] = "60"
-os.environ["PHASE5_ALLOW_A_GRADE"] = "true"
-os.environ["PHASE5_ALLOW_BPLUS_STARTER"] = "true"
-os.environ["ELITE_ALLOWED_GRADES"] = "A+,A,B+"
-os.environ["LIVE_ELITE_ALLOWED_GRADES"] = "A+,A,B+"
-
-# Tiered sizing. A+ can be full, A reduced, B+ starter only.
-os.environ["UNIFIED_SIZE_MULT_HIGH"] = "1.0"
-os.environ["UNIFIED_SIZE_MULT_MED"] = "0.6"
-os.environ["UNIFIED_SIZE_MULT_LOW"] = "0.25"
-os.environ["UNIFIED_DECISION_SIZE_MAX"] = "1.0"
-os.environ["UNIFIED_DECISION_SIZE_MED"] = "0.6"
-os.environ["UNIFIED_DECISION_SIZE_LOW"] = "0.25"
-os.environ["STARTER_SIZE_MULT"] = "0.25"
-os.environ["A_GRADE_SIZE_MULT"] = "0.6"
-os.environ["APLUS_GRADE_SIZE_MULT"] = "1.0"
-
-# Risk/DD profile: protective but not so tight that every trade is killed instantly.
-os.environ["UNREALIZED_MAX_DD_PCT"] = "0.30"
-os.environ["UNREALIZED_HARD_STOP_PCT"] = "0.40"
-os.environ["UNREALIZED_DD_EXIT_MODE"] = "scale"
-os.environ["PORTFOLIO_MAX_HEAT_PCT"] = "0.06"
-os.environ["REALTIME_RISK_MAX_SIZE_MULT"] = "1.25"
-os.environ["REALTIME_RISK_WINSTREAK_SIZEUP"] = "4"
-
-# Preserve production safety locks.
-os.environ["ENABLE_EXECUTION_IDEMPOTENCY"] = os.environ.get("ENABLE_EXECUTION_IDEMPOTENCY", "true")
-os.environ["ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY"] = os.environ.get("ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY", "true")
-os.environ["ENABLE_LIVE_SAFETY_LOCK"] = os.environ.get("ENABLE_LIVE_SAFETY_LOCK", "true")
-os.environ["ENABLE_PORTFOLIO_HEAT_EXPOSURE"] = os.environ.get("ENABLE_PORTFOLIO_HEAT_EXPOSURE", "true")
-
-
-# =========================================================
-# BUILT-IN STARTER LIVE RISK CONFIG — $1,000 ACCOUNT PROFILE
-# Purpose: Render ENV screen is unreliable, so these non-secret live-risk
-# controls are embedded directly in code. Secrets still stay in Render:
-# ALPACA_API_KEY, ALPACA_SECRET_KEY, Discord/Telegram tokens, data keys.
-#
-# This profile is intentionally conservative:
-# - max 1 contract
-# - max 1 open position
-# - stop after 2 consecutive losses
-# - $60 max daily loss target on a $1,000 starter account
-# - controlled sniper grades A+/A/B+ with tiered sizing
-# =========================================================
-
-# Live routing/profile. This intentionally sets live mode behavior in code.
-# Make sure your Alpaca keys are LIVE keys before deploying this file.
-os.environ["LIVE_MODE"] = "true"
-os.environ["MODE"] = "live"
-os.environ["ENABLE_PAPER_EXECUTION"] = "false"
-os.environ["USE_ALPACA_PAPER"] = "false"
-os.environ["PAPER_BROKER_MODE"] = "alpaca"
+os.environ["LIVE_MODE"] = "false"
+os.environ["MODE"] = "paper"
+os.environ["ENABLE_PAPER_EXECUTION"] = "true"
 os.environ["ENABLE_ALPACA"] = "true"
 os.environ["ENABLE_EXECUTION"] = "true"
-# Do not set API keys here. Keep keys in Render secrets.
-# If your code reads ALPACA_BASE_URL, this points to live Alpaca.
-os.environ["ALPACA_BASE_URL"] = "https://api.alpaca.markets"
-os.environ["ALPACA_ORDERS_URL"] = "https://api.alpaca.markets/v2/orders"
-os.environ["ALPACA_ACCOUNT_URL"] = "https://api.alpaca.markets/v2/account"
-os.environ["ALPACA_POSITIONS_URL"] = "https://api.alpaca.markets/v2/positions"
+os.environ["USE_ALPACA_PAPER"] = "true"
+os.environ["PAPER_BROKER_MODE"] = "alpaca"
+os.environ["ALPACA_BASE_URL"] = "https://paper-api.alpaca.markets"
+os.environ["ALPACA_DATA_BASE_URL"] = "https://data.alpaca.markets"
+os.environ["ALLOW_LIVE_BUYS"] = "false"
+os.environ["ALPACA_LIVE_OPTIONS_APPROVED"] = "false"
+os.environ["FORCE_EXECUTION_MODE"] = "false"
+os.environ["AUTOBLOCK_LIVE_UNLESS_FULLY_APPROVED"] = "true"
+os.environ["AUTO_DETECT_PAPER_LIVE_MODE"] = "true"
 
-# Starter live account sizing/risk.
-os.environ["MAX_RISK_PER_TRADE_PCT"] = "0.03"
-os.environ["MAXRISKPERTRADEPCT"] = "0.03"
-os.environ["MAX_DAILY_LOSS_PCT"] = "0.06"
-os.environ["MAXDAILYLOSSPCT"] = "0.06"
-os.environ["MAX_OPEN_POSITIONS"] = "1"
-os.environ["MAXOPENPOSITIONS"] = "1"
-os.environ["MAX_CONSECUTIVE_LOSSES"] = "2"
-os.environ["MAXCONSECUTIVELOSSES"] = "2"
-os.environ["MAX_DAILY_TRADES"] = "2"
-os.environ["MAXDAILYTRADES"] = "2"
-os.environ["MAX_TOTAL_CONTRACTS_PER_TRADE"] = "1"
-os.environ["ALPACA_OPTION_QTY"] = "1"
-os.environ["BASE_OPTION_QTY"] = "1"
-os.environ["SCALE_OPTION_QTY"] = "0"
-os.environ["ALLOW_SCALING"] = "false"
+# Keep allocator-controlled execution path. Old/direct ai_signal execution stays blocked.
+os.environ["REQUIRE_ALLOCATOR_SELECTED_SIGNAL_FOR_EXECUTION"] = "true"
+os.environ["BLOCK_DIRECT_AI_SIGNAL_EXECUTION"] = "true"
+os.environ["PORTFOLIO_ALLOCATOR_ENABLED"] = "true"
+os.environ["ENABLE_PORTFOLIO_ALLOCATOR"] = "true"
+os.environ["SCANNER_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
+os.environ["MULTI_TICKER_SCAN_SYMBOLS"] = "QQQ,SPY,NVDA,TSLA"
 
-# Live safety lock. Max one contract, one open position, $60 daily loss.
-os.environ["LIVESAFETYMAXQTY"] = "1"
-os.environ["LIVE_SAFETY_MAX_QTY"] = "1"
-os.environ["LIVESAFETYMAXOPENPOSITIONS"] = "1"
-os.environ["LIVE_SAFETY_MAX_OPEN_POSITIONS"] = "1"
-os.environ["LIVESAFETYMAXDAILYLOSSDOLLARS"] = "60"
-os.environ["LIVE_SAFETY_MAX_DAILY_LOSS_DOLLARS"] = "60"
-os.environ["LIVESAFETYREQUIREMANUALUNLOCK"] = "true"
-os.environ["LIVE_SAFETY_REQUIRE_MANUAL_UNLOCK"] = "true"
-os.environ["LIVESAFETYREQUIREFORCEOFF"] = "true"
-os.environ["LIVE_SAFETY_REQUIRE_FORCE_OFF"] = "true"
-
-# Unrealized drawdown controls.
-os.environ["UNREALIZED_MAX_DD_PCT"] = "0.30"
-os.environ["UNREALIZEDMAXDDPCT"] = "0.30"
-os.environ["UNREALIZED_HARD_STOP_PCT"] = "0.40"
-os.environ["UNREALIZEDHARDSTOPPCT"] = "0.40"
-os.environ["UNREALIZED_DD_EXIT_MODE"] = "scale"
-os.environ["UNREALIZEDDDEXITMODE"] = "scale"
-os.environ["PORTFOLIO_MAX_HEAT_PCT"] = "0.06"
-os.environ["PORTFOLIOMAXHEATPCT"] = "0.06"
-
-# Controlled Sniper thresholds.
+# Controlled Sniper Mode: A+/A/B+ with tiered sizing, no forced after-hours trading.
 os.environ["PHASE5_MIN_SCORE"] = "65"
+os.environ["PHASE5_OPEN_MIN_SCORE"] = "65"
+os.environ["PHASE5_POWER_HOUR_MIN_SCORE"] = "68"
+os.environ["PHASE5_MIDDAY_MIN_SCORE"] = "72"
 os.environ["ELITE_ALLOWED_GRADES"] = "A+,A,B+"
-os.environ["LIVE_ELITE_ALLOWED_GRADES"] = "A+,A,B+"
 os.environ["UNIFIED_SIZE_MULT_HIGH"] = "1.0"
 os.environ["UNIFIED_SIZE_MULT_MED"] = "0.6"
 os.environ["UNIFIED_SIZE_MULT_LOW"] = "0.25"
 os.environ["UNIFIED_DECISION_MIN_SCORE"] = "65"
-os.environ["UNIFIEDDECISIONMINSCORE"] = "65"
 os.environ["UNIFIED_DECISION_MIN_RISK_SCORE"] = "60"
-os.environ["UNIFIEDDECISIONMINRISKSCORE"] = "60"
-
-# Adaptive risk controls.
-os.environ["REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_SOFT"] = "0.03"
-os.environ["REALTIMERISKMAXDAILYDRAWDOWNPCTSOFT"] = "0.03"
-os.environ["REALTIME_RISK_MAX_DAILY_DRAWDOWN_PCT_HARD"] = "0.06"
-os.environ["REALTIMERISKMAXDAILYDRAWDOWNPCTHARD"] = "0.06"
-os.environ["REALTIME_RISK_MAX_SIZE_MULT"] = "1.25"
-os.environ["REALTIMERISKMAXSIZEMULT"] = "1.25"
-os.environ["REALTIME_RISK_WINSTREAK_SIZEUP"] = "4"
-os.environ["REALTIMERISKWINSTREAKSIZEUP"] = "4"
-
-# Anti-chase / execution drift control.
 os.environ["NOCHASEMAXENTRYDRIFTPCT"] = "0.05"
-os.environ["NO_CHASE_MAX_ENTRY_DRIFT_PCT"] = "0.05"
 
-# Safety modules must remain on.
-os.environ["ENABLE_LIVE_SAFETY_LOCK"] = "true"
-os.environ["ENABLELIVESAFETYLOCK"] = "true"
-os.environ["ENABLE_EXECUTION_IDEMPOTENCY"] = "true"
-os.environ["ENABLEEXECUTIONIDEMPOTENCY"] = "true"
-os.environ["ENABLE_PHASE2B_UNCERTAIN_ORDER_RECOVERY"] = "true"
-os.environ["ENABLEPHASE2BUNCERTAINORDERRECOVERY"] = "true"
-os.environ["ENABLE_PORTFOLIO_HEAT_EXPOSURE"] = "true"
-os.environ["ENABLEPORTFOLIOHEATEXPOSURE"] = "true"
-os.environ["ENABLE_REALTIME_ADAPTIVE_RISK"] = "true"
-os.environ["ENABLEREALTIMEADAPTIVERISK"] = "true"
+# Starter PAPER risk profile for about a $1,000 validation account.
+os.environ["MAX_RISK_PER_TRADE_PCT"] = "0.03"
+os.environ["MAX_DAILY_LOSS_PCT"] = "0.06"
+os.environ["MAX_OPEN_POSITIONS"] = "1"
+os.environ["MAX_CONSECUTIVE_LOSSES"] = "2"
+os.environ["LIVESAFETYMAXQTY"] = "1"
+os.environ["LIVESAFETYMAXOPENPOSITIONS"] = "1"
+os.environ["LIVESAFETYMAXDAILYLOSSDOLLARS"] = "60"
+os.environ["UNREALIZED_MAX_DD_PCT"] = "0.30"
+os.environ["UNREALIZED_HARD_STOP_PCT"] = "0.40"
+os.environ["UNREALIZED_DD_EXIT_MODE"] = "scale"
+os.environ["PORTFOLIO_MAX_HEAT_PCT"] = "0.06"
 
-print(
-    "[STARTER LIVE RISK CONFIG ACTIVE] live=true | max_qty=1 | max_positions=1 | "
-    "max_daily_loss=$60/6% | risk_per_trade=3% | grades=A+,A,B+ | sizing=1.0/0.6/0.25",
-    flush=True,
-)
+# Data stability: Alpaca market data first, Twelve Data/WebSocket as non-blocking fallback only.
+os.environ["ALPACA_MARKET_DATA_PRIMARY"] = "true"
+os.environ["MARKET_DATA_PROVIDER"] = "auto"
+os.environ["ALPACA_MARKET_DATA_FEED"] = "iex"
+os.environ["ENABLE_WEBSOCKET_MARKET_DATA"] = "false"
+os.environ["TWELVE_WS_SYMBOLS"] = "QQQ,SPY,USO"
+os.environ["PREMARKET_READINESS_REQUIRED_SYMBOLS"] = "QQQ,SPY"
+os.environ["MARKET_REGIME_SYMBOLS"] = "QQQ,SPY"
 
-print(
-    "[CONTROLLED SNIPER MODE ACTIVE] grades=A+,A,B+ | sizing=1.0/0.6/0.25 | "
-    "phase5_min=65 | allocator+dual_approval required | no forced market/session bypass",
-    flush=True,
-)
+# Make sure test-only bypasses are OFF.
+os.environ["FORCE_REGIME_ALLOW"] = "false"
+os.environ["FORCE_NEW_SIGNALS_FOR_ALLOCATOR_TEST"] = "false"
+os.environ["ALLOW_DUPLICATE_SIGNALS"] = "false"
+os.environ["FORCE_ENGINE_ACTIVE"] = "false"
+print("[PAPER MODE CONFIG ACTIVE] Alpaca paper execution enabled | LIVE_MODE=false | base=https://paper-api.alpaca.markets", flush=True)
+print("[CONTROLLED SNIPER PAPER MODE ACTIVE] A+/A/B+ tiered sizing | max_qty=1 | max_open_positions=1", flush=True)
 print("[ALLOCATOR HARD BLOCK ACTIVE] ai_signal.json cannot execute unless source=multi_candidate_allocator", flush=True)
+
 try:
     import websocket  # pip package: websocket-client
     WEBSOCKET_CLIENT_AVAILABLE = True
