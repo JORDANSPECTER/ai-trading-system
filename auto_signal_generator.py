@@ -16,7 +16,7 @@ except Exception:
     pytz = None
 
 
-SIGNAL_FILE = "/opt/render/project/src/ai_signal.json"
+SIGNAL_FILE = "signal.json""
 MARKET_FILE = "/opt/render/project/src/market_prices.json"
 STATE_FILE = "/opt/render/project/src/auto_signal_generator_state.json"
 
